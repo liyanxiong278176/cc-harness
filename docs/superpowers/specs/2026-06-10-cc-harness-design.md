@@ -94,40 +94,47 @@ ToolSpec = {
 # 流式累积的 tool_call(LLM 输出 tool_calls 字段的 delta)
 @dataclass
 class PendingToolCall:
-    index: int                         # delta 中的工具序号(从 0 开始)
+    index: int | None = None           # delta 中的工具序号,兼容 API 不给时为 None(llm.py 本地兜底)
     id: str | None = None              # 首 chunk 拿到,兼容 API 不给时为 None
     name: str | None = None            # 首 chunk 拿到,流式结束仍为 None 视为解析失败
     arguments_json: str = ""           # 后续 delta.arguments 字符串 concat
 
-# MCP 工具调用返回结构(区分成功/失败)
+# MCP 工具调用返回结构(区分成功/失败,两种文本)
 @dataclass
 class ToolResult:
-    text: str                          # 序列化后的文本(给 LLM 看的)
-    is_error: bool = False             # True = 异常或 isError=True;False = 正常结果
+    is_error: bool = False
+    display_text: str                  # 给用户看的(终端打印);成功=序列化结果,失败=简洁错误信息
+    llm_text: str                      # 给 LLM 看的(回灌 messages);成功==display_text,失败=带 [Tool Error] 前缀的结构化信息
 ```
+
+**`PendingToolCall.index` 的兜底规则(`llm.py`)**:
+- 若 `delta.index` 不为 None → 按 index 对齐插入(`while len(pending) <= index: pending.append(PendingToolCall())`,然后赋值)
+- 若 `delta.index` 为 None → 顺序追加到 `pending` 末尾(`pending.append(PendingToolCall())`)
 
 ## 数据流(一次用户提问的完整路径)
 
 **核心约定**:**全面使用 OpenAI 原生 tool_calls**,LLM 通过 API 字段返回结构化工具调用,
 **不再**用正则解析 assistant 文本中的 `Action: {...}` 块。prompts.py 不再要求 LLM 输出特定 JSON 格式。
 
-**单一判定**:agent.py 只用一个布尔值决定是否走"工具调用路径":
+**单一判定**:`has_tool_calls` 决定是否进"工具调用分支",name 缺失在该分支内处理:
 
 ```python
-has_tool_calls = (finish_reason == "tool_calls") and bool(pending) and all(p.name for p in pending)
+has_tool_calls = (finish_reason == "tool_calls") and bool(pending)
 ```
 
-`has_tool_calls == True` → 走工具调用路径(黄色打印 + 执行 + 回灌)
-`has_tool_calls == False`:
-  - 有 `content` → 当作 Final Answer(白色打印,加入 messages)
-  - 无 `content` → 空 turn,黄色警告 `[yellow]empty LLM turn, ending[/yellow]`,回到 REPL
+分支表(4 种,穷举):
 
-**`has_tool_calls == False` 但有 `pending` 的情况(流式结束 `name` 仍为 None)**:
-- 不执行工具
-- 把这个 pending 工具(`id` 可能也是 None,占位填 `"unknown_{i}"`)作为 `role: tool` 的 error 回灌
-  `content = f"[Tool Error] tool_call name missing, raw: {json.dumps({'id': p.id, 'arguments_json': p.arguments_json})}"`
-- 黄色警告 `tool_call parse failed: missing name`
-- 不终止整个 turn,等 LLM 下一轮重试
+| 情形 | `has_tool_calls` | `content` | 行为 |
+|------|-----------------|-----------|------|
+| 正常工具调用 | True | 有/无 | 黄色打印 → 执行工具(逐个 `call_tool`)→ 把结果以 `role: tool` 回灌 → 继续内部循环 |
+| name 缺失的工具调用 | True | 有/无 | 不执行,黄色警告 + 把缺失的 pending 用占位 id `"unknown_{i}"` 作为 `role: tool` error 回灌(`llm_text` 自动带 `[Tool Error]` 前缀)→ 继续内部循环 |
+| 正常 Final Answer | False | 有 | 白色打印 → assistant message 入 history → 退出内部循环 |
+| 空 turn | False | 无 | 黄色警告 `[yellow]empty LLM turn, ending[/yellow]` → 回到 REPL |
+
+**`finish_reason == "tool_calls"` 但 `pending` 为空**(兼容 API 异常):
+- 黄色警告 `[yellow]finish_reason=tool_calls but no pending tool_calls, treating as stop[/yellow]`
+- **降级按 stop 处理**:有 content 当 Final Answer,无 content 当空 turn
+- 不在 agent.py 写额外 elif,这条警告让实现保持简洁
 
 1. 用户在 REPL 输入 "读一下 main.py 然后给我总结"
 2. `repl.py`:`messages.append({"role": "user", "content": "..."})`
@@ -135,21 +142,19 @@ has_tool_calls = (finish_reason == "tool_calls") and bool(pending) and all(p.nam
 4. `llm.chat(messages, tools=tool_specs, stream=True)` → 流式生成
    - 流式阶段逐 token 处理每个 chunk:
      - `delta.content` → **蓝色**逐 token 打印(LLM 推理过程的"思考");流式结束前不写进 messages
-     - `delta.tool_calls[i]` → 累积到 `pending[i]`(id / name 首 chunk 拿,arguments 字符串 concat),
-       **不在流式中途执行**
+     - `delta.tool_calls[i]` → 按 `index` 字段对齐或顺序追加到 `pending`;id / name 首 chunk 拿,arguments 字符串 concat,**不在流式中途执行**
    - 流式结束后:
      - 算出 `has_tool_calls`(见上)
-     - `True` → 构建 assistant message(见 § 消息累积)加入 messages → 黄色打印调用 → 进入 §5
-     - `False` 且有 content → 构建 assistant message 加入 messages → 白色打印 final → 退出内部循环
-     - `False` 且有 pending 但 name 缺 → 把缺失的 pending 当作 `role: tool` error 回灌 → 继续内部循环
-     - `False` 且无 content → 黄色警告,本次 turn 终止,回到 REPL
+     - 若是 `finish_reason == "tool_calls" but not pending` → 黄色警告 + 降级按 stop
+     - 然后查表 4 种情形走对应分支
 5. `mcp_client.call_tool(name, args) -> ToolResult`
    - 调 MCP `session.callTool()`,捕获异常
-   - 成功:序列化 `result.content` 为 `text`;若 `result.isError` 或抛异常,`is_error=True`,`text` 放错误信息
-6. 绿色 / 红色打印(根据 `result.is_error`):`render.print_tool_result(text, is_error=result.is_error)`
-7. `messages.append({"role":"tool", "tool_call_id": pending[i].id, "content": content_for_llm})`
-   - 成功:`content_for_llm = result.text`
-   - 失败:`content_for_llm = f"[Tool Error] {result.text}"`(让 LLM 看到前缀并自愈)
+   - 成功:`is_error=False`,`display_text = llm_text = texts` 拼接
+   - 失败 / `isError=True` / 超时:`is_error=True`,
+     `display_text = 简洁错误(给用户看)`,`llm_text = f"[Tool Error] {structured_payload}"`(给 LLM 看)
+6. 绿色 / 红色打印(根据 `result.is_error`):`render.print_tool_result(result.display_text, is_error=result.is_error)`
+7. `messages.append({"role":"tool", "tool_call_id": pending[i].id, "content": result.llm_text})`
+   - 关键:**直接用 `result.llm_text`**,agent.py 不再需要拼 `[Tool Error]` 前缀
 8. 回到 [4] (`iter=1`),把工具结果喂给 LLM
 9. LLM 这次 `has_tool_calls == False` 且有 content,白色打印 final,退出
 10. 退出内部循环,等下一个用户问题
@@ -161,7 +166,7 @@ has_tool_calls = (finish_reason == "tool_calls") and bool(pending) and all(p.nam
 
 **assistant message 三种形态**(路由后只写其中一种):
 
-1. **纯 content**(`has_tool_calls == False` 且有 content):
+1. **纯 content**(正常 Final Answer 分支):
    ```python
    messages.append({"role": "assistant", "content": assistant_content})
    ```
@@ -193,21 +198,31 @@ has_tool_calls = (finish_reason == "tool_calls") and bool(pending) and all(p.nam
 |---|------|------|
 | **配置** | `mcp.json` 找不到 / 解析错 / `.env` 缺 `OPENAI_API_KEY` | 启动时失败,红字打印 + 退出码 1,不进入 REPL |
 | **MCP server 启动** | `npx` 不存在 / 子进程退出 / 握手超时(5s) | 红色打印 "server X failed to start: <err>",**继续启动其他 server**,REPL 仍可用;若所有 server 失败则警告 |
-| **工具调用** | MCP session 抛异常 / 返回 `isError=True` / 工具超时(30s) | `call_tool` 返回 `ToolResult(is_error=True, text=<错误信息>)`;agent.py 红色打印 + `content_for_llm = f"[Tool Error] {result.text}"` 回灌,让 LLM 自愈(改参数/换工具);**不终止整个 turn** |
+| **工具调用** | MCP session 抛异常 / 返回 `isError=True` / 工具超时(30s) | `call_tool` 返回 `ToolResult(is_error=True, display_text=..., llm_text="[Tool Error] ...")`;agent.py 红色打印 `result.display_text`,`messages.append({..., "content": result.llm_text})` — **`[Tool Error]` 前缀已封装在 `llm_text` 中**,agent.py 不再拼字符串 |
 | **LLM** | 流式连接断 / API key 错 / 429 限流 | 红色打印,本次 turn 终止,回到 REPL 等用户重试;历史保留 |
 | **LLM 输出异常** | `finish_reason` 既非 `tool_calls` 也非 `stop` | 黄色警告 + 本次 turn 终止,回到 REPL |
-| **空 turn** | `has_tool_calls == False` 且 `assistant_content` 为空 | 黄色警告 `[yellow]empty LLM turn, ending[/yellow]`,本次 turn 终止,回到 REPL |
-| **tool_call JSON 解析失败** | `json.loads(arguments_json)` 失败 | 红色打印,把 `arguments_json` 原文回灌为 `role: tool` 的 error,让 LLM 下一轮重试,**不终止整个 turn** |
-| **tool_call name 缺失** | 流式结束 `pending[i].name` 仍为 `None` | 黄色警告,把这个 pending 用占位 id `"unknown_{i}"` 作为 `role: tool` 的 error 回灌,**不终止整个 turn** |
-| **循环护栏** | `iter >= 20` | 黄色打印 "max iterations reached";**若还有 pending tool_calls,不执行它们,直接给一个温和 final**:"达到最大迭代次数,任务未完成。"(若已有 content 则用 content,否则用兜底文案);不暴露 JSON 给用户 |
+| **空 turn** | 严格定义:`has_tool_calls == False` 且 `content` 为空 且 `finish_reason != "tool_calls"` | 黄色警告 `[yellow]empty LLM turn, ending[/yellow]`,本次 turn 终止,回到 REPL |
+| **finish_reason=tool_calls 但 pending 空** | 兼容 API 异常:LLM 说"要调工具"但没拼出 tool_calls | 黄色警告 + 降级按 stop 处理(有 content 当 Final,无 content 当空 turn);不再单独 elif |
+| **tool_call JSON 解析失败** | `json.loads(arguments_json)` 失败 | 红色打印,把 `arguments_json` 原文塞进 `ToolResult.llm_text`(带 `[Tool Error]` 前缀)回灌,**不终止整个 turn** |
+| **tool_call name 缺失** | 流式结束 `pending[i].name` 仍为 `None` | 黄色警告,把这个 pending 用占位 id `"unknown_{i}"` 通过 `ToolResult(is_error=True, llm_text="[Tool Error] name missing: ...")` 回灌,**不终止整个 turn** |
+| **循环护栏** | `iter >= 20` | 见下表(分两种情形) |
 | **危险命令** | shell 类工具的 `command` 字段含 `rm -rf` / `drop table` 等 | 黄色打印警告 + 工具名 + 参数 + "Confirm? [y/N]",默认 N;N 则回灌 error,LLM 可重选 |
+
+**`iter >= 20` 分情形处理**:
+
+| 当时 `has_tool_calls` | 行为 |
+|------------------------|------|
+| True(还有 pending tool_calls) | 1) 不执行任何工具;2) 黄色警告 `"max iterations reached with pending tool calls, forcing stop"`;3) 若 `assistant_content` 非空,白色打印作为 final;若空,固定打印 `"达到最大迭代次数,任务未完成。"`;4) **把 pending 里的 tool_calls 丢弃,既不进 assistant message 也不回灌 role:tool**(避免 LLM 以为还要继续调工具);5) 退出内部循环 |
+| False(无 pending) | 正常按 Final Answer 路径处理(白色打印 content 或空 turn 警告) |
 
 ## 危险命令匹配(初版规则)
 
 ```python
 # 体验级安全 — 不是安全边界。真正安全要靠沙箱和权限控制,这里只是防误操作的提示。
+# MVP 阶段只匹配最危险的 rm -rf(避免 rm -r 这种日常用法频繁误报);
+# 等以后接沙箱/权限系统,再放宽回 rm -r。
 DANGEROUS_PATTERNS = [
-    r"\brm\s+-rf?\b",                # rm -r / rm -rf
+    r"\brm\s+-rf\b",                 # rm -rf(只匹配 -rf,不匹配 -r)
     r"\brm\s+--\s",                  # rm -- 强制后续参数
     r"\brm\s+.*--no-preserve-root\b",# rm 强制删根
     r"\bdel\s+/[sqf]\b",             # windows del /s /q /f
@@ -303,12 +318,26 @@ class AppConfig(BaseModel):
 
 ```python
 class MCPServerConfig(BaseModel):
-    type: Literal["stdio", "sse", "http"] = "stdio"  # http = streamable-http
+    type: Literal["stdio", "sse", "http"] = "stdio"  # 只用 "http",不用 "streamable-http"
     command: str | None = None
     args: list[str] = []
     url: str | None = None
     env: dict[str, str] = {}
+
+    @property
+    def transport_type(self) -> Literal["stdio", "sse", "http"]:
+        """mcp_client.py 只看这个属性,不再判断字符串别名。"""
+        if self.type in ("http", "streamable-http"):
+            return "http"
+        return self.type
 ```
+
+**`streamablehttp_client` 导入路径**(实现时确认):
+官方 `mcp` Python SDK 的 import 形如:
+```python
+from mcp.client.streamable_http import streamablehttp_client
+```
+实现时如果路径不同,以 `python -c "import mcp.client; help(mcp.client)"` 实际查到的为准。
 
 **mcp.json key 与配置类字段映射**:`mcp.json` 用标准 MCP 配置的 `mcpServers` 驼峰命名,
 `AppConfig` 用 Python 风格 `mcp_servers` 蛇形命名。`load_config()` 内部做一次映射:
@@ -322,7 +351,9 @@ return AppConfig(
 )
 ```
 
-业务代码**永远**用 `cfg.mcp_servers`,不接触 `mcpServers` 拼写。
+**强约束**:
+- 业务代码**永远**用 `cfg.mcp_servers`,不直接 `raw["mcpServers"]` 绕过配置类
+- 任何地方都不出现字符串字面量 `"mcpServers"`,除了 `config.py` 的 `load_config()` 内部
 
 ## 系统提示词(放在 `cc_harness/prompts.py`)
 
@@ -339,6 +370,8 @@ return AppConfig(
 5. 危险操作(rm -rf、删库、format 等)即使工具允许,也请先在思考中向用户说明并请求确认。
 6. 不要编造文件内容,没读过就说没读过。
 7. 简洁优先,不要写无谓的客套话。
+8. 如果一个任务需要超过 10 步工具调用,请在思考中向用户说明进度,并考虑是否可以简化或拆分任务
+   (系统硬护栏是 20 步,超过会被强制终止)。
 ```
 
 **无文本正则解析**。所有工具调用走 OpenAI 原生 `tool_calls` 字段;`agent.py` 只看
@@ -393,10 +426,10 @@ return AppConfig(
 }
 ```
 
-`type` 字段:
-- `"stdio"`(或省略 + 有 `command`)→ `stdio_client(StdioServerParameters(...))`
-- `"sse"`(有 `url`)→ `sse_client(url)`
-- `"http"` 或 `"streamable-http"`(有 `url`)→ `streamablehttp_client(url)`
+`type` 字段(只看 `MCPServerConfig.transport_type` 属性,不再判断字符串别名):
+- `"stdio"` → `stdio_client(StdioServerParameters(...))`
+- `"sse"` → `sse_client(url)`
+- `"http"`(也兼容 `"streamable-http"`,但 mcp.json 里**只写** `"http"`)→ `streamablehttp_client(url)`
 
 ### Tool schema 转换
 
@@ -454,7 +487,7 @@ async def start(self):
 | `tests/test_config.py` | 解析合法/非法的 mcp.json;`.env` 缺失 key 抛错 | 临时写 mcp.json、用 `monkeypatch` 改 env |
 | `tests/test_mcp_client.py` | stdio 启动 in-process fake MCP server(`mcp.server.Server` 实例);`list_tools()` 转换正确;`call_tool()` 序列化结果 | 用 `mcp.server.Server` 起内存 stdio server,client 连过去调 |
 | `tests/test_llm.py` | 流式 chunk 累积成完整 text;`tool_calls` delta 拼接正确(空 name → 后续 delta;name 出现后拼 arguments) | 用一个 mock 假流,喂 delta 序列断言 |
-| `tests/test_agent.py` | 路由:`finish_reason=tool_calls` + 非空 `pending` → 执行工具并回灌 `role: tool`;`finish_reason=stop` + 非空 `content` → 当作 final 退出;`iter=20` 强制退出;危险命令 confirm 后 N 走回灌;空 turn(无 content 无 tool_calls)黄色警告 | 喂 mock LLM 模拟三类响应 |
+| `tests/test_agent.py` | 路由:`finish_reason=tool_calls` + 非空 `pending` → 执行工具并回灌 `role: tool`;`finish_reason=stop` + 非空 `content` → 当作 final 退出;`iter=20` 强制退出;危险命令 confirm 后 N 走回灌;空 turn(无 content 无 tool_calls)黄色警告;`finish_reason=tool_calls` 但 `pending` 空 → 黄色警告 + 降级 stop;`iter=20` 时 `has_tool_calls=True` → 丢弃 pending,不打 tool_calls 也不回灌;**危险命令 N → LLM 下一轮换工具(改 name)** | 喂 mock LLM 模拟多类响应,验证消息序列(用 `messages[-3:]` 切片断言) |
 | `tests/test_render.py` | 颜色常量与 Rich Style 匹配(蓝/黄/绿/红/白) | 断言 `console.export_text()` 含 ANSI 颜色码 |
 
 **不测**:`tools.py` 走经验,3 条命令覆盖即可;`repl.py` 是 I/O 胶水,集成测试覆盖。
