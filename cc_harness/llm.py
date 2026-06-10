@@ -60,3 +60,66 @@ def accumulate_delta(
     if name is not None:
         slot.name = name
     slot.arguments_json += arguments_json
+
+
+# --- LLMClient ---
+
+class LLMClient:
+    """Thin async wrapper around AsyncOpenAI for streaming chat + tools.
+
+    NB: `model` is per-call, NOT a constructor arg of AsyncOpenAI.
+    """
+
+    def __init__(self, api_key: str, model: str, base_url: str | None) -> None:
+        self.model = model
+        self._client = AsyncOpenAI(api_key=api_key, base_url=base_url)
+
+    async def chat(
+        self,
+        messages: list[dict],
+        tools: list[dict] | None = None,
+    ) -> AsyncIterator[StreamEvent]:
+        """Yield StreamEvents; the final 'done' event carries the full assistant
+        message (content + pending tool_calls + finish_reason)."""
+        kwargs: dict[str, Any] = {"model": self.model, "messages": messages, "stream": True}
+        if tools:
+            kwargs["tools"] = tools
+
+        pending: list[PendingToolCall] = []
+        content_parts: list[str] = []
+        finish_reason: str | None = None
+
+        async for chunk in await self._client.chat.completions.create(**kwargs):
+            if not chunk.choices:
+                continue
+            choice = chunk.choices[0]
+            delta = choice.delta
+
+            if delta.content:
+                content_parts.append(delta.content)
+                yield StreamEvent(kind="content", text=delta.content)
+
+            if delta.tool_calls:
+                for tc in delta.tool_calls:
+                    index = getattr(tc, "index", None)
+                    tc_id = getattr(tc, "id", None)
+                    tc_name = getattr(tc, "name", None) or getattr(tc, "function", None) and getattr(tc.function, "name", None)
+                    tc_args = ""
+                    fn = getattr(tc, "function", None)
+                    if fn is not None:
+                        tc_args = getattr(fn, "arguments", "") or ""
+                    accumulate_delta(pending, index, tc_id, tc_name, tc_args)
+                    yield StreamEvent(
+                        kind="tool_call_delta",
+                        tool_call=pending[index if index is not None else len(pending) - 1],
+                    )
+
+            if choice.finish_reason:
+                finish_reason = choice.finish_reason
+
+        yield StreamEvent(
+            kind="done",
+            finish_reason=finish_reason,
+            pending=pending,
+            content="".join(content_parts),
+        )
