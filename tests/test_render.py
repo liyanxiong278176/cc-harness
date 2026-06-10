@@ -10,6 +10,7 @@ ANSI_YELLOW = re.compile(r"\x1b\[.*?33m")
 ANSI_GREEN = re.compile(r"\x1b\[.*?32m")
 ANSI_RED = re.compile(r"\x1b\[.*?31m")
 ANSI_WHITE = re.compile(r"\x1b\[.*?37m")
+ANSI_CYAN = re.compile(r"\x1b\[.*?36m")
 
 def test_print_thought_blue(console):
     console.print = lambda *a, **kw: print_thought(console, "thinking")
@@ -80,3 +81,12 @@ def test_print_error_red():
     print_error(c, "boom")
     text = buf.getvalue()
     assert ANSI_RED.search(text)
+
+def test_print_info_cyan():
+    from io import StringIO
+    from rich.console import Console as C
+    buf = StringIO()
+    c = C(file=buf, force_terminal=True, color_system="truecolor", width=120)
+    print_info(c, "info")
+    text = buf.getvalue()
+    assert ANSI_CYAN.search(text)
