@@ -8,7 +8,6 @@ import pytest
 from dataclasses import dataclass, field
 from typing import Any
 from cc_harness.llm import PendingToolCall
-from cc_harness.tools import is_dangerous, confirm
 
 # --- Test fixtures ---
 
@@ -139,7 +138,6 @@ async def test_finish_reason_tool_calls_with_empty_pending_degrades_to_stop(monk
 @pytest.mark.asyncio
 async def test_pending_tool_call_name_missing_backfills_error(monkeypatch, capfd):
     from cc_harness import agent as agent_mod
-    from cc_harness.mcp_client import ToolResult
 
     pending = [PendingToolCall(index=0, id=None, name=None, arguments_json='{}')]
     llm = FakeLLM(responses=[

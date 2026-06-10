@@ -7,8 +7,6 @@ Speaks JSON-RPC over stdio. Exposes:
   - one tool 'slow' that sleeps 0.2s
 """
 import asyncio
-import json
-import sys
 from mcp.server import Server
 from mcp.server.stdio import stdio_server
 from mcp.types import Tool, TextContent

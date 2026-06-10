@@ -1,5 +1,8 @@
+from types import SimpleNamespace
+from unittest.mock import AsyncMock, MagicMock
+
 import pytest
-from cc_harness.llm import PendingToolCall, accumulate_delta
+from cc_harness.llm import LLMClient, PendingToolCall, accumulate_delta
 
 def test_pending_tool_call_index_optional():
     p = PendingToolCall()
@@ -29,10 +32,6 @@ def test_accumulate_delta_concat_arguments():
     accumulate_delta(pending, index=0, id="c1", name="t1", arguments_json='{"a":')
     accumulate_delta(pending, index=0, id=None, name=None, arguments_json=' 1}')
     assert pending[0].arguments_json == '{"a": 1}'
-
-from types import SimpleNamespace
-from unittest.mock import AsyncMock, MagicMock
-from cc_harness.llm import LLMClient
 
 class _FakeChoiceDelta:
     def __init__(self, content=None, tool_calls=None):

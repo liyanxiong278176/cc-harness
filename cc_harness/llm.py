@@ -1,6 +1,5 @@
 """OpenAI-compatible LLM client with native tool_calls streaming."""
 from __future__ import annotations
-import json
 from dataclasses import dataclass, field
 from typing import Any, AsyncIterator, Literal
 from openai import AsyncOpenAI

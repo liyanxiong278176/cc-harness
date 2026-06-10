@@ -3,8 +3,7 @@
 from __future__ import annotations
 import asyncio
 from rich.console import Console
-from rich.prompt import Prompt
-from cc_harness.render import print_info, print_warn
+from cc_harness.render import print_info
 
 
 async def _read_user() -> str:

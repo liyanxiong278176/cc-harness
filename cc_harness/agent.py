@@ -83,7 +83,7 @@ async def run_turn(
             for i, p in enumerate(pending):
                 if p.name is None:
                     placeholder_id = f"unknown_{i}"
-                    print_warn(console, f"tool_call name missing; feeding back error")
+                    print_warn(console, "tool_call name missing; feeding back error")
                     error_llm_text = (
                         f"[Tool Error] tool_call name missing, raw: "
                         f"{json.dumps({'id': p.id, 'arguments_json': p.arguments_json})}"
