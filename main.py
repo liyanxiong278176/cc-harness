@@ -1,16 +1,43 @@
-# This is a sample Python script.
+#!/usr/bin/env python3
+"""cc-harness entry point."""
+from __future__ import annotations
+import asyncio
+from pathlib import Path
+from rich.console import Console
+from cc_harness.config import load_config, ConfigError
+from cc_harness.llm import LLMClient
+from cc_harness.mcp_client import MCPClient
+from cc_harness.repl import run_repl
 
-# Press Shift+F10 to execute it or replace it with your code.
-# Press Double Shift to search everywhere for classes, files, tool windows, actions, and settings.
+PROJECT_ROOT = Path(__file__).parent
+
+def main() -> None:
+    console = Console()
+    try:
+        cfg = load_config(
+            env_path=PROJECT_ROOT / ".env",
+            mcp_json_path=PROJECT_ROOT / "mcp.json",
+        )
+    except ConfigError as e:
+        console.print(f"[red]config error: {e}[/red]")
+        raise SystemExit(1)
+
+    llm = LLMClient(
+        api_key=cfg.openai_api_key,
+        model=cfg.openai_model,
+        base_url=cfg.openai_base_url,
+    )
+
+    async def boot():
+        mcp = MCPClient(cfg.mcp_servers)
+        try:
+            await mcp.start()
+            await run_repl(llm, mcp)
+        finally:
+            await mcp.shutdown()
+
+    asyncio.run(boot())
 
 
-def print_hi(name):
-    # Use a breakpoint in the code line below to debug your script.
-    print(f'Hi, {name}')  # Press Ctrl+F8 to toggle the breakpoint.
-
-
-# Press the green button in the gutter to run the script.
-if __name__ == '__main__':
-    print_hi('PyCharm')
-
-# See PyCharm help at https://www.jetbrains.com/help/pycharm/
+if __name__ == "__main__":
+    main()
