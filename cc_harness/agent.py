@@ -134,8 +134,10 @@ async def run_turn(
             print_warn(console, "finish_reason=tool_calls but no pending tool_calls, treating as stop")
 
         if content:
+            # The streamed content is the final answer; do NOT reprint it
+            # (that would create a duplicate). The streaming print above
+            # already showed it. We just record it in the message history.
             messages.append({"role": "assistant", "content": content})
-            print_final(console, content)
             return
         else:
             print_warn(console, "empty LLM turn, ending")
