@@ -104,9 +104,13 @@ PendingToolCall = {
 2. `repl.py`:`messages.append({"role": "user", "content": "..."})`
 3. `agent.run_turn(messages, mcp)` 内部循环开始 (`iter=0`)
 4. `llm.chat(messages, tools=tool_specs, stream=True)` → 流式生成
-   - 蓝色逐 token 输出 Thought 段
-   - 黄色输出 Action: `mcp__fs__read_file(path="main.py")`
-   - 工具调用被解析,循环挂起
+   - **解析时机约定**:流式阶段**只**把原始 assistant content 逐 token 打印为蓝色(用户看到 Thought 段在持续生长);
+     **不在流式中途解析** Action。等 `stream` 结束(`finish_reason="tool_calls"` 或 `"stop"`),得到完整
+     assistant message 后,再走解析流程(见 §系统提示词)。
+   - 流式结束后:
+     - 若解析到 `Action:` → 黄色打印该调用 → 进入 §5
+     - 若解析到 `Final Answer:` → 白色打印 final → 退出内部循环
+     - 若都未匹配 → 当作 Final Answer,把整段原文回灌,见 §错误处理
 5. `mcp_client.call_tool("mcp__fs__read_file", {"path": "main.py"})`
    - 调 MCP `session.callTool()` → 拿到 `TextContent`/`ImageContent`
    - 转 str(优先取 `.text`,序列化兜底)
@@ -126,7 +130,7 @@ PendingToolCall = {
 | **工具调用** | MCP session 抛异常 / 返回 `isError=True` / 工具超时(30s) | 红色打印,作为 `role: tool` 的 error 内容回灌给 LLM,让 LLM 自愈(改参数/换工具) |
 | **LLM** | 流式连接断 / API key 错 / 429 限流 / 解析失败 | 红色打印,本次 turn 终止,回到 REPL 等用户重试;历史保留 |
 | **循环护栏** | `iter >= 20` | 黄色打印 "max iterations reached",强制把当前 LLM 输出作为 final,等用户 |
-| **危险命令** | 工具参数含 `rm -rf` / `drop table` 等 | 黄色打印警告 + 工具名 + 参数 + "Confirm? [y/N]",默认 N;N 则回灌 error,LLM 可重选 |
+| **危险命令** | shell 类工具的 `command` 字段含 `rm -rf` / `drop table` 等 | 黄色打印警告 + 工具名 + 参数 + "Confirm? [y/N]",默认 N;N 则回灌 error,LLM 可重选 |
 
 ## 危险命令匹配(初版规则)
 
@@ -145,7 +149,46 @@ DANGEROUS_PATTERNS = [
 ]
 ```
 
-匹配位置:**工具调用前**(对 `mcp__filesystem__write_file` 检查 `path`+`content`,对 `mcp__bash` 类检查 `command`)。仅检查,无内置白名单;只让用户决定。
+匹配位置:**仅对类 shell 工具的 `command` 字符串参数**(`name` 形如 `mcp__*__bash` / `mcp__*__run_command` /
+`mcp__*__shell` / `mcp__*__execute` 之一,或工具的 `parameters` schema 中有名为 `command` 的字段)。
+对 `mcp__filesystem__write_file` 等写文件工具**不做内容扫描**,避免 `content` 字段里偶然出现的
+`rm -rf` 字符串误伤(用户完全可能让 agent 写一份"如何在 rm -rf 之前备份"的文档)。
+仅检查,无内置白名单;只让用户决定。
+
+`tools.py` 的签名: `is_dangerous(tool_name: str, arguments: dict) -> bool`。
+判定逻辑: 先按工具名后缀(粗筛,模式如 `__bash$|__run_command$|__shell$|__execute$`),
+或按 arguments 的 key 集合是否含 `command` 字段;两者命中任一即对 `command` 字符串做正则扫描。
+
+## REPL 退出与 MCP 清理
+
+| 触发 | 行为 | 退出码 |
+|------|------|--------|
+| REPL 提示符下按 Ctrl+D(EOF) | 走正常退出流程 | 0 |
+| REPL 提示符下输入 `exit` 或 `quit` | 走正常退出流程 | 0 |
+| REPL 提示符下按 Ctrl+C | 走正常退出流程(提示符层捕获) | 0 |
+| LLM 流式生成中按 Ctrl+C | 关闭 OpenAI 流连接,本次 turn 中断并打印 "[yellow]interrupted[/yellow]",回到 REPL 提示符 | — (不退出 REPL) |
+| LLM 流式生成中按 Ctrl+D | 同 Ctrl+C 处理(罕见) | — |
+| 未捕获异常 | 红色打印 traceback 摘要,走正常退出流程 | 1 |
+
+**正常退出流程(`repl.shutdown()`)**:
+1. 红色提示"shutting down" + 等待 0.5s 让 stdout flush
+2. 关闭所有 MCP `ClientSession`(调 `session.__aexit__()`)
+3. 关闭所有 transport(`stdio_client` / `sse_client` / `streamablehttp_client` 的 `__aexit__()`,
+   这会向 stdio 子进程发 EOF)
+4. 等待 2s,若子进程未退则 `process.terminate()`(stdio 场景)
+5. `asyncio.run()` 正常返回 → Python 进程退出码 0
+
+**异常退出**:任何 step 抛异常都不阻断后续 step(用 `try/except` 串联),最后仍以 1 退出。
+
+## 配置加载约定
+
+- `.env` 与 `mcp.json` **同目录**(项目根 `D:\agent_learning\cc-harness`)。
+- `config.py` 入口函数 `load_config() -> AppConfig`,内部先 `dotenv.load_dotenv(env_path)`,再 `os.getenv`
+  读:
+  - `OPENAI_API_KEY` — **必填**,缺失则抛 `ConfigError`,启动失败
+  - `OPENAI_BASE_URL` — 可选,默认 `https://api.openai.com/v1`
+  - `OPENAI_MODEL` — 可选,默认 `gpt-4o-mini`
+- 任何业务模块都**不直接**调 `dotenv`,只通过 `config.AppConfig` 拿到所需字段。
 
 ## 系统提示词(放在 `cc_harness/prompts.py`)
 
@@ -184,6 +227,17 @@ FINAL_RE   = re.compile(r"Final Answer:\s*(.+)$", re.S)
 ```
 
 `llm.py` 在流式阶段只把"原文"吐给 `render.py`(蓝色),agent 在拿到完整 assistant message 后再解析 Action / Final。**没有原文回灌歧义**。
+
+### 流式 tool_call delta 拼接规范(`llm.py`)
+
+- OpenAI 的 tool_calls 流式响应,`delta.tool_calls[i].arguments` 是一段**不完整的 JSON 字符串片段**,
+  不是整段 JSON 也不是 key-value patch。
+- `llm.py` 维护 `pending[i].arguments_json`,每个 delta 把 `arguments` 字符串 **concat 追加**到末尾。
+- 首个含 `tool_calls` 的 delta 拿到 `id` 和 `name`(`name` 可能为 `None`,需要用 `delta.name` 出现过的版本)。
+- 流式结束后,对每个 tool_call 整体执行 `json.loads(arguments_json)`。
+  - 成功 → 拿 `(name, arguments_dict)`,转交 agent。
+  - 失败 → 红色打印 `tool call JSON parse failed: ...`,把 `arguments_json` 原文回灌成 `role: tool` 的 error,
+    让 LLM 在下一轮重新输出(不终止整个 turn)。
 
 ## Rich 颜色规范
 
@@ -345,7 +399,7 @@ REPL 提示符:
 
 | 风险 | 缓解 |
 |------|------|
-| OpenAI `tool_call.arguments` delta 拼接在某些兼容 API 上格式不一致 | 兜底:流式拿到完整 JSON 后整体 `json.loads`,失败则报错并终止 turn |
-| MCP stdio server 子进程在 Windows 上假死 | 加 `asyncio.wait_for(..., 30)` 兜底;子进程退出后 session 标记为 dead,REPL 提示重连 |
+| OpenAI `tool_call.arguments` delta 拼接在某些兼容 API 上格式不一致 | 兜底:流式拿到完整 JSON 后整体 `json.loads`,失败则把 `arguments_json` 原文回灌为 `role: tool` 的 error,让 LLM 在下一轮重新输出,**不终止整个 turn** |
+| MCP stdio server 子进程在 Windows 上假死 | 加 `asyncio.wait_for(..., 30)` 兜底;子进程退出后 session 标记为 dead,REPL 仅打印黄色警告,**不做自动重连** |
 | 不同 LLM 提示词遵从度不同,可能不输出 `Action:` 段 | 解析失败时把 LLM 原文回灌成 `role: tool` 的 error,提示"请按格式回复" |
 | `npx` 首次运行需要下载 `@modelcontextprotocol/server-filesystem` | README 中提示提前 `npx -y @modelcontextprotocol/server-filesystem --help` 验证 |
