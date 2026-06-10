@@ -18,6 +18,7 @@
 - 工具调用并发(只串行)
 - Plan mode / subagent / TodoWrite(全部留给未来)
 - 任何前端 / TUI 框架(只 Rich)
+- **文本格式的工具调用解析**(用 `Action: {json}` 之类的协议);**所有工具调用走 OpenAI 原生 `tool_calls` 字段**
 
 ## 架构
 
@@ -61,11 +62,11 @@
 | `cc_harness/config.py` | 解析 `mcp.json`、读取 `.env`、路径解析、校验 | 50 |
 | `cc_harness/llm.py` | OpenAI 兼容 client 封装;流式 `chat()` 返回 `(text, tool_calls, finished)`;`accumulate_tool_calls()` 拼 delta | 90 |
 | `cc_harness/mcp_client.py` | 三种 transport 启动;`list_tools()` 转 OpenAI tool schema;`call_tool(name, args)` 返回 str | 110 |
-| `cc_harness/agent.py` | `run_turn(messages, mcp)` 单问题内部 ReAct 循环;解析 Thought/Action/Final | 80 |
+| `cc_harness/agent.py` | `run_turn(messages, mcp)` 单问题内部 ReAct 循环;`finish_reason` 路由;危险命令拦截;max_iter 护栏 | 60 |
 | `cc_harness/repl.py` | REPL 主循环;维护 messages 列表;输入提示 | 30 |
 | `cc_harness/tools.py` | `is_dangerous(name, args)` 危险命令模式匹配 + `confirm()` | 30 |
 | `cc_harness/render.py` | `print_thought()`/`print_tool_call()`/`print_tool_result()`/`print_final()` 颜色封装 | 50 |
-| `cc_harness/prompts.py` | 系统提示词常量 | 20 |
+| `cc_harness/prompts.py` | 系统提示词常量 | 12 |
 | `mcp.json` | MCP servers 配置 | 10 |
 | `.env.example` | 环境变量样例 | 5 |
 | `tests/test_config.py` | 配置解析 | 40 |
@@ -100,26 +101,38 @@ PendingToolCall = {
 
 ## 数据流(一次用户提问的完整路径)
 
+**核心约定**:**全面使用 OpenAI 原生 tool_calls**,LLM 通过 API 字段返回结构化工具调用,
+**不再**用正则解析 assistant 文本中的 `Action: {...}` 块。prompts.py 不再要求 LLM 输出特定 JSON 格式。
+
 1. 用户在 REPL 输入 "读一下 main.py 然后给我总结"
 2. `repl.py`:`messages.append({"role": "user", "content": "..."})`
 3. `agent.run_turn(messages, mcp)` 内部循环开始 (`iter=0`)
 4. `llm.chat(messages, tools=tool_specs, stream=True)` → 流式生成
-   - **解析时机约定**:流式阶段**只**把原始 assistant content 逐 token 打印为蓝色(用户看到 Thought 段在持续生长);
-     **不在流式中途解析** Action。等 `stream` 结束(`finish_reason="tool_calls"` 或 `"stop"`),得到完整
-     assistant message 后,再走解析流程(见 §系统提示词)。
-   - 流式结束后:
-     - 若解析到 `Action:` → 黄色打印该调用 → 进入 §5
-     - 若解析到 `Final Answer:` → 白色打印 final → 退出内部循环
-     - 若都未匹配 → 当作 Final Answer,把整段原文回灌,见 §错误处理
+   - 流式阶段逐 token 处理每个 chunk:
+     - `delta.content` → **蓝色**逐 token 打印(LLM 推理过程的"思考");这部分不进 messages 历史(见 § 消息累积)
+     - `delta.tool_calls[i]` → 累积到 `pending[i]`(id / name 首 chunk 拿,arguments 字符串 concat),
+       **不在流式中途执行**
+   - 流式结束后,根据 `finish_reason` 与 `pending` 决策:
+     - `finish_reason == "tool_calls"` 且 `pending` 非空 → 把 assistant message(含 tool_calls)加入 messages → 黄色打印调用 → 进入 §5
+     - `finish_reason == "stop"` 且 `pending` 为空 且 `content` 非空 → 白色打印 final → 退出内部循环
+     - `finish_reason == "stop"` 且 `pending` 非空(罕见:LLM 表达混乱) → 仍按 tool_calls 处理
+     - 其他异常 / 两者皆空 → 黄色警告,本次 turn 终止,回到 REPL
 5. `mcp_client.call_tool("mcp__fs__read_file", {"path": "main.py"})`
-   - 调 MCP `session.callTool()` → 拿到 `TextContent`/`ImageContent`
-   - 转 str(优先取 `.text`,序列化兜底)
+   - 调 MCP `session.callTool()` → 拿到 `result.content: list[Content]`
+   - 转 str:`texts = [c.text for c in result.content if hasattr(c, "text")]; return "\n".join(texts) if texts else json.dumps([c.model_dump() for c in result.content])`
 6. 绿色打印工具结果
-7. `messages.append({"role":"assistant", "tool_calls":[...]})`
-   `messages.append({"role":"tool", "tool_call_id":"...", "content": "..."})`
+7. `messages.append({"role":"tool", "tool_call_id":pending[0].id, "content": "..."})`(每个 tool_call 一条)
 8. 回到 [4] (`iter=1`),把工具结果喂给 LLM
-9. LLM 这次只输出白色 final answer(没有新 `tool_call`)
-10. 退出内部循环,返回 final,等下一个用户问题
+9. LLM 这次 `finish_reason == "stop"` 且 `pending` 为空,白色打印 final,退出
+10. 退出内部循环,等下一个用户问题
+
+### 消息累积(关键边界)
+
+- 流式阶段**实时打印**的蓝色 `delta.content` 文字**不**单独保存;流式结束后若决定把这条 message 写进
+  `messages` 历史,再把 `content` 字段(完整文本)赋给 `{"role": "assistant", "content": "..."}`。
+  (OpenAI API 接受:assistant message 的 `content` 字段就是这次的全部文本输出。)
+- 若这次 assistant message **同时**含 `content` 和 `tool_calls`,完整保留两者(`content` 是给用户看的思考,`tool_calls` 是结构化调用)。
+- 避免双计费:流式打印归打印,`messages` 归 `messages`,不重复渲染。
 
 ## 错误处理(分四层)
 
@@ -128,7 +141,9 @@ PendingToolCall = {
 | **配置** | `mcp.json` 找不到 / 解析错 / `.env` 缺 `OPENAI_API_KEY` | 启动时失败,红字打印 + 退出码 1,不进入 REPL |
 | **MCP server 启动** | `npx` 不存在 / 子进程退出 / 握手超时(5s) | 红色打印 "server X failed to start: <err>",**继续启动其他 server**,REPL 仍可用;若所有 server 失败则警告 |
 | **工具调用** | MCP session 抛异常 / 返回 `isError=True` / 工具超时(30s) | 红色打印,作为 `role: tool` 的 error 内容回灌给 LLM,让 LLM 自愈(改参数/换工具) |
-| **LLM** | 流式连接断 / API key 错 / 429 限流 / 解析失败 | 红色打印,本次 turn 终止,回到 REPL 等用户重试;历史保留 |
+| **LLM** | 流式连接断 / API key 错 / 429 限流 | 红色打印,本次 turn 终止,回到 REPL 等用户重试;历史保留 |
+| **LLM 输出异常** | `finish_reason` 既非 `tool_calls` 也非 `stop` / 两者皆空(content 空且 tool_calls 空) | 黄色警告 `[yellow]empty LLM turn, ending[/yellow]`,本次 turn 终止,回到 REPL |
+| **tool_call JSON 解析失败** | `json.loads(arguments_json)` 失败 | 红色打印,把 `arguments_json` 原文回灌为 `role: tool` 的 error,让 LLM 下一轮重试,**不终止整个 turn** |
 | **循环护栏** | `iter >= 20` | 黄色打印 "max iterations reached",强制把当前 LLM 输出作为 final,等用户 |
 | **危险命令** | shell 类工具的 `command` 字段含 `rm -rf` / `drop table` 等 | 黄色打印警告 + 工具名 + 参数 + "Confirm? [y/N]",默认 N;N 则回灌 error,LLM 可重选 |
 
@@ -180,6 +195,33 @@ DANGEROUS_PATTERNS = [
 
 **异常退出**:任何 step 抛异常都不阻断后续 step(用 `try/except` 串联),最后仍以 1 退出。
 
+### 异步输入桥接(`repl.py` 关键点)
+
+LLM 流式输出是 `async`,但 `input()` 是同步阻塞,**不能**直接 `await input()`。
+`repl.py` 用 `asyncio.to_thread` 把阻塞调用丢到默认线程池,事件循环不被阻塞:
+
+```python
+import asyncio
+
+async def _read_user() -> str:
+    return await asyncio.to_thread(input, "› ")
+
+async def run_repl(agent: Agent) -> None:
+    while True:
+        try:
+            user_input = (await _read_user()).strip()
+        except (EOFError, KeyboardInterrupt):
+            break
+        if user_input.lower() in ("exit", "quit", ""):
+            continue  # 空行或退出指令都直接回到提示符(quit/exit 走 break)
+        if user_input.lower() in ("exit", "quit"):
+            break
+        await agent.run_turn(messages, mcp)
+```
+
+`asyncio.run()` 由 `main.py` 调,内部驱动 `repl.run_repl()` 协程。
+**不引入** `prompt_toolkit`,保持依赖最小。
+
 ## 配置加载约定
 
 - `.env` 与 `mcp.json` **同目录**(项目根 `D:\agent_learning\cc-harness`)。
@@ -188,7 +230,29 @@ DANGEROUS_PATTERNS = [
   - `OPENAI_API_KEY` — **必填**,缺失则抛 `ConfigError`,启动失败
   - `OPENAI_BASE_URL` — 可选,默认 `https://api.openai.com/v1`
   - `OPENAI_MODEL` — 可选,默认 `gpt-4o-mini`
+- `AppConfig` 用 `pydantic.BaseModel` 定义,字段类型 + 默认值 + 校验都走 pydantic,无 `dataclass`。
 - 任何业务模块都**不直接**调 `dotenv`,只通过 `config.AppConfig` 拿到所需字段。
+
+```python
+class AppConfig(BaseModel):
+    openai_api_key: str
+    openai_base_url: str = "https://api.openai.com/v1"
+    openai_model: str = "gpt-4o-mini"
+    mcp_servers: dict[str, MCPServerConfig]  # 从 mcp.json 解析
+
+    model_config = SettingsConfigDict(env_prefix="")  # 不从 env 读,只从 .env 显式灌入
+```
+
+`MCPServerConfig` 用 Pydantic 区分三种 transport:
+
+```python
+class MCPServerConfig(BaseModel):
+    type: Literal["stdio", "sse", "http"] = "stdio"  # http = streamable-http
+    command: str | None = None
+    args: list[str] = []
+    url: str | None = None
+    env: dict[str, str] = {}
+```
 
 ## 系统提示词(放在 `cc_harness/prompts.py`)
 
@@ -196,37 +260,18 @@ DANGEROUS_PATTERNS = [
 你是一个运行在终端里的编程助手,可以访问一组 MCP 工具(文件、shell 等)。
 当前工作目录: {cwd}
 
-# 输出格式(每次回复必须严格遵守)
-你的每次回复必须包含两段,顺序如下,不能多也不能少:
-
-Thought: <你的自然语言推理,1-3 句,说明下一步要做什么>
-Action: <调用一个工具,JSON 格式,例如>
-  {"name": "mcp__filesystem__read_file", "arguments": {"path": "main.py"}}
-
-# 收尾
-当不需要再调用工具时,直接输出:
-Thought: <简短的总结>
-Final Answer: <给用户的最终回答,1-5 段,可以包含代码块>
-
 # 规则
-1. 每次只调用一个工具,等结果回来再决定下一步。
-2. 工具名前缀: mcp__<server_name>__<tool_name>(来自工具清单)。
-3. 如果工具执行失败,根据错误信息调整参数或换工具,不要重复同样的失败调用。
-4. 如果用户的问题不需要工具就能回答,直接给 Final Answer,不要硬塞工具调用。
-5. 危险操作(rm -rf、删库、format 等)即使工具允许,也请先在 Thought 中向用户说明并请求确认。
+1. 当你需要执行操作时,请先输出你的思考过程(以"思考:"开头或自然段落皆可),然后通过工具调用来执行。
+2. 工具调用由系统处理,你不需要输出 JSON 格式的 Action 块,只需在合适的时候调用工具。
+3. 如果不需要工具就能回答用户问题,直接回答,不要硬塞工具调用。
+4. 如果工具执行失败,根据错误信息调整参数或换工具,不要重复同样的失败调用。
+5. 危险操作(rm -rf、删库、format 等)即使工具允许,也请先在思考中向用户说明并请求确认。
 6. 不要编造文件内容,没读过就说没读过。
 7. 简洁优先,不要写无谓的客套话。
 ```
 
-解析正则:
-
-```python
-THOUGHT_RE = re.compile(r"Thought:\s*(.+?)(?=\nAction:|\nFinal Answer:|$)", re.S)
-ACTION_RE  = re.compile(r"Action:\s*(\{.*?\})", re.S)
-FINAL_RE   = re.compile(r"Final Answer:\s*(.+)$", re.S)
-```
-
-`llm.py` 在流式阶段只把"原文"吐给 `render.py`(蓝色),agent 在拿到完整 assistant message 后再解析 Action / Final。**没有原文回灌歧义**。
+**无文本正则解析**。所有工具调用走 OpenAI 原生 `tool_calls` 字段;`agent.py` 只看
+`finish_reason` + `tool_calls` + `content` 三个信号,不再 grep 文本中的 `Action:` / `Final Answer:`。
 
 ### 流式 tool_call delta 拼接规范(`llm.py`)
 
@@ -322,10 +367,12 @@ async def start(self):
 | 角色 | 通用编程助手 | 用户选定;提示词通用化 |
 | 安全 | 危险命令提示 | 用户选定;本地用,无需精细权限 |
 | 历史 | 不持久化 | 用户选定;贴合"最小闭环" |
-| 思考过程 | 提示词驱动 | 用户选定;兼容任何 OpenAI 兼容 API |
+| 思考过程 | LLM 自然语言输出 + 原生 `tool_calls` | **第二轮 review 决定**:放弃文本正则解析,全面用 OpenAI 原生 tool_calls;`delta.content` 蓝色打印当思考,`tool_calls` 走结构化路由 |
 | 路径范围 | 整个项目根 `D:\agent_learning\cc-harness` | 用户选定 |
 | 循环护栏 | `max_iterations = 20` | 用户选定 |
 | 项目结构 | 模块化分层 | 关注点分离,每个文件 < 150 行 |
+| 配置类 | Pydantic `BaseModel` | 类型校验,第二 review 建议 |
+| 同步输入 | `asyncio.to_thread(input, ...)` 桥接 | 第二 review 建议,避免阻塞事件循环 |
 
 ## 测试策略
 
@@ -334,7 +381,7 @@ async def start(self):
 | `tests/test_config.py` | 解析合法/非法的 mcp.json;`.env` 缺失 key 抛错 | 临时写 mcp.json、用 `monkeypatch` 改 env |
 | `tests/test_mcp_client.py` | stdio 启动 in-process fake MCP server(`mcp.server.Server` 实例);`list_tools()` 转换正确;`call_tool()` 序列化结果 | 用 `mcp.server.Server` 起内存 stdio server,client 连过去调 |
 | `tests/test_llm.py` | 流式 chunk 累积成完整 text;`tool_calls` delta 拼接正确(空 name → 后续 delta;name 出现后拼 arguments) | 用一个 mock 假流,喂 delta 序列断言 |
-| `tests/test_agent.py` | ReAct 解析:Thought/Action 拆分;Final Answer 截断;`iter=20` 强制退出;危险命令 confirm 后 N 走回灌 | 喂 LLM 输出字符串、模拟 tool_call 返回值 |
+| `tests/test_agent.py` | 路由:`finish_reason=tool_calls` + 非空 `pending` → 执行工具并回灌 `role: tool`;`finish_reason=stop` + 非空 `content` → 当作 final 退出;`iter=20` 强制退出;危险命令 confirm 后 N 走回灌;空 turn(无 content 无 tool_calls)黄色警告 | 喂 mock LLM 模拟三类响应 |
 | `tests/test_render.py` | 颜色常量与 Rich Style 匹配(蓝/黄/绿/红/白) | 断言 `console.export_text()` 含 ANSI 颜色码 |
 
 **不测**:`tools.py` 走经验,3 条命令覆盖即可;`repl.py` 是 I/O 胶水,集成测试覆盖。
@@ -401,5 +448,6 @@ REPL 提示符:
 |------|------|
 | OpenAI `tool_call.arguments` delta 拼接在某些兼容 API 上格式不一致 | 兜底:流式拿到完整 JSON 后整体 `json.loads`,失败则把 `arguments_json` 原文回灌为 `role: tool` 的 error,让 LLM 在下一轮重新输出,**不终止整个 turn** |
 | MCP stdio server 子进程在 Windows 上假死 | 加 `asyncio.wait_for(..., 30)` 兜底;子进程退出后 session 标记为 dead,REPL 仅打印黄色警告,**不做自动重连** |
-| 不同 LLM 提示词遵从度不同,可能不输出 `Action:` 段 | 解析失败时把 LLM 原文回灌成 `role: tool` 的 error,提示"请按格式回复" |
+| LLM 偶发不返回 `tool_calls` 也不返回 `content` 的空 turn(罕见) | 黄色警告 + 本次 turn 终止,回到 REPL 等用户决定(不重试) |
 | `npx` 首次运行需要下载 `@modelcontextprotocol/server-filesystem` | README 中提示提前 `npx -y @modelcontextprotocol/server-filesystem --help` 验证 |
+| 同步 `input()` 阻塞事件循环 → 流式输出时无法响应 Ctrl+C | `repl.py` 用 `asyncio.to_thread(input, "› ")` 桥接,事件循环不阻塞 |
