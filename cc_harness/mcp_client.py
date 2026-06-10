@@ -39,9 +39,22 @@ class MCPClient:
         self._sessions: dict[str, ClientSession] = {}
         self._tools: list[dict] = []
 
-    async def start(self) -> None:
-        """Connect to all servers, initialize sessions, list tools."""
+    async def start(self, init_timeout_s: float = INIT_TIMEOUT_S) -> None:
+        """Connect to all servers, initialize sessions, list tools.
+
+        Per-server failures are isolated: a single bad server is logged and
+        skipped, the rest still come up. ``init_timeout_s`` is exposed for tests
+        so they can use a shorter value; production code uses the default.
+
+        Each server gets its own ``AsyncExitStack`` so that a failed server's
+        anyio task-group cleanup does not leak cancellation into the next
+        server's setup.
+        """
         for name, cfg in self._servers.items():
+            # Per-server stack: if this server fails we close the stack
+            # (which tears down the transport and its background tasks
+            # cleanly) and the next server starts with a fresh stack.
+            local = AsyncExitStack()
             try:
                 if cfg.transport_type == "stdio":
                     params = StdioServerParameters(
@@ -51,24 +64,27 @@ class MCPClient:
                     )
                     cm = stdio_client(params)
                     read, write = await asyncio.wait_for(
-                        self._stack.enter_async_context(cm),
-                        timeout=INIT_TIMEOUT_S,
+                        local.enter_async_context(cm),
+                        timeout=init_timeout_s,
                     )
                 elif cfg.transport_type == "sse":
                     from mcp.client.sse import sse_client
                     url = cfg.url  # type: ignore[assignment]
-                    read, write = await self._stack.enter_async_context(sse_client(url))
+                    read, write = await asyncio.wait_for(
+                        local.enter_async_context(sse_client(url)),
+                        timeout=init_timeout_s,
+                    )
                 else:  # http
                     from mcp.client.streamable_http import streamablehttp_client
                     url = cfg.url  # type: ignore[assignment]
                     cm = streamablehttp_client(url)
                     read, write, _ = await asyncio.wait_for(
-                        self._stack.enter_async_context(cm),
-                        timeout=INIT_TIMEOUT_S,
+                        local.enter_async_context(cm),
+                        timeout=init_timeout_s,
                     )
 
-                session = await self._stack.enter_async_context(ClientSession(read, write))
-                await asyncio.wait_for(session.initialize(), timeout=INIT_TIMEOUT_S)
+                session = await local.enter_async_context(ClientSession(read, write))
+                await asyncio.wait_for(session.initialize(), timeout=init_timeout_s)
                 self._sessions[name] = session
 
                 listed = await session.list_tools()
@@ -81,8 +97,25 @@ class MCPClient:
                             "parameters": tool.inputSchema,
                         },
                     })
+
+                # Success: hand the local stack's contexts over to the main
+                # stack so shutdown() will tear them down later.
+                self._stack.push_async_exit(local)
+            except asyncio.CancelledError:
+                # CancelledError is a BaseException, not an Exception, so the
+                # ``except Exception`` below would not catch it. anyio's task
+                # groups (used by sse_client / streamable_http_client) can
+                # surface a "Cancelled via cancel scope" here when the previous
+                # server's TaskGroup teardown leaks into the next server's
+                # setup. Treat it as a per-server failure so the boot continues.
+                await self._close_silently(local)
+                from rich.console import Console
+                Console().print(
+                    f"[red]server {name} failed to start: init timed out[/red]"
+                )
             except Exception as e:
                 # Per spec: continue starting other servers, print red warning.
+                await self._close_silently(local)
                 from rich.console import Console
                 Console().print(f"[red]server {name} failed to start: {e}[/red]")
 
@@ -94,6 +127,22 @@ class MCPClient:
 
     def list_tools(self) -> list[dict]:
         return list(self._tools)
+
+    @staticmethod
+    async def _close_silently(stack: AsyncExitStack) -> None:
+        """Close an AsyncExitStack, swallowing any cleanup-time errors.
+
+        When a server's initialization fails (timeout, unreachable host, broken
+        transport, etc.) we still want to release whatever the transport was
+        holding — but the cleanup itself can raise (anyio's task group surfaces
+        BrokenResourceError / ExceptionGroup when its child tasks were
+        cancelled mid-flight). Those are noise: log nothing, the per-server
+        failure message already explains why we got here.
+        """
+        try:
+            await stack.aclose()
+        except BaseException:
+            pass
 
     def _route(self, namespaced_name: str) -> tuple[str, str]:
         """Split 'mcp__server__tool' into ('server', 'tool')."""
