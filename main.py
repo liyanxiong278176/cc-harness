@@ -1,4 +1,5 @@
-#!/usr/bin/env python3
+#!/usr/bin/env python
+# -*- coding: utf-8 -*-
 """cc-harness entry point."""
 from __future__ import annotations
 import asyncio
