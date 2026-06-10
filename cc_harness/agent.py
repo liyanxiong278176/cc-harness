@@ -4,7 +4,7 @@ import json
 from rich.console import Console
 from cc_harness.render import (
     print_thought, print_tool_call, print_tool_result, print_final,
-    print_warn, print_error,
+    print_warn, print_error, print_done,
 )
 from cc_harness.tools import is_dangerous, confirm
 
@@ -136,8 +136,11 @@ async def run_turn(
         if content:
             # The streamed content is the final answer; do NOT reprint it
             # (that would create a duplicate). The streaming print above
-            # already showed it. We just record it in the message history.
+            # already showed it. We just record it in the message history
+            # and emit a ✅ done marker so the user sees the turn has
+            # finished.
             messages.append({"role": "assistant", "content": content})
+            print_done(console)
             return
         else:
             print_warn(console, "empty LLM turn, ending")

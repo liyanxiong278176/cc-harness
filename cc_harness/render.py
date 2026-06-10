@@ -29,22 +29,34 @@ def print_thought(console: Console, text: str) -> None:
     _flush(console)
 
 def print_tool_call(console: Console, name: str, arguments: dict) -> None:
-    """Yellow: emit a tool invocation summary."""
-    args_str = json.dumps(arguments, ensure_ascii=False)
-    console.print(f"\n→ {name} {args_str}", style="yellow")
+    """Yellow: emit a tool invocation with emoji + indented parameters."""
+    console.print(f"🔧 调用工具: {name}", style="yellow")
+    args_str = json.dumps(arguments, ensure_ascii=False, indent=2)
+    for line in args_str.splitlines() or [""]:
+        console.print(f"   {line}", style="dim")
     _flush(console)
 
 def print_tool_result(console: Console, text: str, is_error: bool = False) -> None:
-    """Green on success, red on error."""
+    """Green on success, red on error, with 📤 label and indented body."""
     style = "red" if is_error else "green"
-    label = "✗ tool result" if is_error else "✓ tool result"
-    console.print(Panel(text, title=label, border_style=style, expand=False))
+    label = "✗ 执行结果" if is_error else "📤 执行结果:"
+    console.print(label, style=style)
+    for line in (text or "").splitlines() or [""]:
+        console.print(f"   {line}", style=style)
     _flush(console)
 
 def print_final(console: Console, text: str) -> None:
-    """White: the LLM's final answer, rendered as Markdown so code blocks highlight."""
+    """White: print a 'task done' marker followed by the final answer."""
     console.print()
+    console.print("✅ 任务完成:", style="green")
     console.print(Markdown(text), style="white")
+    _flush(console)
+
+def print_done(console: Console) -> None:
+    """Emit a ✅ done marker on its own line. Use when the LLM's streamed
+    response already serves as the visible final text (so we just need a
+    visual signal that the turn has ended, not a re-print of the text)."""
+    console.print("✅", style="green")
     _flush(console)
 
 def print_warn(console: Console, text: str) -> None:
