@@ -1,92 +1,224 @@
-# tests/test_render.py
-import re
+"""Tests for the 4-phase ReAct renderers in cc_harness.render.
+
+Per the current design:
+  - No ANSI color codes
+  - 4 phases: 思考 / 行动 / 观察 / 结果, each on its own block
+  - 思考 = LLM's full text (no truncation)
+  - 行动 = tool name + one arg per line
+  - 观察 = tool's actual result (what the LLM sees), indented
+  - 结果 = final answer
+  - Each block preceded by a blank line for visual separation
+  - print_warn uses ⚠, print_error uses ✗, print_info is plain
+"""
+from io import StringIO
+from rich.console import Console as C
 from cc_harness.render import (
-    print_thought, print_tool_call, print_tool_result, print_final,
+    print_thought, print_action, print_observation, print_result,
     print_warn, print_error, print_info,
 )
 
-ANSI_BLUE = re.compile(r"\x1b\[.*?34m")
-ANSI_YELLOW = re.compile(r"\x1b\[.*?33m")
-ANSI_GREEN = re.compile(r"\x1b\[.*?32m")
-ANSI_RED = re.compile(r"\x1b\[.*?31m")
-ANSI_WHITE = re.compile(r"\x1b\[.*?37m")
-ANSI_CYAN = re.compile(r"\x1b\[.*?36m")
 
-def test_print_thought_blue(console):
-    console.print = lambda *a, **kw: print_thought(console, "thinking")
-    # Use Console.capture path
-    from io import StringIO
-    from rich.console import Console as C
+def _make_console() -> tuple[C, StringIO]:
+    """Console writing to a StringIO. color_system=None → no ANSI."""
     buf = StringIO()
-    c = C(file=buf, force_terminal=True, color_system="truecolor", width=120)
-    print_thought(c, "hello thought")
-    text = buf.getvalue()
-    assert ANSI_BLUE.search(text), f"expected blue ANSI in: {text!r}"
-    assert "hello thought" in text
+    c = C(file=buf, force_terminal=False, color_system=None, width=120)
+    return c, buf
 
-def test_print_tool_call_yellow(console):
-    from io import StringIO
-    from rich.console import Console as C
-    buf = StringIO()
-    c = C(file=buf, force_terminal=True, color_system="truecolor", width=120)
-    print_tool_call(c, "mcp__fs__read_file", {"path": "main.py"})
+
+# --- 思考 (Thought) ---
+
+def test_print_thought_emits_thought_label_and_full_text():
+    c, buf = _make_console()
+    print_thought(c, "我需要找到 JSON 文件。")
     text = buf.getvalue()
-    assert ANSI_YELLOW.search(text)
-    assert "mcp__fs__read_file" in text
+    assert "思考:" in text
+    assert "我需要找到 JSON 文件。" in text
+    assert "\x1b[" not in text
+
+
+def test_print_thought_preserves_full_text_no_truncation():
+    """Per user spec: 思考 must be the COMPLETE LLM text, not truncated.
+    Note: Rich wraps long lines at the console width, so we check for the
+    presence of the text by stripping line breaks."""
+    c, buf = _make_console()
+    long_text = "final answer. " * 50  # 700+ chars
+    print_thought(c, long_text)
+    text = buf.getvalue()
+    # Remove whitespace (newlines inserted by Rich's wrapping) and compare
+    plain_compact = "".join(text.split())
+    expected_compact = "".join(long_text.split())
+    assert expected_compact in plain_compact, "long thought text should NOT be truncated"
+
+
+def test_print_thought_preceded_by_blank_line():
+    """Each non-streaming phase is preceded by a blank line."""
+    c, buf = _make_console()
+    print_thought(c, "first thought")
+    text = buf.getvalue()
+    # First line should be blank (the leading \\n\\n from _blank)
+    lines = text.splitlines()
+    assert lines[0] == "", f"first line should be blank, got: {lines[0]!r}"
+    assert "思考: first thought" in lines[1]
+
+
+# --- 行动 (Action) ---
+
+def test_print_action_shows_action_label():
+    c, buf = _make_console()
+    print_action(c, "mcp__fs__read_file", {"path": "main.py"})
+    text = buf.getvalue()
+    assert "行动: mcp__fs__read_file" in text
+    assert "path" in text
     assert "main.py" in text
+    assert "\x1b[" not in text
 
-def test_print_tool_result_success_green():
-    from io import StringIO
-    from rich.console import Console as C
-    buf = StringIO()
-    c = C(file=buf, force_terminal=True, color_system="truecolor", width=120)
-    print_tool_result(c, "file contents here", is_error=False)
+
+def test_print_action_compact_args():
+    """One arg per line, not multi-line indented JSON."""
+    c, buf = _make_console()
+    print_action(c, "mcp__fs__list_dir", {"path": "D:/x", "recursive": True})
     text = buf.getvalue()
-    assert ANSI_GREEN.search(text)
-    assert "file contents here" in text
+    assert "path" in text
+    assert "D:/x" in text
+    assert "recursive" in text
+    assert "  path:" in text
+    assert "  recursive:" in text
 
-def test_print_tool_result_error_red():
-    from io import StringIO
-    from rich.console import Console as C
-    buf = StringIO()
-    c = C(file=buf, force_terminal=True, color_system="truecolor", width=120)
-    print_tool_result(c, "ENOENT", is_error=True)
+
+def test_print_action_with_no_args():
+    c, buf = _make_console()
+    print_action(c, "mcp__fs__list_allowed_directories", {})
     text = buf.getvalue()
-    assert ANSI_RED.search(text)
+    assert "行动: mcp__fs__list_allowed_directories" in text
 
-def test_print_final_white():
-    from io import StringIO
-    from rich.console import Console as C
-    buf = StringIO()
-    c = C(file=buf, force_terminal=True, color_system="truecolor", width=120)
-    print_final(c, "the answer is 42")
+
+def test_print_action_preceded_by_blank_line():
+    c, buf = _make_console()
+    print_action(c, "mcp__x__y", {})
     text = buf.getvalue()
-    assert ANSI_WHITE.search(text)
-    assert "the answer is 42" in text
+    lines = text.splitlines()
+    assert lines[0] == ""
 
-def test_print_warn_yellow():
-    from io import StringIO
-    from rich.console import Console as C
-    buf = StringIO()
-    c = C(file=buf, force_terminal=True, color_system="truecolor", width=120)
+
+# --- 观察 (Observation) ---
+
+def test_print_observation_shows_observation_label():
+    c, buf = _make_console()
+    print_observation(c, "Allowed directories: D:\\agent_learning\\cc-harness")
+    text = buf.getvalue()
+    assert "观察:" in text
+    assert "Allowed directories" in text
+    assert "\x1b[" not in text
+
+
+def test_print_observation_indents_multiline_content():
+    """Multi-line tool results (e.g. file contents) should be indented under
+    the '观察:' label, one line per row."""
+    c, buf = _make_console()
+    print_observation(c, "line1\nline2\nline3")
+    text = buf.getvalue()
+    assert "观察:" in text
+    assert "  line1" in text
+    assert "  line2" in text
+    assert "  line3" in text
+
+
+def test_print_observation_handles_empty_text():
+    c, buf = _make_console()
+    print_observation(c, "")
+    text = buf.getvalue()
+    assert "观察:" in text
+
+
+def test_print_observation_preceded_by_blank_line():
+    c, buf = _make_console()
+    print_observation(c, "some result")
+    text = buf.getvalue()
+    lines = text.splitlines()
+    assert lines[0] == ""
+
+
+# --- 结果 (Result) ---
+
+def test_print_result_shows_result_label_and_full_text():
+    c, buf = _make_console()
+    print_result(c, "the final answer is 42")
+    text = buf.getvalue()
+    assert "结果:" in text
+    assert "the final answer is 42" in text
+    assert "\x1b[" not in text
+
+
+def test_print_result_full_text_no_truncation():
+    c, buf = _make_console()
+    long_text = "final answer. " * 50
+    print_result(c, long_text)
+    text = buf.getvalue()
+    # Strip whitespace to handle Rich's line-wrapping
+    plain_compact = "".join(text.split())
+    expected_compact = "".join(long_text.split())
+    assert expected_compact in plain_compact
+
+
+def test_print_result_preceded_by_blank_line():
+    c, buf = _make_console()
+    print_result(c, "done")
+    text = buf.getvalue()
+    lines = text.splitlines()
+    assert lines[0] == ""
+
+
+# --- 4-phase layout: blank lines between blocks ---
+
+def test_four_phase_layout_has_blank_between_each_phase():
+    """The full ReAct cycle: 思考 → 行动 → 观察 → (next) 思考
+    Each block separated by a blank line."""
+    c, buf = _make_console()
+    print_thought(c, "thought 1")
+    print_action(c, "tool1", {"arg": "val"})
+    print_observation(c, "result 1")
+    print_thought(c, "thought 2")
+    print_action(c, "tool2", {})
+    print_observation(c, "result 2")
+    text = buf.getvalue()
+    lines = text.splitlines()
+    # All four phase labels should appear in order
+    assert "思考: thought 1" in lines
+    assert "行动: tool1" in lines
+    assert "观察:" in lines
+    assert "思考: thought 2" in lines
+    assert "行动: tool2" in lines
+    # Verify the order
+    i_t1 = next(i for i, ln in enumerate(lines) if "思考: thought 1" in ln)
+    i_a1 = next(i for i, ln in enumerate(lines) if "行动: tool1" in ln)
+    i_o1 = next(i for i, ln in enumerate(lines) if ln.strip() == "观察:")
+    i_t2 = next(i for i, ln in enumerate(lines) if "思考: thought 2" in ln)
+    assert i_t1 < i_a1 < i_o1 < i_t2, f"4-phase order broken: {i_t1} < {i_a1} < {i_o1} < {i_t2}"
+
+
+# --- warn / error / info ---
+
+def test_print_warn_uses_warning_glyph():
+    c, buf = _make_console()
     print_warn(c, "careful")
     text = buf.getvalue()
-    assert ANSI_YELLOW.search(text)
+    assert "⚠" in text
+    assert "careful" in text
+    assert "\x1b[" not in text
 
-def test_print_error_red():
-    from io import StringIO
-    from rich.console import Console as C
-    buf = StringIO()
-    c = C(file=buf, force_terminal=True, color_system="truecolor", width=120)
+
+def test_print_error_uses_error_glyph():
+    c, buf = _make_console()
     print_error(c, "boom")
     text = buf.getvalue()
-    assert ANSI_RED.search(text)
+    assert "✗" in text
+    assert "boom" in text
+    assert "\x1b[" not in text
 
-def test_print_info_cyan():
-    from io import StringIO
-    from rich.console import Console as C
-    buf = StringIO()
-    c = C(file=buf, force_terminal=True, color_system="truecolor", width=120)
-    print_info(c, "info")
+
+def test_print_info_plain():
+    c, buf = _make_console()
+    print_info(c, "ready")
     text = buf.getvalue()
-    assert ANSI_CYAN.search(text)
+    assert "ready" in text
+    assert "\x1b[" not in text

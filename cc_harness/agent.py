@@ -1,10 +1,18 @@
-"""ReAct loop: streams one LLM turn, routes finish_reason, dispatches tools."""
+"""ReAct loop: streams one LLM turn, routes finish_reason, dispatches tools.
+
+Output is the classic 4-phase ReAct format (per user spec):
+    思考: <LLM's full reasoning text>
+    行动: <tool call>
+    观察: <tool result>
+    [loop]
+    结果: <final answer>
+"""
 from __future__ import annotations
 import json
 from rich.console import Console
 from cc_harness.render import (
-    print_thought, print_tool_call, print_tool_result, print_final,
-    print_warn, print_error, print_done,
+    print_thought, print_action, print_observation, print_result,
+    print_warn, print_error,
 )
 from cc_harness.tools import is_dangerous, confirm
 
@@ -29,14 +37,19 @@ async def run_turn(
     while iter_count < max_iter:
         iter_count += 1
 
-        # 1. Stream one LLM turn
+        # 1. Stream one LLM turn. We BUFFER the content (don't print during
+        # the stream) because the routing decision — has_tool_calls vs
+        # final answer — is only known after the "done" event. We always
+        # print the LLM's content as a single "思考:" block per iteration
+        # (no real-time token streaming). The trade-off is loss of streaming
+        # feel, in exchange for a clean per-iteration 思考/行动/观察/结果
+        # layout with no duplication.
         content_parts: list[str] = []
         pending: list = []
         finish_reason: str | None = None
         try:
             async for ev in llm.chat(messages, tool_specs):
                 if ev.kind == "content":
-                    print_thought(console, ev.text)
                     content_parts.append(ev.text)
                 elif ev.kind == "tool_call_delta":
                     pass  # accumulation handled inside llm.chat
@@ -56,19 +69,19 @@ async def run_turn(
         has_tool_calls = (finish_reason == "tool_calls") and bool(pending)
 
         if has_tool_calls:
-            # 6. Max-iter guard: if this is the last allowed iteration and the
-            # LLM still wants to call tools, DROP the tool_calls entirely.
-            # We must check here (not after the loop) so we don't append a
-            # 20th tool_call message that the test would then count.
+            # Non-final iteration. Print the FULL buffered content as 思考
+            # (per user spec: "所有文本"), then execute each tool with
+            # 行动 / 观察 labels.
             if iter_count >= max_iter:
+                # Max-iter guard: drop the tool_calls, fall back to final.
                 print_warn(console, "max iterations reached with pending tool calls, forcing stop")
                 if content:
                     messages.append({"role": "assistant", "content": content})
-                    print_final(console, content)
+                    print_result(console, content)
                 else:
                     fallback = "达到最大迭代次数,任务未完成。"
                     messages.append({"role": "assistant", "content": fallback})
-                    print_final(console, fallback)
+                    print_result(console, fallback)
                 return
 
             # 3. Build assistant message (with tool_calls; content may be None)
@@ -79,15 +92,20 @@ async def run_turn(
             }
             messages.append(assistant_msg)
 
-            # 4. Execute each tool (or backfill error)
+            # 3.5 Print the 思考 block (full LLM text for this iter)
+            if content:
+                print_thought(console, content)
+
+            # 4. Execute each tool with 行动 + 观察 labels
             for i, p in enumerate(pending):
                 if p.name is None:
                     placeholder_id = f"unknown_{i}"
-                    print_warn(console, "tool_call name missing; feeding back error")
+                    print_warn(console, f"tool_call name missing; backfilling error")
                     error_llm_text = (
                         f"[Tool Error] tool_call name missing, raw: "
                         f"{json.dumps({'id': p.id, 'arguments_json': p.arguments_json})}"
                     )
+                    print_observation(console, error_llm_text)
                     messages.append({
                         "role": "tool",
                         "tool_call_id": placeholder_id,
@@ -99,27 +117,33 @@ async def run_turn(
                     args = json.loads(p.arguments_json) if p.arguments_json else {}
                 except json.JSONDecodeError as e:
                     print_error(console, f"tool_call JSON parse failed: {e}")
+                    error_text = f"[Tool Error] JSON parse failed: {p.arguments_json}"
+                    print_observation(console, error_text)
                     messages.append({
                         "role": "tool",
                         "tool_call_id": p.id or f"unknown_{i}",
-                        "content": f"[Tool Error] JSON parse failed: {p.arguments_json}",
+                        "content": error_text,
                     })
                     continue
 
-                # Danger check
+                # Danger check — same as before, but show the rejection as 观察
                 if is_dangerous(p.name, args):
                     print_warn(console, f"dangerous command detected: {p.name} {args}")
                     if not confirm("Confirm execution?"):
+                        error_text = f"[Tool Error] user rejected dangerous command: {p.name}"
+                        print_observation(console, error_text)
                         messages.append({
                             "role": "tool",
                             "tool_call_id": p.id or f"unknown_{i}",
-                            "content": f"[Tool Error] user rejected dangerous command: {p.name}",
+                            "content": error_text,
                         })
                         continue
 
-                print_tool_call(console, p.name, args)
+                print_action(console, p.name, args)
                 result = await mcp.call_tool(p.name, args)
-                print_tool_result(console, result.display_text, is_error=result.is_error)
+                # 观察 shows what the LLM actually sees (llm_text, not display_text,
+                # so error markers like "[Tool Error]" are visible).
+                print_observation(console, result.llm_text)
                 messages.append({
                     "role": "tool",
                     "tool_call_id": p.id or f"unknown_{i}",
@@ -129,18 +153,14 @@ async def run_turn(
             # 5. Continue the loop — feed tool results back to LLM
             continue
 
-        # has_tool_calls == False
+        # has_tool_calls == False → final answer
         if finish_reason == "tool_calls" and not pending:
             print_warn(console, "finish_reason=tool_calls but no pending tool_calls, treating as stop")
 
         if content:
-            # The streamed content is the final answer; do NOT reprint it
-            # (that would create a duplicate). The streaming print above
-            # already showed it. We just record it in the message history
-            # and emit a ✅ done marker so the user sees the turn has
-            # finished.
+            # Final. Print "结果:" + the FULL content as the LLM's answer.
             messages.append({"role": "assistant", "content": content})
-            print_done(console)
+            print_result(console, content)
             return
         else:
             print_warn(console, "empty LLM turn, ending")
@@ -153,7 +173,7 @@ async def run_turn(
     print_warn(console, "max iterations reached")
     if content:
         messages.append({"role": "assistant", "content": content})
-        print_final(console, content)
+        print_result(console, content)
 
 
 def _pending_to_openai_tc(p) -> dict:
