@@ -820,6 +820,7 @@ git commit -m "Task 5a: PendingToolCall, StreamEvent, accumulate_delta"
 Append to `tests/test_llm.py`:
 
 ```python
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 from cc_harness.llm import LLMClient
 
@@ -836,6 +837,16 @@ class _FakeChoice:
 class _FakeChunk:
     def __init__(self, delta, finish_reason=None):
         self.choices = [_FakeChoice(delta, finish_reason)]
+
+def _tc(index, id_, name, arguments):
+    """Build a fake tool_call delta. Use SimpleNamespace (NOT MagicMock) because
+    `name` is the third positional/keyword arg of MagicMock.__init__ and gets
+    consumed as the mock's repr-name, not an attribute. tc.name would then
+    return a child MagicMock (truthy), not None."""
+    return SimpleNamespace(
+        index=index, id=id_, name=name,
+        function=SimpleNamespace(arguments=arguments),
+    )
 
 def _make_client(stream_chunks):
     """Build an LLMClient whose underlying openai client yields stream_chunks."""
@@ -855,8 +866,8 @@ async def test_chat_streams_content_and_tool_calls():
     chunks = [
         _FakeChunk(_FakeChoiceDelta(content="I will ")),
         _FakeChunk(_FakeChoiceDelta(content="read the file")),
-        _FakeChunk(_FakeChoiceDelta(tool_calls=[MagicMock(index=0, id="c1", name="t1", function=MagicMock(arguments='{"pa'))])),
-        _FakeChunk(_FakeChoiceDelta(tool_calls=[MagicMock(index=0, id=None, name=None, function=MagicMock(arguments='th":1}'))])),
+        _FakeChunk(_FakeChoiceDelta(tool_calls=[_tc(0, "c1", "t1", '{"pa')])),
+        _FakeChunk(_FakeChoiceDelta(tool_calls=[_tc(0, None, None, 'th":1}')])),
         _FakeChunk(_FakeChoiceDelta(), finish_reason="tool_calls"),
     ]
     client = _make_client(chunks)
@@ -879,7 +890,7 @@ async def test_chat_bad_json_finishes_with_raw_arguments():
     """If a tool_call's concatenated arguments_json doesn't parse, the pending
     entry is left as-is (no exception). Caller (agent.py) will detect this."""
     chunks = [
-        _FakeChunk(_FakeChoiceDelta(tool_calls=[MagicMock(index=0, id="c1", name="t1", function=MagicMock(arguments='{"a": oops'))])),
+        _FakeChunk(_FakeChoiceDelta(tool_calls=[_tc(0, "c1", "t1", '{"a": oops')])),
         _FakeChunk(_FakeChoiceDelta(), finish_reason="tool_calls"),
     ]
     client = _make_client(chunks)
@@ -1612,6 +1623,21 @@ async def _run_turn_async(messages, llm, mcp, *, max_iter: int) -> None:
         has_tool_calls = (finish_reason == "tool_calls") and bool(pending)
 
         if has_tool_calls:
+            # 6. Max-iter guard: if this is the last allowed iteration and the
+            # LLM still wants to call tools, DROP the tool_calls entirely.
+            # We must check here (not after the loop) so we don't append a
+            # 20th tool_call message that the test would then count.
+            if iter_count >= max_iter:
+                print_warn(console, "max iterations reached with pending tool calls, forcing stop")
+                if content:
+                    messages.append({"role": "assistant", "content": content})
+                    print_final(console, content)
+                else:
+                    fallback = "达到最大迭代次数,任务未完成。"
+                    messages.append({"role": "assistant", "content": fallback})
+                    print_final(console, fallback)
+                return
+
             # 3. Build assistant message (with tool_calls; content may be None)
             assistant_msg: dict = {
                 "role": "assistant",
@@ -1682,18 +1708,12 @@ async def _run_turn_async(messages, llm, mcp, *, max_iter: int) -> None:
             print_warn(console, "empty LLM turn, ending")
             return
 
-    # 6. max_iter reached
+    # 6. max_iter reached (safety net — the inner has_tool_calls branch above
+    # already handles this case and returns early, so this only runs if the
+    # LLM never returned has_tool_calls=True but somehow the loop also never
+    # appended an assistant message and never returned).
     print_warn(console, "max iterations reached")
-    if pending:
-        # Drop pending tool_calls entirely
-        if content:
-            messages.append({"role": "assistant", "content": content})
-            print_final(console, content)
-        else:
-            fallback = "达到最大迭代次数,任务未完成。"
-            messages.append({"role": "assistant", "content": fallback})
-            print_final(console, fallback)
-    elif content:
+    if content:
         messages.append({"role": "assistant", "content": content})
         print_final(console, content)
 
