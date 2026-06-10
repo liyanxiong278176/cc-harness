@@ -1,0 +1,17 @@
+{
+  "mcpServers": {
+    "filesystem": {
+      "type": "stdio",
+      "command": "npx",
+      "args": ["-y", "@modelcontextprotocol/server-filesystem", "D:/agent_learning/cc-harness"]
+    },
+    "remote-sse-example": {
+      "type": "sse",
+      "url": "http://localhost:8000/sse"
+    },
+    "remote-http-example": {
+      "type": "http",
+      "url": "http://localhost:8000/mcp"
+    }
+  }
+}
