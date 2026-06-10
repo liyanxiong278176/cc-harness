@@ -904,13 +904,14 @@ Append to `cc_harness/llm.py`:
 
 ```python
 class LLMClient:
-    """Thin async wrapper around AsyncOpenAI for streaming chat + tools."""
+    """Thin async wrapper around AsyncOpenAI for streaming chat + tools.
+
+    NB: `model` is per-call, NOT a constructor arg of AsyncOpenAI.
+    """
 
     def __init__(self, api_key: str, model: str, base_url: str | None) -> None:
-        self._client = AsyncOpenAI(api_key=api_key, model=model, base_url=base_url)
-        # NB: AsyncOpenAI's signature takes api_key, not model; model is per-call.
-        # Fix: store model separately, pass per-call.
         self.model = model
+        self._client = AsyncOpenAI(api_key=api_key, base_url=base_url)
 
     async def chat(
         self,
@@ -1300,7 +1301,7 @@ git commit -m "Task 6b: MCPClient with stdio/sse/http transports + ToolResult"
 ```python
 # tests/test_agent.py
 import pytest
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any
 from cc_harness.llm import PendingToolCall
 from cc_harness.tools import is_dangerous, confirm
@@ -1327,7 +1328,7 @@ class FakeStreamEvent:
     text: str = ""
     tool_call: PendingToolCall | None = None
     finish_reason: str | None = None
-    pending: list[PendingToolCall] = None
+    pending: list[PendingToolCall] = field(default_factory=list)  # mutable default needs factory
     content: str = ""
 
 @dataclass
@@ -1478,13 +1479,27 @@ async def test_max_iter_reached_with_pending_drops_tool_calls(monkeypatch):
 
     messages = [{"role": "user", "content": "loop"}]
     await agent_mod.run_turn(messages, llm, mcp, max_iter=20)
-    # Last message should be the gentle fallback (no tool_calls)
+    # Spec: on iter==20 with has_tool_calls=True, the agent MUST:
+    #   (1) drop pending tool_calls (no tool_calls on the final assistant message)
+    #   (2) NOT append any role:tool backfill after the final assistant
+    #   (3) emit a gentle fallback text instead
     final = messages[-1]
-    assert "tool_calls" not in final
-    assert final["content"]  # either a thought or the fallback
-    # tool_calls were dropped on the final assistant message
+    assert final["role"] == "assistant"
+    assert "tool_calls" not in final, "final assistant must not have tool_calls"
+    assert final["content"]  # either a thought or the fallback text
+
+    # Walk backwards: find the LAST assistant message; nothing after it should be role:tool
+    final_assistant_idx = max(
+        i for i, m in enumerate(messages) if m["role"] == "assistant"
+    )
+    assert not any(
+        m["role"] == "tool" for m in messages[final_assistant_idx + 1:]
+    ), "no role:tool backfill after the final assistant message"
+
+    # The total number of assistant-with-tool_calls messages should be < 20
+    # (one fewer than max_iter because the final turn drops them)
     tool_call_msgs = [m for m in messages if m.get("role") == "assistant" and "tool_calls" in m]
-    assert len(tool_call_msgs) < 20  # not every turn kept its tool_call
+    assert len(tool_call_msgs) < 20
 
 
 @pytest.mark.asyncio
@@ -1523,7 +1538,7 @@ async def test_danger_command_user_says_no_llm_changes_tool(monkeypatch):
 
     messages = [{"role": "user", "content": "clean up"}]
     await agent_mod.run_turn(messages, llm, mcp, max_iter=5)
-    assert confirm_calls == ["dangerous command detected"]
+    assert confirm_calls == ["Confirm execution?"]
     # Bash tool was NOT called
     assert all(name != "mcp__bash__run" for name, _ in mcp.calls)
     # Safe tool WAS called
