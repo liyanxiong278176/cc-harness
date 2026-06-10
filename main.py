@@ -2,12 +2,23 @@
 """cc-harness entry point."""
 from __future__ import annotations
 import asyncio
+import sys
 from pathlib import Path
 from rich.console import Console
 from cc_harness.config import load_config, ConfigError
 from cc_harness.llm import LLMClient
 from cc_harness.mcp_client import MCPClient
 from cc_harness.repl import run_repl
+
+# Force UTF-8 for stdio on Windows (default codepage is GBK/cp936 on zh-CN
+# systems, which breaks the prompt char and any non-ASCII LLM output).
+if sys.platform == "win32":
+    try:
+        sys.stdin.reconfigure(encoding="utf-8")
+        sys.stdout.reconfigure(encoding="utf-8")
+        sys.stderr.reconfigure(encoding="utf-8")
+    except (AttributeError, OSError):
+        pass  # Python < 3.7 or stream not reconfigurable; user can set PYTHONUTF8=1
 
 PROJECT_ROOT = Path(__file__).parent
 

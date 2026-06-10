@@ -8,7 +8,7 @@ from cc_harness.render import print_info
 
 async def _read_user() -> str:
     """Block on input() in a worker thread so the event loop stays responsive."""
-    return await asyncio.to_thread(input, "› ")
+    return await asyncio.to_thread(input, "> ")
 
 
 async def run_repl(llm, mcp, *, max_iter: int = 20) -> None:
