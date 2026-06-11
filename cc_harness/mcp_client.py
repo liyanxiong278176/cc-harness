@@ -8,7 +8,7 @@ from mcp import ClientSession, StdioServerParameters
 from mcp.client.stdio import stdio_client
 from cc_harness.config import MCPServerConfig
 
-INIT_TIMEOUT_S = 5.0
+INIT_TIMEOUT_S = 30.0
 CALL_TIMEOUT_S = 30.0
 
 

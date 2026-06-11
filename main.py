@@ -2,6 +2,7 @@
 # -*- coding: utf-8 -*-
 """cc-harness entry point."""
 from __future__ import annotations
+import argparse
 import asyncio
 import sys
 from pathlib import Path
@@ -23,7 +24,23 @@ if sys.platform == "win32":
 
 PROJECT_ROOT = Path(__file__).parent
 
+
+def _parse_args() -> argparse.Namespace:
+    p = argparse.ArgumentParser(description="cc-harness: terminal coding agent with MCP tools")
+    p.add_argument(
+        "--mode", choices=("coding", "plan", "design"),
+        default="coding",
+        help="Initial sticky mode (switchable at runtime via /plan /design /coding)",
+    )
+    p.add_argument(
+        "--design-dir", type=Path, default=None,
+        help="Where design-mode outputs are saved (default: ~/.cc-harness/designs/)",
+    )
+    return p.parse_args()
+
+
 def main() -> None:
+    args = _parse_args()
     console = Console()
     try:
         cfg = load_config(
@@ -44,7 +61,12 @@ def main() -> None:
         mcp = MCPClient(cfg.mcp_servers)
         try:
             await mcp.start()
-            await run_repl(llm, mcp)
+            await run_repl(
+                llm, mcp,
+                cwd=str(PROJECT_ROOT),
+                default_mode=args.mode,
+                design_dir=args.design_dir,
+            )
         finally:
             await mcp.shutdown()
 

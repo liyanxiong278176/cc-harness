@@ -27,21 +27,32 @@ class ConfigError(Exception):
 
 class AppConfig(BaseModel):
     openai_api_key: str
-    openai_base_url: str = "https://api.openai.com/v1"
-    openai_model: str = "gpt-4o-mini"
+    openai_base_url: str
+    openai_model: str
     mcp_servers: dict[str, MCPServerConfig]
 
     model_config = {"extra": "ignore"}
 
 
 def load_config(env_path: Path, mcp_json_path: Path) -> AppConfig:
-    """Load .env (no-op if missing) + mcp.json + required OPENAI_API_KEY."""
+    """Load .env (no-op if missing) + mcp.json + required env vars.
+
+    Required: OPENAI_API_KEY, OPENAI_BASE_URL, OPENAI_MODEL.
+    """
     if env_path.exists():
         load_dotenv(env_path, override=False)
 
     api_key = os.getenv("OPENAI_API_KEY")
     if not api_key:
         raise ConfigError("OPENAI_API_KEY is required (set in .env or env var)")
+
+    base_url = os.getenv("OPENAI_BASE_URL")
+    if not base_url:
+        raise ConfigError("OPENAI_BASE_URL is required (set in .env)")
+
+    model = os.getenv("OPENAI_MODEL")
+    if not model:
+        raise ConfigError("OPENAI_MODEL is required (set in .env)")
 
     if not mcp_json_path.exists():
         raise ConfigError(f"mcp.json not found at {mcp_json_path}")
@@ -52,7 +63,7 @@ def load_config(env_path: Path, mcp_json_path: Path) -> AppConfig:
 
     return AppConfig(
         openai_api_key=api_key,
-        openai_base_url=os.getenv("OPENAI_BASE_URL", "https://api.openai.com/v1"),
-        openai_model=os.getenv("OPENAI_MODEL", "gpt-4o-mini"),
+        openai_base_url=base_url,
+        openai_model=model,
         mcp_servers=servers,
     )

@@ -5,13 +5,10 @@
       "command": "npx",
       "args": ["-y", "@modelcontextprotocol/server-filesystem", "D:/agent_learning/cc-harness"]
     },
-    "remote-sse-example": {
-      "type": "sse",
-      "url": "http://localhost:8000/sse"
-    },
-    "remote-http-example": {
-      "type": "http",
-      "url": "http://localhost:8000/mcp"
+    "git": {
+      "type": "stdio",
+      "command": "uvx",
+      "args": ["mcp-server-git", "--repository", "D:/agent_learning/cc-harness"]
     }
   }
 }

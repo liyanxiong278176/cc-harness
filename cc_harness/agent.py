@@ -6,15 +6,36 @@ Output is the classic 4-phase ReAct format (per user spec):
     观察: <tool result>
     [loop]
     结果: <final answer>
+
+Modes (see task #4 / #6):
+    "coding"  — full ReAct loop, tools enabled (default)
+    "plan"    — one-shot final answer, no tool execution, no tools passed to LLM
+    "design"  — one-shot final answer, no tool execution, output saved to disk
 """
 from __future__ import annotations
 import json
+import re
+import time
+from pathlib import Path
 from rich.console import Console
 from cc_harness.render import (
     print_thought, print_action, print_observation, print_result,
-    print_warn, print_error,
+    print_warn, print_error, print_info,
 )
-from cc_harness.tools import is_dangerous, confirm
+from cc_harness.tools import is_dangerous, confirm, run_command, RUN_COMMAND_SPEC
+
+_VALID_MODES = ("coding", "plan", "design")
+
+# --- Native (non-MCP) tool registry ---
+# Tools registered here are exposed to the LLM alongside MCP tools, but
+# dispatched directly inside the agent (no protocol round-trip, no extra
+# process). Each entry: {"spec": <OpenAI tool spec>, "handler": async fn}.
+NATIVE_TOOLS: dict[str, dict] = {
+    "run_command": {
+        "spec": RUN_COMMAND_SPEC,
+        "handler": run_command,
+    },
+}
 
 
 async def run_turn(
@@ -23,16 +44,42 @@ async def run_turn(
     mcp,                    # any object with list_tools() and async call_tool(name, args) -> ToolResult
     *,
     max_iter: int = 20,
+    mode: str = "coding",
+    cwd: str | None = None,
+    design_dir: Path | None = None,
 ) -> None:
-    """Run one user turn (may involve multiple LLM <-> tool rounds). Mutates messages in place.
+    """Run one user turn in the given mode.
 
-    Async so the repl (T8) can call it from inside its persistent event loop
-    without `asyncio.run` overhead. For one-shot sync callers, wrap with
-    `asyncio.run(run_turn(...))`.
+    In `coding` mode: full ReAct loop with tool execution.
+    In `plan` mode: one-shot LLM call (no tools passed, tool_calls dropped if any).
+    In `design` mode: same as plan, plus the final assistant content is
+        persisted to `design_dir` (default: ~/.cc-harness/designs/).
+
+    If `cwd` is provided, the system prompt at `messages[0]` is refreshed
+    to match the current mode before the first LLM call. If `cwd` is None,
+    the caller is responsible for having the right system prompt in place.
+
+    Mutates `messages` in place. Async so the repl can call it from its
+    persistent event loop without `asyncio.run` overhead.
     """
+    if mode not in _VALID_MODES:
+        raise ValueError(f"unknown mode: {mode!r} (expected one of {_VALID_MODES})")
+
     console = Console()
-    tool_specs = mcp.list_tools()
     iter_count = 0
+
+    if cwd is not None:
+        _refresh_system_prompt(messages, cwd, mode)
+
+    # In plan/design mode, the LLM should not see any tool definitions, so
+    # it physically cannot emit tool_calls. In coding mode, expose both the
+    # MCP tool set and the native tool registry.
+    if mode == "coding":
+        tool_specs = list(mcp.list_tools())
+        for native in NATIVE_TOOLS.values():
+            tool_specs.append(native["spec"])
+    else:
+        tool_specs = None
 
     while iter_count < max_iter:
         iter_count += 1
@@ -68,10 +115,8 @@ async def run_turn(
         # 2. Compute routing
         has_tool_calls = (finish_reason == "tool_calls") and bool(pending)
 
-        if has_tool_calls:
-            # Non-final iteration. Print the FULL buffered content as 思考
-            # (per user spec: "所有文本"), then execute each tool with
-            # 行动 / 观察 labels.
+        if has_tool_calls and mode == "coding":
+            # Coding mode: full ReAct loop with tool execution.
             if iter_count >= max_iter:
                 # Max-iter guard: drop the tool_calls, fall back to final.
                 print_warn(console, "max iterations reached with pending tool calls, forcing stop")
@@ -140,7 +185,13 @@ async def run_turn(
                         continue
 
                 print_action(console, p.name, args)
-                result = await mcp.call_tool(p.name, args)
+                if p.name in NATIVE_TOOLS:
+                    # Native (built-in) tool — call the handler directly.
+                    result = await NATIVE_TOOLS[p.name]["handler"](
+                        args, cwd=cwd or "."
+                    )
+                else:
+                    result = await mcp.call_tool(p.name, args)
                 # 观察 shows what the LLM actually sees (llm_text, not display_text,
                 # so error markers like "[Tool Error]" are visible).
                 print_observation(console, result.llm_text)
@@ -153,14 +204,21 @@ async def run_turn(
             # 5. Continue the loop — feed tool results back to LLM
             continue
 
-        # has_tool_calls == False → final answer
-        if finish_reason == "tool_calls" and not pending:
-            print_warn(console, "finish_reason=tool_calls but no pending tool_calls, treating as stop")
+        # Either: (a) coding mode with no tool_calls → final answer, or
+        #         (b) plan/design mode regardless of tool_calls → force final
+        if has_tool_calls and mode != "coding":
+            # Defensive: the LLM shouldn't emit tool_calls in plan/design
+            # (we passed no tool specs), but if it does, drop them and warn.
+            print_warn(console, f"mode={mode}: dropping {len(pending)} unexpected tool call(s)")
 
         if content:
             # Final. Print "结果:" + the FULL content as the LLM's answer.
             messages.append({"role": "assistant", "content": content})
             print_result(console, content)
+            if mode == "design":
+                saved = _save_design_output(messages, base_dir=design_dir)
+                if saved is not None:
+                    print_info(console, f"已保存到 {saved}")
             return
         else:
             print_warn(console, "empty LLM turn, ending")
@@ -186,3 +244,41 @@ def _pending_to_openai_tc(p) -> dict:
             "arguments": p.arguments_json,
         },
     }
+
+
+def _refresh_system_prompt(messages: list[dict], cwd: str, mode: str) -> None:
+    """Insert or update the system prompt at messages[0] for the current mode."""
+    from cc_harness.prompts import build_system_prompt
+    prompt = build_system_prompt(cwd, mode=mode)
+    if messages and messages[0].get("role") == "system":
+        messages[0]["content"] = prompt
+    else:
+        messages.insert(0, {"role": "system", "content": prompt})
+
+
+def _save_design_output(
+    messages: list[dict],
+    base_dir: Path | None = None,
+) -> Path | None:
+    """Persist the last assistant content to base_dir / '{ts}-{slug}.md'.
+
+    Returns the path written, or None if no assistant content to save.
+    """
+    if base_dir is None:
+        base_dir = Path.home() / ".cc-harness" / "designs"
+    base_dir.mkdir(parents=True, exist_ok=True)
+
+    last = next(
+        (m for m in reversed(messages) if m.get("role") == "assistant" and m.get("content")),
+        None,
+    )
+    if last is None:
+        return None
+
+    content = last["content"]
+    ts = time.strftime("%Y%m%d-%H%M%S")
+    first_line = content.split("\n", 1)[0].strip()[:30]
+    slug = re.sub(r"[^\w一-鿿-]+", "-", first_line).strip("-") or "design"
+    path = base_dir / f"{ts}-{slug}.md"
+    path.write_text(content, encoding="utf-8")
+    return path

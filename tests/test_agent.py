@@ -245,3 +245,187 @@ async def test_danger_command_user_says_no_llm_changes_tool(monkeypatch):
     assert all(name != "mcp__bash__run" for name, _ in mcp.calls)
     # Safe tool WAS called
     assert ("mcp__safe__read", {}) in mcp.calls
+
+
+# --- Mode branches (task #4) ---
+
+@pytest.mark.asyncio
+async def test_plan_mode_does_not_execute_tools(capfd):
+    """In plan mode, no tools are executed even if a tool_call comes through."""
+    from cc_harness import agent as agent_mod
+    from cc_harness.mcp_client import ToolResult
+
+    fs_tool = {"type": "function", "function": {
+        "name": "mcp__fs__read", "description": "r",
+        "parameters": {"type": "object"},
+    }}
+    pending = [PendingToolCall(index=0, id="c1", name="mcp__fs__read", arguments_json="{}")]
+    llm = FakeLLM(responses=[[
+        # Even though finish_reason=tool_calls, in plan mode the call is
+        # dropped and the content is treated as the final answer.
+        FakeStreamEvent(kind="done", content="## 目标\n完成 X", pending=pending, finish_reason="tool_calls"),
+    ]])
+    mcp = FakeMCP(tools_spec=[fs_tool], results={}, calls=[])
+
+    messages = [{"role": "user", "content": "plan X"}]
+    await agent_mod.run_turn(messages, llm, mcp, mode="plan", max_iter=5)
+
+    # Tool was NOT called
+    assert mcp.calls == []
+    # Final assistant message is the plan content
+    assert messages[-1] == {"role": "assistant", "content": "## 目标\n完成 X"}
+
+
+@pytest.mark.asyncio
+async def test_plan_mode_refreshes_system_prompt():
+    """When cwd is provided, the system prompt is set to the plan-mode variant."""
+    from cc_harness import agent as agent_mod
+    llm = FakeLLM(responses=[[
+        FakeStreamEvent(kind="done", content="plan", pending=[], finish_reason="stop"),
+    ]])
+    mcp = FakeMCP(tools_spec=[], results={}, calls=[])
+
+    messages = [{"role": "user", "content": "x"}]
+    await agent_mod.run_turn(messages, llm, mcp, mode="plan", cwd="/test/cwd")
+
+    assert messages[0]["role"] == "system"
+    assert "Plan 模式" in messages[0]["content"]
+    assert "/test/cwd" in messages[0]["content"]
+
+
+@pytest.mark.asyncio
+async def test_coding_mode_does_not_inject_plan_override():
+    """In coding mode, the plan-mode override is NOT in the system prompt."""
+    from cc_harness import agent as agent_mod
+    llm = FakeLLM(responses=[[
+        FakeStreamEvent(kind="done", content="ok", pending=[], finish_reason="stop"),
+    ]])
+    mcp = FakeMCP(tools_spec=[], results={}, calls=[])
+
+    messages = [{"role": "user", "content": "x"}]
+    await agent_mod.run_turn(messages, llm, mcp, mode="coding", cwd="/test/cwd")
+
+    assert messages[0]["role"] == "system"
+    assert "Plan 模式" not in messages[0]["content"]
+    assert "Design 模式" not in messages[0]["content"]
+    # Coding sections ARE present
+    assert "工具使用纪律" in messages[0]["content"]
+
+
+@pytest.mark.asyncio
+async def test_design_mode_saves_output_to_disk(tmp_path):
+    """Design mode persists the final assistant content under design_dir."""
+    from cc_harness import agent as agent_mod
+    llm = FakeLLM(responses=[[
+        FakeStreamEvent(kind="done", content="mermaid\ngraph TD;\nA-->B", pending=[], finish_reason="stop"),
+    ]])
+    mcp = FakeMCP(tools_spec=[], results={}, calls=[])
+
+    messages = [{"role": "user", "content": "draw graph"}]
+    await agent_mod.run_turn(
+        messages, llm, mcp, mode="design",
+        cwd="/x", design_dir=tmp_path,
+    )
+
+    # File created under tmp_path with .md suffix
+    files = list(tmp_path.glob("*.md"))
+    assert len(files) == 1
+    saved = files[0].read_text(encoding="utf-8")
+    assert "mermaid" in saved
+    assert "A-->B" in saved
+    # Slug derived from first line "mermaid" — file name should contain it
+    assert "mermaid" in saved or "mermaid" in files[0].name
+
+
+@pytest.mark.asyncio
+async def test_plan_mode_does_not_save_to_disk(tmp_path):
+    """Plan mode prints the plan but does NOT save to disk."""
+    from cc_harness import agent as agent_mod
+    llm = FakeLLM(responses=[[
+        FakeStreamEvent(kind="done", content="## 目标\nX", pending=[], finish_reason="stop"),
+    ]])
+    mcp = FakeMCP(tools_spec=[], results={}, calls=[])
+
+    messages = [{"role": "user", "content": "plan"}]
+    await agent_mod.run_turn(
+        messages, llm, mcp, mode="plan",
+        cwd="/x", design_dir=tmp_path,
+    )
+    assert list(tmp_path.glob("*.md")) == []
+
+
+@pytest.mark.asyncio
+async def test_unknown_mode_raises():
+    from cc_harness import agent as agent_mod
+    llm = FakeLLM(responses=[[]])
+    mcp = FakeMCP(tools_spec=[], results={}, calls=[])
+    messages = [{"role": "user", "content": "x"}]
+    with pytest.raises(ValueError, match="unknown mode"):
+        await agent_mod.run_turn(messages, llm, mcp, mode="bogus")
+
+
+@pytest.mark.asyncio
+async def test_cwd_none_leaves_messages_unchanged():
+    """If cwd is None, run_turn does not touch messages[0] (callers manage prompt)."""
+    from cc_harness import agent as agent_mod
+    llm = FakeLLM(responses=[[
+        FakeStreamEvent(kind="done", content="ok", pending=[], finish_reason="stop"),
+    ]])
+    mcp = FakeMCP(tools_spec=[], results={}, calls=[])
+    messages = [{"role": "user", "content": "x"}]
+    await agent_mod.run_turn(messages, llm, mcp, mode="coding", cwd=None)
+    # No system prompt was inserted
+    assert messages[0]["role"] == "user"
+
+
+# --- _save_design_output + _refresh_system_prompt helpers ---
+
+def test_save_design_output_writes_file(tmp_path):
+    from cc_harness.agent import _save_design_output
+    messages = [
+        {"role": "user", "content": "draw"},
+        {"role": "assistant", "content": "mermaid\nA-->B"},
+    ]
+    path = _save_design_output(messages, base_dir=tmp_path)
+    assert path is not None
+    assert path.exists()
+    assert path.suffix == ".md"
+    assert "A-->B" in path.read_text(encoding="utf-8")
+
+
+def test_save_design_output_no_assistant_returns_none(tmp_path):
+    from cc_harness.agent import _save_design_output
+    messages = [{"role": "user", "content": "x"}]
+    assert _save_design_output(messages, base_dir=tmp_path) is None
+
+
+def test_save_design_output_creates_dir(tmp_path):
+    from cc_harness.agent import _save_design_output
+    target = tmp_path / "nested" / "designs"
+    messages = [{"role": "assistant", "content": "x"}]
+    path = _save_design_output(messages, base_dir=target)
+    assert path is not None
+    assert target.exists()
+
+
+def test_refresh_system_prompt_inserts_when_missing():
+    from cc_harness.agent import _refresh_system_prompt
+    messages = [{"role": "user", "content": "x"}]
+    _refresh_system_prompt(messages, cwd="/abc", mode="plan")
+    assert messages[0]["role"] == "system"
+    assert "/abc" in messages[0]["content"]
+    assert "Plan 模式" in messages[0]["content"]
+
+
+def test_refresh_system_prompt_updates_existing():
+    from cc_harness.agent import _refresh_system_prompt
+    messages = [
+        {"role": "system", "content": "old prompt"},
+        {"role": "user", "content": "x"},
+    ]
+    _refresh_system_prompt(messages, cwd="/new", mode="design")
+    # System message updated, not duplicated
+    assert len(messages) == 2
+    assert messages[0]["role"] == "system"
+    assert messages[0]["content"] != "old prompt"
+    assert "Design 模式" in messages[0]["content"]
