@@ -20,7 +20,7 @@
 
 - **Microcompact (tier 0.5)**:每条消息的空白/换行规范化、JSON 紧凑化。5-10% 收益但需要解析代码块和 JSON tool args,风险高。留待 v2。
 - **跨 session 持久化**:与"进程退出即丢"现有约束保持一致,不跨进程保留摘要。
-- **Per-tool token 拆解**:只到 6 类粗粒度(user_input / tool_calls / llm_output / system_prompt / tool_definitions / summary)。
+- **Per-tool token 拆解**:只到 6 类粗粒度(user_input / tool_calls / llm_output / system_prompt / tool_definitions / summary;改动前是 5 类,改完 6 类)。
 - **自动 cost 估算**:不显示 $ 成本,只显示 token 数。
 - **多窗口模型适配**:不做 GPT-4o / Claude / DeepSeek 的自动窗口检测,`context_window` 走 env 手动配置。
 - **压缩的压缩**(meta-compaction):防止 summary 本身无限变长。靠 `summarize_max_output_tokens` 上限控制,不做主动截断。
@@ -86,7 +86,11 @@
 
 **`TurnTokenStats` / `SessionTokenStats`** 同步加 `summary: int = 0` 字段,`breakdown_subtotal` 包含 `summary`。
 
-**`test_categorize_empty_list` 需更新** 为 6-key 期望(precise dict 断言)。
+**`tests/test_tokens.py` 需更新 2 个 test**:
+- `test_categorize_empty_list`(line 98)—— 5-key precise dict 断言 → 扩到 6-key。
+- `test_categorize_tool_definitions_counted_when_provided`(line 106)—— 显式断言 4 个其他 key `== 0`,需加 `assert cats["summary"] == 0`。
+
+其他 7 个 `test_categorize_*` 用例(line 44/59/71/83/91/125/132)用的是单独 key 断言或 `all(v == 0)`,不受 6-key dict 形状影响,**不需改**。
 
 ### Summary 消息格式
 
@@ -181,12 +185,13 @@ class CompactionStats:
 - 工具名匹配 `_compiled_patterns` 中任一正则的 tool 消息
 
 **用户代码块处理**:
-- 用 3-group 正则 `` ```(.*?)\n(.*?)\n``` `` 匹配 ``` 围栏,group 2 是代码 body。
+- 用 3-group 正则 `` ```([^\n]*)\n(.*?)\n``` `` 匹配 ``` 围栏:group 1 是 language tag(可空),group 2 是代码 body。
 - 若 `len(body.splitlines()) <= head + tail + 1`,跳过(不截)。
 - 否则保留首 N 行 + 省略标记(`... (X lines omitted) ...`) + 末 M 行。
+- **不支持嵌套围栏**(若代码块内含 ``` 行,会错配)——已知限制,先这样。代码块匹配失败的 fallback:把整段当 prose 看待,Tier 1 不动。
 
 **工具输出截短**(同模式):
-- 找到首个 `\n` 前的 `head` 行,追加省略标记,追加末尾 `tail` 行。
+- 从 content 开头取 `head` 行,追加省略标记,追加末尾 `tail` 行(若 content 以 `\n` 起头,先剥)。
 - 省略标记文本:`"... ({skipped} lines omitted) ..."`
 
 ### Tier 2: Prune(零成本,占位替换)
@@ -199,6 +204,7 @@ class CompactionStats:
 **绝对不删消息**:
 - tool 消息**只换 content**,不删——保护 `assistant.tool_calls[i]` ↔ `tool[i]` 的配对关系(OpenAI API 拒绝 dangling tool_calls)。
 - assistant 消息**只换 content**,不删。
+- **assistant 消息若 `m.get(SUMMARY_MARKER_KEY)` 为真,完全跳过**(不截、不删、不替换——这是 Tier 3 自己生成的摘要,被 Tier 2 截了等于自毁)。
 
 **首句检测**:
 - `re.split(r'(?<=[.。!?！？\n])\s*', content, maxsplit=1)` —— 中英文标点 + 换行都算句末。
@@ -224,6 +230,11 @@ class CompactionStats:
 - tool 消息打成 `[tool result] <content>`。
 - assistant 消息若有 tool_calls,打成 `[assistant tool_call: <name>(<args_json>)]`。
 - assistant 文本直接打 `<content>`。
+- **非 string content**:`m.get("content")` 可能是 `None`(assistant 跳过不渲染)或 `list[dict]`(多模态,序列化成 `<multimodal: N items>`;`tool` 消息的 list content 则序列化为 `[tool result (multimodal)]`)。
+- 标记消息(`_compaction_summary`) 渲染成 `[previous summary] <content>`。
+
+**Delta 大小上限**:
+- `summary_user_prompt(prev, delta)` 序列化后若 tiktoken > `summarize_max_output_tokens * 4`(= 8K tokens,默认配置),截 delta 到 70% 预算,前置 `... (delta truncated, N earlier messages omitted) ...` 标记。防止 LLM call 触发 context 窗口又不够,或被静默截掉。
 
 **红线**:
 - 保护区消息不参与摘要。
@@ -236,6 +247,9 @@ class CompactionStats:
 async def maybe_compact(messages, tool_specs, counter, config, llm) -> CompactionStats:
     if not config.enabled:
         return _noop_stats(messages, counter)
+    before = after = 0
+    ratio = 0.0
+    snapshot: list[dict] | None = None
     try:
         before = sum(counter.categorize(messages, tool_specs).values())
         ratio = before / config.context_window
@@ -245,19 +259,27 @@ async def maybe_compact(messages, tool_specs, counter, config, llm) -> Compactio
         if protect_until == 0 or protect_until >= len(messages):
             return CompactionStats(tier=NONE, before_tokens=before, after_tokens=before, ratio_before=ratio, ratio_after=ratio)
         apply_tier1_snip(messages, protect_until, config)
-        after1 = sum(counter.categorize(messages, tool_specs).values())
-        if after1 / config.context_window < config.tier2_threshold:
-            return CompactionStats(tier=SNIP, before_tokens=before, after_tokens=after1, ...)
+        after = sum(counter.categorize(messages, tool_specs).values())
+        if after / config.context_window < config.tier2_threshold:
+            return CompactionStats(tier=SNIP, before_tokens=before, after_tokens=after, ratio_before=ratio, ratio_after=after / config.context_window)
         apply_tier2_prune(messages, protect_until, config)
-        after2 = sum(counter.categorize(messages, tool_specs).values())
-        if after2 / config.context_window < config.tier3_threshold:
-            return CompactionStats(tier=PRUNE, before_tokens=before, after_tokens=after2, ...)
+        after = sum(counter.categorize(messages, tool_specs).values())
+        if after / config.context_window < config.tier3_threshold:
+            return CompactionStats(tier=PRUNE, before_tokens=before, after_tokens=after, ratio_before=ratio, ratio_after=after / config.context_window)
         stats = await apply_tier3_summarize(messages, protect_until, config, llm)
         stats.before_tokens = before
         return stats
     except Exception as e:
         # 不 raise:压缩失败不能让 run_turn 主循环崩
-        return CompactionStats(tier=NONE, before_tokens=before, after_tokens=after, ratio_before=ratio, ratio_after=ratio, error=str(e), before_snapshot=_snapshot(messages))
+        # before / after / ratio / snapshot 已在 try 开头初始化,UnboundLocalError 安全
+        if snapshot is None:
+            snapshot = [dict(m) for m in messages]  # 只在异常时深拷贝,正常路径零成本
+        return CompactionStats(
+            tier=CompactionTier.NONE,
+            before_tokens=before, after_tokens=after,
+            ratio_before=ratio, ratio_after=ratio,
+            error=str(e), before_snapshot=snapshot,
+        )
 ```
 
 **关键性质**:
@@ -308,7 +330,7 @@ class TurnTokenStats:
     compaction: CompactionStats | None = None
 ```
 
-`agent._stats()` 的 4 个 `return` 点都把 `last_compaction` 传进 `compaction` 字段。
+`agent._stats()` 的 **5 个 `return` 点**(`cc_harness/agent.py:136, 158, 250, 253, 263` —— LLM 流失败、max_iter+pending、空 LLM turn、最终答案、max_iter 兜底)都把 `last_compaction` 传进 `compaction` 字段。
 
 ### 三种模式(coding / plan / design)都启用
 
@@ -358,15 +380,15 @@ class ReplState:
 | 文件 | 类型 | 改动 |
 |---|---|---|
 | `cc_harness/context.py` | **新** | `CompactionTier` / `CompactionStats` / `find_protect_boundary` / `apply_tier1_snip` / `apply_tier2_prune` / `apply_tier3_summarize` / `_find_previous_summary` / `_summarize` / `_render_messages_for_summary` / `maybe_compact` / 常量 + helpers |
-| `cc_harness/tokens.py` | 改 | 加 `SUMMARY_MARKER_KEY` 常量;`categorize` 加 `summary` 桶;`TurnTokenStats` / `SessionTokenStats` 加 `summary` 字段;`breakdown_subtotal` 包含 `summary`;`add` 累加 `summary` |
+| `cc_harness/tokens.py` | 改 | 加 `SUMMARY_MARKER_KEY` 常量;`categorize` 加 `summary` 桶;`TurnTokenStats` / `SessionTokenStats` 加 `summary` 字段;`breakdown_subtotal` 包含 `summary`;`add` 累加 `summary`;**更新模块 docstring**("4-bucket categorizer" → "6-bucket", "5-category breakdown" → "6-category") |
 | `cc_harness/config.py` | 改 | 新增 `ContextConfig` Pydantic 模型;`AppConfig` 加 `context: ContextConfig`;`load_config` 读 `CONTEXT_*` env vars |
 | `cc_harness/prompts.py` | 改 | 新增 `SUMMARY_SYSTEM_PROMPT` / `summary_user_prompt` / `_render_messages_for_summary` / `SUMMARY_MARKER_KEY` 常量 |
-| `cc_harness/agent.py` | 改 | `run_turn` 加 `context_config` 参数;`while` 循环调 `maybe_compact`;`TurnTokenStats.compaction` 字段;4 个 `_stats()` 点传 `last_compaction` |
+| `cc_harness/agent.py` | 改 | `run_turn` 加 `context_config` 参数;`while` 循环调 `maybe_compact`;`TurnTokenStats.compaction` 字段;**5 个 `_stats()` 点**(`agent.py:136, 158, 250, 253, 263`)传 `last_compaction` |
 | `cc_harness/repl.py` | 改 | `ReplState` 加 `context_config`;`run_repl` 传 `run_turn`;`print_compaction_summary` 调用 |
 | `cc_harness/render.py` | 改 | 新增 `print_compaction_summary`;`print_token_summary` 加 `summary` 桶(仅 > 0) |
 | `main.py` | 改 | `run_repl(...)` 调用加 `context_config=cfg.context`(1 行) |
-| `tests/test_context.py` | **新** | ~30 个 test,覆盖 4 个 tier + maybe_compact + 集成 |
-| `tests/test_tokens.py` | 改 | `test_categorize_empty_list` 更新为 6-key 期望 |
+| `tests/test_context.py` | **新** | **38 个 test**(per-tier table 见下方) |
+| `tests/test_tokens.py` | 改 | `test_categorize_empty_list` 6-key 期望;`test_categorize_tool_definitions_counted_when_provided` 加 `summary == 0` 断言 |
 | `tests/test_config.py` | 改 | 5 个 test:ContextConfig 默认值、阈值验证、env override |
 | `tests/test_prompts.py` | 改 | 4 个 test:summary prompt 渲染 |
 | `tests/test_render.py` | 改 | 4 个 test:compaction summary 渲染、token summary summary 桶 |
@@ -375,6 +397,34 @@ class ReplState:
 | `docs/superpowers/specs/2026-06-12-context-compaction-design.md` | **新** | 本文件 |
 | `docs/superpowers/plans/2026-06-12-context-compaction.md` | **新** | 实施计划 |
 | `CLAUDE.md` | 改 | 新增"Context Management"一节 |
+
+### `test_context.py` 38 个 test 分布(per spec 推导)
+
+| 分组 | # tests | 覆盖范围 |
+|---|---:|---|
+| `test_find_protect_boundary_*` | 6 | 空 / 仅 system / 单 user / 预算 < 最后 user / 预算够 5 条 / token 计数等价 |
+| `test_apply_tier1_snip_*` | 8 | 工具截首尾 / 用户代码块截 / 跳保护区 / 跳 protected / 短内容 no-op / 纯文本不碰 / 无 tool 消息 / 不删消息 |
+| `test_apply_tier2_prune_*` | 8 | 工具 → 占位符 / assistant 首句 / 无标点 fallback / **不删** tool 消息 / 保留 tool_calls 字段 / 跳保护区 / 跳 protected / 跳过 summary 消息 |
+| `test_apply_tier3_summarize_*` | 8 | 无 prev 摘要 / 找到 prev 摘要 / 插入 system 后 / 增量(两次调用 `previous_summary` 相等)/ `tools=None` / LLM 错误 → 返 stats(error=...) / 记录 `summary_index` / 保留用户代码块 |
+| `test_maybe_compact_*` | 7 | `enabled=False` / ratio < tier1 / 单独 tier1 / tier1+tier2 / 完整级联 / 异常隔离(不 raise) / 异常时 `before_snapshot` 非 None |
+| `test_compaction_cascade_real_scenario` | 1 | 集成测试,压测混合 messages |
+| **合计** | **38** | |
+
+## 实施期约束(实施者必读)
+
+1. **`categorize` 4x 调用 per iter 可接受**:`maybe_compact` 一次完整级联会跑 `categorize` 最多 3 次(before / after tier1 / after tier2)。`tool_definitions` 桶在 `tools` 不变时是常量,3 次重复 < 10ms。**不**做缓存,保持代码简单。Tier 3 自身不调 `categorize`(LLM 算摘要,不查 token)。
+
+2. **`_find_previous_summary` 验证**:每次 Tier 3 完成后,`stats.summary_index` 必须能通过 `_find_previous_summary(messages)[0]` 找回。**在 `test_apply_tier3_summarize_incremental_across_two_calls` 中**显式断言第二次调用的 `_find_previous_summary` 返回的 `prev_summary_idx == 第一次调用的 stats.summary_index`。
+
+3. **`breakdown_subtotal` 变更影响面**:
+   - `TurnTokenStats.breakdown_subtotal` 和 `SessionTokenStats.breakdown_subtotal` 从 5 项求和 → 6 项求和(加 `summary`)。
+   - `render.print_token_summary` 渲染时若 `summary == 0` 不显示新桶(保 backward-compat);若 `> 0` 则在 `LLM 输出` 之后插入 `摘要 N`。
+   - `test_token_summary_printed_after_each_turn`(test_repl.py)只断言 `out` 含 `本轮` `累计`,**不受**新桶影响。
+   - 任何断言 `breakdown_subtotal` 具体数值的 test(目前没有)需要在改完后用新 6 桶数重算。
+
+4. **`compaction` 字段加在 `TurnTokenStats` 是 `None` 默认**:不影响 `breakdown_subtotal`(不参与求和)。只在 `run_turn` 收尾时由 `_stats()` 注入。
+
+5. **`TurnTokenStats` 字段顺序**:`# 5-category breakdown (tiktoken)` 区块改成 `# 6-category breakdown (tiktoken)`,字段从 5 个 → 6 个。
 
 ## 风险与决策记录
 
@@ -474,9 +524,9 @@ class ReplState:
 ## 验证标准
 
 **单元测试**(全过):`.venv/Scripts/python.exe -m pytest tests/`
-- 新增 `test_context.py` ~30 tests 全过
-- 现有 14 个 test 文件全过(尤其 `test_tokens.py::test_categorize_empty_list` 6-key 更新)
-- 现有 161 → 至少 195 tests passed
+- 新增 `test_context.py` 38 tests 全过(per-tier 分布:`find_protect_boundary` 6 / `apply_tier1_snip` 8 / `apply_tier2_prune` 8 / `apply_tier3_summarize` 8 / `maybe_compact` 7 / 集成 1)
+- 现有 14 个 test 文件全过(尤其 `test_tokens.py::test_categorize_empty_list` 6-key 更新;`test_categorize_tool_definitions_counted_when_provided` 加 `summary == 0`)
+- 现有 161 → 至少 199 tests passed
 
 **Lint**:`.venv/Scripts/python.exe -m ruff check cc_harness/ tests/` 干净。
 
