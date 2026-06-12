@@ -412,7 +412,7 @@ class ReplState:
 
 ## 实施期约束(实施者必读)
 
-1. **`categorize` 4x 调用 per iter 可接受**:`maybe_compact` 一次完整级联会跑 `categorize` 最多 3 次(before / after tier1 / after tier2)。`tool_definitions` 桶在 `tools` 不变时是常量,3 次重复 < 10ms。**不**做缓存,保持代码简单。Tier 3 自身不调 `categorize`(LLM 算摘要,不查 token)。
+1. **`categorize` 3 次调用 per iter 可接受**:`maybe_compact` 一次完整级联会跑 `categorize` 最多 3 次(before / after tier1 / after tier2)。`tool_definitions` 桶在 `tools` 不变时是常量,3 次重复 < 10ms。**不**做缓存,保持代码简单。Tier 3 自身不调 `categorize`(LLM 算摘要,不查 token)。
 
 2. **`_find_previous_summary` 验证**:每次 Tier 3 完成后,`stats.summary_index` 必须能通过 `_find_previous_summary(messages)[0]` 找回。**在 `test_apply_tier3_summarize_incremental_across_two_calls` 中**显式断言第二次调用的 `_find_previous_summary` 返回的 `prev_summary_idx == 第一次调用的 stats.summary_index`。
 
