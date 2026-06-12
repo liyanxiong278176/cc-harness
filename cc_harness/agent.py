@@ -86,16 +86,17 @@ async def run_turn(
     iter_usages: list[UsageRecord] = []   # per-iter API-reported usage
 
     def _stats() -> TurnTokenStats:
-        """Build TurnTokenStats from current messages + iter_usages."""
+        """Build TurnTokenStats from current messages + tool_specs + iter_usages."""
         counter = token_counter
         if counter is None:
             counter = TokenCounter()
-        cats = counter.categorize(messages)
+        cats = counter.categorize(messages, tools=tool_specs)
         return TurnTokenStats(
             user_input=cats["user_input"],
             tool_calls=cats["tool_calls"],
             llm_output=cats["llm_output"],
             system_prompt=cats["system_prompt"],
+            tool_definitions=cats["tool_definitions"],
             api_prompt_tokens=sum(u.prompt_tokens for u in iter_usages),
             api_completion_tokens=sum(u.completion_tokens for u in iter_usages),
             api_total_tokens=sum(u.total_tokens for u in iter_usages),

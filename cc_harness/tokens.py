@@ -38,7 +38,7 @@ class UsageRecord:
 
 
 class TokenCounter:
-    """Categorize an OpenAI-format messages list into 4 token buckets.
+    """Categorize an OpenAI-format messages list (+ optional tools) into 5 token buckets.
 
     Default encoding: cl100k_base (works for GPT-4/3.5, DeepSeek-V2/V3).
     For GPT-4o, pass encoding_name="o200k_base".
@@ -57,13 +57,16 @@ class TokenCounter:
             return 0
         return len(self._enc.encode(text))
 
-    def categorize(self, messages: list[dict]) -> dict[str, int]:
-        """Walk messages, bucket each into 1 of 4 categories.
+    def categorize(
+        self, messages: list[dict], tools: list[dict] | None = None,
+    ) -> dict[str, int]:
+        """Walk messages (+ optional tool schemas) and bucket tokens into 5 categories.
 
-        - system_prompt: role=system content
-        - user_input:    role=user content
-        - tool_calls:    role=tool content + assistant tool_calls field
-        - llm_output:    assistant content (text only)
+        - system_prompt:    role=system content
+        - user_input:       role=user content
+        - tool_calls:       role=tool content + assistant tool_calls field
+        - llm_output:       assistant content (text only)
+        - tool_definitions: JSON-serialized `tools` parameter (sent every API call)
         """
         system_prompt = user_input = tool_calls = llm_output = 0
         for m in messages:
@@ -81,11 +84,18 @@ class TokenCounter:
                 for tc in (m.get("tool_calls") or []):
                     tool_calls += self.count_text(json.dumps(tc, ensure_ascii=False))
             # unknown roles: silently skip
+
+        tool_definitions = 0
+        if tools:
+            for tool in tools:
+                tool_definitions += self.count_text(json.dumps(tool, ensure_ascii=False))
+
         return {
             "user_input": user_input,
             "tool_calls": tool_calls,
             "llm_output": llm_output,
             "system_prompt": system_prompt,
+            "tool_definitions": tool_definitions,
         }
 
 
@@ -93,15 +103,16 @@ class TokenCounter:
 class TurnTokenStats:
     """Aggregate of one run_turn call (1..N LLM calls in ReAct loop).
 
-    4-category breakdown is computed by TokenCounter over the final messages
-    list (tiktoken-based, may have small drift vs API total).
+    5-category breakdown is computed by TokenCounter over the final messages
+    list + tool schemas (tiktoken-based, may have small drift vs API total).
     API fields are summed across iters (authoritative billable count).
     """
-    # 4-category breakdown (tiktoken)
+    # 5-category breakdown (tiktoken)
     user_input: int = 0
     tool_calls: int = 0
     llm_output: int = 0
     system_prompt: int = 0
+    tool_definitions: int = 0
     # API-reported (sum across iters in this turn)
     api_prompt_tokens: int = 0
     api_completion_tokens: int = 0
@@ -112,7 +123,13 @@ class TurnTokenStats:
 
     @property
     def breakdown_subtotal(self) -> int:
-        return self.user_input + self.tool_calls + self.llm_output + self.system_prompt
+        return (
+            self.user_input
+            + self.tool_calls
+            + self.llm_output
+            + self.system_prompt
+            + self.tool_definitions
+        )
 
     @property
     def api_vs_breakdown_drift_pct(self) -> float:
@@ -129,11 +146,22 @@ class SessionTokenStats:
     tool_calls: int = 0
     llm_output: int = 0
     system_prompt: int = 0
+    tool_definitions: int = 0
     api_prompt_tokens: int = 0
     api_completion_tokens: int = 0
     api_total_tokens: int = 0
     iters_total: int = 0
     turns_with_usage: int = 0
+
+    @property
+    def breakdown_subtotal(self) -> int:
+        return (
+            self.user_input
+            + self.tool_calls
+            + self.llm_output
+            + self.system_prompt
+            + self.tool_definitions
+        )
 
     def add(self, turn: TurnTokenStats) -> None:
         self.turns += 1
@@ -141,6 +169,7 @@ class SessionTokenStats:
         self.tool_calls += turn.tool_calls
         self.llm_output += turn.llm_output
         self.system_prompt += turn.system_prompt
+        self.tool_definitions += turn.tool_definitions
         self.api_prompt_tokens += turn.api_prompt_tokens
         self.api_completion_tokens += turn.api_completion_tokens
         self.api_total_tokens += turn.api_total_tokens

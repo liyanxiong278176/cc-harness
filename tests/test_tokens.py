@@ -99,7 +99,41 @@ def test_categorize_empty_list():
     counter = TokenCounter()
     assert counter.categorize([]) == {
         "user_input": 0, "tool_calls": 0, "llm_output": 0, "system_prompt": 0,
+        "tool_definitions": 0,
     }
+
+
+def test_categorize_tool_definitions_counted_when_provided():
+    """5 类拆解:tools 参数的 JSON schema 也要算到 tool_definitions 桶。"""
+    counter = TokenCounter()
+    tools = [
+        {"type": "function", "function": {
+            "name": "read_file",
+            "description": "Read a file from disk",
+            "parameters": {"type": "object", "properties": {"path": {"type": "string"}}},
+        }},
+    ]
+    cats = counter.categorize([], tools=tools)
+    assert cats["tool_definitions"] > 0
+    # 其余 4 类都还应该是 0
+    assert cats["user_input"] == 0
+    assert cats["tool_calls"] == 0
+    assert cats["llm_output"] == 0
+    assert cats["system_prompt"] == 0
+
+
+def test_categorize_tool_definitions_zero_when_none():
+    """不传 tools 参数(默认 None)时,tool_definitions = 0。"""
+    counter = TokenCounter()
+    cats = counter.categorize([{"role": "user", "content": "hi"}])
+    assert cats["tool_definitions"] == 0
+
+
+def test_categorize_tool_definitions_zero_when_empty_list():
+    """传空列表 tools=[] 时,tool_definitions = 0(不抛错)。"""
+    counter = TokenCounter()
+    cats = counter.categorize([{"role": "user", "content": "hi"}], tools=[])
+    assert cats["tool_definitions"] == 0
 
 
 def test_invalid_encoding_raises():
@@ -110,8 +144,9 @@ def test_invalid_encoding_raises():
 # --- TurnTokenStats ---
 
 def test_turn_token_stats_breakdown_subtotal():
-    t = TurnTokenStats(user_input=10, tool_calls=20, llm_output=30, system_prompt=40)
-    assert t.breakdown_subtotal == 100
+    """5 类求和:user + tool_calls + llm_output + system + tool_definitions。"""
+    t = TurnTokenStats(user_input=10, tool_calls=20, llm_output=30, system_prompt=40, tool_definitions=50)
+    assert t.breakdown_subtotal == 150
 
 
 def test_turn_token_stats_drift_pct():
@@ -133,12 +168,12 @@ def test_turn_token_stats_drift_pct_no_api():
 def test_session_token_stats_add_accumulates():
     s = SessionTokenStats()
     t1 = TurnTokenStats(
-        user_input=10, tool_calls=20, llm_output=30, system_prompt=40,
+        user_input=10, tool_calls=20, llm_output=30, system_prompt=40, tool_definitions=100,
         api_prompt_tokens=50, api_completion_tokens=25, api_total_tokens=75,
         iter_count=1, api_reported=True,
     )
     t2 = TurnTokenStats(
-        user_input=15, tool_calls=25, llm_output=35, system_prompt=45,
+        user_input=15, tool_calls=25, llm_output=35, system_prompt=45, tool_definitions=200,
         api_prompt_tokens=60, api_completion_tokens=30, api_total_tokens=90,
         iter_count=2, api_reported=True,
     )
@@ -149,6 +184,7 @@ def test_session_token_stats_add_accumulates():
     assert s.tool_calls == 45
     assert s.llm_output == 65
     assert s.system_prompt == 85
+    assert s.tool_definitions == 300
     assert s.api_total_tokens == 165
     assert s.iters_total == 3
     assert s.turns_with_usage == 2

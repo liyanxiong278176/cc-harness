@@ -119,17 +119,19 @@ def print_token_summary(console: Console, label: str, stats) -> None:
     """Print a one-line token breakdown for a turn or session.
 
     `label` is the prefix, e.g. '本轮' / '累计 3 轮' / 'session 总计'.
-    `stats` is either a TurnTokenStats or SessionTokenStats (both have
-    user_input/tool_calls/llm_output/system_prompt and api_total_tokens).
+    `stats` is either a TurnTokenStats or SessionTokenStats (both have the
+    5-category fields: user_input / tool_calls / llm_output / system_prompt /
+    tool_definitions, plus api_total_tokens).
     """
     _blank(console)
-    sub = stats.user_input + stats.tool_calls + stats.llm_output + stats.system_prompt
+    sub = stats.breakdown_subtotal
     line = (
         f"{label}  "
         f"用户输入 {stats.user_input}  "
         f"工具调用 {stats.tool_calls}  "
         f"LLM 输出 {stats.llm_output}  "
         f"系统 {stats.system_prompt}  "
+        f"工具定义 {stats.tool_definitions}  "
         f"= {sub}"
     )
     console.print(line)
