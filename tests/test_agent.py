@@ -8,6 +8,7 @@ import pytest
 from dataclasses import dataclass, field
 from typing import Any
 from cc_harness.llm import PendingToolCall
+from cc_harness.tokens import TurnTokenStats, UsageRecord
 
 # --- Test fixtures ---
 
@@ -33,6 +34,7 @@ class FakeStreamEvent:
     finish_reason: str | None = None
     pending: list[PendingToolCall] = field(default_factory=list)  # mutable default needs factory
     content: str = ""
+    usage: "UsageRecord | None" = None
 
 @dataclass
 class FakeLLM:
@@ -429,3 +431,117 @@ def test_refresh_system_prompt_updates_existing():
     assert messages[0]["role"] == "system"
     assert messages[0]["content"] != "old prompt"
     assert "Design 模式" in messages[0]["content"]
+
+
+# --- Token tracking tests (Task 3) ---
+
+@pytest.mark.asyncio
+async def test_run_turn_returns_turn_token_stats_with_api_usage(monkeypatch):
+    """run_turn should return TurnTokenStats populated from API usage."""
+    from cc_harness import agent as agent_mod
+
+    usage = UsageRecord(prompt_tokens=100, completion_tokens=50, total_tokens=150)
+    events = [[
+        FakeStreamEvent(
+            kind="done", content="hi", pending=[], finish_reason="stop",
+            usage=usage,
+        ),
+    ]]
+    llm = FakeLLM(responses=events)
+    mcp = FakeMCP(tools_spec=[], results={}, calls=[])
+    messages = [{"role": "system", "content": "sys"}, {"role": "user", "content": "x"}]
+
+    stats = await agent_mod.run_turn(messages, llm, mcp, max_iter=5)
+    assert isinstance(stats, TurnTokenStats)
+    assert stats.api_total_tokens == 150
+    assert stats.api_prompt_tokens == 100
+    assert stats.api_completion_tokens == 50
+    assert stats.iter_count == 1
+    assert stats.api_reported is True
+    # tiktoken breakdown also populated
+    assert stats.system_prompt > 0
+    assert stats.user_input > 0
+
+
+@pytest.mark.asyncio
+async def test_run_turn_accumulates_usage_across_iters(monkeypatch):
+    """Multiple LLM iters: api_total_tokens is sum across iters."""
+    from cc_harness import agent as agent_mod
+    from cc_harness.mcp_client import ToolResult
+
+    fs_tool = {"type": "function", "function": {"name": "mcp__fs__r", "description": "r", "parameters": {}}}
+    pending = [PendingToolCall(index=0, id="c1", name="mcp__fs__r", arguments_json="{}")]
+    responses = [
+        # iter 1: tool call, usage=100
+        [FakeStreamEvent(
+            kind="done", content="", pending=pending, finish_reason="tool_calls",
+            usage=UsageRecord(80, 20, 100),
+        )],
+        # iter 2: stop, usage=50
+        [FakeStreamEvent(
+            kind="done", content="done", pending=[], finish_reason="stop",
+            usage=UsageRecord(40, 10, 50),
+        )],
+    ]
+    llm = FakeLLM(responses=responses)
+    mcp = FakeMCP(tools_spec=[fs_tool], results={"mcp__fs__r": ToolResult.success("ok")}, calls=[])
+    monkeypatch.setattr(agent_mod, "confirm", lambda p: True)
+
+    messages = [{"role": "user", "content": "x"}]
+    stats = await agent_mod.run_turn(messages, llm, mcp, max_iter=5)
+    assert stats.api_total_tokens == 150   # 100 + 50
+    assert stats.iter_count == 2
+
+
+@pytest.mark.asyncio
+async def test_run_turn_no_usage_api_reported_false(monkeypatch):
+    """No iter reported usage: api_reported=False, api_*=0, breakdown still populated."""
+    from cc_harness import agent as agent_mod
+
+    events = [[FakeStreamEvent(
+        kind="done", content="hi", pending=[], finish_reason="stop",
+        usage=None,   # ← API 没报告
+    )]]
+    llm = FakeLLM(responses=events)
+    mcp = FakeMCP(tools_spec=[], results={}, calls=[])
+    messages = [{"role": "system", "content": "sys"}, {"role": "user", "content": "x"}]
+
+    stats = await agent_mod.run_turn(messages, llm, mcp, max_iter=5)
+    assert stats.api_reported is False
+    assert stats.api_total_tokens == 0
+    # iter_count is the count of iters with API usage reported; none here
+    assert stats.iter_count == 0
+    # 拆解仍然有(tiktoken 不依赖 API)
+    assert stats.user_input > 0
+    assert stats.system_prompt > 0
+
+
+@pytest.mark.asyncio
+async def test_run_turn_tool_calls_counted_in_tool_bucket(monkeypatch):
+    """assistant tool_calls in final messages should be in tool_calls bucket, not llm_output."""
+    from cc_harness import agent as agent_mod
+    from cc_harness.mcp_client import ToolResult
+
+    fs_tool = {"type": "function", "function": {"name": "mcp__fs__r", "description": "r", "parameters": {}}}
+    pending = [PendingToolCall(
+        index=0, id="c1", name="mcp__fs__r",
+        arguments_json='{"path":"/foo.py"}',
+    )]
+    responses = [
+        [FakeStreamEvent(
+            kind="done", content="let me read", pending=pending, finish_reason="tool_calls",
+            usage=None,
+        )],
+        [FakeStreamEvent(
+            kind="done", content="done", pending=[], finish_reason="stop",
+            usage=None,
+        )],
+    ]
+    llm = FakeLLM(responses=responses)
+    mcp = FakeMCP(tools_spec=[fs_tool], results={"mcp__fs__r": ToolResult.success("ok")}, calls=[])
+    monkeypatch.setattr(agent_mod, "confirm", lambda p: True)
+
+    messages = [{"role": "user", "content": "x"}]
+    stats = await agent_mod.run_turn(messages, llm, mcp, max_iter=5)
+    # tool_calls bucket should be > 0 from both tool result + assistant's tool_calls
+    assert stats.tool_calls > 0

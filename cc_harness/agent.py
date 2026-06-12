@@ -23,6 +23,7 @@ from cc_harness.render import (
     print_warn, print_error, print_info,
 )
 from cc_harness.tools import is_dangerous, confirm, run_command, RUN_COMMAND_SPEC
+from cc_harness.tokens import TokenCounter, TurnTokenStats, UsageRecord
 
 _VALID_MODES = ("coding", "plan", "design")
 
@@ -47,7 +48,8 @@ async def run_turn(
     mode: str = "coding",
     cwd: str | None = None,
     design_dir: Path | None = None,
-) -> None:
+    token_counter: TokenCounter | None = None,
+) -> TurnTokenStats:
     """Run one user turn in the given mode.
 
     In `coding` mode: full ReAct loop with tool execution.
@@ -81,8 +83,29 @@ async def run_turn(
     else:
         tool_specs = None
 
+    iter_usages: list[UsageRecord] = []   # per-iter API-reported usage
+
+    def _stats() -> TurnTokenStats:
+        """Build TurnTokenStats from current messages + iter_usages."""
+        counter = token_counter
+        if counter is None:
+            counter = TokenCounter()
+        cats = counter.categorize(messages)
+        return TurnTokenStats(
+            user_input=cats["user_input"],
+            tool_calls=cats["tool_calls"],
+            llm_output=cats["llm_output"],
+            system_prompt=cats["system_prompt"],
+            api_prompt_tokens=sum(u.prompt_tokens for u in iter_usages),
+            api_completion_tokens=sum(u.completion_tokens for u in iter_usages),
+            api_total_tokens=sum(u.total_tokens for u in iter_usages),
+            iter_count=len(iter_usages),
+            api_reported=bool(iter_usages),
+        )
+
     while iter_count < max_iter:
         iter_count += 1
+        iter_usage: UsageRecord | None = None   # usage for this iter (set on done)
 
         # 1. Stream one LLM turn. We BUFFER the content (don't print during
         # the stream) because the routing decision — has_tool_calls vs
@@ -103,12 +126,16 @@ async def run_turn(
                 elif ev.kind == "done":
                     finish_reason = ev.finish_reason
                     pending = ev.pending
+                    iter_usage = ev.usage
                     # Prefer the consolidated content on the done event if set;
                     # fall back to the streamed parts we collected above.
                     content_parts = [ev.content] if ev.content else content_parts
         except Exception as e:
             print_error(console, f"LLM stream failed: {e}")
-            return
+            return _stats()
+
+        if iter_usage is not None:
+            iter_usages.append(iter_usage)
 
         content = "".join(content_parts)
 
@@ -127,7 +154,7 @@ async def run_turn(
                     fallback = "达到最大迭代次数,任务未完成。"
                     messages.append({"role": "assistant", "content": fallback})
                     print_result(console, fallback)
-                return
+                return _stats()
 
             # 3. Build assistant message (with tool_calls; content may be None)
             assistant_msg: dict = {
@@ -219,10 +246,10 @@ async def run_turn(
                 saved = _save_design_output(messages, base_dir=design_dir)
                 if saved is not None:
                     print_info(console, f"已保存到 {saved}")
-            return
+            return _stats()
         else:
             print_warn(console, "empty LLM turn, ending")
-            return
+            return _stats()
 
     # 6. max_iter reached (safety net — the inner has_tool_calls branch above
     # already handles this case and returns early, so this only runs if the
@@ -232,6 +259,7 @@ async def run_turn(
     if content:
         messages.append({"role": "assistant", "content": content})
         print_result(console, content)
+    return _stats()
 
 
 def _pending_to_openai_tc(p) -> dict:
