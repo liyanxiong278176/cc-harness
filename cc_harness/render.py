@@ -114,3 +114,39 @@ def print_error(console: Console, text: str) -> None:
 def print_info(console: Console, text: str) -> None:
     console.print(text)
     _flush(console)
+
+
+def print_token_summary(console: Console, label: str, stats) -> None:
+    """Print a one-line token breakdown for a turn or session.
+
+    `label` is the prefix, e.g. '本轮' / '累计 3 轮' / 'session 总计'.
+    `stats` is either a TurnTokenStats or SessionTokenStats (both have
+    user_input/tool_calls/llm_output/system_prompt and api_total_tokens).
+    """
+    _blank(console)
+    sub = stats.user_input + stats.tool_calls + stats.llm_output + stats.system_prompt
+    line = (
+        f"{label}  "
+        f"用户输入 {stats.user_input}  "
+        f"工具调用 {stats.tool_calls}  "
+        f"LLM 输出 {stats.llm_output}  "
+        f"系统 {stats.system_prompt}  "
+        f"= {sub}"
+    )
+    console.print(line)
+    # API delta (only meaningful when api_total_tokens > 0)
+    if getattr(stats, "api_total_tokens", 0):
+        delta = sub - stats.api_total_tokens
+        pct = 100.0 * delta / stats.api_total_tokens
+        console.print(
+            f"        API 报告 {stats.api_total_tokens}  "
+            f"差 {delta:+d} ({pct:+.1f}%)",
+            highlight=False,
+        )
+    # Warning if this turn's API didn't report usage
+    if hasattr(stats, "api_reported") and not stats.api_reported:
+        console.print(
+            "⚠ 本轮后端未报告 token(可能未实现 stream_options.include_usage)",
+            highlight=False,
+        )
+    _flush(console)

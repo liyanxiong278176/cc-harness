@@ -17,7 +17,8 @@ import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from rich.console import Console
-from cc_harness.render import print_info, print_warn
+from cc_harness.render import print_info, print_warn, print_token_summary
+from cc_harness.tokens import TokenCounter, SessionTokenStats
 
 _VALID_MODES = ("coding", "plan", "design")
 
@@ -42,6 +43,8 @@ _HELP_TEXT = """\
 class ReplState:
     mode: str = "coding"
     messages: list[dict] = field(default_factory=list)
+    session_stats: SessionTokenStats = field(default_factory=SessionTokenStats)
+    token_counter: TokenCounter = field(default_factory=TokenCounter)
 
 
 async def _read_user(prompt: str) -> str:
@@ -127,12 +130,14 @@ async def run_repl(
         try:
             raw = (await _read_user(_prompt_for(state.mode))).strip()
         except (EOFError, KeyboardInterrupt):
+            print_token_summary(console, "session 总计", state.session_stats)
             print_info(console, "shutting down")
             break
 
         if not raw:
             continue
         if raw.lower() in ("exit", "quit"):
+            print_token_summary(console, "session 总计", state.session_stats)
             print_info(console, "shutting down")
             break
 
@@ -146,13 +151,20 @@ async def run_repl(
         state.messages.append({"role": "user", "content": raw})
         turn_start = time.time()
         from cc_harness.agent import run_turn
-        await run_turn(
+        turn_stats = await run_turn(
             state.messages, llm, mcp,
             max_iter=max_iter,
             mode=state.mode,
             cwd=cwd,
             design_dir=design_dir,
+            token_counter=state.token_counter,
         )
+        state.session_stats.add(turn_stats)
+
+        # 打印 token 明细
+        print_token_summary(console, "本轮", turn_stats)
+        print_token_summary(console, f"累计 {state.session_stats.turns} 轮", state.session_stats)
+
         # After the turn, show what actually changed on disk — so the user
         # can see real file state without F5-ing their file manager.
         _print_disk_changes(console, cwd, since=turn_start)

@@ -10,6 +10,7 @@ from cc_harness.repl import (
     _prompt_for,
     _VALID_MODES,
 )
+from cc_harness.tokens import TurnTokenStats
 
 
 # --- _prompt_for ---
@@ -197,6 +198,7 @@ async def test_run_repl_passes_design_dir(monkeypatch):
     from cc_harness import repl as repl_mod
     from cc_harness.repl import run_repl
     from cc_harness import agent as agent_mod
+    from cc_harness.tokens import TurnTokenStats
     import tempfile
 
     inputs = iter(["/design", "draw graph", "exit"])
@@ -212,7 +214,7 @@ async def test_run_repl_passes_design_dir(monkeypatch):
 
         async def spy_run_turn(messages, llm, mcp, **kwargs):
             captured.update(kwargs)
-            return None
+            return TurnTokenStats()
 
         monkeypatch.setattr(agent_mod, "run_turn", spy_run_turn)
 
@@ -539,6 +541,70 @@ async def test_run_repl_empty_input_does_not_call_llm(monkeypatch):
 
     # Only the non-empty input triggered an LLM call
     assert len(capturing_llm.captured) == 1
+
+
+# --- Token tracking tests (Task 4) ---
+
+@pytest.mark.asyncio
+async def test_session_stats_add_method_accumulates(monkeypatch):
+    """SessionTokenStats.add should accumulate fields across two TurnTokenStats.
+    (Unit test of state, not a full REPL integration test.)"""
+    from cc_harness import agent as agent_mod
+
+    # Stub run_turn to return specified TurnTokenStats
+    call_count = 0
+    async def fake_run_turn(messages, llm, mcp, **kwargs):
+        nonlocal call_count
+        call_count += 1
+        t = TurnTokenStats(
+            user_input=10 * call_count, tool_calls=20,
+            llm_output=30, system_prompt=40,
+            api_total_tokens=100 * call_count, iter_count=1, api_reported=True,
+        )
+        messages.append({"role": "assistant", "content": f"reply {call_count}"})
+        return t
+
+    monkeypatch.setattr(agent_mod, "run_turn", fake_run_turn)
+
+    from cc_harness.repl import ReplState
+    state = ReplState(mode="coding", messages=[])
+    state.messages.append({"role": "user", "content": "q1"})
+    t1 = await agent_mod.run_turn(state.messages, None, None)
+    state.session_stats.add(t1)
+    state.messages.append({"role": "user", "content": "q2"})
+    t2 = await agent_mod.run_turn(state.messages, None, None)
+    state.session_stats.add(t2)
+
+    assert state.session_stats.turns == 2
+    assert state.session_stats.user_input == 30   # 10+20
+    assert state.session_stats.api_total_tokens == 300   # 100+200
+
+
+@pytest.mark.asyncio
+async def test_token_summary_printed_after_each_turn(monkeypatch, capfd):
+    """After run_turn, print_token_summary should fire and emit '本轮' + '累计' labels."""
+    from cc_harness import agent as agent_mod
+    from cc_harness.repl import run_repl
+
+    async def fake_run_turn(messages, llm, mcp, **kwargs):
+        messages.append({"role": "assistant", "content": "ok"})
+        return TurnTokenStats(
+            user_input=10, tool_calls=20, llm_output=30, system_prompt=40,
+            api_total_tokens=100, iter_count=1, api_reported=True,
+        )
+    monkeypatch.setattr(agent_mod, "run_turn", fake_run_turn)
+
+    inputs = iter(["./test", "exit"])
+    monkeypatch.setattr("cc_harness.repl._read_user", _fake_read_user(inputs))
+
+    fake_llm = _StoppingLLM()  # already defined in this file
+    fake_mcp = _NoopMCP()      # already defined in this file
+
+    await run_repl(fake_llm, fake_mcp, cwd="/x", default_mode="coding")
+
+    out = capfd.readouterr().out
+    assert "本轮" in out
+    assert "累计" in out
 
 
 class _CapturingLLM:
