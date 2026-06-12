@@ -1,0 +1,131 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>GSAP Timeline 动画序列</title>
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+
+        body {
+            min-height: 100vh;
+            display: flex;
+            flex-direction: column;
+            justify-content: center;
+            align-items: center;
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+            padding: 20px;
+        }
+
+        .card {
+            width: 360px;
+            background: #ffffff;
+            border-radius: 16px;
+            padding: 32px;
+            box-shadow: 0 20px 60px rgba(0, 0, 0, 0.3);
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            gap: 20px;
+            will-change: transform, opacity;
+        }
+
+        .title {
+            font-size: 22px;
+            color: #2d3748;
+            font-weight: 600;
+            text-align: center;
+        }
+
+        .btn {
+            padding: 12px 32px;
+            font-size: 16px;
+            font-weight: 500;
+            color: #ffffff;
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            border: none;
+            border-radius: 8px;
+            cursor: pointer;
+            transition: box-shadow 0.2s ease;
+            will-change: transform, opacity;
+        }
+
+        .btn:hover {
+            box-shadow: 0 6px 20px rgba(102, 126, 234, 0.5);
+        }
+
+        .trigger {
+            margin-top: 32px;
+            padding: 14px 36px;
+            font-size: 16px;
+            font-weight: 600;
+            color: #ffffff;
+            background: rgba(255, 255, 255, 0.2);
+            border: 2px solid rgba(255, 255, 255, 0.4);
+            border-radius: 10px;
+            cursor: pointer;
+            backdrop-filter: blur(10px);
+            transition: all 0.2s ease;
+        }
+
+        .trigger:hover {
+            background: rgba(255, 255, 255, 0.3);
+            transform: translateY(-2px);
+        }
+    </style>
+</head>
+<body>
+    <div class="card">
+        <h2 class="title">GSAP Timeline 动画</h2>
+        <button class="btn">确认</button>
+    </div>
+
+    <button class="trigger">开始动画</button>
+
+    <script src="https://cdn.jsdelivr.net/npm/gsap@3.15/dist/gsap.min.js"></script>
+    <script>
+        // 初始状态:卡片和按钮隐藏,标题也隐藏
+        gsap.set('.card', { x: -300, opacity: 1 });
+        gsap.set('.title', { opacity: 0 });
+        gsap.set('.btn', { scale: 0, opacity: 1, transformOrigin: 'center center' });
+
+        let tl = null;
+
+        document.querySelector('.trigger').addEventListener('click', () => {
+            // 如果上一次动画还在进行,先 kill 掉,避免叠加
+            if (tl) {
+                tl.kill();
+            }
+
+            // 把所有元素重置到初始状态
+            gsap.set('.card', { x: -300 });
+            gsap.set('.title', { opacity: 0 });
+            gsap.set('.btn', { scale: 0 });
+
+            // 创建一个 timeline 编排动画序列
+            tl = gsap.timeline();
+
+            tl.to('.card', {
+                x: 0,
+                duration: 0.5,
+                ease: 'power2.out'
+            })
+            .to('.title', {
+                opacity: 1,
+                duration: 0.4,
+                ease: 'power1.out'
+            }, '+=0.2')
+            .to('.btn', {
+                scale: 1,
+                duration: 0.9,
+                ease: 'elastic.out(1, 0.5)'
+            });
+        });
+    </script>
+</body>
+</html>

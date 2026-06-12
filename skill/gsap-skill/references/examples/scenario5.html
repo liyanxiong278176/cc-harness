@@ -1,0 +1,128 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <meta name="description" content="ScrollToPlugin demo: smooth anchor nav with reduced-motion fallback and fixed-header offset.">
+    <title>GSAP ScrollToPlugin — Anchor Nav</title>
+
+    <script src="https://cdn.jsdelivr.net/npm/gsap@3.15/dist/gsap.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/gsap@3.15/dist/ScrollToPlugin.min.js"></script>
+
+    <style>
+        *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+        :root {
+            --header-h: 64px;
+        }
+
+        html { scroll-behavior: auto; } /* GSAP drives the scroll, not the browser */
+
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+            background: #0f1115;
+            color: #f5f5f7;
+            line-height: 1.5;
+        }
+
+        header {
+            position: fixed;
+            inset: 0 0 auto 0;
+            height: var(--header-h);
+            display: flex;
+            align-items: center;
+            padding: 0 24px;
+            background: rgba(15, 17, 21, 0.85);
+            backdrop-filter: blur(8px);
+            border-bottom: 1px solid #222;
+            z-index: 10;
+        }
+
+        nav { display: flex; gap: 24px; }
+
+        nav a {
+            color: #f5f5f7;
+            text-decoration: none;
+            font-size: 14px;
+            padding: 6px 10px;
+            border-radius: 4px;
+            transition: background 0.2s;
+        }
+
+        nav a:hover { background: #1d1f25; }
+
+        section {
+            min-height: 100vh;
+            padding: calc(var(--header-h) + 48px) 24px 48px;
+            display: flex;
+            flex-direction: column;
+            justify-content: center;
+            max-width: 720px;
+            margin: 0 auto;
+        }
+
+        section h1 { font-size: clamp(32px, 5vw, 56px); margin-bottom: 16px; }
+        section p  { color: #b8b9bf; font-size: 18px; }
+
+        .accent { color: #6ee7b7; }
+    </style>
+</head>
+<body>
+    <header>
+        <nav aria-label="Section navigation">
+            <a href="#intro">Intro</a>
+            <a href="#work">Work</a>
+            <a href="#about">About</a>
+            <a href="#contact">Contact</a>
+        </nav>
+    </header>
+
+    <main>
+        <section id="intro">
+            <h1>ScrollToPlugin <span class="accent">anchor nav</span></h1>
+            <p>Click any link above. GSAP tween handles the scroll with a fixed-header offset, auto-cancels if you start scrolling manually, and falls back to instant scroll under prefers-reduced-motion.</p>
+        </section>
+        <section id="work">
+            <h1>Work</h1>
+            <p>Long page sections with min-height 100vh. Each click cancels the previous tween so spamming the nav doesn't queue jumps.</p>
+        </section>
+        <section id="about">
+            <h1>About</h1>
+            <p>The header is 64px tall, passed as <code>offsetY</code> so headings aren't hidden under it.</p>
+        </section>
+        <section id="contact">
+            <h1>Contact</h1>
+            <p>You can scroll past this section — the page ends here.</p>
+        </section>
+    </main>
+
+    <script>
+        // Reduce-motion guard: respect user preference
+        const prefersReducedMotion = window.matchMedia("(prefers-reduced-motion: reduce)").matches;
+        const HEADER_OFFSET = 64;
+
+        document.querySelectorAll('nav a[href^="#"]').forEach((link) => {
+            link.addEventListener("click", (e) => {
+                e.preventDefault();
+                const id = link.getAttribute("href");
+                const target = document.querySelector(id);
+                if (!target) return;
+
+                // Kill any in-flight scroll tween so back-to-back clicks don't queue
+                gsap.killTweensOf(window);
+
+                if (prefersReducedMotion) {
+                    target.scrollIntoView();
+                    return;
+                }
+
+                gsap.to(window, {
+                    duration: 0.7,
+                    scrollTo: { y: target, offsetY: HEADER_OFFSET, autoKill: true },
+                    ease: "power2.out",
+                });
+            });
+        });
+    </script>
+</body>
+</html>

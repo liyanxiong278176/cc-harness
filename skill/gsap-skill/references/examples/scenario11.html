@@ -1,0 +1,130 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <meta name="description" content="GSAP CustomEase + CustomWiggle demo: designer-tuned curves and procedurally generated wiggle.">
+    <title>GSAP CustomEase & CustomWiggle</title>
+
+    <script src="https://cdn.jsdelivr.net/npm/gsap@3.15/dist/gsap.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/gsap@3.15/dist/CustomEase.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/gsap@3.15/dist/CustomWiggle.min.js"></script>
+
+    <style>
+        *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+            background: #0f1115;
+            color: #f5f5f7;
+            min-height: 100vh;
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            justify-content: center;
+            gap: 48px;
+            padding: 48px 24px;
+        }
+
+        .stage {
+            display: flex;
+            gap: 32px;
+            flex-wrap: wrap;
+            justify-content: center;
+        }
+
+        .card {
+            width: 160px;
+            height: 200px;
+            border-radius: 12px;
+            background: linear-gradient(135deg, #1d1f25, #2a2d35);
+            border: 1px solid #2c2f37;
+            display: flex;
+            align-items: flex-end;
+            padding: 16px;
+            font-weight: 600;
+            font-size: 16px;
+        }
+
+        .card.linear   { background: linear-gradient(135deg, #1d1f25, #2a3a4a); }
+        .card.soft     { background: linear-gradient(135deg, #1d1f25, #3a2a4a); }
+        .card.bouncy   { background: linear-gradient(135deg, #1d1f25, #4a2a3a); }
+
+        .wiggle-target {
+            width: 80px;
+            height: 80px;
+            border-radius: 50%;
+            background: linear-gradient(135deg, #6ee7b7, #34d399);
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            color: #0f1115;
+            font-weight: 700;
+            cursor: pointer;
+        }
+
+        button {
+            background: #1d1f25;
+            color: #f5f5f7;
+            border: 1px solid #2c2f37;
+            padding: 10px 18px;
+            border-radius: 8px;
+            font-size: 14px;
+            cursor: pointer;
+        }
+
+        button:hover { background: #262932; }
+
+        .label {
+            color: #6b6d75;
+            font-size: 13px;
+            text-align: center;
+        }
+    </style>
+</head>
+<body>
+    <div class="stage">
+        <div class="card linear"  id="cardLinear">power2.out</div>
+        <div class="card soft"    id="cardSoft">softLanding</div>
+        <div class="card bouncy"  id="cardBouncy">elastic.out</div>
+    </div>
+
+    <div>
+        <div class="wiggle-target" id="wiggle">Wiggle</div>
+        <p class="label">Click for CustomWiggle</p>
+    </div>
+
+    <button id="replay">Replay entry</button>
+
+    <script>
+        // Register custom easings once at module init
+        // Curves are SVG path data; the points between (0,0) and (1,1) shape the motion.
+        // Build visually at https://gsap.com/docs/v3/Eases/CustomEase
+        CustomEase.create("softLanding", "M0,0 C0.25,0.1 0.25,1 1,1");
+        CustomEase.create("bouncyDrop",  "M0,0 C0.6,0 0.3,1.4 1,1");
+
+        // CustomWiggle: procedurally generates a wiggle curve
+        CustomWiggle.create("wiggle", { wiggles: 6, type: "easeOut" });
+
+        function playEntry() {
+            // gsap.set resets to "before-entry" state so re-clicking works
+            gsap.set([".card"], { y: 80, opacity: 0 });
+
+            gsap.to("#cardLinear", { y: 0, opacity: 1, duration: 0.8, ease: "power2.out" });
+            gsap.to("#cardSoft",   { y: 0, opacity: 1, duration: 0.8, ease: "softLanding", delay: 0.1 });
+            gsap.to("#cardBouncy", { y: 0, opacity: 1, duration: 1.2, ease: "elastic.out(1, 0.5)", delay: 0.2 });
+        }
+
+        document.getElementById("replay").addEventListener("click", playEntry);
+
+        document.getElementById("wiggle").addEventListener("click", () => {
+            gsap.fromTo("#wiggle",
+                { x: -20 },
+                { x: 20, duration: 0.6, ease: "wiggle" }
+            );
+        });
+
+        playEntry();
+    </script>
+</body>
+</html>

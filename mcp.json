@@ -5,10 +5,23 @@
       "command": "npx",
       "args": ["-y", "@modelcontextprotocol/server-filesystem", "D:/agent_learning/cc-harness"]
     },
-    "git": {
-      "type": "stdio",
-      "command": "uvx",
-      "args": ["mcp-server-git", "--repository", "D:/agent_learning/cc-harness"]
+    "bing-cn-mcp-server": {
+      "type": "sse",
+      "url": "https://mcp.api-inference.modelscope.net/0ba674d0b9a041/sse"
+    },
+    "playwright": {
+      "command": "npx",
+      "args": [
+        "@playwright/mcp@latest"
+      ]
+    },
+    "fetch": {
+      "type": "sse",
+      "url": "https://mcp.api-inference.modelscope.net/88e1d1f9d93444/sse"
+    },
+    "context7-mcp": {
+      "type": "sse",
+      "url": "https://mcp.api-inference.modelscope.net/664741cf0d6642/sse"
     }
   }
 }

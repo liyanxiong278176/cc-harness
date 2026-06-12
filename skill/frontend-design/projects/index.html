@@ -1,0 +1,1465 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <meta name="description" content="AI 教学博客 — 探索人工智能的无限可能，从基础到前沿，用最直观的方式学习 AI 知识。">
+  <title>Neural Mind — AI 教学博客</title>
+
+  <!-- Google Fonts -->
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Orbitron:wght@400;600;700;900&family=Playfair+Display:ital,wght@0,400;0,600;1,400&family=Plus+Jakarta+Sans:wght@300;400;500;600;700;800&display=swap" rel="stylesheet">
+
+  <!-- GSAP -->
+  <script src="https://cdn.jsdelivr.net/npm/gsap@3.15/dist/gsap.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/gsap@3.15/dist/ScrollTrigger.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/gsap@3.15/dist/ScrambleTextPlugin.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/gsap@3.15/dist/TextPlugin.min.js"></script>
+
+  <style>
+    /* ===== Reset & Base ===== */
+    *, *::before, *::after {
+      box-sizing: border-box;
+      margin: 0;
+      padding: 0;
+    }
+
+    html {
+      scroll-behavior: smooth;
+      -webkit-font-smoothing: antialiased;
+      -moz-osx-font-smoothing: grayscale;
+    }
+
+    body {
+      font-family: 'Plus Jakarta Sans', sans-serif;
+      background: #080a0f;
+      color: #e8ecf1;
+      line-height: 1.6;
+      overflow-x: hidden;
+    }
+
+    /* ===== Noise Texture Overlay ===== */
+    body::before {
+      content: '';
+      position: fixed;
+      inset: 0;
+      z-index: 9999;
+      pointer-events: none;
+      opacity: 0.035;
+      background-image: url("data:image/svg+xml,%3Csvg viewBox='0 0 256 256' xmlns='http://www.w3.org/2000/svg'%3E%3Cfilter id='noise'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='0.9' numOctaves='4' stitchTiles='stitch'/%3E%3C/filter%3E%3Crect width='100%25' height='100%25' filter='url(%23noise)' opacity='1'/%3E%3C/svg%3E");
+      background-repeat: repeat;
+      background-size: 256px 256px;
+    }
+
+    /* ===== Scrollbar ===== */
+    ::-webkit-scrollbar { width: 6px; }
+    ::-webkit-scrollbar-track { background: #0a0c12; }
+    ::-webkit-scrollbar-thumb { background: #2a2e3a; border-radius: 3px; }
+    ::-webkit-scrollbar-thumb:hover { background: #3d4354; }
+
+    /* ===== Typography ===== */
+    h1, h2, h3, h4 {
+      font-weight: 700;
+      line-height: 1.2;
+    }
+
+    /* ===== CSS Variables ===== */
+    :root {
+      --color-bg: #080a0f;
+      --color-surface: #0d1017;
+      --color-card: #11151e;
+      --color-border: #1c2130;
+      --color-text: #e8ecf1;
+      --color-text-muted: #7a8296;
+      --color-accent: #6c5ce7;
+      --color-accent-light: #8b7cf7;
+      --color-neon-blue: #00d4ff;
+      --color-neon-purple: #a855f7;
+      --color-neon-teal: #22d3ee;
+      --color-gradient-1: linear-gradient(135deg, #6c5ce7, #a855f7);
+      --color-gradient-2: linear-gradient(135deg, #00d4ff, #22d3ee);
+      --color-gradient-hero: linear-gradient(135deg, #6c5ce7 0%, #a855f7 30%, #22d3ee 70%, #00d4ff 100%);
+      --font-display: 'Orbitron', sans-serif;
+      --font-serif: 'Playfair Display', serif;
+      --font-body: 'Plus Jakarta Sans', sans-serif;
+      --max-width: 1200px;
+      --radius-sm: 8px;
+      --radius-md: 16px;
+      --radius-lg: 24px;
+    }
+
+    /* ===== Container ===== */
+    .container {
+      max-width: var(--max-width);
+      margin: 0 auto;
+      padding: 0 24px;
+    }
+
+    /* ===== Grain Overlay ===== */
+    .grain {
+      position: fixed;
+      inset: 0;
+      z-index: 9998;
+      pointer-events: none;
+      opacity: 0.025;
+      background-image: url("data:image/svg+xml,%3Csvg viewBox='0 0 512 512' xmlns='http://www.w3.org/2000/svg'%3E%3Cfilter id='g'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='0.65' numOctaves='3' stitchTiles='stitch'/%3E%3C/filter%3E%3Crect width='100%25' height='100%25' filter='url(%23g)'/%3E%3C/svg%3E");
+    }
+
+    /* ===== Header/Nav ===== */
+    .header {
+      position: fixed;
+      top: 0;
+      left: 0;
+      right: 0;
+      z-index: 100;
+      padding: 16px 0;
+      transition: background 0.4s ease, backdrop-filter 0.4s ease;
+    }
+
+    .header.scrolled {
+      background: rgba(8, 10, 15, 0.85);
+      backdrop-filter: blur(20px);
+      -webkit-backdrop-filter: blur(20px);
+      border-bottom: 1px solid rgba(255, 255, 255, 0.04);
+    }
+
+    .header .container {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+    }
+
+    .logo {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      text-decoration: none;
+      color: var(--color-text);
+      font-family: var(--font-display);
+      font-size: 1.15rem;
+      font-weight: 700;
+      letter-spacing: 0.08em;
+    }
+
+    .logo-icon {
+      width: 32px;
+      height: 32px;
+      border-radius: 8px;
+      background: var(--color-gradient-1);
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      font-size: 1.1rem;
+    }
+
+    .logo span {
+      background: var(--color-gradient-hero);
+      -webkit-background-clip: text;
+      background-clip: text;
+      -webkit-text-fill-color: transparent;
+    }
+
+    .nav-links {
+      display: flex;
+      align-items: center;
+      gap: 32px;
+      list-style: none;
+    }
+
+    .nav-links a {
+      text-decoration: none;
+      color: var(--color-text-muted);
+      font-size: 0.875rem;
+      font-weight: 500;
+      transition: color 0.3s ease;
+      position: relative;
+    }
+
+    .nav-links a::after {
+      content: '';
+      position: absolute;
+      bottom: -4px;
+      left: 0;
+      width: 0;
+      height: 2px;
+      background: var(--color-gradient-1);
+      transition: width 0.3s ease;
+      border-radius: 1px;
+    }
+
+    .nav-links a:hover {
+      color: var(--color-text);
+    }
+
+    .nav-links a:hover::after {
+      width: 100%;
+    }
+
+    /* ===== Hero Section ===== */
+    .hero {
+      position: relative;
+      min-height: 100vh;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      overflow: hidden;
+      padding: 120px 0 80px;
+    }
+
+    /* Hero Background Effects */
+    .hero-bg {
+      position: absolute;
+      inset: 0;
+      overflow: hidden;
+      pointer-events: none;
+    }
+
+    .hero-bg__grid {
+      position: absolute;
+      inset: 0;
+      background-image:
+        linear-gradient(rgba(108, 92, 231, 0.03) 1px, transparent 1px),
+        linear-gradient(90deg, rgba(108, 92, 231, 0.03) 1px, transparent 1px);
+      background-size: 60px 60px;
+      mask-image: radial-gradient(ellipse 60% 50% at 50% 40%, black, transparent 70%);
+      -webkit-mask-image: radial-gradient(ellipse 60% 50% at 50% 40%, black, transparent 70%);
+    }
+
+    .hero-bg__glow {
+      position: absolute;
+      border-radius: 50%;
+      filter: blur(100px);
+      opacity: 0.3;
+    }
+
+    .hero-bg__glow--1 {
+      width: 500px;
+      height: 500px;
+      background: #6c5ce7;
+      top: -100px;
+      left: -100px;
+      animation: glowFloat 8s ease-in-out infinite alternate;
+    }
+
+    .hero-bg__glow--2 {
+      width: 400px;
+      height: 400px;
+      background: #22d3ee;
+      bottom: -50px;
+      right: -50px;
+      animation: glowFloat 10s ease-in-out infinite alternate-reverse;
+    }
+
+    .hero-bg__glow--3 {
+      width: 300px;
+      height: 300px;
+      background: #a855f7;
+      top: 50%;
+      left: 60%;
+      animation: glowFloat 12s ease-in-out infinite alternate;
+      opacity: 0.15;
+    }
+
+    @keyframes glowFloat {
+      0% { transform: translate(0, 0) scale(1); }
+      100% { transform: translate(40px, -30px) scale(1.15); }
+    }
+
+    /* Hero Particles */
+    .hero-particles {
+      position: absolute;
+      inset: 0;
+      overflow: hidden;
+      pointer-events: none;
+    }
+
+    .particle {
+      position: absolute;
+      width: 3px;
+      height: 3px;
+      border-radius: 50%;
+      background: var(--color-neon-blue);
+      opacity: 0.3;
+      box-shadow: 0 0 6px var(--color-neon-blue);
+    }
+
+    .hero-content {
+      position: relative;
+      z-index: 2;
+      text-align: center;
+      max-width: 900px;
+      padding: 0 24px;
+    }
+
+    .hero-badge {
+      display: inline-flex;
+      align-items: center;
+      gap: 8px;
+      padding: 8px 20px;
+      border-radius: 100px;
+      background: rgba(108, 92, 231, 0.1);
+      border: 1px solid rgba(108, 92, 231, 0.2);
+      font-size: 0.8rem;
+      font-weight: 500;
+      color: var(--color-accent-light);
+      letter-spacing: 0.05em;
+      margin-bottom: 32px;
+      backdrop-filter: blur(10px);
+    }
+
+    .hero-badge__dot {
+      width: 6px;
+      height: 6px;
+      border-radius: 50%;
+      background: #22d3ee;
+      animation: dotPulse 1.5s ease-in-out infinite;
+    }
+
+    @keyframes dotPulse {
+      0%, 100% { opacity: 1; transform: scale(1); }
+      50% { opacity: 0.4; transform: scale(0.8); }
+    }
+
+    .hero-title {
+      font-family: var(--font-display);
+      font-size: clamp(2.5rem, 7vw, 5.5rem);
+      font-weight: 900;
+      line-height: 1.05;
+      letter-spacing: -0.03em;
+      margin-bottom: 24px;
+      text-transform: uppercase;
+    }
+
+    .hero-title .line {
+      display: block;
+    }
+
+    .hero-title .gradient-text {
+      background: var(--color-gradient-hero);
+      -webkit-background-clip: text;
+      background-clip: text;
+      -webkit-text-fill-color: transparent;
+      background-size: 200% auto;
+      animation: gradientShift 4s ease-in-out infinite alternate;
+    }
+
+    @keyframes gradientShift {
+      0% { background-position: 0% 50%; }
+      100% { background-position: 100% 50%; }
+    }
+
+    .hero-subtitle {
+      font-size: clamp(1rem, 1.4vw, 1.2rem);
+      color: var(--color-text-muted);
+      max-width: 640px;
+      margin: 0 auto 40px;
+      font-weight: 300;
+      line-height: 1.7;
+    }
+
+    .hero-actions {
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      gap: 16px;
+      flex-wrap: wrap;
+    }
+
+    .btn {
+      display: inline-flex;
+      align-items: center;
+      gap: 10px;
+      padding: 14px 32px;
+      border-radius: 100px;
+      font-family: var(--font-body);
+      font-size: 0.9rem;
+      font-weight: 600;
+      text-decoration: none;
+      transition: all 0.3s ease;
+      cursor: pointer;
+      border: none;
+    }
+
+    .btn--primary {
+      background: var(--color-gradient-1);
+      color: #fff;
+      box-shadow: 0 4px 24px rgba(108, 92, 231, 0.3);
+    }
+
+    .btn--primary:hover {
+      transform: translateY(-2px);
+      box-shadow: 0 8px 32px rgba(108, 92, 231, 0.45);
+    }
+
+    .btn--ghost {
+      background: transparent;
+      color: var(--color-text);
+      border: 1px solid rgba(255, 255, 255, 0.1);
+    }
+
+    .btn--ghost:hover {
+      border-color: rgba(255, 255, 255, 0.25);
+      background: rgba(255, 255, 255, 0.03);
+      transform: translateY(-2px);
+    }
+
+    .scroll-indicator {
+      position: absolute;
+      bottom: 40px;
+      left: 50%;
+      transform: translateX(-50%);
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      gap: 8px;
+      color: var(--color-text-muted);
+      font-size: 0.7rem;
+      letter-spacing: 0.15em;
+      text-transform: uppercase;
+      z-index: 2;
+    }
+
+    .scroll-indicator__line {
+      width: 1px;
+      height: 32px;
+      background: linear-gradient(180deg, transparent 0%, var(--color-text-muted) 50%, transparent 100%);
+      position: relative;
+      overflow: hidden;
+    }
+
+    .scroll-indicator__line::after {
+      content: '';
+      position: absolute;
+      top: 0;
+      left: 0;
+      width: 100%;
+      height: 50%;
+      background: var(--color-accent-light);
+      animation: scrollPulse 1.8s ease-in-out infinite;
+    }
+
+    @keyframes scrollPulse {
+      0% { transform: translateY(-100%); }
+      100% { transform: translateY(200%); }
+    }
+
+    /* ===== Section Common ===== */
+    .section {
+      padding: 100px 0;
+      position: relative;
+    }
+
+    .section-label {
+      display: inline-flex;
+      align-items: center;
+      gap: 8px;
+      font-family: var(--font-display);
+      font-size: 0.7rem;
+      font-weight: 600;
+      letter-spacing: 0.2em;
+      text-transform: uppercase;
+      color: var(--color-accent-light);
+      margin-bottom: 16px;
+    }
+
+    .section-label::before {
+      content: '';
+      width: 24px;
+      height: 1px;
+      background: var(--color-accent-light);
+    }
+
+    .section-header {
+      margin-bottom: 56px;
+    }
+
+    .section-title {
+      font-size: clamp(1.8rem, 3.5vw, 2.8rem);
+      font-weight: 700;
+      letter-spacing: -0.02em;
+      color: var(--color-text);
+      margin-bottom: 12px;
+    }
+
+    .section-title .highlight {
+      background: var(--color-gradient-hero);
+      -webkit-background-clip: text;
+      background-clip: text;
+      -webkit-text-fill-color: transparent;
+    }
+
+    .section-desc {
+      font-size: 1rem;
+      color: var(--color-text-muted);
+      max-width: 560px;
+      font-weight: 300;
+    }
+
+    /* ===== Featured / Stats ===== */
+    .stats-grid {
+      display: grid;
+      grid-template-columns: repeat(4, 1fr);
+      gap: 24px;
+      margin-bottom: 80px;
+    }
+
+    .stat-card {
+      background: var(--color-card);
+      border: 1px solid var(--color-border);
+      border-radius: var(--radius-md);
+      padding: 28px 24px;
+      text-align: center;
+      transition: border-color 0.3s ease, transform 0.3s ease;
+    }
+
+    .stat-card:hover {
+      border-color: rgba(108, 92, 231, 0.3);
+      transform: translateY(-4px);
+    }
+
+    .stat-number {
+      font-family: var(--font-display);
+      font-size: clamp(1.8rem, 2.5vw, 2.4rem);
+      font-weight: 700;
+      background: var(--color-gradient-2);
+      -webkit-background-clip: text;
+      background-clip: text;
+      -webkit-text-fill-color: transparent;
+      margin-bottom: 4px;
+    }
+
+    .stat-label {
+      font-size: 0.85rem;
+      color: var(--color-text-muted);
+      font-weight: 400;
+    }
+
+    /* ===== Blog Posts Grid ===== */
+    .posts-grid {
+      display: grid;
+      grid-template-columns: repeat(3, 1fr);
+      gap: 28px;
+    }
+
+    .post-card {
+      background: var(--color-card);
+      border: 1px solid var(--color-border);
+      border-radius: var(--radius-lg);
+      overflow: hidden;
+      transition: border-color 0.4s ease, transform 0.4s ease, box-shadow 0.4s ease;
+      cursor: pointer;
+      position: relative;
+      group: true;
+    }
+
+    .post-card:hover {
+      border-color: rgba(108, 92, 231, 0.35);
+      transform: translateY(-8px);
+      box-shadow: 0 20px 60px rgba(0, 0, 0, 0.4), 0 0 40px rgba(108, 92, 231, 0.05);
+    }
+
+    .post-card__image {
+      position: relative;
+      width: 100%;
+      aspect-ratio: 16 / 10;
+      overflow: hidden;
+      background: var(--color-surface);
+    }
+
+    .post-card__image-placeholder {
+      width: 100%;
+      height: 100%;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      font-size: 2.5rem;
+      transition: transform 0.6s ease;
+    }
+
+    .post-card:hover .post-card__image-placeholder {
+      transform: scale(1.05);
+    }
+
+    .post-card__overlay {
+      position: absolute;
+      inset: 0;
+      background: linear-gradient(0deg, rgba(0,0,0,0.4) 0%, transparent 50%);
+      pointer-events: none;
+    }
+
+    .post-card__tag {
+      position: absolute;
+      top: 16px;
+      left: 16px;
+      padding: 4px 14px;
+      border-radius: 100px;
+      font-size: 0.7rem;
+      font-weight: 600;
+      letter-spacing: 0.05em;
+      background: rgba(0, 0, 0, 0.6);
+      backdrop-filter: blur(10px);
+      border: 1px solid rgba(255, 255, 255, 0.08);
+      color: var(--color-text);
+    }
+
+    /* Card image variants */
+    .card-img--neural {
+      background: linear-gradient(135deg, #1a0533, #0d1b3e);
+    }
+    .card-img--llm {
+      background: linear-gradient(135deg, #0a1a2e, #1a0a2e);
+    }
+    .card-img--vision {
+      background: linear-gradient(135deg, #0a1f1a, #1a0f2e);
+    }
+    .card-img--rl {
+      background: linear-gradient(135deg, #1f0a0a, #0a1f2e);
+    }
+    .card-img--audio {
+      background: linear-gradient(135deg, #0d1a0d, #2e0a1a);
+    }
+    .card-img--ethics {
+      background: linear-gradient(135deg, #1a1a0a, #0a0a2e);
+    }
+
+    .post-card__body {
+      padding: 24px;
+    }
+
+    .post-card__meta {
+      display: flex;
+      align-items: center;
+      gap: 12px;
+      margin-bottom: 12px;
+      font-size: 0.75rem;
+      color: var(--color-text-muted);
+    }
+
+    .post-card__meta-dot {
+      width: 3px;
+      height: 3px;
+      border-radius: 50%;
+      background: var(--color-text-muted);
+    }
+
+    .post-card__title {
+      font-size: 1.15rem;
+      font-weight: 700;
+      color: var(--color-text);
+      margin-bottom: 10px;
+      line-height: 1.3;
+      transition: color 0.3s ease;
+    }
+
+    .post-card:hover .post-card__title {
+      color: var(--color-accent-light);
+    }
+
+    .post-card__excerpt {
+      font-size: 0.85rem;
+      color: var(--color-text-muted);
+      line-height: 1.6;
+      font-weight: 300;
+      display: -webkit-box;
+      -webkit-line-clamp: 2;
+      -webkit-box-orient: vertical;
+      overflow: hidden;
+    }
+
+    .post-card__footer {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      padding: 16px 24px 20px;
+      border-top: 1px solid rgba(255, 255, 255, 0.04);
+    }
+
+    .post-card__author {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+    }
+
+    .post-card__avatar {
+      width: 28px;
+      height: 28px;
+      border-radius: 50%;
+      background: var(--color-gradient-1);
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      font-size: 0.6rem;
+      font-weight: 700;
+      color: #fff;
+    }
+
+    .post-card__author-name {
+      font-size: 0.8rem;
+      color: var(--color-text-muted);
+    }
+
+    .post-card__read {
+      font-size: 0.75rem;
+      color: var(--color-accent-light);
+      text-decoration: none;
+      font-weight: 500;
+      transition: gap 0.3s ease;
+      display: inline-flex;
+      align-items: center;
+      gap: 4px;
+    }
+
+    .post-card__read:hover {
+      gap: 8px;
+    }
+
+    /* ===== Newsletter Section ===== */
+    .newsletter {
+      background: var(--color-surface);
+      border: 1px solid var(--color-border);
+      border-radius: var(--radius-lg);
+      padding: 64px;
+      text-align: center;
+      position: relative;
+      overflow: hidden;
+    }
+
+    .newsletter::before {
+      content: '';
+      position: absolute;
+      inset: 0;
+      background: radial-gradient(ellipse at 50% 0%, rgba(108, 92, 231, 0.06), transparent 60%);
+      pointer-events: none;
+    }
+
+    .newsletter__content {
+      position: relative;
+      z-index: 1;
+      max-width: 500px;
+      margin: 0 auto;
+    }
+
+    .newsletter__title {
+      font-size: 1.8rem;
+      font-weight: 700;
+      margin-bottom: 12px;
+    }
+
+    .newsletter__desc {
+      color: var(--color-text-muted);
+      font-size: 0.95rem;
+      margin-bottom: 32px;
+      font-weight: 300;
+    }
+
+    .newsletter__form {
+      display: flex;
+      gap: 12px;
+      max-width: 440px;
+      margin: 0 auto;
+    }
+
+    .newsletter__input {
+      flex: 1;
+      padding: 14px 20px;
+      border-radius: 100px;
+      border: 1px solid var(--color-border);
+      background: rgba(255, 255, 255, 0.03);
+      color: var(--color-text);
+      font-family: var(--font-body);
+      font-size: 0.9rem;
+      outline: none;
+      transition: border-color 0.3s ease;
+    }
+
+    .newsletter__input:focus {
+      border-color: var(--color-accent);
+    }
+
+    .newsletter__input::placeholder {
+      color: var(--color-text-muted);
+      font-weight: 300;
+    }
+
+    /* ===== Footer ===== */
+    .footer {
+      padding: 48px 0 32px;
+      border-top: 1px solid rgba(255, 255, 255, 0.04);
+      margin-top: 40px;
+    }
+
+    .footer__inner {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      flex-wrap: wrap;
+      gap: 24px;
+    }
+
+    .footer__copy {
+      font-size: 0.8rem;
+      color: var(--color-text-muted);
+      font-weight: 300;
+    }
+
+    .footer__links {
+      display: flex;
+      gap: 24px;
+      list-style: none;
+    }
+
+    .footer__links a {
+      color: var(--color-text-muted);
+      text-decoration: none;
+      font-size: 0.8rem;
+      transition: color 0.3s ease;
+    }
+
+    .footer__links a:hover {
+      color: var(--color-text);
+    }
+
+    /* ===== Deerflow Branding ===== */
+    .deerflow-badge {
+      position: fixed;
+      bottom: 24px;
+      right: 24px;
+      z-index: 999;
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      padding: 8px 18px;
+      border-radius: 100px;
+      background: rgba(8, 10, 15, 0.8);
+      backdrop-filter: blur(16px);
+      -webkit-backdrop-filter: blur(16px);
+      border: 1px solid rgba(255, 255, 255, 0.06);
+      font-size: 0.75rem;
+      font-weight: 500;
+      color: rgba(255, 255, 255, 0.35);
+      text-decoration: none;
+      transition: all 0.4s ease;
+      font-family: var(--font-body);
+      letter-spacing: 0.02em;
+    }
+
+    .deerflow-badge:hover {
+      color: rgba(255, 255, 255, 0.7);
+      border-color: rgba(108, 92, 231, 0.25);
+      background: rgba(8, 10, 15, 0.95);
+      transform: translateY(-2px);
+      box-shadow: 0 8px 32px rgba(0, 0, 0, 0.3);
+    }
+
+    .deerflow-badge__icon {
+      font-size: 0.85rem;
+      opacity: 0.6;
+      transition: opacity 0.3s ease, transform 0.4s ease;
+    }
+
+    .deerflow-badge:hover .deerflow-badge__icon {
+      opacity: 1;
+      transform: rotate(4deg);
+    }
+
+    .deerflow-badge__text {
+      font-size: 0.7rem;
+      letter-spacing: 0.06em;
+    }
+
+    .deerflow-badge__divider {
+      width: 1px;
+      height: 12px;
+      background: rgba(255, 255, 255, 0.1);
+    }
+
+    /* ===== Responsive ===== */
+    @media (max-width: 1024px) {
+      .stats-grid {
+        grid-template-columns: repeat(2, 1fr);
+      }
+      .posts-grid {
+        grid-template-columns: repeat(2, 1fr);
+      }
+    }
+
+    @media (max-width: 768px) {
+      .section { padding: 60px 0; }
+      .stats-grid { grid-template-columns: repeat(2, 1fr); gap: 16px; }
+      .posts-grid { grid-template-columns: 1fr; gap: 20px; }
+      .newsletter { padding: 40px 24px; }
+      .newsletter__form { flex-direction: column; }
+      .hero-title { font-size: clamp(2rem, 10vw, 3.5rem); }
+      .nav-links { display: none; }
+      .footer__inner { flex-direction: column; text-align: center; }
+    }
+
+    @media (max-width: 480px) {
+      .stats-grid { grid-template-columns: 1fr; }
+      .hero-actions { flex-direction: column; width: 100%; }
+      .hero-actions .btn { width: 100%; justify-content: center; }
+    }
+
+    /* ===== Reduced Motion ===== */
+    @media (prefers-reduced-motion: reduce) {
+      *, *::before, *::after {
+        animation-duration: 0.01ms !important;
+        animation-iteration-count: 1 !important;
+        transition-duration: 0.01ms !important;
+      }
+      .hero-bg__glow { animation: none !important; }
+    }
+  </style>
+</head>
+<body>
+
+  <!-- Grain Overlay -->
+  <div class="grain" aria-hidden="true"></div>
+
+  <!-- ===== Header ===== -->
+  <header class="header" id="header">
+    <div class="container">
+      <a href="#" class="logo">
+        <span class="logo-icon">🧠</span>
+        <span>Neural Mind</span>
+      </a>
+      <nav>
+        <ul class="nav-links">
+          <li><a href="#articles">文章</a></li>
+          <li><a href="#popular">热门</a></li>
+          <li><a href="#subscribe">订阅</a></li>
+        </ul>
+      </nav>
+    </div>
+  </header>
+
+  <!-- ===== Hero ===== -->
+  <section class="hero" id="hero">
+    <div class="hero-bg">
+      <div class="hero-bg__grid"></div>
+      <div class="hero-bg__glow hero-bg__glow--1"></div>
+      <div class="hero-bg__glow hero-bg__glow--2"></div>
+      <div class="hero-bg__glow hero-bg__glow--3"></div>
+    </div>
+
+    <!-- Particles generated by JS -->
+
+    <div class="hero-content">
+      <div class="hero-badge" id="heroBadge">
+        <span class="hero-badge__dot"></span>
+        在线学习平台 · 2025
+      </div>
+
+      <h1 class="hero-title" id="heroTitle">
+        <span class="line">探索</span>
+        <span class="line gradient-text">人工智能</span>
+        <span class="line" id="scrambleTarget">的无限可能</span>
+      </h1>
+
+      <p class="hero-subtitle" id="heroSubtitle">
+        从机器学习基础到前沿深度学习，我们为你拆解复杂的 AI 概念，<br>
+        用最直观的方式构建你的 AI 知识体系。
+      </p>
+
+      <div class="hero-actions">
+        <a href="#articles" class="btn btn--primary">
+          开始学习
+          <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><path d="M5 12h14"/><path d="m12 5 7 7-7 7"/></svg>
+        </a>
+        <a href="#popular" class="btn btn--ghost">浏览热门课程</a>
+      </div>
+    </div>
+
+    <div class="scroll-indicator" id="scrollIndicator">
+      <span>Scroll</span>
+      <span class="scroll-indicator__line"></span>
+    </div>
+  </section>
+
+  <!-- ===== Stats Section ===== -->
+  <section class="section" id="popular">
+    <div class="container">
+      <div class="stats-grid" id="statsGrid">
+        <div class="stat-card">
+          <div class="stat-number" data-count="24">0</div>
+          <div class="stat-label">精品课程</div>
+        </div>
+        <div class="stat-card">
+          <div class="stat-number" data-count="12800">0</div>
+          <div class="stat-label">在线学员</div>
+        </div>
+        <div class="stat-card">
+          <div class="stat-number" data-count="96">0</div>
+          <div class="stat-label">教学项目</div>
+        </div>
+        <div class="stat-card">
+          <div class="stat-number" data-count="4.9">0</div>
+          <div class="stat-label">学员评分</div>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- ===== Articles Section ===== -->
+  <section class="section" id="articles">
+    <div class="container">
+      <div class="section-header">
+        <div class="section-label">Latest Articles</div>
+        <h2 class="section-title">
+          精选<span class="highlight"> AI 教学文章</span>
+        </h2>
+        <p class="section-desc">
+          每篇文章都经过精心打磨，帮助你系统化地理解人工智能的核心概念与实践技巧。
+        </p>
+      </div>
+
+      <div class="posts-grid" id="postsGrid">
+        <!-- Card 1 -->
+        <article class="post-card" data-delay="0">
+          <div class="post-card__image">
+            <div class="post-card__image-placeholder card-img--neural">
+              🧠
+            </div>
+            <div class="post-card__overlay"></div>
+            <span class="post-card__tag">入门</span>
+          </div>
+          <div class="post-card__body">
+            <div class="post-card__meta">
+              <span>2025.01.15</span>
+              <span class="post-card__meta-dot"></span>
+              <span>12 min</span>
+            </div>
+            <h3 class="post-card__title">神经网络入门：从感知机到多层网络</h3>
+            <p class="post-card__excerpt">
+              用最直观的方式理解神经网络的核心原理，从单个感知机逐步构建出完整的多层网络结构。
+            </p>
+          </div>
+          <div class="post-card__footer">
+            <div class="post-card__author">
+              <div class="post-card__avatar">AI</div>
+              <span class="post-card__author-name">Alex Chen</span>
+            </div>
+            <a href="#" class="post-card__read">阅读 →</a>
+          </div>
+        </article>
+
+        <!-- Card 2 -->
+        <article class="post-card" data-delay="1">
+          <div class="post-card__image">
+            <div class="post-card__image-placeholder card-img--llm">
+              🤖
+            </div>
+            <div class="post-card__overlay"></div>
+            <span class="post-card__tag">进阶</span>
+          </div>
+          <div class="post-card__body">
+            <div class="post-card__meta">
+              <span>2025.01.10</span>
+              <span class="post-card__meta-dot"></span>
+              <span>18 min</span>
+            </div>
+            <h3 class="post-card__title">大语言模型原理：Transformer 深度解析</h3>
+            <p class="post-card__excerpt">
+              从注意力机制到自回归生成，拆解 GPT 系列模型背后的核心技术，理解 LLM 为什么能与你对话。
+            </p>
+          </div>
+          <div class="post-card__footer">
+            <div class="post-card__author">
+              <div class="post-card__avatar">ML</div>
+              <span class="post-card__author-name">Mia Li</span>
+            </div>
+            <a href="#" class="post-card__read">阅读 →</a>
+          </div>
+        </article>
+
+        <!-- Card 3 -->
+        <article class="post-card" data-delay="2">
+          <div class="post-card__image">
+            <div class="post-card__image-placeholder card-img--vision">
+              👁️
+            </div>
+            <div class="post-card__overlay"></div>
+            <span class="post-card__tag">计算机视觉</span>
+          </div>
+          <div class="post-card__body">
+            <div class="post-card__meta">
+              <span>2025.01.05</span>
+              <span class="post-card__meta-dot"></span>
+              <span>15 min</span>
+            </div>
+            <h3 class="post-card__title">卷积神经网络：让机器看懂世界</h3>
+            <p class="post-card__excerpt">
+              探索 CNN 如何通过层次化特征提取实现图像识别，从边缘检测到语义理解的全过程。
+            </p>
+          </div>
+          <div class="post-card__footer">
+            <div class="post-card__author">
+              <div class="post-card__avatar">CV</div>
+              <span class="post-card__author-name">Sophia Wang</span>
+            </div>
+            <a href="#" class="post-card__read">阅读 →</a>
+          </div>
+        </article>
+
+        <!-- Card 4 -->
+        <article class="post-card" data-delay="3">
+          <div class="post-card__image">
+            <div class="post-card__image-placeholder card-img--rl">
+              🎮
+            </div>
+            <div class="post-card__overlay"></div>
+            <span class="post-card__tag">强化学习</span>
+          </div>
+          <div class="post-card__body">
+            <div class="post-card__meta">
+              <span>2024.12.28</span>
+              <span class="post-card__meta-dot"></span>
+              <span>20 min</span>
+            </div>
+            <h3 class="post-card__title">强化学习从零开始：Q-Learning 实战</h3>
+            <p class="post-card__excerpt">
+              通过一个简单的游戏案例，掌握强化学习的核心思想与 Q-Learning 算法的实现细节。
+            </p>
+          </div>
+          <div class="post-card__footer">
+            <div class="post-card__author">
+              <div class="post-card__avatar">RL</div>
+              <span class="post-card__author-name">James Park</span>
+            </div>
+            <a href="#" class="post-card__read">阅读 →</a>
+          </div>
+        </article>
+
+        <!-- Card 5 -->
+        <article class="post-card" data-delay="4">
+          <div class="post-card__image">
+            <div class="post-card__image-placeholder card-img--audio">
+              🎵
+            </div>
+            <div class="post-card__overlay"></div>
+            <span class="post-card__tag">生成式 AI</span>
+          </div>
+          <div class="post-card__body">
+            <div class="post-card__meta">
+              <span>2024.12.20</span>
+              <span class="post-card__meta-dot"></span>
+              <span>14 min</span>
+            </div>
+            <h3 class="post-card__title">扩散模型实战：从文本到图像生成</h3>
+            <p class="post-card__excerpt">
+              理解 Stable Diffusion 背后的扩散模型原理，掌握提示词工程与模型微调的核心技巧。
+            </p>
+          </div>
+          <div class="post-card__footer">
+            <div class="post-card__author">
+              <div class="post-card__avatar">AI</div>
+              <span class="post-card__author-name">Alex Chen</span>
+            </div>
+            <a href="#" class="post-card__read">阅读 →</a>
+          </div>
+        </article>
+
+        <!-- Card 6 -->
+        <article class="post-card" data-delay="5">
+          <div class="post-card__image">
+            <div class="post-card__image-placeholder card-img--ethics">
+              ⚖️
+            </div>
+            <div class="post-card__overlay"></div>
+            <span class="post-card__tag">伦理</span>
+          </div>
+          <div class="post-card__body">
+            <div class="post-card__meta">
+              <span>2024.12.15</span>
+              <span class="post-card__meta-dot"></span>
+              <span>10 min</span>
+            </div>
+            <h3 class="post-card__title">AI 伦理与安全：构建负责任的智能系统</h3>
+            <p class="post-card__excerpt">
+              探讨 AI 发展中的伦理挑战，了解公平性、可解释性与安全性在现代 AI 系统中的重要性。
+            </p>
+          </div>
+          <div class="post-card__footer">
+            <div class="post-card__author">
+              <div class="post-card__avatar">ET</div>
+              <span class="post-card__author-name">Eva Torres</span>
+            </div>
+            <a href="#" class="post-card__read">阅读 →</a>
+          </div>
+        </article>
+      </div>
+    </div>
+  </section>
+
+  <!-- ===== Newsletter ===== -->
+  <section class="section" id="subscribe">
+    <div class="container">
+      <div class="newsletter" id="newsletter">
+        <div class="newsletter__content">
+          <div class="section-label" style="justify-content:center;">Stay Connected</div>
+          <h2 class="newsletter__title">订阅 AI 学习周刊</h2>
+          <p class="newsletter__desc">
+            每周一封精选邮件，为你汇总最值得学习的 AI 教程、论文解读与实战项目。
+          </p>
+          <form class="newsletter__form" onsubmit="event.preventDefault();">
+            <input type="email" class="newsletter__input" placeholder="输入你的邮箱地址" required>
+            <button type="submit" class="btn btn--primary" style="flex-shrink:0;">立即订阅</button>
+          </form>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- ===== Footer ===== -->
+  <footer class="footer">
+    <div class="container">
+      <div class="footer__inner">
+        <div class="footer__copy">
+          © 2025 Neural Mind — AI 教学博客
+        </div>
+        <ul class="footer__links">
+          <li><a href="#">关于我们</a></li>
+          <li><a href="#">隐私政策</a></li>
+          <li><a href="#">联系我们</a></li>
+        </ul>
+      </div>
+    </div>
+  </footer>
+
+  <!-- ===== Deerflow Branding ===== -->
+  <a href="https://deerflow.tech" target="_blank" class="deerflow-badge" id="deerflowBadge" aria-label="Created By Deerflow">
+    <span class="deerflow-badge__icon">🦌</span>
+    <span class="deerflow-badge__text">Created by</span>
+    <span class="deerflow-badge__divider"></span>
+    <span style="font-weight:600;letter-spacing:0.04em;background:linear-gradient(135deg,#6c5ce7,#22d3ee);-webkit-background-clip:text;background-clip:text;-webkit-text-fill-color:transparent;">Deerflow</span>
+  </a>
+
+  <!-- ===== GSAP Script ===== -->
+  <script>
+    gsap.registerPlugin(ScrollTrigger, ScrambleTextPlugin, TextPlugin);
+    (function() {
+      'use strict';
+
+      // ===== Header scroll effect =====
+      const header = document.getElementById('header');
+      ScrollTrigger.create({
+        start: 'top -80px',
+        onUpdate: (self) => {
+          header.classList.toggle('scrolled', self.progress > 0);
+        }
+      });
+
+      // ===== Hero Particles =====
+      const particlesContainer = document.querySelector('.hero-particles');
+      if (particlesContainer) {
+        for (let i = 0; i < 40; i++) {
+          const dot = document.createElement('div');
+          dot.className = 'particle';
+          dot.style.left = Math.random() * 100 + '%';
+          dot.style.top = Math.random() * 100 + '%';
+          dot.style.width = dot.style.height = (1.5 + Math.random() * 3) + 'px';
+          dot.style.opacity = 0.15 + Math.random() * 0.3;
+          dot.style.animation = `glowFloat ${6 + Math.random() * 8}s ease-in-out ${Math.random() * 4}s infinite alternate`;
+          particlesContainer.appendChild(dot);
+        }
+        document.querySelector('.hero').appendChild(particlesContainer);
+      }
+
+      // ===== Hero ScrambleText =====
+      const scrambleEl = document.getElementById('scrambleTarget');
+      const heroTitle = document.getElementById('heroTitle');
+      const heroSubtitle = document.getElementById('heroSubtitle');
+      const heroBadge = document.getElementById('heroBadge');
+      const scrollIndicator = document.getElementById('scrollIndicator');
+
+      // Initial hero load animation
+      const heroTimeline = gsap.timeline({ defaults: { ease: 'power3.out' } });
+
+      heroTimeline
+        .from(heroBadge, { y: 30, opacity: 0, duration: 0.6 })
+        .from('.hero-title .line', {
+          y: 60,
+          opacity: 0,
+          stagger: 0.1,
+          duration: 0.7,
+        }, '-=0.3')
+        .from(heroSubtitle, { y: 30, opacity: 0, duration: 0.6 }, '-=0.3')
+        .from('.hero-actions', { y: 30, opacity: 0, duration: 0.5 }, '-=0.2')
+        .from(scrollIndicator, { opacity: 0, duration: 0.4 }, '-=0.1')
+        .add(() => {
+          // ScrambleText effect on the last line
+          gsap.to(scrambleEl, {
+            duration: 1.2,
+            scrambleText: {
+              text: '的无限可能',
+              chars: '!@#$%^&*()_+AI01你好世界',
+              speed: 0.35,
+              revealDelay: 0.1,
+            },
+            ease: 'none',
+          });
+        }, '-=0.2');
+
+      // ===== Hero scroll animation (fade out on scroll) =====
+      gsap.to('.hero-content', {
+        y: -80,
+        opacity: 0.5,
+        ease: 'none',
+        scrollTrigger: {
+          trigger: '.hero',
+          start: 'top top',
+          end: 'bottom top',
+          scrub: 0.6,
+        }
+      });
+
+      gsap.to(scrollIndicator, {
+        opacity: 0,
+        ease: 'none',
+        scrollTrigger: {
+          trigger: '.hero',
+          start: 'top top',
+          end: 'bottom top',
+          scrub: 0.6,
+        }
+      });
+
+      // ===== Stats counter animation =====
+      const statCards = document.querySelectorAll('.stat-card');
+      statCards.forEach((card, i) => {
+        gsap.from(card, {
+          y: 40,
+          opacity: 0,
+          duration: 0.6,
+          delay: i * 0.1,
+          ease: 'power3.out',
+          scrollTrigger: {
+            trigger: card,
+            start: 'top 85%',
+          }
+        });
+      });
+
+      // Count-up animation
+      const statNumbers = document.querySelectorAll('.stat-number');
+      statNumbers.forEach(el => {
+        const target = parseFloat(el.dataset.count);
+        const isDecimal = target % 1 !== 0;
+        ScrollTrigger.create({
+          trigger: el,
+          start: 'top 85%',
+          once: true,
+          onEnter: () => {
+            gsap.to(el, {
+              duration: 1.8,
+              ease: 'power2.out',
+              onUpdate: function() {
+                const val = this.progress() * target;
+                if (isDecimal) {
+                  el.textContent = val.toFixed(1) + (target === 4.9 ? ' ★' : '');
+                } else {
+                  el.textContent = Math.round(val).toLocaleString() + '+';
+                }
+              },
+              onComplete: () => {
+                if (isDecimal) {
+                  el.textContent = target + (target === 4.9 ? ' ★' : '');
+                } else {
+                  el.textContent = target.toLocaleString() + '+';
+                }
+              }
+            });
+          }
+        });
+      });
+
+      // ===== Post cards staggered entrance =====
+      const cards = document.querySelectorAll('.post-card');
+      cards.forEach((card, i) => {
+        const delay = parseFloat(card.dataset.delay) * 0.08;
+        gsap.from(card, {
+          y: 60,
+          opacity: 0,
+          duration: 0.7,
+          delay: delay,
+          ease: 'power3.out',
+          scrollTrigger: {
+            trigger: card,
+            start: 'top 88%',
+          }
+        });
+      });
+
+      // ===== Newsletter entrance =====
+      gsap.from('.newsletter', {
+        y: 60,
+        opacity: 0,
+        duration: 0.8,
+        ease: 'power3.out',
+        scrollTrigger: {
+          trigger: '.newsletter',
+          start: 'top 85%',
+        }
+      });
+
+      // ===== Deerflow badge entrance =====
+      gsap.from('#deerflowBadge', {
+        y: 20,
+        opacity: 0,
+        duration: 0.6,
+        delay: 1.2,
+        ease: 'power3.out',
+      });
+
+      // ===== Card hover glitch effect (mouse follow) =====
+      cards.forEach(card => {
+        const img = card.querySelector('.post-card__image-placeholder');
+        card.addEventListener('mousemove', (e) => {
+          const rect = card.getBoundingClientRect();
+          const x = ((e.clientX - rect.left) / rect.width - 0.5) * 8;
+          const y = ((e.clientY - rect.top) / rect.height - 0.5) * 8;
+          gsap.to(img, {
+            x: x,
+            y: y,
+            duration: 0.4,
+            ease: 'power2.out',
+            overwrite: 'auto',
+          });
+        });
+        card.addEventListener('mouseleave', () => {
+          gsap.to(img, { x: 0, y: 0, duration: 0.4, ease: 'power2.out' });
+        });
+      });
+
+      // ===== Smooth scroll for anchor links =====
+      document.querySelectorAll('a[href^="#"]').forEach(link => {
+        link.addEventListener('click', (e) => {
+          const target = document.querySelector(link.getAttribute('href'));
+          if (!target) return;
+          e.preventDefault();
+          if (matchMedia('(prefers-reduced-motion: reduce)').matches) {
+            target.scrollIntoView();
+          } else {
+            gsap.to(window, {
+              duration: 0.8,
+              scrollTo: { y: target, offsetY: 80, autoKill: true },
+              ease: 'power2.out',
+            });
+          }
+        });
+      });
+
+      // ===== Refresh ScrollTrigger on load =====
+      window.addEventListener('load', () => {
+        ScrollTrigger.refresh();
+      });
+
+    })();
+  </script>
+
+  <!-- ScrollToPlugin for smooth anchor -->
+  <script src="https://cdn.jsdelivr.net/npm/gsap@3.15/dist/ScrollToPlugin.min.js"></script>
+
+</body>
+</html>

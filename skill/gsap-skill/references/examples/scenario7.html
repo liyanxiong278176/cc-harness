@@ -1,0 +1,199 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <meta name="description" content="GSAP Flip demo: shuffle a grid of cards and expand a card to a fullscreen detail overlay with shared layout.">
+    <title>GSAP Flip — Reorder + Expand</title>
+
+    <script src="https://cdn.jsdelivr.net/npm/gsap@3.15/dist/gsap.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/gsap@3.15/dist/Flip.min.js"></script>
+
+    <style>
+        *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+            background: #0f1115;
+            color: #f5f5f7;
+            min-height: 100vh;
+        }
+
+        .toolbar {
+            position: fixed;
+            top: 16px;
+            left: 16px;
+            display: flex;
+            gap: 8px;
+            z-index: 5;
+        }
+
+        .toolbar button {
+            background: #1d1f25;
+            color: #f5f5f7;
+            border: 1px solid #2c2f37;
+            padding: 8px 14px;
+            border-radius: 8px;
+            font-size: 14px;
+            cursor: pointer;
+        }
+
+        .toolbar button:hover { background: #262932; }
+
+        .grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fill, minmax(180px, 1fr));
+            gap: 16px;
+            padding: 80px 24px 24px;
+        }
+
+        .card {
+            aspect-ratio: 4 / 5;
+            border-radius: 12px;
+            background: linear-gradient(135deg, #1d1f25, #2a2d35);
+            border: 1px solid #2c2f37;
+            padding: 16px;
+            cursor: pointer;
+            display: flex;
+            flex-direction: column;
+            justify-content: space-between;
+            transition: border-color 0.2s;
+        }
+
+        .card:hover { border-color: #4a4d57; }
+
+        .card .num   { font-size: 13px; color: #6b6d75; }
+        .card .title { font-size: 22px; font-weight: 600; }
+
+        .detail {
+            position: fixed;
+            inset: 0;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            pointer-events: none;
+            opacity: 0;
+            z-index: 20;
+        }
+
+        .detail-card {
+            width: min(80vw, 720px);
+            aspect-ratio: 4 / 5;
+            border-radius: 12px;
+            background: linear-gradient(135deg, #1d1f25, #2a2d35);
+            border: 1px solid #2c2f37;
+            padding: 32px;
+            display: flex;
+            flex-direction: column;
+            gap: 16px;
+            pointer-events: auto;
+        }
+
+        .detail-card .title { font-size: 32px; }
+        .detail-card .body  { color: #b8b9bf; font-size: 16px; }
+
+        .back-btn {
+            align-self: flex-start;
+            background: transparent;
+            border: 1px solid #4a4d57;
+            color: #f5f5f7;
+            padding: 6px 12px;
+            border-radius: 6px;
+            cursor: pointer;
+        }
+    </style>
+</head>
+<body>
+    <div class="toolbar">
+        <button id="shuffle">Shuffle</button>
+    </div>
+
+    <div class="grid" id="grid"></div>
+
+    <div class="detail" id="detail">
+        <div class="detail-card" id="detailCard">
+            <button class="back-btn" id="back">← Back</button>
+            <div class="title" id="detailTitle">—</div>
+            <div class="body">Detail content for the card. Click "Back" to animate the card back to its grid position via Flip.</div>
+        </div>
+    </div>
+
+    <script>
+        const grid   = document.getElementById("grid");
+        const detail = document.getElementById("detail");
+
+        const titles = ["Aurora", "Borealis", "Cobalt", "Driftwood", "Ember", "Foundry", "Glacier", "Helix"];
+        let cards = [];
+
+        // Build initial grid
+        function render() {
+            grid.innerHTML = "";
+            cards.forEach((c, i) => {
+                const el = document.createElement("div");
+                el.className = "card";
+                el.dataset.id = c.id;
+                el.innerHTML = `<div class="num">${String(i + 1).padStart(2, "0")}</div><div class="title">${c.title}</div>`;
+                el.addEventListener("click", () => expand(el));
+                grid.appendChild(el);
+            });
+        }
+
+        // Shuffle: capture -> permute -> animate from captured state
+        document.getElementById("shuffle").addEventListener("click", () => {
+            cards = gsap.utils.shuffle(cards);
+            const state = Flip.getState(".card");    // 1) capture
+            render();                                 // 2) reorder DOM
+            Flip.from(state, {                        // 3) tween
+                duration: 0.6,
+                ease: "power2.inOut",
+                stagger: 0.04,
+                absolute: true,
+            });
+        });
+
+        // Expand: clone-like FLIP from card to detail overlay
+        function expand(cardEl) {
+            const state = Flip.getState(cardEl);
+            detail.style.opacity = "1";
+            detail.style.pointerEvents = "auto";
+            cardEl.style.opacity = "0";              // hide source after capture
+            document.getElementById("detailTitle").textContent =
+                cardEl.querySelector(".title").textContent;
+            Flip.from(state, {
+                targets: "#detailCard",
+                duration: 0.5,
+                ease: "power2.inOut",
+                absolute: true,
+            });
+        }
+
+        // Back: capture detail -> reset grid -> animate detail back to card
+        document.getElementById("back").addEventListener("click", () => {
+            const target = document.querySelector(`.card[data-id="${detailCardId}"]`);
+            if (!target) { detail.style.opacity = "0"; return; }
+            const state = Flip.getState("#detailCard");
+            target.style.opacity = "1";
+            detail.style.pointerEvents = "none";
+            detail.style.opacity = "0";
+            Flip.from(state, {
+                targets: target,
+                duration: 0.5,
+                ease: "power2.inOut",
+                absolute: true,
+                onComplete: () => target.style.opacity = "",
+            });
+        });
+
+        // Track which card is currently expanded (used by the Back handler)
+        let detailCardId = null;
+        grid.addEventListener("click", (e) => {
+            const cardEl = e.target.closest(".card");
+            if (cardEl) detailCardId = cardEl.dataset.id;
+        });
+
+        // Init
+        cards = titles.map((t, i) => ({ id: String(i), title: t }));
+        render();
+    </script>
+</body>
+</html>
