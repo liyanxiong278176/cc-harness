@@ -108,3 +108,50 @@ async def test_chat_bad_json_finishes_with_raw_arguments():
             final = ev
     assert final is not None
     assert final.pending[0].arguments_json == '{"a": oops'  # not parsed yet
+
+
+class _FakeUsage:
+    def __init__(self, prompt_tokens, completion_tokens, total_tokens):
+        self.prompt_tokens = prompt_tokens
+        self.completion_tokens = completion_tokens
+        self.total_tokens = total_tokens
+
+class _FakeUsageChunk:
+    """The final stream chunk that carries usage (choices=[])."""
+    def __init__(self, usage):
+        self.choices = []
+        self.usage = usage
+
+
+@pytest.mark.asyncio
+async def test_chat_captures_usage_on_final_chunk():
+    """When the stream ends with a usage chunk, StreamEvent.usage should be set."""
+    chunks = [
+        _FakeChunk(_FakeChoiceDelta(content="hi"), finish_reason="stop"),
+        _FakeUsageChunk(_FakeUsage(prompt_tokens=100, completion_tokens=50, total_tokens=150)),
+    ]
+    client = _make_client(chunks)
+    final = None
+    async for ev in client.chat(messages=[{"role": "user", "content": "hi"}], tools=[]):
+        if ev.kind == "done":
+            final = ev
+    assert final is not None
+    assert final.usage is not None
+    assert final.usage.prompt_tokens == 100
+    assert final.usage.completion_tokens == 50
+    assert final.usage.total_tokens == 150
+
+
+@pytest.mark.asyncio
+async def test_chat_usage_none_when_no_usage_chunk():
+    """When no usage chunk is present, StreamEvent.usage should be None."""
+    chunks = [
+        _FakeChunk(_FakeChoiceDelta(content="ok"), finish_reason="stop"),
+    ]
+    client = _make_client(chunks)
+    final = None
+    async for ev in client.chat(messages=[{"role": "user", "content": "hi"}], tools=[]):
+        if ev.kind == "done":
+            final = ev
+    assert final is not None
+    assert final.usage is None

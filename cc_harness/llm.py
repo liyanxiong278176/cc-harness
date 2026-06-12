@@ -4,6 +4,8 @@ from dataclasses import dataclass, field
 from typing import Any, AsyncIterator, Literal
 from openai import AsyncOpenAI
 
+from cc_harness.tokens import UsageRecord
+
 
 # --- Data contracts ---
 
@@ -25,6 +27,7 @@ class StreamEvent:
     finish_reason: str | None = None
     pending: list[PendingToolCall] = field(default_factory=list)
     content: str = ""
+    usage: "UsageRecord | None" = None
 
 
 # --- Delta accumulator ---
@@ -81,14 +84,19 @@ class LLMClient:
         """Yield StreamEvents; the final 'done' event carries the full assistant
         message (content + pending tool_calls + finish_reason)."""
         kwargs: dict[str, Any] = {"model": self.model, "messages": messages, "stream": True}
+        kwargs["stream_options"] = {"include_usage": True}
         if tools:
             kwargs["tools"] = tools
 
         pending: list[PendingToolCall] = []
         content_parts: list[str] = []
         finish_reason: str | None = None
+        usage: UsageRecord | None = None
 
         async for chunk in await self._client.chat.completions.create(**kwargs):
+            chunk_usage = getattr(chunk, "usage", None)
+            if chunk_usage is not None:
+                usage = UsageRecord.from_api(chunk_usage)
             if not chunk.choices:
                 continue
             choice = chunk.choices[0]
@@ -121,4 +129,5 @@ class LLMClient:
             finish_reason=finish_reason,
             pending=pending,
             content="".join(content_parts),
+            usage=usage,
         )
