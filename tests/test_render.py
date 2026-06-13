@@ -222,3 +222,49 @@ def test_print_info_plain():
     text = buf.getvalue()
     assert "ready" in text
     assert "\x1b[" not in text
+
+
+# --- compaction summary (Task 9) ---
+
+def test_print_compaction_summary_no_op_on_none_tier(capfd):
+    from cc_harness.render import print_compaction_summary
+    from cc_harness.context import CompactionTier, CompactionStats
+    from rich.console import Console
+    console = Console(file=None, force_terminal=False)
+    stats = CompactionStats(tier=CompactionTier.NONE, before_tokens=0, after_tokens=0, ratio_before=0.0, ratio_after=0.0)
+    print_compaction_summary(console, "本轮", stats)
+    out = capfd.readouterr().out
+    assert "上下文压缩" not in out
+
+
+def test_print_compaction_summary_prints_tier_and_ratio(capfd):
+    from cc_harness.render import print_compaction_summary
+    from cc_harness.context import CompactionTier, CompactionStats
+    from rich.console import Console
+    console = Console(file=None, force_terminal=False)
+    stats = CompactionStats(
+        tier=CompactionTier.SNIP, before_tokens=1000, after_tokens=500,
+        ratio_before=0.7, ratio_after=0.35, messages_snip=3,
+    )
+    print_compaction_summary(console, "本轮", stats)
+    out = capfd.readouterr().out
+    assert "上下文压缩" in out
+    assert "tier 1" in out
+    assert "70%" in out
+    assert "35%" in out
+    assert "snip 3" in out
+
+
+def test_print_compaction_summary_prints_error_line(capfd):
+    from cc_harness.render import print_compaction_summary
+    from cc_harness.context import CompactionTier, CompactionStats
+    from rich.console import Console
+    console = Console(file=None, force_terminal=False)
+    stats = CompactionStats(
+        tier=CompactionTier.SUMMARIZE, before_tokens=2000, after_tokens=2000,
+        ratio_before=0.95, ratio_after=0.95, summarized=False, error="LLM down",
+    )
+    print_compaction_summary(console, "本轮", stats)
+    out = capfd.readouterr().out
+    assert "压缩失败" in out
+    assert "LLM down" in out

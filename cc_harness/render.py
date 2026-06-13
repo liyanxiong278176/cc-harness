@@ -151,3 +151,35 @@ def print_token_summary(console: Console, label: str, stats) -> None:
             highlight=False,
         )
     _flush(console)
+
+
+def print_compaction_summary(console: Console, label: str, stats) -> None:
+    """Print a single-line summary of a compaction event.
+
+    No-op if stats is None or stats.tier is NONE.
+    """
+    if stats is None:
+        return
+    if stats.tier == 0:  # CompactionTier.NONE
+        return
+    _blank(console)
+    tier_name = {
+        1: "tier 1 (snip)",
+        2: "tier 2 (prune)",
+        3: "tier 3 (summarize)",
+    }.get(int(stats.tier), f"tier {int(stats.tier)}")
+    line = (
+        f"上下文压缩 [{label}]: {tier_name}  "
+        f"{stats.ratio_before:.0%} → {stats.ratio_after:.0%}  "
+        f"snip {stats.messages_snip} 条  "
+        f"prune {stats.messages_prune} 条  "
+        f"assistant 截 {stats.messages_assistant_truncated} 条"
+    )
+    if stats.summarized:
+        line += f"  summary 插入 #{stats.summary_index}"
+    elif stats.error:
+        line += "  (未生成摘要)"
+    console.print(line, highlight=False)
+    if stats.error:
+        console.print(f"⚠ 压缩失败: {stats.error}", highlight=False)
+    _flush(console)
