@@ -545,3 +545,89 @@ async def test_run_turn_tool_calls_counted_in_tool_bucket(monkeypatch):
     stats = await agent_mod.run_turn(messages, llm, mcp, max_iter=5)
     # tool_calls bucket should be > 0 from both tool result + assistant's tool_calls
     assert stats.tool_calls > 0
+
+
+# --- Context compression integration (Task 10) ---
+
+@pytest.mark.asyncio
+async def test_run_turn_with_context_config_none_does_not_compact(monkeypatch):
+    """context_config=None 时,maybe_compact 不应被调用。"""
+    from cc_harness import agent as agent_mod
+
+    maybe_compact_calls = []
+    async def fake_maybe_compact(*a, **kw):
+        maybe_compact_calls.append(1)
+        from cc_harness.context import CompactionStats, CompactionTier
+        return CompactionStats(
+            tier=CompactionTier.NONE, before_tokens=0, after_tokens=0,
+            ratio_before=0.0, ratio_after=0.0,
+        )
+    monkeypatch.setattr(agent_mod, "maybe_compact", fake_maybe_compact)
+
+    llm = FakeLLM(responses=[[
+        FakeStreamEvent(kind="done", content="ok", pending=[], finish_reason="stop"),
+    ]])
+    mcp = FakeMCP(tools_spec=[], results={}, calls=[])
+    messages = [{"role": "user", "content": "x"}]
+    await agent_mod.run_turn(messages, llm, mcp, max_iter=5, context_config=None)
+    assert len(maybe_compact_calls) == 0
+
+
+@pytest.mark.asyncio
+async def test_run_turn_with_disabled_context_config_does_not_compact(monkeypatch):
+    """context_config.enabled=False 时,maybe_compact 不应被调用。"""
+    from cc_harness import agent as agent_mod
+    from cc_harness.config import ContextConfig
+
+    async def fake_maybe_compact(*a, **kw):
+        from cc_harness.context import CompactionStats, CompactionTier
+        return CompactionStats(
+            tier=CompactionTier.NONE, before_tokens=0, after_tokens=0,
+            ratio_before=0.0, ratio_after=0.0,
+        )
+    monkeypatch.setattr(agent_mod, "maybe_compact", fake_maybe_compact)
+
+    cfg = ContextConfig(enabled=False)
+    llm = FakeLLM(responses=[[
+        FakeStreamEvent(kind="done", content="ok", pending=[], finish_reason="stop"),
+    ]])
+    mcp = FakeMCP(tools_spec=[], results={}, calls=[])
+    messages = [{"role": "user", "content": "x"}]
+    await agent_mod.run_turn(messages, llm, mcp, max_iter=5, context_config=cfg)
+    assert len(mcp.calls) == 0  # sanity
+
+
+@pytest.mark.asyncio
+async def test_run_turn_calls_maybe_compact_each_iter(monkeypatch):
+    """每个 iter 都应调用 maybe_compact 一次(无 cost 路径)。"""
+    from cc_harness import agent as agent_mod
+    from cc_harness.config import ContextConfig
+
+    calls = []
+    async def fake_maybe_compact(messages, tool_specs, counter, config, llm):
+        calls.append((list(messages), tool_specs, config, llm))
+        from cc_harness.context import CompactionStats, CompactionTier
+        return CompactionStats(
+            tier=CompactionTier.NONE, before_tokens=0, after_tokens=0,
+            ratio_before=0.0, ratio_after=0.0,
+        )
+    monkeypatch.setattr(agent_mod, "maybe_compact", fake_maybe_compact)
+    monkeypatch.setattr(agent_mod, "confirm", lambda p: True)
+
+    # Use a 2-iter scenario: tool call then final answer
+    from cc_harness.llm import PendingToolCall
+    from cc_harness.mcp_client import ToolResult
+    fs_tool = {"type": "function", "function": {"name": "mcp__fs__r", "description": "r", "parameters": {}}}
+    pending = [PendingToolCall(index=0, id="c1", name="mcp__fs__r", arguments_json="{}")]
+    responses = [
+        [FakeStreamEvent(kind="done", content="", pending=pending, finish_reason="tool_calls")],
+        [FakeStreamEvent(kind="done", content="ok", pending=[], finish_reason="stop")],
+    ]
+    llm = FakeLLM(responses=responses)
+    mcp = FakeMCP(tools_spec=[fs_tool], results={"mcp__fs__r": ToolResult.success("x")}, calls=[])
+
+    cfg = ContextConfig()
+    messages = [{"role": "user", "content": "x"}]
+    await agent_mod.run_turn(messages, llm, mcp, max_iter=5, context_config=cfg)
+    # 2 LLM iters → 2 maybe_compact calls
+    assert len(calls) == 2

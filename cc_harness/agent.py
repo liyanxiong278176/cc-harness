@@ -24,6 +24,9 @@ from cc_harness.render import (
 )
 from cc_harness.tools import is_dangerous, confirm, run_command, RUN_COMMAND_SPEC
 from cc_harness.tokens import TokenCounter, TurnTokenStats, UsageRecord
+from cc_harness.config import ContextConfig
+from cc_harness.context import maybe_compact, CompactionTier
+from cc_harness.render import print_compaction_summary
 
 _VALID_MODES = ("coding", "plan", "design")
 
@@ -49,6 +52,7 @@ async def run_turn(
     cwd: str | None = None,
     design_dir: Path | None = None,
     token_counter: TokenCounter | None = None,
+    context_config: ContextConfig | None = None,
 ) -> TurnTokenStats:
     """Run one user turn in the given mode.
 
@@ -84,6 +88,7 @@ async def run_turn(
         tool_specs = None
 
     iter_usages: list[UsageRecord] = []   # per-iter API-reported usage
+    last_compaction = None                # most recent CompactionStats (or None)
 
     def _stats() -> TurnTokenStats:
         """Build TurnTokenStats from current messages + tool_specs + iter_usages."""
@@ -101,12 +106,25 @@ async def run_turn(
             api_completion_tokens=sum(u.completion_tokens for u in iter_usages),
             api_total_tokens=sum(u.total_tokens for u in iter_usages),
             iter_count=len(iter_usages),
+            compaction=last_compaction,
             api_reported=bool(iter_usages),
         )
 
     while iter_count < max_iter:
         iter_count += 1
         iter_usage: UsageRecord | None = None   # usage for this iter (set on done)
+
+        # 0. Context compression: cheap (no LLM) when ratio is below tier1,
+        # expensive (LLM summarize) at tier3. Failure-isolated inside
+        # maybe_compact itself; never raises. Per spec: called at the START
+        # of each iter, AFTER iter_count += 1 and BEFORE the LLM stream.
+        if context_config is not None and context_config.enabled:
+            counter = token_counter or TokenCounter()
+            last_compaction = await maybe_compact(
+                messages, tool_specs, counter, context_config, llm,
+            )
+            if last_compaction.tier != CompactionTier.NONE:
+                print_compaction_summary(console, f"本轮 iter {iter_count}", last_compaction)
 
         # 1. Stream one LLM turn. We BUFFER the content (don't print during
         # the stream) because the routing decision — has_tool_calls vs

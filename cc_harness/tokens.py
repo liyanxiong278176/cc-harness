@@ -115,6 +115,12 @@ class TurnTokenStats:
     6-category breakdown is computed by TokenCounter over the final messages
     list + tool schemas (tiktoken-based, may have small drift vs API total).
     API fields are summed across iters (authoritative billable count).
+
+    `compaction` is optional context-window state populated by the 4-tier
+    context-compression pipeline (cc_harness.context). It is None when
+    context compression is disabled, or when no compaction occurred in
+    this turn. Uses a string annotation to avoid circular import
+    (tokens -> context -> tokens).
     """
     # 6-category breakdown (tiktoken)
     user_input: int = 0
@@ -129,6 +135,7 @@ class TurnTokenStats:
     api_total_tokens: int = 0
     # Metadata
     iter_count: int = 0
+    compaction: "CompactionStats | None" = None  # noqa: F821  (string annotation; defined in cc_harness.context to avoid circular import)
     api_reported: bool = False
 
     @property
