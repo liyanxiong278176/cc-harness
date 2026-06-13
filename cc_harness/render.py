@@ -125,11 +125,13 @@ def print_token_summary(console: Console, label: str, stats) -> None:
     """
     _blank(console)
     sub = stats.breakdown_subtotal
+    summary_str = f"  摘要 {stats.summary}" if stats.summary > 0 else ""
     line = (
         f"{label}  "
         f"用户输入 {stats.user_input}  "
         f"工具调用 {stats.tool_calls}  "
         f"LLM 输出 {stats.llm_output}  "
+        f"{summary_str}"
         f"系统 {stats.system_prompt}  "
         f"工具定义 {stats.tool_definitions}  "
         f"= {sub}"

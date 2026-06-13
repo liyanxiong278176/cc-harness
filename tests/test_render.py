@@ -268,3 +268,28 @@ def test_print_compaction_summary_prints_error_line(capfd):
     out = capfd.readouterr().out
     assert "压缩失败" in out
     assert "LLM down" in out
+
+
+# --- print_token_summary summary bucket (Task 14) ---
+
+def test_print_token_summary_includes_summary_bucket_when_nonzero(capfd):
+    from cc_harness.render import print_token_summary
+    from cc_harness.tokens import TurnTokenStats
+    from rich.console import Console
+    console = Console(file=None, force_terminal=False)
+    stats = TurnTokenStats(user_input=10, tool_calls=0, llm_output=0, system_prompt=5, tool_definitions=0, summary=42)
+    print_token_summary(console, "本轮", stats)
+    out = capfd.readouterr().out
+    assert "摘要 42" in out
+
+
+def test_print_token_summary_omits_summary_bucket_when_zero(capfd):
+    """summary=0 时不显示"摘要"桶 — 保持 backward-compat 与现有 test 字节级一致。"""
+    from cc_harness.render import print_token_summary
+    from cc_harness.tokens import TurnTokenStats
+    from rich.console import Console
+    console = Console(file=None, force_terminal=False)
+    stats = TurnTokenStats(user_input=10, tool_calls=0, llm_output=0, system_prompt=5, tool_definitions=0)
+    print_token_summary(console, "本轮", stats)
+    out = capfd.readouterr().out
+    assert "摘要" not in out
