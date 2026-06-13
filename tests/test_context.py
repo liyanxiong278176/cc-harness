@@ -41,3 +41,100 @@ def test_find_protect_boundary_budget_too_small_clamps_at_last_user():
     ]
     # Even budget=1, clamp at last user message (index 1)
     assert find_protect_boundary(msgs, counter, budget_tokens=1) == 1
+
+
+# --- Tier 1: apply_tier1_snip tests ---
+
+def test_apply_tier1_snip_truncates_long_tool_output():
+    from cc_harness.context import apply_tier1_snip, CompactionTier
+    from cc_harness.config import ContextConfig
+    msgs = [
+        {"role": "system", "content": "sys"},
+        {"role": "user", "content": "old"},
+        {"role": "assistant", "content": "thinking"},
+        {"role": "tool", "tool_call_id": "c1", "content": "\n".join(f"line {i}" for i in range(100))},
+        {"role": "user", "content": "current"},
+    ]
+    cfg = ContextConfig(snip_head_lines=2, snip_tail_lines=1)
+    stats = apply_tier1_snip(msgs, protect_until=4, cfg=cfg)
+    assert stats.tier == CompactionTier.SNIP
+    assert stats.messages_snip == 1
+    assert "line 0" in msgs[3]["content"]
+    assert "line 1" in msgs[3]["content"]
+    assert "line 99" in msgs[3]["content"]
+    assert "line 50" not in msgs[3]["content"]
+    assert "omitted" in msgs[3]["content"]
+
+def test_apply_tier1_snip_truncates_user_code_blocks():
+    from cc_harness.context import apply_tier1_snip
+    from cc_harness.config import ContextConfig
+    msgs = [
+        {"role": "system", "content": "sys"},
+        {"role": "user", "content": "old"},
+        {"role": "user", "content": "请看:\n```python\n" + "\n".join(f"x_{i} = {i}" for i in range(50)) + "\n```\n谢谢"},
+        {"role": "user", "content": "current"},
+    ]
+    cfg = ContextConfig(snip_head_lines=2, snip_tail_lines=1)
+    apply_tier1_snip(msgs, protect_until=3, cfg=cfg)
+    assert "请看" in msgs[2]["content"]
+    assert "谢谢" in msgs[2]["content"]
+    assert "x_0" in msgs[2]["content"]
+    assert "x_49" in msgs[2]["content"]
+    assert "x_25" not in msgs[2]["content"]
+    assert "omitted" in msgs[2]["content"]
+
+def test_apply_tier1_snip_does_not_touch_assistant_content():
+    """Tier 1 永远不截 assistant 消息(content)— 保守处理,避免破坏思考连贯性。"""
+    from cc_harness.context import apply_tier1_snip
+    from cc_harness.config import ContextConfig
+    long_text = "thinking... " * 500
+    msgs = [
+        {"role": "system", "content": "sys"},
+        {"role": "user", "content": "old"},
+        {"role": "assistant", "content": long_text},
+        {"role": "user", "content": "current"},
+    ]
+    cfg = ContextConfig()
+    apply_tier1_snip(msgs, protect_until=3, cfg=cfg)
+    assert msgs[2]["content"] == long_text
+
+def test_apply_tier1_snip_skips_protected_tools():
+    from cc_harness.context import apply_tier1_snip
+    from cc_harness.config import ContextConfig
+    msgs = [
+        {"role": "system", "content": "sys"},
+        {"role": "user", "content": "old"},
+        {"role": "assistant", "content": None, "tool_calls": [{"id": "skill_call_1", "type": "function", "function": {"name": "skill_run", "arguments": "{}"}}]},
+        {"role": "tool", "tool_call_id": "skill_call_1", "content": "huge\n" * 1000},
+        {"role": "user", "content": "current"},
+    ]
+    cfg = ContextConfig(protected_tool_patterns=[r"^skill_"])
+    original = msgs[3]["content"]
+    apply_tier1_snip(msgs, protect_until=4, cfg=cfg)
+    assert msgs[3]["content"] == original
+
+def test_apply_tier1_snip_short_content_no_op():
+    from cc_harness.context import apply_tier1_snip
+    from cc_harness.config import ContextConfig
+    msgs = [
+        {"role": "system", "content": "sys"},
+        {"role": "user", "content": "old"},
+        {"role": "tool", "tool_call_id": "c1", "content": "line 0\nline 1"},
+        {"role": "user", "content": "current"},
+    ]
+    cfg = ContextConfig(snip_head_lines=2, snip_tail_lines=1)
+    apply_tier1_snip(msgs, protect_until=3, cfg=cfg)
+    assert msgs[2]["content"] == "line 0\nline 1"
+
+def test_apply_tier1_snip_does_not_delete_messages():
+    from cc_harness.context import apply_tier1_snip
+    from cc_harness.config import ContextConfig
+    msgs = [
+        {"role": "system", "content": "sys"},
+        {"role": "user", "content": "old"},
+        {"role": "tool", "tool_call_id": "c1", "content": "huge\n" * 1000},
+        {"role": "user", "content": "current"},
+    ]
+    cfg = ContextConfig()
+    apply_tier1_snip(msgs, protect_until=3, cfg=cfg)
+    assert len(msgs) == 4

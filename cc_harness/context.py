@@ -9,8 +9,11 @@ Public API:
 - `CompactionTier` (IntEnum), `CompactionStats` (dataclass)
 """
 from __future__ import annotations
+import re
 from dataclasses import dataclass
 from enum import IntEnum
+
+from cc_harness.config import ContextConfig
 
 
 # --- Public types ---
@@ -98,3 +101,94 @@ def find_protect_boundary(messages: list[dict], counter, budget_tokens: int) -> 
                 return floor
             return i + 1
     return 0  # entire messages fits in budget; nothing to compress
+
+
+# --- Tier 1: snip (zero-cost text truncation) ---
+
+# Code fence: opening ``` (with optional language tag) + body + closing ```
+FENCE_RE = re.compile(r"```([^\n]*)\n(.*?)\n```", re.DOTALL)
+
+
+def _snip_text_lines(content: str, head: int, tail: int) -> str | None:
+    """Truncate content to head + tail lines with an omitted marker.
+
+    Returns None if content is too short to bother truncating.
+    """
+    lines = content.splitlines()
+    if len(lines) <= head + tail + 1:
+        return None
+    kept_head = lines[:head]
+    kept_tail = lines[-tail:] if tail > 0 else []
+    omitted = len(lines) - head - tail
+    marker = TIER1_CODE_BLOCK_TRUNCATION_NOTICE.format(omitted)
+    return "\n".join(kept_head + [marker] + kept_tail)
+
+
+def _truncate_user_code_blocks(content: str, head: int, tail: int) -> str:
+    """Apply _snip_text_lines to each ``` fenced code block in content."""
+    def _repl(m: re.Match) -> str:
+        lang = m.group(1) or ""
+        body = m.group(2)
+        snipped = _snip_text_lines(body, head, tail)
+        if snipped is None:
+            return m.group(0)
+        return f"```{lang}\n{snipped}\n```"
+    return FENCE_RE.sub(_repl, content)
+
+
+def _is_protected_tool_name(tool_name: str | None, compiled: list[re.Pattern]) -> bool:
+    if not tool_name:
+        return False
+    return any(p.search(tool_name) for p in compiled)
+
+
+def _resolve_tool_name(messages: list[dict], tool_call_id: str | None) -> str | None:
+    """Walk backwards from given tool message to find the assistant's tool_calls and return the function name."""
+    if not tool_call_id:
+        return None
+    for j in range(len(messages) - 1, -1, -1):
+        m = messages[j]
+        if m.get("role") == "assistant":
+            for tc in (m.get("tool_calls") or []):
+                if isinstance(tc, dict) and tc.get("id") == tool_call_id:
+                    fn = tc.get("function", {})
+                    return fn.get("name")
+    return None
+
+
+def apply_tier1_snip(
+    messages: list[dict],
+    protect_until: int,
+    cfg: ContextConfig,
+) -> CompactionStats:
+    """Mutate messages in place: truncate long tool outputs and user code blocks.
+
+    Skip: protect zone, protected tools, assistant content, user prose.
+    """
+    snipped = 0
+    upper = min(protect_until, len(messages))
+    for i in range(0, upper):
+        m = messages[i]
+        role = m.get("role")
+        if role == "tool":
+            tool_name = _resolve_tool_name(messages[:i + 1], m.get("tool_call_id"))
+            if _is_protected_tool_name(tool_name, cfg._compiled_patterns):
+                continue
+            content = m.get("content")
+            if isinstance(content, str):
+                new_content = _snip_text_lines(content, cfg.snip_head_lines, cfg.snip_tail_lines)
+                if new_content is not None:
+                    m["content"] = new_content
+                    snipped += 1
+        elif role == "user":
+            content = m.get("content")
+            if isinstance(content, str):
+                new_content = _truncate_user_code_blocks(content, cfg.snip_head_lines, cfg.snip_tail_lines)
+                if new_content != content:
+                    m["content"] = new_content
+                    snipped += 1
+    return CompactionStats(
+        tier=CompactionTier.SNIP,
+        before_tokens=0, after_tokens=0, ratio_before=0.0, ratio_after=0.0,
+        messages_snip=snipped,
+    )
