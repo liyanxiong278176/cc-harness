@@ -622,3 +622,60 @@ class _CapturingLLM:
         yield StreamEvent(
             kind="done", content="ok", pending=[], finish_reason="stop"
         )
+
+
+# --- ContextConfig threading tests (Task 11) ---
+
+@pytest.mark.asyncio
+async def test_run_repl_threads_context_config_to_run_turn(monkeypatch):
+    """run_repl 必须把 state.context_config 透传给 run_turn。"""
+    from cc_harness import repl as repl_mod
+    from cc_harness import agent as agent_mod
+    from cc_harness.config import ContextConfig
+
+    captured = {}
+
+    async def spy_run_turn(messages, llm, mcp, **kwargs):
+        captured.update(kwargs)
+        return TurnTokenStats()
+
+    monkeypatch.setattr(agent_mod, "run_turn", spy_run_turn)
+
+    inputs = iter(["hello", "exit"])
+    monkeypatch.setattr(repl_mod, "_read_user", _fake_read_user(inputs))
+
+    fake_llm = object()  # not used (run_turn is mocked)
+    fake_mcp = _NoopMCP()
+
+    await repl_mod.run_repl(fake_llm, fake_mcp, cwd="/tmp", default_mode="coding")
+    assert "context_config" in captured
+    assert isinstance(captured["context_config"], ContextConfig)
+
+
+@pytest.mark.asyncio
+async def test_run_repl_prints_compaction_summary_after_turn(monkeypatch, capfd):
+    """turn_stats.compaction 非 NONE 时,repl 必须打印 上下文压缩 行。"""
+    from cc_harness import repl as repl_mod
+    from cc_harness import agent as agent_mod
+    from cc_harness.context import CompactionTier, CompactionStats
+
+    async def fake_run_turn(messages, llm, mcp, **kwargs):
+        messages.append({"role": "assistant", "content": "ok"})
+        return TurnTokenStats(
+            user_input=100, tool_calls=0, llm_output=0, system_prompt=0, tool_definitions=0,
+            api_total_tokens=100, iter_count=1, api_reported=True,
+            compaction=CompactionStats(
+                tier=CompactionTier.SNIP, before_tokens=1000, after_tokens=500,
+                ratio_before=0.7, ratio_after=0.35, messages_snip=2,
+            ),
+        )
+    monkeypatch.setattr(agent_mod, "run_turn", fake_run_turn)
+
+    inputs = iter(["hello", "exit"])
+    monkeypatch.setattr(repl_mod, "_read_user", _fake_read_user(inputs))
+    fake_llm = _StoppingLLM()
+    fake_mcp = _NoopMCP()
+    await repl_mod.run_repl(fake_llm, fake_mcp, cwd="/tmp", default_mode="coding")
+    out = capfd.readouterr().out
+    assert "上下文压缩" in out
+    assert "snip 2" in out

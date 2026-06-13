@@ -17,7 +17,9 @@ import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from rich.console import Console
-from cc_harness.render import print_info, print_warn, print_token_summary
+from cc_harness.config import ContextConfig
+from cc_harness.context import CompactionTier
+from cc_harness.render import print_info, print_warn, print_token_summary, print_compaction_summary
 from cc_harness.tokens import TokenCounter, SessionTokenStats
 
 _VALID_MODES = ("coding", "plan", "design")
@@ -45,6 +47,7 @@ class ReplState:
     messages: list[dict] = field(default_factory=list)
     session_stats: SessionTokenStats = field(default_factory=SessionTokenStats)
     token_counter: TokenCounter = field(default_factory=TokenCounter)
+    context_config: ContextConfig = field(default_factory=ContextConfig)
 
 
 async def _read_user(prompt: str) -> str:
@@ -158,12 +161,15 @@ async def run_repl(
             cwd=cwd,
             design_dir=design_dir,
             token_counter=state.token_counter,
+            context_config=state.context_config,
         )
         state.session_stats.add(turn_stats)
 
         # 打印 token 明细
         print_token_summary(console, "本轮", turn_stats)
         print_token_summary(console, f"累计 {state.session_stats.turns} 轮", state.session_stats)
+        if turn_stats.compaction and turn_stats.compaction.tier != CompactionTier.NONE:
+            print_compaction_summary(console, "本轮", turn_stats.compaction)
 
         # After the turn, show what actually changed on disk — so the user
         # can see real file state without F5-ing their file manager.
