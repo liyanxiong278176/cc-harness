@@ -99,3 +99,58 @@ def test_load_config_missing_mcp_json_raises(tmp_path: Path, monkeypatch: pytest
     monkeypatch.setenv("OPENAI_MODEL", "m")
     with pytest.raises(ConfigError, match="mcp.json"):
         load_config(env_path=tmp_path / ".env", mcp_json_path=tmp_path / "missing.json")
+
+
+def test_context_config_defaults():
+    from cc_harness.config import ContextConfig
+    cfg = ContextConfig()
+    assert cfg.enabled is True
+    assert cfg.context_window == 200_000
+    assert cfg.tier1_threshold == 0.6
+    assert cfg.tier2_threshold == 0.8
+    assert cfg.tier3_threshold == 0.95
+    assert cfg.protect_zone_tokens == 8_192
+    assert cfg.protected_tool_patterns == []
+    assert cfg.snip_head_lines == 5
+    assert cfg.snip_tail_lines == 1
+    assert cfg.summarize_max_output_tokens == 2_000
+
+
+def test_context_config_threshold_ordering_raises():
+    from cc_harness.config import ContextConfig
+    with pytest.raises(ValueError, match="[Tt]hreshold"):
+        ContextConfig(tier1_threshold=0.9, tier2_threshold=0.7, tier3_threshold=0.95)
+
+
+def test_context_config_threshold_out_of_range_raises():
+    from cc_harness.config import ContextConfig
+    with pytest.raises(ValueError, match="[Rr]ange|0, 1"):
+        ContextConfig(tier1_threshold=1.5)
+
+
+def test_context_config_protected_tool_patterns_compile():
+    from cc_harness.config import ContextConfig
+    with pytest.raises(ValueError, match="[Cc]ompile|pattern"):
+        ContextConfig(protected_tool_patterns=["[invalid("])
+
+
+def test_appconfig_context_default_is_context_config():
+    from cc_harness.config import ContextConfig
+    cfg = AppConfig(
+        openai_api_key="k", openai_base_url="u", openai_model="m",
+        mcp_servers={},
+    )
+    assert isinstance(cfg.context, ContextConfig)
+    assert cfg.context.tier1_threshold == 0.6
+
+
+def test_load_config_overrides_context_window_from_env(monkeypatch, tmp_path):
+    from cc_harness.config import load_config
+    monkeypatch.setenv("CONTEXT_WINDOW", "50000")
+    monkeypatch.setenv("OPENAI_API_KEY", "k")
+    monkeypatch.setenv("OPENAI_BASE_URL", "u")
+    monkeypatch.setenv("OPENAI_MODEL", "m")
+    mcp_json = tmp_path / "mcp.json"
+    mcp_json.write_text('{"mcpServers": {}}', encoding="utf-8")
+    cfg = load_config(env_path=tmp_path / ".env", mcp_json_path=mcp_json)
+    assert cfg.context.context_window == 50_000
