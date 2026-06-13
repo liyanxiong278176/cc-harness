@@ -66,6 +66,7 @@ def main() -> None:
                 cwd=str(PROJECT_ROOT),
                 default_mode=args.mode,
                 design_dir=args.design_dir,
+                context_config=cfg.context,
             )
         finally:
             await mcp.shutdown()
