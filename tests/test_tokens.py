@@ -1,7 +1,7 @@
 """Unit tests for cc_harness.tokens."""
 import pytest
 from cc_harness.tokens import (
-    TokenCounter, UsageRecord, TurnTokenStats, SessionTokenStats,
+    SUMMARY_MARKER_KEY, TokenCounter, UsageRecord, TurnTokenStats, SessionTokenStats,
 )
 
 
@@ -99,7 +99,7 @@ def test_categorize_empty_list():
     counter = TokenCounter()
     assert counter.categorize([]) == {
         "user_input": 0, "tool_calls": 0, "llm_output": 0, "system_prompt": 0,
-        "tool_definitions": 0,
+        "tool_definitions": 0, "summary": 0,
     }
 
 
@@ -120,6 +120,7 @@ def test_categorize_tool_definitions_counted_when_provided():
     assert cats["tool_calls"] == 0
     assert cats["llm_output"] == 0
     assert cats["system_prompt"] == 0
+    assert cats["summary"] == 0
 
 
 def test_categorize_tool_definitions_zero_when_none():
@@ -196,3 +197,39 @@ def test_session_token_stats_add_turns_without_usage():
     s.add(t)
     assert s.turns == 1
     assert s.turns_with_usage == 0
+
+
+# --- summary bucket (Tier 3 LLM Summarize marker) ---
+
+def test_categorize_summary_message_in_summary_bucket():
+    """带 _compaction_summary=True 的 assistant 消息应计入 summary 桶。"""
+    counter = TokenCounter()
+    msgs = [
+        {"role": "assistant", "content": "compacted history here", SUMMARY_MARKER_KEY: True},
+    ]
+    cats = counter.categorize(msgs)
+    assert cats["summary"] > 0
+
+
+def test_categorize_summary_does_not_count_in_llm_output():
+    """summary 消息不应计入 llm_output 桶。"""
+    counter = TokenCounter()
+    msgs = [
+        {"role": "assistant", "content": "compacted history here", SUMMARY_MARKER_KEY: True},
+    ]
+    cats = counter.categorize(msgs)
+    assert cats["llm_output"] == 0
+    assert cats["summary"] > 0
+
+
+def test_turn_token_stats_breakdown_subtotal_includes_summary():
+    """6 类求和包含 summary。"""
+    t = TurnTokenStats(user_input=10, tool_calls=20, llm_output=30, system_prompt=40, tool_definitions=50, summary=100)
+    assert t.breakdown_subtotal == 250
+
+
+def test_session_token_stats_add_includes_summary():
+    """SessionTokenStats.add() 必须累加 summary 字段。"""
+    s = SessionTokenStats()
+    s.add(TurnTokenStats(summary=50))
+    assert s.summary == 50

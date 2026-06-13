@@ -2,7 +2,7 @@
 
 Provides:
 - `UsageRecord`: wraps a single API-reported usage snapshot.
-- `TokenCounter`: tiktoken-backed 4-bucket categorizer for OpenAI message lists.
+- `TokenCounter`: tiktoken-backed 6-bucket categorizer for OpenAI message lists.
 - `TurnTokenStats`: aggregate of one ReAct turn (1..N LLM calls).
 - `SessionTokenStats`: cross-turn session totals.
 """
@@ -10,6 +10,9 @@ from __future__ import annotations
 import json
 from dataclasses import dataclass
 from typing import Any
+
+
+SUMMARY_MARKER_KEY = "_compaction_summary"
 
 
 @dataclass(frozen=True)
@@ -38,7 +41,7 @@ class UsageRecord:
 
 
 class TokenCounter:
-    """Categorize an OpenAI-format messages list (+ optional tools) into 5 token buckets.
+    """Categorize an OpenAI-format messages list (+ optional tools) into 6 token buckets.
 
     Default encoding: cl100k_base (works for GPT-4/3.5, DeepSeek-V2/V3).
     For GPT-4o, pass encoding_name="o200k_base".
@@ -60,15 +63,16 @@ class TokenCounter:
     def categorize(
         self, messages: list[dict], tools: list[dict] | None = None,
     ) -> dict[str, int]:
-        """Walk messages (+ optional tool schemas) and bucket tokens into 5 categories.
+        """Walk messages (+ optional tool schemas) and bucket tokens into 6 categories.
 
         - system_prompt:    role=system content
         - user_input:       role=user content
         - tool_calls:       role=tool content + assistant tool_calls field
-        - llm_output:       assistant content (text only)
+        - llm_output:       assistant content (text only, no summary marker)
         - tool_definitions: JSON-serialized `tools` parameter (sent every API call)
+        - summary:          assistant content when _compaction_summary=True
         """
-        system_prompt = user_input = tool_calls = llm_output = 0
+        system_prompt = user_input = tool_calls = llm_output = summary = 0
         for m in messages:
             role = m.get("role")
             if role == "system":
@@ -79,10 +83,14 @@ class TokenCounter:
                 tool_calls += self.count_text(m.get("content"))
             elif role == "assistant":
                 content = m.get("content")
-                if content:
-                    llm_output += self.count_text(content)
-                for tc in (m.get("tool_calls") or []):
-                    tool_calls += self.count_text(json.dumps(tc, ensure_ascii=False))
+                if m.get(SUMMARY_MARKER_KEY):
+                    # Compaction summary — counts ONLY in `summary`, not in `llm_output`.
+                    summary += self.count_text(content)
+                else:
+                    if content:
+                        llm_output += self.count_text(content)
+                    for tc in (m.get("tool_calls") or []):
+                        tool_calls += self.count_text(json.dumps(tc, ensure_ascii=False))
             # unknown roles: silently skip
 
         tool_definitions = 0
@@ -96,6 +104,7 @@ class TokenCounter:
             "llm_output": llm_output,
             "system_prompt": system_prompt,
             "tool_definitions": tool_definitions,
+            "summary": summary,
         }
 
 
@@ -103,16 +112,17 @@ class TokenCounter:
 class TurnTokenStats:
     """Aggregate of one run_turn call (1..N LLM calls in ReAct loop).
 
-    5-category breakdown is computed by TokenCounter over the final messages
+    6-category breakdown is computed by TokenCounter over the final messages
     list + tool schemas (tiktoken-based, may have small drift vs API total).
     API fields are summed across iters (authoritative billable count).
     """
-    # 5-category breakdown (tiktoken)
+    # 6-category breakdown (tiktoken)
     user_input: int = 0
     tool_calls: int = 0
     llm_output: int = 0
     system_prompt: int = 0
     tool_definitions: int = 0
+    summary: int = 0
     # API-reported (sum across iters in this turn)
     api_prompt_tokens: int = 0
     api_completion_tokens: int = 0
@@ -129,6 +139,7 @@ class TurnTokenStats:
             + self.llm_output
             + self.system_prompt
             + self.tool_definitions
+            + self.summary
         )
 
     @property
@@ -147,6 +158,7 @@ class SessionTokenStats:
     llm_output: int = 0
     system_prompt: int = 0
     tool_definitions: int = 0
+    summary: int = 0
     api_prompt_tokens: int = 0
     api_completion_tokens: int = 0
     api_total_tokens: int = 0
@@ -161,6 +173,7 @@ class SessionTokenStats:
             + self.llm_output
             + self.system_prompt
             + self.tool_definitions
+            + self.summary
         )
 
     def add(self, turn: TurnTokenStats) -> None:
@@ -170,6 +183,7 @@ class SessionTokenStats:
         self.llm_output += turn.llm_output
         self.system_prompt += turn.system_prompt
         self.tool_definitions += turn.tool_definitions
+        self.summary += turn.summary
         self.api_prompt_tokens += turn.api_prompt_tokens
         self.api_completion_tokens += turn.api_completion_tokens
         self.api_total_tokens += turn.api_total_tokens
