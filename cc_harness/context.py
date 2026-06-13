@@ -242,3 +242,86 @@ def apply_tier2_prune(
         messages_prune=pruned,
         messages_assistant_truncated=assistant_truncated,
     )
+
+
+# --- Tier 3: summarize (async, LLM-driven) ---
+
+async def _summarize(llm, previous_summary: str, delta_messages: list[dict]) -> str:
+    """Call llm.chat with the summary prompt (no tools). Return the merged summary text."""
+    from cc_harness.prompts import SUMMARY_SYSTEM_PROMPT, summary_user_prompt
+    msgs = [
+        {"role": "system", "content": SUMMARY_SYSTEM_PROMPT},
+        {"role": "user", "content": summary_user_prompt(previous_summary, delta_messages)},
+    ]
+    content_parts: list[str] = []
+    finish_reason: str | None = None
+    async for ev in llm.chat(msgs, tools=None):
+        if ev.kind == "content":
+            content_parts.append(ev.text)
+        elif ev.kind == "done":
+            finish_reason = ev.finish_reason
+            if ev.content:
+                content_parts = [ev.content]
+    if not content_parts or not "".join(content_parts).strip():
+        raise RuntimeError("LLM returned empty summary")
+    if finish_reason not in (None, "stop", "length"):
+        # Anything other than normal finish is suspicious but not necessarily fatal
+        pass
+    return "".join(content_parts)
+
+
+def _find_previous_summary(messages: list[dict]) -> tuple[int | None, str]:
+    """Find the most recent summary-marked assistant message. Return (index, content) or (None, '').
+
+    Summaries are always inserted at index 1 (after system), so the most recent
+    summary has the LOWEST index among all summaries. Walk forward and return
+    the first match. This preserves the invariant that stats.summary_index is
+    recoverable via _find_previous_summary(messages)[0].
+    """
+    for i, m in enumerate(messages):
+        if m.get("role") == "assistant" and m.get(SUMMARY_MARKER_KEY):
+            return i, m.get("content") or ""
+    return None, ""
+
+
+async def apply_tier3_summarize(
+    messages: list[dict],
+    protect_until: int,
+    config: ContextConfig,
+    counter,
+    llm,
+) -> CompactionStats:
+    """Build delta, call LLM, insert summary message. Returns stats.
+
+    On failure: returns CompactionStats with summarized=False, error=str.
+    """
+    prev_idx, prev_content = _find_previous_summary(messages)
+    if prev_idx is None:
+        # Skip system prompt at index 0
+        delta_start = 1 if messages and messages[0].get("role") == "system" else 0
+    else:
+        delta_start = prev_idx + 1
+    delta = messages[delta_start:protect_until]
+
+    try:
+        new_summary = await _summarize(llm, prev_content, delta)
+    except Exception as e:
+        return CompactionStats(
+            tier=CompactionTier.SUMMARIZE,
+            before_tokens=0, after_tokens=0, ratio_before=0.0, ratio_after=0.0,
+            summarized=False, error=str(e),
+        )
+
+    # Insert after system prompt (or at index 0 if no system)
+    insert_idx = 1 if messages and messages[0].get("role") == "system" else 0
+    summary_msg = {
+        "role": "assistant",
+        "content": new_summary,
+        SUMMARY_MARKER_KEY: True,
+    }
+    messages.insert(insert_idx, summary_msg)
+    return CompactionStats(
+        tier=CompactionTier.SUMMARIZE,
+        before_tokens=0, after_tokens=0, ratio_before=0.0, ratio_after=0.0,
+        summarized=True, summary_index=insert_idx,
+    )

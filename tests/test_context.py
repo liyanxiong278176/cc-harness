@@ -1,4 +1,6 @@
 """Tests for cc_harness.context — protect boundary, tiers, orchestrator."""
+from dataclasses import dataclass
+import pytest
 from cc_harness.tokens import TokenCounter
 
 
@@ -227,3 +229,163 @@ def test_apply_tier2_prune_skips_protected_tools():
     cfg = ContextConfig(protected_tool_patterns=[r"^skill_"])
     apply_tier2_prune(msgs, protect_until=4, config=cfg)
     assert msgs[3]["content"] == "preserve me"
+
+
+# --- Tier 3: apply_tier3_summarize tests ---
+
+
+@dataclass
+class FakeSummarizerLLM:
+    """Records each chat() call and returns a pre-programmed summary."""
+    responses: list[str]
+    call_count: int = 0
+    last_tools: list | None = None
+
+    async def chat(self, messages, tools):
+        idx = self.call_count
+        self.call_count += 1
+        self.last_tools = tools
+        # Lazy import to avoid pulling llm into this test file's namespace
+        from cc_harness.llm import StreamEvent
+        content = self.responses[idx] if idx < len(self.responses) else "default summary"
+        yield StreamEvent(
+            kind="done", content=content, pending=[], finish_reason="stop",
+        )
+
+
+def test_find_previous_summary_returns_none_when_no_summary():
+    from cc_harness.context import _find_previous_summary
+    msgs = [
+        {"role": "system", "content": "sys"},
+        {"role": "user", "content": "hi"},
+        {"role": "assistant", "content": "hello"},
+    ]
+    idx, content = _find_previous_summary(msgs)
+    assert idx is None
+    assert content == ""
+
+
+def test_find_previous_summary_returns_last_summary():
+    from cc_harness.context import _find_previous_summary
+    from cc_harness.prompts import SUMMARY_MARKER_KEY
+    # Summaries are inserted at index 1, so the most recent has the lowest index.
+    # Simulate two Tier 3 calls: first inserts "summary 1" at idx 1, then
+    # second inserts "summary 2" at idx 1, pushing "summary 1" to idx 2.
+    msgs = [
+        {"role": "system", "content": "sys"},
+        {"role": "assistant", "content": "summary 2", SUMMARY_MARKER_KEY: True},
+        {"role": "assistant", "content": "summary 1", SUMMARY_MARKER_KEY: True},
+        {"role": "user", "content": "now"},
+    ]
+    idx, content = _find_previous_summary(msgs)
+    assert idx == 1
+    assert content == "summary 2"
+
+
+@pytest.mark.asyncio
+async def test_apply_tier3_summarize_creates_summary_message():
+    from cc_harness.context import apply_tier3_summarize, CompactionTier
+    from cc_harness.config import ContextConfig
+    from cc_harness.prompts import SUMMARY_MARKER_KEY
+    from cc_harness.tokens import TokenCounter
+    msgs = [
+        {"role": "system", "content": "sys"},
+        {"role": "user", "content": "q1"},
+        {"role": "assistant", "content": "a1"},
+    ]
+    cfg = ContextConfig()
+    counter = TokenCounter()
+    llm = FakeSummarizerLLM(responses=["NEW SUMMARY"])
+    stats = await apply_tier3_summarize(msgs, protect_until=3, config=cfg, counter=counter, llm=llm)
+    assert stats.tier == CompactionTier.SUMMARIZE
+    assert stats.summarized is True
+    # Summary inserted at index 1 (after system)
+    assert msgs[1][SUMMARY_MARKER_KEY] is True
+    assert "NEW SUMMARY" in msgs[1]["content"]
+    assert stats.summary_index == 1
+
+
+@pytest.mark.asyncio
+async def test_apply_tier3_summarize_passes_tools_none_to_llm():
+    """Tier 3 严禁 LLM 调用工具 — spec line 67-68。"""
+    from cc_harness.context import apply_tier3_summarize
+    from cc_harness.config import ContextConfig
+    from cc_harness.tokens import TokenCounter
+    msgs = [
+        {"role": "system", "content": "sys"},
+        {"role": "user", "content": "q"},
+    ]
+    cfg = ContextConfig()
+    counter = TokenCounter()
+    llm = FakeSummarizerLLM(responses=["s"])
+    await apply_tier3_summarize(msgs, protect_until=2, config=cfg, counter=counter, llm=llm)
+    assert llm.last_tools is None
+
+
+@pytest.mark.asyncio
+async def test_apply_tier3_summarize_incremental_across_two_calls():
+    """第二次调用应使用第一次插入的摘要作为 previous_summary。"""
+    from cc_harness.context import apply_tier3_summarize, _find_previous_summary
+    from cc_harness.config import ContextConfig
+    from cc_harness.tokens import TokenCounter
+    msgs = [
+        {"role": "system", "content": "sys"},
+        {"role": "user", "content": "q1"},
+        {"role": "assistant", "content": "a1"},
+    ]
+    cfg = ContextConfig()
+    counter = TokenCounter()
+    llm = FakeSummarizerLLM(responses=["FIRST SUMMARY", "SECOND SUMMARY"])
+    stats1 = await apply_tier3_summarize(msgs, protect_until=3, config=cfg, counter=counter, llm=llm)
+    # Add more messages
+    msgs.append({"role": "user", "content": "q2"})
+    msgs.append({"role": "assistant", "content": "a2"})
+    await apply_tier3_summarize(msgs, protect_until=5, config=cfg, counter=counter, llm=llm)
+    assert llm.call_count == 2
+    # Second call's previous_summary_idx should match stats1.summary_index
+    prev_idx, prev_content = _find_previous_summary(msgs)
+    assert prev_idx == stats1.summary_index
+
+
+@pytest.mark.asyncio
+async def test_apply_tier3_summarize_llm_error_returns_stats_with_error():
+    """LLM 失败不应 raise — 应返回 stats with error 字段(spec line 482)。"""
+    from cc_harness.context import apply_tier3_summarize
+    from cc_harness.config import ContextConfig
+    from cc_harness.tokens import TokenCounter
+
+    class FailingLLM:
+        async def chat(self, messages, tools):
+            raise RuntimeError("LLM down")
+            yield  # never reached, but makes it a generator
+
+    msgs = [
+        {"role": "system", "content": "sys"},
+        {"role": "user", "content": "q"},
+    ]
+    cfg = ContextConfig()
+    counter = TokenCounter()
+    stats = await apply_tier3_summarize(msgs, protect_until=2, config=cfg, counter=counter, llm=FailingLLM())
+    assert stats.error is not None
+    assert "LLM down" in stats.error
+    assert stats.summarized is False
+
+
+@pytest.mark.asyncio
+async def test_apply_tier3_summarize_summary_index_recoverable():
+    """stats.summary_index 必须能通过 _find_previous_summary 找回(实施期约束 #2)。"""
+    from cc_harness.context import apply_tier3_summarize, _find_previous_summary
+    from cc_harness.config import ContextConfig
+    from cc_harness.tokens import TokenCounter
+    msgs = [
+        {"role": "system", "content": "sys"},
+        {"role": "user", "content": "q1"},
+        {"role": "assistant", "content": "a1"},
+        {"role": "user", "content": "q2"},
+    ]
+    cfg = ContextConfig()
+    counter = TokenCounter()
+    llm = FakeSummarizerLLM(responses=["S"])
+    stats = await apply_tier3_summarize(msgs, protect_until=4, config=cfg, counter=counter, llm=llm)
+    prev_idx, _ = _find_previous_summary(msgs)
+    assert prev_idx == stats.summary_index
