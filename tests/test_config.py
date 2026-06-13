@@ -122,6 +122,14 @@ def test_context_config_threshold_ordering_raises():
         ContextConfig(tier1_threshold=0.9, tier2_threshold=0.7, tier3_threshold=0.95)
 
 
+def test_context_config_threshold_ordering_equal_raises():
+    """tier1 == tier2 (even when both in range) 应该 raise — 严格 <,非 <=。"""
+    from cc_harness.config import ContextConfig
+    import pytest
+    with pytest.raises(ValueError, match="[Tt]hreshold|ordered"):
+        ContextConfig(tier1_threshold=0.5, tier2_threshold=0.5, tier3_threshold=0.9)
+
+
 def test_context_config_threshold_out_of_range_raises():
     from cc_harness.config import ContextConfig
     with pytest.raises(ValueError, match="[Rr]ange|0, 1"):
@@ -132,6 +140,15 @@ def test_context_config_protected_tool_patterns_compile():
     from cc_harness.config import ContextConfig
     with pytest.raises(ValueError, match="[Cc]ompile|pattern"):
         ContextConfig(protected_tool_patterns=["[invalid("])
+
+
+def test_context_config_protected_tool_patterns_compiles_valid():
+    """合法的 protected_tool_patterns 字符串应在 _compiled_patterns 中被编译缓存。"""
+    from cc_harness.config import ContextConfig
+    cfg = ContextConfig(protected_tool_patterns=[r"^mcp__.*", r"__skill$"])
+    assert len(cfg._compiled_patterns) == 2
+    assert cfg._compiled_patterns[0].search("mcp__fs__read").group(0) == "mcp__fs__read"
+    assert cfg._compiled_patterns[1].search("tool__skill").group(0) == "__skill"
 
 
 def test_appconfig_context_default_is_context_config():

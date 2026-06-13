@@ -42,6 +42,20 @@ class ContextConfig(BaseModel):
             raise ValueError(f"threshold must be in (0, 1), got {v}")
         return v
 
+    @field_validator("context_window")
+    @classmethod
+    def _check_context_window(cls, v: int) -> int:
+        if v <= 0:
+            raise ValueError(f"context_window must be > 0, got {v}")
+        return v
+
+    @field_validator("protect_zone_tokens")
+    @classmethod
+    def _check_protect_zone(cls, v: int) -> int:
+        if v < 0:
+            raise ValueError(f"protect_zone_tokens must be >= 0, got {v}")
+        return v
+
     @model_validator(mode="after")
     def _check_threshold_order(self) -> "ContextConfig":
         if not (self.tier1_threshold < self.tier2_threshold < self.tier3_threshold):
@@ -103,11 +117,21 @@ def load_config(env_path: Path, mcp_json_path: Path) -> AppConfig:
     # Optional context config overrides
     def _maybe_int(name: str) -> int | None:
         v = os.getenv(name)
-        return int(v) if v else None
+        if not v:
+            return None
+        try:
+            return int(v)
+        except ValueError as e:
+            raise ConfigError(f"{name} must be an integer, got {v!r}") from e
 
     def _maybe_float(name: str) -> float | None:
         v = os.getenv(name)
-        return float(v) if v else None
+        if not v:
+            return None
+        try:
+            return float(v)
+        except ValueError as e:
+            raise ConfigError(f"{name} must be a float, got {v!r}") from e
 
     context_kwargs: dict = {}
     for key, conv, name in [
