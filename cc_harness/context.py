@@ -325,3 +325,70 @@ async def apply_tier3_summarize(
         before_tokens=0, after_tokens=0, ratio_before=0.0, ratio_after=0.0,
         summarized=True, summary_index=insert_idx,
     )
+
+
+# --- maybe_compact orchestrator ---
+
+async def maybe_compact(
+    messages: list[dict],
+    tool_specs: list[dict] | None,
+    counter,
+    config: ContextConfig,
+    llm,
+) -> CompactionStats:
+    """Cascading tier orchestrator. Mutates messages in place.
+
+    Returns CompactionStats; never raises.
+    """
+    if not config.enabled:
+        return CompactionStats(
+            tier=CompactionTier.NONE, before_tokens=0, after_tokens=0,
+            ratio_before=0.0, ratio_after=0.0,
+        )
+
+    before = 0
+    after = 0
+    ratio = 0.0
+    snapshot: list[dict] | None = None
+    try:
+        before = sum(counter.categorize(messages, tool_specs).values())
+        ratio = before / config.context_window
+        if ratio < config.tier1_threshold:
+            return CompactionStats(
+                tier=CompactionTier.NONE, before_tokens=before, after_tokens=before,
+                ratio_before=ratio, ratio_after=ratio,
+            )
+        protect_until = find_protect_boundary(messages, counter, config.protect_zone_tokens)
+        if protect_until <= 0 or protect_until >= len(messages):
+            return CompactionStats(
+                tier=CompactionTier.NONE, before_tokens=before, after_tokens=before,
+                ratio_before=ratio, ratio_after=ratio,
+            )
+        apply_tier1_snip(messages, protect_until, cfg=config)
+        after = sum(counter.categorize(messages, tool_specs).values())
+        if after / config.context_window < config.tier2_threshold:
+            return CompactionStats(
+                tier=CompactionTier.SNIP, before_tokens=before, after_tokens=after,
+                ratio_before=ratio, ratio_after=after / config.context_window,
+                messages_snip=1,
+            )
+        apply_tier2_prune(messages, protect_until, config)
+        after = sum(counter.categorize(messages, tool_specs).values())
+        if after / config.context_window < config.tier3_threshold:
+            return CompactionStats(
+                tier=CompactionTier.PRUNE, before_tokens=before, after_tokens=after,
+                ratio_before=ratio, ratio_after=after / config.context_window,
+                messages_prune=1,
+            )
+        stats = await apply_tier3_summarize(messages, protect_until, config, counter, llm)
+        stats.before_tokens = before
+        return stats
+    except Exception as e:
+        if snapshot is None:
+            snapshot = [dict(m) for m in messages]  # only in error branch
+        return CompactionStats(
+            tier=CompactionTier.NONE,
+            before_tokens=before, after_tokens=after,
+            ratio_before=ratio, ratio_after=ratio,
+            error=str(e), before_snapshot=snapshot,
+        )

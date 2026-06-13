@@ -389,3 +389,98 @@ async def test_apply_tier3_summarize_summary_index_recoverable():
     stats = await apply_tier3_summarize(msgs, protect_until=4, config=cfg, counter=counter, llm=llm)
     prev_idx, _ = _find_previous_summary(msgs)
     assert prev_idx == stats.summary_index
+
+
+# --- maybe_compact orchestrator tests (Task 8) ---
+
+@pytest.mark.asyncio
+async def test_maybe_compact_no_op_when_disabled():
+    from cc_harness.context import maybe_compact, CompactionTier
+    from cc_harness.config import ContextConfig
+    from cc_harness.tokens import TokenCounter
+    msgs = [{"role": "user", "content": "x" * 10_000}]
+    cfg = ContextConfig(enabled=False)
+    counter = TokenCounter()
+    llm = FakeSummarizerLLM(responses=[])
+    stats = await maybe_compact(msgs, [], counter, cfg, llm)
+    assert stats.tier == CompactionTier.NONE
+    assert msgs[0]["content"] == "x" * 10_000
+
+
+@pytest.mark.asyncio
+async def test_maybe_compact_no_op_below_tier1():
+    """ratio < tier1 时不触发任何 tier,直接返 NONE。"""
+    from cc_harness.context import maybe_compact, CompactionTier
+    from cc_harness.config import ContextConfig
+    from cc_harness.tokens import TokenCounter
+    msgs = [{"role": "system", "content": "sys"}, {"role": "user", "content": "hi"}]
+    cfg = ContextConfig(context_window=1_000_000)  # ratio well below 0.6
+    counter = TokenCounter()
+    llm = FakeSummarizerLLM(responses=[])
+    stats = await maybe_compact(msgs, [], counter, cfg, llm)
+    assert stats.tier == CompactionTier.NONE
+
+
+@pytest.mark.asyncio
+async def test_maybe_compact_tier1_only():
+    """ratio 落在 tier1-tier2 之间,只跑 Tier 1。"""
+    from cc_harness.context import maybe_compact, CompactionTier
+    from cc_harness.config import ContextConfig
+    from cc_harness.tokens import TokenCounter
+    big_tool_content = "line\n" * 500
+    msgs = [
+        {"role": "system", "content": "sys"},
+        {"role": "user", "content": "q"},
+        {"role": "tool", "tool_call_id": "c1", "content": big_tool_content},
+        {"role": "user", "content": "current"},
+    ]
+    cfg = ContextConfig(
+        context_window=1000,
+        tier1_threshold=0.6, tier2_threshold=0.8, tier3_threshold=0.95,
+        protect_zone_tokens=10,  # small so the tool message falls outside protect zone
+    )
+    counter = TokenCounter()
+    llm = FakeSummarizerLLM(responses=[])
+    stats = await maybe_compact(msgs, [], counter, cfg, llm)
+    # Tier 1 should have run; tier 2 may or may not depending on exact ratio
+    assert stats.tier in (CompactionTier.SNIP, CompactionTier.PRUNE)
+
+
+@pytest.mark.asyncio
+async def test_maybe_compact_exception_returns_stats_with_error():
+    """任何内部异常都被 try/except 捕获,返 stats with error,不 raise。"""
+    from cc_harness.context import maybe_compact
+    from cc_harness.config import ContextConfig
+    msgs = [
+        {"role": "system", "content": "sys"},
+        {"role": "user", "content": "x" * 100_000},
+    ]
+    cfg = ContextConfig(context_window=1000)
+
+    class Boom:
+        def categorize(self, messages, tools=None):
+            raise RuntimeError("categorize failed")
+
+    counter = Boom()
+    llm = FakeSummarizerLLM(responses=[])
+    stats = await maybe_compact(msgs, [], counter, cfg, llm)
+    assert stats.error is not None
+    assert "categorize failed" in stats.error
+    assert stats.before_snapshot is not None  # snapshot populated in error branch
+    assert len(stats.before_snapshot) == 2
+
+
+@pytest.mark.asyncio
+async def test_maybe_compact_exception_does_not_raise():
+    """失败必须不 raise — 压缩是额外保险,不能让 run_turn 主循环崩。"""
+    from cc_harness.context import maybe_compact
+    from cc_harness.config import ContextConfig
+    msgs = [{"role": "user", "content": "x"}]
+
+    class Boom:
+        def categorize(self, messages, tools=None):
+            raise ValueError("nope")
+
+    cfg = ContextConfig(context_window=10)
+    stats = await maybe_compact(msgs, [], Boom(), cfg, FakeSummarizerLLM(responses=[]))
+    assert stats.error is not None
