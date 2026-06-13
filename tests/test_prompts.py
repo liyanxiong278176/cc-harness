@@ -257,3 +257,40 @@ def test_composed_prompt_does_not_leak_unresolved_placeholders():
     import re
     leftovers = re.findall(r"\{[a-z_]+\}", out)
     assert leftovers == [], f"unresolved placeholders: {leftovers}"
+
+
+# --- Tier 3 summary prompt helpers (Task 3) ---
+
+def test_summary_user_prompt_includes_previous_summary():
+    from cc_harness.prompts import summary_user_prompt
+    out = summary_user_prompt("old summary", [])
+    assert "old summary" in out
+    assert "[历史摘要]" in out
+
+
+def test_summary_user_prompt_renders_delta_messages():
+    from cc_harness.prompts import summary_user_prompt
+    delta = [
+        {"role": "user", "content": "hi"},
+        {"role": "assistant", "content": "hello"},
+    ]
+    out = summary_user_prompt("", delta)
+    assert "user" in out
+    assert "assistant" in out
+    assert "hi" in out
+    assert "hello" in out
+    assert "[新增消息]" in out
+
+
+def test_summary_user_prompt_preserves_code_blocks():
+    from cc_harness.prompts import summary_user_prompt
+    delta = [{"role": "user", "content": "```python\nprint('x')\n```"}]
+    out = summary_user_prompt("", delta)
+    assert "```python" in out
+    assert "print('x')" in out
+
+
+def test_summary_user_prompt_first_call_previous_summary_empty():
+    from cc_harness.prompts import summary_user_prompt
+    out = summary_user_prompt("", [])
+    assert "无" in out or "(无" in out or "首次" in out

@@ -186,3 +186,101 @@ def build_system_prompt(cwd: str, mode: str = "coding") -> str:
     """Public entry point. Renders the system prompt for the given mode
     with `cwd` substituted. mode is one of 'coding', 'plan', 'design'."""
     return PromptComposer(mode=mode, ctx={"cwd": cwd}).render()
+
+
+# --- Tier 3 summary prompts (canonical home for SUMMARY_MARKER_KEY) ---
+
+SUMMARY_MARKER_KEY = "_compaction_summary"
+
+SUMMARY_SYSTEM_PROMPT = """你是 cc-harness 的会话历史压缩器,把累积的 messages 压缩成结构化摘要。
+
+# 输出格式(强制)
+## 进展
+<已完成的工作,用过去时,1-3 条>
+## 关键文件
+<被创建/修改/读取的文件路径,1-N 条>
+## 待办
+<尚未完成的工作,1-N 条>
+## 上下文
+<关键决策、用户偏好、需要保留的代码片段>
+
+# 规则
+1. 仅基于 [历史摘要] + [新增消息] 改写,绝不编造历史中没有的事实。
+2. 保留用户贴的代码块原文(不要"修正"或重写)。
+3. 长度 ≤ 2000 tokens。
+4. 严禁调用任何工具,直接输出摘要文本。
+"""
+
+
+def _render_messages_for_summary(messages: list[dict]) -> str:
+    """Walk messages, produce a text dump for the summary LLM call.
+
+    - user code blocks are preserved verbatim
+    - tool messages → [tool result] <content>
+    - assistant with tool_calls → [assistant tool_call: <name>(<args>)]
+    - assistant with content → <content>
+    - multimodal content (list) → <multimodal: N items>
+    - _compaction_summary-marked assistant → [previous summary] <content>
+    """
+    out: list[str] = []
+    for m in messages:
+        role = m.get("role")
+        if role == "system":
+            continue
+        content = m.get("content")
+        if role == "assistant" and m.get(SUMMARY_MARKER_KEY):
+            out.append(f"[assistant previous summary] {content or ''}")
+            continue
+        if role == "tool":
+            if content is None:
+                out.append("[tool] (empty)")
+            elif isinstance(content, str):
+                out.append(f"[tool] {content}")
+            else:
+                out.append(f"[tool (multimodal: {len(content)} items)]")
+            continue
+        if role == "assistant":
+            tcs = m.get("tool_calls") or []
+            if tcs:
+                for tc in tcs:
+                    fn = tc.get("function", {}) if isinstance(tc, dict) else {}
+                    name = fn.get("name", "?")
+                    args = fn.get("arguments", "{}")
+                    out.append(f"[assistant tool_call: {name}({args})]")
+                continue
+            # plain text assistant
+            if isinstance(content, str):
+                out.append(f"[assistant] {content}")
+            elif content is None:
+                out.append("[assistant (empty)]")
+            else:
+                out.append(f"[assistant (multimodal: {len(content)} items)]")
+            continue
+        if role == "user":
+            if isinstance(content, str):
+                out.append(f"[user] {content}")
+            elif content is None:
+                out.append("[user (empty)]")
+            else:
+                out.append(f"[user (multimodal: {len(content)} items)]")
+            continue
+        # unknown role
+        out.append(f"[{role}] {content or ''}")
+    return "\n\n".join(out)
+
+
+def summary_user_prompt(previous_summary: str, delta_messages: list[dict]) -> str:
+    """Build the user-side prompt for a Tier 3 summary LLM call.
+
+    The caller is responsible for delta size cap (see spec §Delta 大小上限).
+    """
+    delta_text = _render_messages_for_summary(delta_messages)
+    return (
+        "[历史摘要]\n"
+        f"{previous_summary or '(无 — 首次压缩)'}\n"
+        "\n"
+        "[新增消息]\n"
+        f"{delta_text or '(空 — 没有新增消息)'}\n"
+        "\n"
+        "请输出新摘要。"
+    )

@@ -12,7 +12,7 @@ from dataclasses import dataclass
 from typing import Any
 
 
-SUMMARY_MARKER_KEY = "_compaction_summary"
+from cc_harness.prompts import SUMMARY_MARKER_KEY  # canonical home
 
 
 @dataclass(frozen=True)
