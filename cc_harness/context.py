@@ -14,6 +14,7 @@ from dataclasses import dataclass
 from enum import IntEnum
 
 from cc_harness.config import ContextConfig
+from cc_harness.prompts import SUMMARY_MARKER_KEY
 
 
 # --- Public types ---
@@ -46,7 +47,6 @@ class CompactionStats:
 TIER2_TOOL_PLACEHOLDER = "[Old tool result content cleared]"
 TIER2_ASSISTANT_TRUNCATION_NOTICE = "[truncated]"
 TIER1_CODE_BLOCK_TRUNCATION_NOTICE = "... ({} lines omitted) ..."
-SUMMARY_MARKER_KEY = "_compaction_summary"
 SENTENCE_SPLIT_RE = r"(?<=[.。!?！？\n])\s*"
 ASSISTANT_TRUNCATE_FALLBACK_CHARS = 200
 
@@ -159,12 +159,17 @@ def _resolve_tool_name(messages: list[dict], tool_call_id: str | None) -> str | 
 def apply_tier1_snip(
     messages: list[dict],
     protect_until: int,
-    cfg: ContextConfig,
+    config: ContextConfig | None = None,
+    *,
+    cfg: ContextConfig | None = None,
 ) -> CompactionStats:
     """Mutate messages in place: truncate long tool outputs and user code blocks.
 
     Skip: protect zone, protected tools, assistant content, user prose.
     """
+    # Back-compat: callers historically used `cfg=cfg`. Prefer `config`.
+    if config is None:
+        config = cfg
     snipped = 0
     upper = min(protect_until, len(messages))
     for i in range(0, upper):
@@ -172,18 +177,18 @@ def apply_tier1_snip(
         role = m.get("role")
         if role == "tool":
             tool_name = _resolve_tool_name(messages[:i + 1], m.get("tool_call_id"))
-            if _is_protected_tool_name(tool_name, cfg._compiled_patterns):
+            if _is_protected_tool_name(tool_name, config._compiled_patterns):
                 continue
             content = m.get("content")
             if isinstance(content, str):
-                new_content = _snip_text_lines(content, cfg.snip_head_lines, cfg.snip_tail_lines)
+                new_content = _snip_text_lines(content, config.snip_head_lines, config.snip_tail_lines)
                 if new_content is not None:
                     m["content"] = new_content
                     snipped += 1
         elif role == "user":
             content = m.get("content")
             if isinstance(content, str):
-                new_content = _truncate_user_code_blocks(content, cfg.snip_head_lines, cfg.snip_tail_lines)
+                new_content = _truncate_user_code_blocks(content, config.snip_head_lines, config.snip_tail_lines)
                 if new_content != content:
                     m["content"] = new_content
                     snipped += 1
@@ -364,7 +369,7 @@ async def maybe_compact(
                 tier=CompactionTier.NONE, before_tokens=before, after_tokens=before,
                 ratio_before=ratio, ratio_after=ratio,
             )
-        apply_tier1_snip(messages, protect_until, cfg=config)
+        apply_tier1_snip(messages, protect_until, config=config)
         after = sum(counter.categorize(messages, tool_specs).values())
         if after / config.context_window < config.tier2_threshold:
             return CompactionStats(

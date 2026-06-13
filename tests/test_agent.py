@@ -255,7 +255,6 @@ async def test_danger_command_user_says_no_llm_changes_tool(monkeypatch):
 async def test_plan_mode_does_not_execute_tools(capfd):
     """In plan mode, no tools are executed even if a tool_call comes through."""
     from cc_harness import agent as agent_mod
-    from cc_harness.mcp_client import ToolResult
 
     fs_tool = {"type": "function", "function": {
         "name": "mcp__fs__read", "description": "r",

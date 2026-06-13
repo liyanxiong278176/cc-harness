@@ -20,13 +20,12 @@ from pathlib import Path
 from rich.console import Console
 from cc_harness.render import (
     print_thought, print_action, print_observation, print_result,
-    print_warn, print_error, print_info,
+    print_warn, print_error, print_info, print_compaction_summary,
 )
 from cc_harness.tools import is_dangerous, confirm, run_command, RUN_COMMAND_SPEC
 from cc_harness.tokens import TokenCounter, TurnTokenStats, UsageRecord
 from cc_harness.config import ContextConfig
 from cc_harness.context import maybe_compact, CompactionTier
-from cc_harness.render import print_compaction_summary
 
 _VALID_MODES = ("coding", "plan", "design")
 
