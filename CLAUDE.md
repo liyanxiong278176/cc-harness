@@ -39,6 +39,7 @@ main.py
   └── repl.py:run_repl()                  # sticky mode (coding/plan/design), slash commands
         │     slash cmds: /plan /design /coding /mode /help /clear (case-insensitive)
         ├── run_turn()  [agent.py]        # ReAct while loop, max_iter=20
+        │     ├── context.py:maybe_compact # 4-tier cascade (Tier 1 Snip / Tier 2 Prune / Tier 3 Summarize)
         │     ├── llm.py:LLMClient        # OpenAI stream + tool_calls accumulator
         │     ├── mcp_client.py:MCPClient # stdio/sse/http → OpenAI tool schema
         │     ├── tools.py:NATIVE_TOOLS   # currently: run_command (asyncio subprocess)
@@ -68,7 +69,7 @@ main.py
 
 ## Test conventions
 
-- 133 tests in `tests/test_*.py` (collected by pytest, default pattern)
+- 217 tests in `tests/test_*.py` (collected by pytest, default pattern)
 - `tests/_test_*.py` (leading underscore) are **integration tests requiring a real LLM** — not collected by pytest by default; only run manually
 - Test agents use `FakeLLM` (pre-programmed stream events) + `FakeMCP` (pre-programmed tool results), defined in `test_agent.py` and reused via imports
 - New test file naming: `test_<module>.py`, mirror source module names
@@ -88,3 +89,34 @@ main.py
 - Session persistence (process exit = session gone)
 - Concurrent tool calls (serial only)
 - SubAgent / Agent Team / Worktree (PDF 阶段 4-5, not started)
+
+## Context management
+
+cc-harness auto-compresses `messages` between LLM calls using a 4-tier waterline:
+
+- **Tier 0** (ratio < 60%): no-op
+- **Tier 1** (60–80%): Snip — truncate long tool outputs and user code blocks
+- **Tier 2** (80–95%): Prune — tool outputs → placeholder; old assistant text → first sentence + `[truncated]`
+- **Tier 3** (≥ 95%): incremental LLM Summarize — merge `previous_summary + delta` into a new summary message
+
+All tiers are no-op for the **protect zone** (default: most recent 8K tokens) and for tools matching `protected_tool_patterns`.
+
+### Environment variables
+
+| Var | Default | Effect |
+|---|---|---|
+| `CONTEXT_WINDOW` | 200000 | Total context budget (tokens) |
+| `CONTEXT_TIER1` | 0.6 | Tier 1 trigger ratio |
+| `CONTEXT_TIER2` | 0.8 | Tier 2 trigger ratio |
+| `CONTEXT_TIER3` | 0.95 | Tier 3 trigger ratio |
+| `CONTEXT_PROTECT_TOKENS` | 8192 | Protect zone size (tokens) |
+
+Set `CONTEXT_TIER1=0.05` etc. to force-trigger each tier for testing.
+
+### Disabling
+
+Pass `context_config = ContextConfig(enabled=False)` in code, or set all `CONTEXT_TIER*` to 0 to disable all tiers. (The compact summary LLM call is the only expensive one; setting `CONTEXT_TIER3=1.0` disables it without affecting Snip/Prune.)
+
+### Summary message format
+
+Tier 3 inserts a `{"role": "assistant", "content": "...", "_compaction_summary": True}` message at index 1 (after system). The `_compaction_summary` marker is a custom OpenAI-extension key (the API ignores unknown keys). The token counter counts these into a 6th `summary` bucket.
