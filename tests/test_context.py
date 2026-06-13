@@ -138,3 +138,92 @@ def test_apply_tier1_snip_does_not_delete_messages():
     cfg = ContextConfig()
     apply_tier1_snip(msgs, protect_until=3, cfg=cfg)
     assert len(msgs) == 4
+
+
+# --- Tier 2: apply_tier2_prune tests ---
+
+def test_apply_tier2_prune_replaces_tool_output_with_placeholder():
+    from cc_harness.context import apply_tier2_prune, TIER2_TOOL_PLACEHOLDER
+    from cc_harness.config import ContextConfig
+    msgs = [
+        {"role": "system", "content": "sys"},
+        {"role": "user", "content": "old"},
+        {"role": "tool", "tool_call_id": "c1", "content": "huge result here"},
+        {"role": "user", "content": "current"},
+    ]
+    cfg = ContextConfig()
+    apply_tier2_prune(msgs, protect_until=3, config=cfg)
+    assert msgs[2]["content"] == TIER2_TOOL_PLACEHOLDER
+
+def test_apply_tier2_prune_truncates_assistant_text():
+    from cc_harness.context import apply_tier2_prune, TIER2_ASSISTANT_TRUNCATION_NOTICE
+    from cc_harness.config import ContextConfig
+    msgs = [
+        {"role": "system", "content": "sys"},
+        {"role": "user", "content": "old"},
+        {"role": "assistant", "content": "First sentence. Second sentence. Third sentence."},
+        {"role": "user", "content": "current"},
+    ]
+    cfg = ContextConfig()
+    apply_tier2_prune(msgs, protect_until=3, config=cfg)
+    truncated = msgs[2]["content"]
+    assert "First sentence" in truncated
+    assert TIER2_ASSISTANT_TRUNCATION_NOTICE in truncated
+    assert "Third sentence" not in truncated
+
+def test_apply_tier2_prune_does_not_delete_tool_messages():
+    """Tier 2 替换 content 但不删消息 — 保护 OpenAI tool_use/tool_result 配对。"""
+    from cc_harness.context import apply_tier2_prune
+    from cc_harness.config import ContextConfig
+    msgs = [
+        {"role": "system", "content": "sys"},
+        {"role": "user", "content": "old"},
+        {"role": "tool", "tool_call_id": "c1", "content": "x"},
+        {"role": "user", "content": "current"},
+    ]
+    cfg = ContextConfig()
+    apply_tier2_prune(msgs, protect_until=3, config=cfg)
+    assert len(msgs) == 4
+    assert any(m.get("role") == "tool" for m in msgs)
+
+def test_apply_tier2_prune_skips_summary_message():
+    """带 _compaction_summary 标记的 assistant 消息不应被 Tier 2 截断。"""
+    from cc_harness.context import apply_tier2_prune
+    from cc_harness.config import ContextConfig
+    from cc_harness.prompts import SUMMARY_MARKER_KEY
+    summary = "This is a previous summary, it must not be truncated."
+    msgs = [
+        {"role": "system", "content": "sys"},
+        {"role": "assistant", "content": summary, SUMMARY_MARKER_KEY: True},
+        {"role": "user", "content": "current"},
+    ]
+    cfg = ContextConfig()
+    apply_tier2_prune(msgs, protect_until=2, config=cfg)
+    assert msgs[1]["content"] == summary
+
+def test_apply_tier2_prune_skips_protect_zone():
+    from cc_harness.context import apply_tier2_prune
+    from cc_harness.config import ContextConfig
+    msgs = [
+        {"role": "system", "content": "sys"},
+        {"role": "user", "content": "old"},
+        {"role": "tool", "tool_call_id": "c1", "content": "keep me"},
+        {"role": "user", "content": "current"},
+    ]
+    cfg = ContextConfig()
+    apply_tier2_prune(msgs, protect_until=2, config=cfg)  # msgs[2:] is protect zone (index 2+ not touched)
+    assert msgs[2]["content"] == "keep me"
+
+def test_apply_tier2_prune_skips_protected_tools():
+    from cc_harness.context import apply_tier2_prune
+    from cc_harness.config import ContextConfig
+    msgs = [
+        {"role": "system", "content": "sys"},
+        {"role": "user", "content": "old"},
+        {"role": "assistant", "content": None, "tool_calls": [{"id": "skill_call_1", "type": "function", "function": {"name": "skill_run", "arguments": "{}"}}]},
+        {"role": "tool", "tool_call_id": "skill_call_1", "content": "preserve me"},
+        {"role": "user", "content": "current"},
+    ]
+    cfg = ContextConfig(protected_tool_patterns=[r"^skill_"])
+    apply_tier2_prune(msgs, protect_until=4, config=cfg)
+    assert msgs[3]["content"] == "preserve me"

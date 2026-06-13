@@ -192,3 +192,53 @@ def apply_tier1_snip(
         before_tokens=0, after_tokens=0, ratio_before=0.0, ratio_after=0.0,
         messages_snip=snipped,
     )
+
+
+# --- Tier 2: prune (replace tool output, truncate assistant text) ---
+
+def _prune_assistant_text(content: str) -> str:
+    """Reduce content to first sentence + ' [truncated]', or fallback to 200 chars."""
+    parts = re.split(SENTENCE_SPLIT_RE, content, maxsplit=1)
+    first = parts[0].strip()
+    if len(parts) > 1:
+        return f"{first} {TIER2_ASSISTANT_TRUNCATION_NOTICE}"
+    if len(first) > ASSISTANT_TRUNCATE_FALLBACK_CHARS:
+        return f"{first[:ASSISTANT_TRUNCATE_FALLBACK_CHARS]} {TIER2_ASSISTANT_TRUNCATION_NOTICE}"
+    return first
+
+
+def apply_tier2_prune(
+    messages: list[dict],
+    protect_until: int,
+    config: ContextConfig,
+) -> CompactionStats:
+    """Mutate messages in place: replace tool outputs with placeholder, truncate assistant text.
+
+    Skip: protect zone, protected tools, summary messages, user prose.
+    """
+    pruned = 0
+    assistant_truncated = 0
+    upper = min(protect_until, len(messages))
+    for i in range(0, upper):
+        m = messages[i]
+        role = m.get("role")
+        if role == "tool":
+            tool_name = _resolve_tool_name(messages[:i + 1], m.get("tool_call_id"))
+            if _is_protected_tool_name(tool_name, config._compiled_patterns):
+                continue
+            if m.get("content") != TIER2_TOOL_PLACEHOLDER:
+                m["content"] = TIER2_TOOL_PLACEHOLDER
+                pruned += 1
+        elif role == "assistant" and not m.get(SUMMARY_MARKER_KEY):
+            content = m.get("content")
+            if isinstance(content, str) and content.strip():
+                new_content = _prune_assistant_text(content)
+                if new_content != content:
+                    m["content"] = new_content
+                    assistant_truncated += 1
+    return CompactionStats(
+        tier=CompactionTier.PRUNE,
+        before_tokens=0, after_tokens=0, ratio_before=0.0, ratio_after=0.0,
+        messages_prune=pruned,
+        messages_assistant_truncated=assistant_truncated,
+    )
