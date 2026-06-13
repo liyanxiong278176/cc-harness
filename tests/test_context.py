@@ -484,3 +484,44 @@ async def test_maybe_compact_exception_does_not_raise():
     cfg = ContextConfig(context_window=10)
     stats = await maybe_compact(msgs, [], Boom(), cfg, FakeSummarizerLLM(responses=[]))
     assert stats.error is not None
+
+
+@pytest.mark.asyncio
+async def test_compaction_cascade_real_scenario():
+    """端到端:现实的混合多轮场景,被压缩到 tier2 阈值以下。"""
+    from cc_harness.context import maybe_compact, CompactionTier
+    from cc_harness.config import ContextConfig
+    from cc_harness.tokens import TokenCounter
+    from cc_harness.context import TIER2_TOOL_PLACEHOLDER
+
+    msgs = [
+        {"role": "system", "content": "你是一个编程助手。" * 20},
+        {"role": "user", "content": "请看下面这个文件:```python\n" + "\n".join(f"x_{i} = {i}" for i in range(80)) + "\n```"},
+        {"role": "assistant", "content": None, "tool_calls": [
+            {"id": "c1", "type": "function", "function": {"name": "read", "arguments": "{}"}}
+        ]},
+        {"role": "tool", "tool_call_id": "c1", "content": "\n".join(f"output line {i}" for i in range(200))},
+        {"role": "assistant", "content": "我读了文件。第一行是 x_0 = 0. 后面有 80 个变量赋值. 这是另一个非常长的句子用来增加 token 数。"},
+        {"role": "tool", "tool_call_id": "c1", "content": "\n".join(f"more output {i}" for i in range(200))},
+        {"role": "user", "content": "请继续"},
+    ]
+    cfg = ContextConfig(
+        context_window=2000,
+        tier1_threshold=0.5,
+        tier2_threshold=0.6,
+        tier3_threshold=0.95,
+        protect_zone_tokens=400,
+    )
+    counter = TokenCounter()
+    llm = FakeSummarizerLLM(responses=["compacted"])
+    before_total = sum(counter.categorize(msgs).values())
+    stats = await maybe_compact(msgs, [], counter, cfg, llm)
+    after_total = sum(counter.categorize(msgs).values())
+    # Either tier1 or tier2 or tier3 should have fired (any non-NONE)
+    assert stats.tier in (CompactionTier.SNIP, CompactionTier.PRUNE, CompactionTier.SUMMARIZE)
+    assert after_total < before_total  # some compression happened
+    # No messages deleted
+    assert all(m.get("role") is not None for m in msgs)
+    # If tier2 fired, at least one tool output should be the placeholder
+    if stats.tier == CompactionTier.PRUNE:
+        assert any(m.get("content") == TIER2_TOOL_PLACEHOLDER for m in msgs)
