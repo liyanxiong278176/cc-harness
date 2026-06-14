@@ -72,8 +72,9 @@ def test_compare_sessions_computes_deltas():
     assert cmp.api_tokens_delta == -400  # cc saved 400
     assert cmp.api_tokens_delta_pct == -40.0
     assert cmp.peak_ratio_delta == cc.peak_ratio_overall - master.peak_ratio_overall
-    assert len(cmp.per_task_diffs) == 1
-    assert cmp.per_task_diffs[0]["task_id"] == "t1"
+    # compare_sessions itself leaves per_task_diffs empty;
+    # the orchestrator populates it via build_per_task_diffs (next test covers that)
+    assert cmp.per_task_diffs == []
 
 
 def test_build_per_task_diffs():
