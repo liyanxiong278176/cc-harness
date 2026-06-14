@@ -121,3 +121,106 @@ async def test_retry_exhausts_and_raises():
     with pytest.raises(Exception, match="429"):
         await _retry_llm_errors(always_fail, max_attempts=3, base_delay=0.01)
     assert len(attempts) == 3
+
+
+# --- Task 4.5: run_session happy path ---
+
+@pytest.mark.asyncio
+async def test_run_session_happy_path_3_tasks(tmp_path):
+    from eval.datasets.gaia_loader import GaiaTask
+    from eval.runners.session_runner import run_session
+    from cc_harness.config import ContextConfig
+
+    tasks = [
+        GaiaTask("t1", "What is 2+2?", 1, "4", None),
+        GaiaTask("t2", "Capital of France?", 1, "Paris", None),
+        GaiaTask("t3", "Sum of 1..10?", 1, "55", None),
+    ]
+    llm = FakeLLM(responses=[
+        _final_event("FINAL ANSWER: 4"),
+        _final_event("FINAL ANSWER: Paris"),
+        _final_event("FINAL ANSWER: 55"),
+    ])
+    mcp = FakeMCP(tools_spec=[], results={}, calls=[])
+
+    result = await run_session(
+        tasks=tasks,
+        llm=llm, mcp=mcp,
+        branch="test", out_dir=tmp_path,
+        context_config=ContextConfig(enabled=False),
+        max_iter=5, checkpoint_every=2,
+        abort_after_overflows=3,
+    )
+    assert result.tasks_total == 3
+    assert result.tasks_correct == 3
+    assert result.accuracy == 1.0
+    assert (tmp_path / "trace.jsonl").exists()
+    assert (tmp_path / "messages.json").exists()
+
+
+# --- Task 4.6: failure paths ---
+
+@pytest.mark.asyncio
+async def test_run_session_continues_after_one_failure(tmp_path, monkeypatch):
+    """When run_turn raises (context_overflow, no retry), session continues."""
+    from eval.datasets.gaia_loader import GaiaTask
+    from eval.runners import session_runner as sr_mod
+    from cc_harness.config import ContextConfig
+
+    tasks = [
+        GaiaTask("t1", "ok", 1, "4", None),
+        GaiaTask("t2", "fail", 1, "x", None),
+        GaiaTask("t3", "ok again", 1, "9", None),
+    ]
+    real_run_turn = sr_mod.run_turn
+    call_n = 0
+    async def maybe_overflow(*args, **kwargs):
+        nonlocal call_n
+        call_n += 1
+        if call_n == 2:
+            # context_overflow is NOT retried by _retry_llm_errors
+            raise Exception("context_length_exceeded: too long")
+        return await real_run_turn(*args, **kwargs)
+    monkeypatch.setattr(sr_mod, "run_turn", maybe_overflow)
+
+    llm = FakeLLM(responses=[
+        _final_event("FINAL ANSWER: 4"),
+        _final_event("FINAL ANSWER: 9"),
+    ])
+    mcp = FakeMCP(tools_spec=[], results={}, calls=[])
+
+    sm = await sr_mod.run_session(
+        tasks=tasks, llm=llm, mcp=mcp,
+        branch="test", out_dir=tmp_path,
+        context_config=ContextConfig(enabled=False),
+        max_iter=3, checkpoint_every=5, abort_after_overflows=3,
+    )
+    assert sm.tasks_total == 3
+    assert sm.tasks_failed == 1
+    assert sm.tasks_correct == 2
+
+
+
+@pytest.mark.asyncio
+async def test_run_session_aborts_after_consecutive_overflows(tmp_path, monkeypatch):
+    """When run_turn raises 3 times in a row with overflow, session aborts early."""
+    from eval.datasets.gaia_loader import GaiaTask
+    from eval.runners import session_runner as sr_mod
+    from cc_harness.config import ContextConfig
+
+    tasks = [GaiaTask(f"t{i}", f"q{i}", 1, "x", None) for i in range(5)]
+
+    async def always_overflow(*args, **kwargs):
+        raise Exception("context_length_exceeded: messages too long")
+    monkeypatch.setattr(sr_mod, "run_turn", always_overflow)
+
+    sm = await sr_mod.run_session(
+        tasks=tasks, llm=FakeLLM(responses=[]),
+        mcp=FakeMCP(tools_spec=[], results={}, calls=[]),
+        branch="test", out_dir=tmp_path,
+        context_config=ContextConfig(enabled=False),
+        max_iter=3, checkpoint_every=5, abort_after_overflows=3,
+    )
+    # Hit 3 overflows in a row → break before all 5 tasks
+    assert sm.tasks_total == 3
+    assert sm.tasks_failed == 3
