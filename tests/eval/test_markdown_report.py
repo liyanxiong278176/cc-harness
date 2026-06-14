@@ -1,7 +1,6 @@
-"""Tests for eval.reports.markdown + csv_report (Phase 5)."""
+"""Tests for eval.reports.markdown (Task 5.1)."""
 from eval.metrics.schema import SessionMetrics, ComparisonReport
 from eval.reports.markdown import render_comparison_report
-from eval.reports.csv_report import write_csv_report
 
 
 def _sm(**overrides):
