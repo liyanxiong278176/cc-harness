@@ -21,10 +21,15 @@ cc-harness 是一个**跑在终端里的编程代理**:通过 OpenAI 兼容 LLM(
 .venv/Scripts/python.exe -m pytest tests/ -k "name_substr" # by name
 
 # Lint
-.venv/Scripts/python.exe -m ruff check cc_harness/ tests/
+.venv/Scripts/python.exe -m ruff check cc_harness/ tests/ eval/ tests/eval/
 
 # Phase-1 regression (creates + runs hello.py end-to-end)
 .venv/Scripts/python.exe run_verify.py
+
+# GAIA context-management eval (compares master vs context-compaction)
+.venv/Scripts/python.exe -m eval.run --dry-run
+.venv/Scripts/python.exe -m eval.run --limit 30 --level 1
+.venv/Scripts/python.exe -m pytest tests/eval/ -v
 ```
 
 Force UTF-8 on Windows (avoids GBK crashes on 思考/✅/中文):
