@@ -50,3 +50,27 @@ def test_scorer_list_with_normalization():
     assert question_scorer("the Apple, an orange", "apple, orange") is True
 
 
+def test_extract_explicit_final_answer_marker():
+    from eval.grading.gaia_grader import extract_final_answer
+    text = "Let me think.\n\nFINAL ANSWER: 42"
+    assert extract_final_answer(text) == "42"
+
+
+def test_extract_case_insensitive_marker():
+    from eval.grading.gaia_grader import extract_final_answer
+    assert extract_final_answer("final answer: paris") == "paris"
+    assert extract_final_answer("Final Answer:  Paris  \n") == "Paris"
+
+
+def test_extract_fallback_to_last_paragraph():
+    from eval.grading.gaia_grader import extract_final_answer
+    text = "Step 1: ...\n\nStep 2: ...\n\nThe answer is 42."
+    assert extract_final_answer(text) == "The answer is 42."
+
+
+def test_extract_empty_or_whitespace():
+    from eval.grading.gaia_grader import extract_final_answer
+    assert extract_final_answer("") == ""
+    assert extract_final_answer("   ") == ""
+
+

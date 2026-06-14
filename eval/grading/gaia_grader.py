@@ -59,3 +59,25 @@ def question_scorer(model_answer: str, ground_truth: str) -> bool:
 
     return _normalize_str(model_answer) == _normalize_str(ground_truth)
 
+
+_FINAL_ANSWER_RE = re.compile(
+    r"final\s+answer\s*[:\-]\s*(.+?)\s*$",
+    re.IGNORECASE | re.DOTALL,
+)
+
+
+def extract_final_answer(assistant_content: str) -> str:
+    """Prefer 'FINAL ANSWER: X' (case-insensitive); else return last paragraph.
+
+    Returns empty string for empty input.
+    """
+    if not assistant_content or not assistant_content.strip():
+        return ""
+    m = _FINAL_ANSWER_RE.search(assistant_content)
+    if m:
+        return m.group(1).strip()
+    # Fallback: last non-empty paragraph
+    paragraphs = [p.strip() for p in assistant_content.split("\n\n") if p.strip()]
+    return paragraphs[-1] if paragraphs else ""
+
+
