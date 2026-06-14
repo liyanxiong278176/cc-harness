@@ -25,3 +25,29 @@ class GaiaTask:
     level: int
     ground_truth: str
     file_name: str | None  # None when task has no attachment
+
+
+def filter_tasks(
+    tasks: list[GaiaTask], *, include_attachments: bool = True,
+) -> tuple[list[GaiaTask], list[GaiaTask]]:
+    """Partition into (runnable, skipped).
+
+    Skipped:
+      - any task whose file_name suffix is in HARD_GAP_SUFFIXES
+      - any task whose file_name suffix is unknown (treated as hard for safety)
+      - if include_attachments is False: any task with a file_name
+    """
+    runnable, skipped = [], []
+    for t in tasks:
+        if t.file_name is None:
+            runnable.append(t)
+            continue
+        if not include_attachments:
+            skipped.append(t)
+            continue
+        suffix = "." + t.file_name.rsplit(".", 1)[-1].lower() if "." in t.file_name else ""
+        if suffix in SOFT_GAP_SUFFIXES:
+            runnable.append(t)
+        else:
+            skipped.append(t)
+    return runnable, skipped
