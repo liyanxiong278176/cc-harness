@@ -51,3 +51,39 @@ def filter_tasks(
         else:
             skipped.append(t)
     return runnable, skipped
+
+
+def stratified_sample(
+    tasks: list[GaiaTask], *, limit: int, seed: int,
+) -> list[GaiaTask]:
+    """Sample up to `limit` tasks, balancing across levels.
+
+    If a level has fewer tasks than its share, surplus is redistributed
+    to other levels. Deterministic on seed.
+    """
+    import random as _random
+    if limit <= 0 or not tasks:
+        return []
+    rng = _random.Random(seed)
+    by_level: dict[int, list[GaiaTask]] = {}
+    for t in tasks:
+        by_level.setdefault(t.level, []).append(t)
+    for lst in by_level.values():
+        rng.shuffle(lst)
+
+    levels = sorted(by_level)
+    per_level = max(1, limit // len(levels))
+    picked: list[GaiaTask] = []
+    for lv in levels:
+        picked.extend(by_level[lv][:per_level])
+    # Fill remaining slots from the largest leftover pools (round-robin)
+    remaining = limit - len(picked)
+    leftover = {lv: by_level[lv][per_level:] for lv in levels}
+    while remaining > 0 and any(leftover.values()):
+        for lv in levels:
+            if leftover[lv]:
+                picked.append(leftover[lv].pop(0))
+                remaining -= 1
+                if remaining == 0:
+                    break
+    return picked[:limit]

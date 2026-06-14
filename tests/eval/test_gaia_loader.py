@@ -41,3 +41,33 @@ def test_filter_tasks_text_only_when_attachments_disabled():
     runnable, skipped = filter_tasks(tasks, include_attachments=False)
     assert {t.task_id for t in runnable} == {"t1"}
     assert {t.task_id for t in skipped} == {"t2"}
+
+def test_stratified_sample_balances_levels():
+    from eval.datasets.gaia_loader import stratified_sample
+    tasks = (
+        [GaiaTask(f"L1-{i}", "q", 1, "a", None) for i in range(50)]
+        + [GaiaTask(f"L2-{i}", "q", 2, "a", None) for i in range(50)]
+        + [GaiaTask(f"L3-{i}", "q", 3, "a", None) for i in range(50)]
+    )
+    out = stratified_sample(tasks, limit=30, seed=42)
+    assert len(out) == 30
+    counts = {1: 0, 2: 0, 3: 0}
+    for t in out:
+        counts[t.level] += 1
+    # Roughly balanced (10 each, +/- 1 due to rounding)
+    assert all(9 <= c <= 11 for c in counts.values())
+
+def test_stratified_sample_deterministic():
+    from eval.datasets.gaia_loader import stratified_sample
+    tasks = [GaiaTask(f"t-{i}", "q", 1, "a", None) for i in range(100)]
+    a = stratified_sample(tasks, limit=10, seed=42)
+    b = stratified_sample(tasks, limit=10, seed=42)
+    assert [t.task_id for t in a] == [t.task_id for t in b]
+    c = stratified_sample(tasks, limit=10, seed=43)
+    assert [t.task_id for t in a] != [t.task_id for t in c]
+
+def test_stratified_sample_limit_exceeds_pool():
+    from eval.datasets.gaia_loader import stratified_sample
+    tasks = [GaiaTask(f"t-{i}", "q", 1, "a", None) for i in range(5)]
+    out = stratified_sample(tasks, limit=10, seed=42)
+    assert len(out) == 5  # cap at pool size
