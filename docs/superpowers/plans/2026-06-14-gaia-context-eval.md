@@ -1579,7 +1579,7 @@ git commit -m "feat(eval): import_from_worktree context manager"
 - Modify: `tests/eval/test_session_runner.py` (append)
 - Modify: `eval/runners/session_runner.py` (append)
 
-Note: `TurnTokenStats.compaction` is the LAST iter's stats only, not a list. We need a different capture path. Plan: monkey-patch `maybe_compact` on the worktree's `cc_harness.context` module to collect every call's stats into a session-scoped list before delegating.
+Note: `TurnTokenStats.compaction` is the LAST iter's stats only, not a list. We need a different capture path. Plan: monkey-patch `cc_harness.agent.maybe_compact` (NOT `cc_harness.context.maybe_compact`) on the worktree-imported `agent` module — `agent.py` does `from cc_harness.context import maybe_compact` at import time and calls it via the bound bare name, so we MUST patch the name on the `agent` module to redirect calls.
 
 - [ ] **Step 1: Write failing test**
 
@@ -1697,6 +1697,100 @@ git add eval/runners/session_runner.py tests/eval/test_session_runner.py
 git commit -m "feat(eval): classify_failure regex-based"
 ```
 
+### Task 4.4b: `_retry_llm_errors` exponential backoff (spec §7 retry-3x)
+
+**Files:**
+- Modify: `tests/eval/test_session_runner.py` (append)
+- Modify: `eval/runners/session_runner.py` (append)
+
+The spec mandates retry-3x with backoff for `rate_limit` / `llm_error`. `context_overflow` should NOT retry (it would just keep failing).
+
+- [ ] **Step 1: Write failing tests**
+
+```python
+import pytest
+
+@pytest.mark.asyncio
+async def test_retry_succeeds_on_third_attempt():
+    from eval.runners.session_runner import _retry_llm_errors
+    attempts = []
+    async def flaky():
+        attempts.append(1)
+        if len(attempts) < 3:
+            raise Exception("429 Too Many Requests")
+        return "ok"
+    result = await _retry_llm_errors(flaky, max_attempts=3, base_delay=0.01)
+    assert result == "ok"
+    assert len(attempts) == 3
+
+
+@pytest.mark.asyncio
+async def test_retry_does_not_retry_on_context_overflow():
+    from eval.runners.session_runner import _retry_llm_errors
+    attempts = []
+    async def overflow():
+        attempts.append(1)
+        raise Exception("context_length_exceeded")
+    with pytest.raises(Exception, match="context_length"):
+        await _retry_llm_errors(overflow, max_attempts=3, base_delay=0.01)
+    assert len(attempts) == 1   # no retry
+
+
+@pytest.mark.asyncio
+async def test_retry_exhausts_and_raises():
+    from eval.runners.session_runner import _retry_llm_errors
+    attempts = []
+    async def always_fail():
+        attempts.append(1)
+        raise Exception("429")
+    with pytest.raises(Exception, match="429"):
+        await _retry_llm_errors(always_fail, max_attempts=3, base_delay=0.01)
+    assert len(attempts) == 3
+```
+
+- [ ] **Step 2: Run, expect ImportError**
+
+- [ ] **Step 3: Implement**
+
+Append to `eval/runners/session_runner.py`:
+```python
+import asyncio as _asyncio
+
+
+async def _retry_llm_errors(
+    coro_factory, *, max_attempts: int = 3, base_delay: float = 1.0,
+):
+    """Retry `coro_factory()` up to max_attempts with exponential backoff.
+
+    Skips retry for context_overflow (deterministic, won't recover by retrying).
+    Retries on rate_limit / llm_error per spec §7.
+    """
+    last_exc = None
+    for attempt in range(1, max_attempts + 1):
+        try:
+            return await coro_factory()
+        except Exception as e:
+            kind = classify_failure(e)
+            if kind == "context_overflow":
+                raise  # don't retry
+            last_exc = e
+            if attempt < max_attempts:
+                await _asyncio.sleep(base_delay * (2 ** (attempt - 1)))
+    raise last_exc  # type: ignore[misc]
+```
+
+- [ ] **Step 4: Run tests, expect pass**
+
+Run: `.venv/Scripts/python.exe -m pytest tests/eval/test_session_runner.py -v`
+Expected: 10 passed.
+
+- [ ] **Step 5: Commit**
+
+```bash
+git add eval/runners/session_runner.py tests/eval/test_session_runner.py
+git commit -m "feat(eval): _retry_llm_errors with exp backoff (spec §7)"
+```
+
 ### Task 4.5: `run_session` — the main loop (TDD with FakeLLM)
 
 **Files:**
@@ -1802,16 +1896,18 @@ async def run_session(
     from cc_harness.agent import run_turn
     from cc_harness.tokens import TokenCounter
     from cc_harness.prompts import build_system_prompt
-    from cc_harness import context as _ctx_mod
+    from cc_harness import agent as _agent_mod   # for monkey-patching maybe_compact
 
     counter = TokenCounter()
     cc_supported = _branch_supports_context_config(run_turn)
 
-    # Install compaction capture (only meaningful on context-compaction branch)
+    # Install compaction capture: agent.py imported maybe_compact at module
+    # load time, so we MUST patch the name on the agent module (not on
+    # cc_harness.context) for the redirect to take effect.
     captured_per_task: list = []
-    if cc_supported and getattr(_ctx_mod, "maybe_compact", None):
-        original = _ctx_mod.maybe_compact
-        _ctx_mod.maybe_compact = make_compaction_capture(original, captured_per_task)
+    original_mc = getattr(_agent_mod, "maybe_compact", None)
+    if cc_supported and original_mc is not None:
+        _agent_mod.maybe_compact = make_compaction_capture(original_mc, captured_per_task)
 
     messages: list[dict] = [{
         "role": "system",
@@ -1834,9 +1930,12 @@ async def run_session(
             kw = {}
             if cc_supported:
                 kw["context_config"] = context_config
-            turn_stats = await run_turn(
-                messages, llm, mcp, max_iter=max_iter, cwd=cwd or ".",
-                token_counter=counter, **kw,
+            turn_stats = await _retry_llm_errors(
+                lambda: run_turn(
+                    messages, llm, mcp, max_iter=max_iter, cwd=cwd or ".",
+                    token_counter=counter, **kw,
+                ),
+                max_attempts=3,
             )
         except Exception as e:
             failed = True
@@ -1924,7 +2023,7 @@ async def run_session(
 - [ ] **Step 4: Run, expect pass**
 
 Run: `.venv/Scripts/python.exe -m pytest tests/eval/test_session_runner.py -v`
-Expected: 8 passed.
+Expected: 11 passed.
 
 - [ ] **Step 5: Commit**
 
@@ -1994,8 +2093,13 @@ async def test_run_session_aborts_after_consecutive_overflows(tmp_path):
             self.model = "fake"
         async def chat(self, messages, tools):
             self.call_count += 1
+            # The lexical presence of `yield` below makes this an async
+            # generator at compile time. When iterated, the body runs:
+            # call_count += 1 → raise. The exception propagates through
+            # the `async for` in agent.run_turn. The yield is unreachable
+            # at runtime but required for the function-type contract.
             raise Exception("context_length_exceeded: messages too long")
-            yield  # unreachable; needed to make it a generator
+            yield  # noqa: B901 — required to make this an async generator
 
     sm = await run_session(
         tasks=tasks, llm=OverflowFakeLLM(),
@@ -2013,7 +2117,7 @@ async def test_run_session_aborts_after_consecutive_overflows(tmp_path):
 - [ ] **Step 2: Run, expect pass (logic already implemented in 4.5)**
 
 Run: `.venv/Scripts/python.exe -m pytest tests/eval/test_session_runner.py -v`
-Expected: 10 passed.
+Expected: 13 passed.
 
 - [ ] **Step 3: Commit**
 
@@ -2696,15 +2800,20 @@ git commit -m "feat(eval): main() orchestrator + dry-run mode"
         out_dir.mkdir(parents=True, exist_ok=True)
         commit = subprocess.run(["git", "-C", str(wt), "rev-parse", "HEAD"],
                                 capture_output=True, text=True).stdout.strip()[:7]
-        # Use the worktree's own load_config / LLMClient / MCPClient
+        # Use the worktree's own load_config / LLMClient / MCPClient.
+        # .env lives at the REPO root, not inside the worktree (worktrees
+        # don't copy untracked files; .env is gitignored). Use the main
+        # repo's .env so credentials are available.
+        repo_env = Path(".env").resolve()
         with import_from_worktree(wt):
             from cc_harness.config import load_config as _load_cfg
             from cc_harness.llm import LLMClient as _LLM
             from cc_harness.mcp_client import MCPClient as _MCP
-            cfg = _load_cfg(env_path=wt / ".env", mcp_json_path=args.mcp_config)
+            cfg = _load_cfg(env_path=repo_env, mcp_json_path=args.mcp_config)
             llm = _LLM(api_key=cfg.openai_api_key, base_url=cfg.openai_base_url,
                        model=cfg.openai_model)
-            mcp = await _MCP.create(cfg.mcp_servers)  # noqa: F821 — context handled outside await
+            mcp = _MCP(cfg.mcp_servers)
+            await mcp.start()
             try:
                 sm = await run_session(
                     tasks=sample, llm=llm, mcp=mcp,
@@ -2715,7 +2824,7 @@ git commit -m "feat(eval): main() orchestrator + dry-run mode"
                     git_commit=commit, cwd=str(wt),
                 )
             finally:
-                await mcp.close()
+                await mcp.shutdown()
         branch_sessions[branch] = sm
         # Re-read trace to collect TaskMetrics list for per_task_diffs
         tms = []
@@ -2728,7 +2837,7 @@ git commit -m "feat(eval): main() orchestrator + dry-run mode"
                 tms.append(TaskMetrics(**d, per_iter_snapshots=[]))
         branch_task_metrics[branch] = tms
 
-    # Compare
+    # Compare (requires both branches; otherwise just print branch summary)
     if "master" in branch_sessions and "context-compaction" in branch_sessions:
         cmp = compare_sessions(
             branch_sessions["master"], branch_sessions["context-compaction"],
@@ -2748,6 +2857,15 @@ git commit -m "feat(eval): main() orchestrator + dry-run mode"
         if not args.no_report and "csv" in args.report_format:
             write_csv_report(cmp, args.output_dir / "report.csv")
         print(f"[report] written to {args.output_dir}")
+    else:
+        print(
+            f"[report] skipped comparison — needs both 'master' and "
+            f"'context-compaction' branches; got {list(branch_sessions)}"
+        )
+        # Still emit per-branch session_metrics.json for inspection
+        for branch, sm in branch_sessions.items():
+            print(f"  - {branch}: {sm.tasks_correct}/{sm.tasks_total} correct, "
+                  f"{sm.overflow_count} overflows, {sm.api_total_tokens_sum:,} API tokens")
 
     # Cleanup
     if not args.keep_worktrees:
