@@ -6,7 +6,6 @@ NOT collected by pytest default (underscore prefix). Run manually:
 
 Costs real LLM tokens (~50K, ~1分钱 on DeepSeek). Requires HF login.
 """
-import asyncio
 import pytest
 from pathlib import Path
 from eval.run import main, Args
