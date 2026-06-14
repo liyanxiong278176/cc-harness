@@ -210,11 +210,12 @@ class IterSnapshot:
     tokens_saved_this_iter: int     # before - after (0 if NONE)
 ```
 
-Collected by **periodic re-categorize** inside `session_runner`: between LLM
-calls within `run_turn`, before each `maybe_compact` call. Since `run_turn` is
-inside the worktree, we don't modify it. Instead, collector reconstructs
-snapshots **post-hoc** by replaying messages + the `compaction` stat objects in
-`turn_stats.compaction` (one per iter that triggered).
+Reconstructed **post-hoc** by collector (we do not modify `run_turn`). Source
+material: the final `messages` list after the turn + the `turn_stats.compaction`
+field (one per iter that triggered compaction). Collector replays bucket
+totals iter-by-iter so each snapshot reflects the state at the boundary of
+that iter. Live in-loop collection would require either patching `run_turn` or
+threading a callback through it; both are rejected to keep eval non-invasive.
 
 Note: master branch has no per-iter compaction stats and no `compaction` field.
 For master, `compaction_tier="NONE"` always, and per-iter snapshots are derived
@@ -236,8 +237,8 @@ class TaskMetrics:
     ground_truth: str
     is_correct: bool
     failed: bool
-    failure_reason: str | None       # context_overflow / llm_error / max_iter
-                                     # / tool_unavailable / grader_error
+    failure_reason: str | None       # context_overflow / llm_error / rate_limit
+                                     # / max_iter / tool_unavailable / grader_error
 
     # Per-iter trace
     per_iter_snapshots: list[IterSnapshot]
@@ -353,11 +354,13 @@ python -m eval.run [OPTIONS]
 --parallel
 --on-error {continue,abort}      default continue
 --checkpoint-every N             default 5
+--abort-after-overflows N        consecutive context_overflow failures that kill
+                                  the session; default 3 (use 0 to disable)
 --dry-run                        load + ping + list tasks, no LLM calls
 
 # Output
 --output-dir PATH                default eval/runs/{YYYY-MM-DD}-{level}-{limit}q-{sha}
---report-format LIST             default markdown,json
+--report-format LIST             default markdown,csv,json
 --no-report
 ```
 
@@ -395,7 +398,7 @@ same explicit `ContextConfig` for fair comparison.
 | Tool call timeout | agent's existing handler | trace records `tool_error`, task continues |
 | LLM rate limit (429) | streaming exception | retry with backoff (3 attempts); on exhaustion: `failed=True, reason=rate_limit`, session continues to next task |
 | LLM other error (5xx, network) | streaming exception | same as rate limit |
-| Context overflow on master (LLM returns `context_length_exceeded`) | exception text match | `failed=True, reason=context_overflow, overflow=True`. Session continues. If **3 consecutive** tasks overflow: session ends, remaining tasks recorded with `skipped: session_dead` |
+| Context overflow on master (LLM returns `context_length_exceeded`) | exception text match | `failed=True, reason=context_overflow, overflow=True`. Session continues. If `--abort-after-overflows` consecutive (default 3) tasks overflow: session ends, remaining tasks recorded with `skipped: session_dead` |
 | User Ctrl-C | KeyboardInterrupt | dump current trace + messages, render partial report with explicit "TRUNCATED" header |
 | Disk write fail | OSError | abort entire session |
 | GAIA grader raises | exception | task marked `is_correct=False, grader_warning=str(e)`, session continues |
