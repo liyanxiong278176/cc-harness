@@ -1,12 +1,8 @@
 """Tests for eval.runners.session_runner (Tasks 4.1-4.6)."""
 import asyncio
 import sys
-import inspect
 import pytest
-from pathlib import Path
-from cc_harness.llm import PendingToolCall
 from tests.test_agent import FakeLLM, FakeMCP, FakeStreamEvent
-from cc_harness.mcp_client import ToolResult
 
 
 def _final_event(text):

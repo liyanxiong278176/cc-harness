@@ -1,6 +1,6 @@
 """Tests for eval.reports.csv_report (Task 5.2)."""
 import csv
-from eval.metrics.schema import SessionMetrics, ComparisonReport
+from eval.metrics.schema import ComparisonReport
 from eval.reports.csv_report import write_csv_report
 from tests.eval.test_markdown_report import _sm
 

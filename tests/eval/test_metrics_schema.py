@@ -1,7 +1,7 @@
 """Tests for eval.metrics.schema dataclasses (Task 3.1)."""
 from dataclasses import asdict
 from eval.metrics.schema import (
-    IterSnapshot, TaskMetrics, SessionMetrics, ComparisonReport,
+    IterSnapshot, TaskMetrics, SessionMetrics,
 )
 
 

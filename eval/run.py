@@ -2,10 +2,19 @@
 from __future__ import annotations
 import argparse
 import asyncio as _asyncio
+import json as _json
 import subprocess
 import sys as _sys
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
+from datetime import datetime, timezone
 from pathlib import Path
+
+from cc_harness.config import ContextConfig
+from eval.metrics.collector import build_per_task_diffs, compare_sessions
+from eval.metrics.schema import SessionMetrics, TaskMetrics
+from eval.reports.csv_report import write_csv_report
+from eval.reports.markdown import render_comparison_report
+from eval.runners.session_runner import import_from_worktree, run_session
 
 
 @dataclass
@@ -132,7 +141,7 @@ def worktree_remove(path: Path, *, force: bool = True) -> None:
 # --- 6.4: main() + dry-run ---
 
 # Imported at module level so test monkeypatches can rebind them on this module.
-from eval.datasets.gaia_loader import (
+from eval.datasets.gaia_loader import (  # noqa: E402  (after dataclass/Args)
     filter_tasks as _filter_tasks,
     load_gaia_validation as _load_gaia_validation,
     stratified_sample as _stratified_sample,
@@ -169,10 +178,115 @@ async def main(args: "Args | None" = None) -> int:
             print(f"    … and {len(sample) - 10} more")
         return 0
 
-    # (Full run path is added in Task 6.5; for now it's a stub that errors
-    # clearly so users get a helpful message rather than a silent dry-run run.)
-    print("[full run] not yet implemented in this build — see Task 6.5")
-    return 3
+    # --- 6.5: full run path ---
+
+    # Resolve output dir
+    if args.output_dir is None:
+        date = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+        head = subprocess.run(["git", "rev-parse", "--short", "HEAD"],
+                              capture_output=True, text=True).stdout.strip()
+        args.output_dir = Path("eval/runs") / f"{date}-L{args.level}-{args.limit}q-{head}"
+    args.output_dir.mkdir(parents=True, exist_ok=True)
+
+    # Build ContextConfig
+    ctx_kwargs: dict = {}
+    if args.context_window:
+        ctx_kwargs["context_window"] = args.context_window
+    if args.tier_overrides:
+        for pair in args.tier_overrides.split(","):
+            k, v = pair.split("=")
+            ctx_kwargs[f"tier{k.strip()}_threshold"] = float(v.strip())
+    ctx_config = ContextConfig(**ctx_kwargs) if ctx_kwargs else ContextConfig()
+
+    # Setup worktrees
+    args.worktree_dir.mkdir(parents=True, exist_ok=True)
+    branch_to_wt: dict[str, Path] = {}
+    for branch in args.branches:
+        wt = args.worktree_dir / branch
+        if not wt.exists():
+            print(f"[worktree] adding {branch} → {wt}")
+            worktree_add(wt, branch)
+        branch_to_wt[branch] = wt
+
+    # Run each branch SERIALLY (parallel disabled in v1)
+    branch_sessions: dict[str, SessionMetrics] = {}
+    branch_task_metrics: dict[str, list] = {}
+    # .env lives at the REPO root, not inside the worktree (worktrees don't
+    # copy untracked files; .env is gitignored). Use the main repo's .env
+    # so credentials are available to LLMClient / MCPClient in the worktree.
+    repo_env = Path(".env").resolve()
+    for branch, wt in branch_to_wt.items():
+        print(f"[branch] {branch} → {wt}")
+        out_dir = args.output_dir / branch
+        out_dir.mkdir(parents=True, exist_ok=True)
+        commit = subprocess.run(["git", "-C", str(wt), "rev-parse", "HEAD"],
+                                capture_output=True, text=True).stdout.strip()[:7]
+
+        with import_from_worktree(wt):
+            from cc_harness.config import load_config as _load_cfg
+            from cc_harness.llm import LLMClient as _LLM
+            from cc_harness.mcp_client import MCPClient as _MCP
+            cfg = _load_cfg(env_path=repo_env, mcp_json_path=args.mcp_config)
+            llm = _LLM(api_key=cfg.openai_api_key, base_url=cfg.openai_base_url,
+                       model=cfg.openai_model)
+            mcp = _MCP(cfg.mcp_servers)
+            await mcp.start()
+            try:
+                sm = await run_session(
+                    tasks=sample, llm=llm, mcp=mcp,
+                    branch=branch, out_dir=out_dir,
+                    context_config=ctx_config, max_iter=args.max_iter,
+                    checkpoint_every=args.checkpoint_every,
+                    abort_after_overflows=args.abort_after_overflows,
+                    git_commit=commit, cwd=str(wt),
+                )
+            finally:
+                await mcp.shutdown()
+        branch_sessions[branch] = sm
+
+        # Re-read trace to collect TaskMetrics list for per_task_diffs
+        tms: list = []
+        with (out_dir / "trace.jsonl").open(encoding="utf-8") as f:
+            for line in f:
+                d = _json.loads(line)
+                d.pop("per_iter_snapshots", None)
+                tms.append(TaskMetrics(**d, per_iter_snapshots=[]))
+        branch_task_metrics[branch] = tms
+
+    # Compare (requires both branches; otherwise just print per-branch summary)
+    if "master" in branch_sessions and "context-compaction" in branch_sessions:
+        cmp = compare_sessions(
+            branch_sessions["master"], branch_sessions["context-compaction"],
+        )
+        cmp.per_task_diffs = build_per_task_diffs(
+            branch_task_metrics["master"],
+            branch_task_metrics["context-compaction"],
+        )
+        (args.output_dir / "comparison.json").write_text(
+            _json.dumps(asdict(cmp), ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+        if not args.no_report and "markdown" in args.report_format:
+            (args.output_dir / "report.md").write_text(
+                render_comparison_report(cmp), encoding="utf-8",
+            )
+        if not args.no_report and "csv" in args.report_format:
+            write_csv_report(cmp, args.output_dir / "report.csv")
+        print(f"[report] written to {args.output_dir}")
+    else:
+        print(
+            f"[report] skipped comparison — needs both 'master' and "
+            f"'context-compaction' branches; got {list(branch_sessions)}"
+        )
+        for branch, sm in branch_sessions.items():
+            print(f"  - {branch}: {sm.tasks_correct}/{sm.tasks_total} correct, "
+                  f"{sm.overflow_count} overflows, {sm.api_total_tokens_sum:,} API tokens")
+
+    # Cleanup
+    if not args.keep_worktrees:
+        for branch, wt in branch_to_wt.items():
+            worktree_remove(wt)
+    return 0
 
 
 if __name__ == "__main__":

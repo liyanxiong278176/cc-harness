@@ -1,7 +1,20 @@
-"""Build TaskMetrics from TurnTokenStats + per-iter snapshots."""
+"""Build TaskMetrics from TurnTokenStats + per-iter snapshots.
+
+Public API:
+- `collect_task_metrics` (Task 3.2/3.3)
+- `reconstruct_iter_snapshots` (Task 3.4)
+- `aggregate_session_metrics` (Task 3.5)
+- `compare_sessions` (Task 3.6)
+- `build_per_task_diffs` (Task 3.6)
+"""
 from __future__ import annotations
+import statistics
 from eval.datasets.gaia_loader import GaiaTask
-from eval.metrics.schema import IterSnapshot, TaskMetrics
+from eval.metrics.schema import (
+    IterSnapshot,
+    SessionMetrics,
+    TaskMetrics,
+)
 
 
 def collect_task_metrics(
@@ -27,8 +40,6 @@ def collect_task_metrics(
     peak_ratio = peak / context_window if context_window else 0.0
     overflow = peak_ratio > 1.0
 
-    # Aggregate compaction across iters from snapshots (works for both branches;
-    # master snapshots will all be NONE)
     tier1 = sum(1 for s in iter_snapshots if s.compaction_tier == "SNIP")
     tier2 = sum(1 for s in iter_snapshots if s.compaction_tier == "PRUNE")
     tier3 = sum(1 for s in iter_snapshots if s.compaction_tier == "SUMMARIZE")
@@ -50,7 +61,7 @@ def collect_task_metrics(
         compactions_in_task=compactions,
         tier1_count=tier1, tier2_count=tier2, tier3_count=tier3,
         tokens_saved_in_task=tokens_saved,
-        summarize_llm_overhead_tokens=0,  # populated by reconstruct (3.4)
+        summarize_llm_overhead_tokens=0,
         api_prompt_tokens=getattr(turn_stats, "api_prompt_tokens", 0),
         api_completion_tokens=getattr(turn_stats, "api_completion_tokens", 0),
         api_total_tokens=getattr(turn_stats, "api_total_tokens", 0),
@@ -70,10 +81,6 @@ def reconstruct_iter_snapshots(
 ) -> list[IterSnapshot]:
     """Walk messages from prefix_before_task forward; emit one snapshot per
     assistant-message boundary (representing one ReAct iter completion).
-
-    For each assistant boundary, categorize the prefix-so-far into 6 buckets
-    via `counter.categorize`. If compaction_per_iter has an entry for that
-    iter, tier + tokens_saved come from it; else NONE / 0.
     """
     snapshots: list[IterSnapshot] = []
     iter_idx = 0
@@ -82,7 +89,6 @@ def reconstruct_iter_snapshots(
             continue
         cats = counter.categorize(messages[:end_idx], tools=tools)
         total = sum(cats.values())
-        # compaction stat for this iter (if any)
         if iter_idx < len(compaction_per_iter):
             comp = compaction_per_iter[iter_idx]
             tier_name = comp.tier.name if comp.tier else "NONE"
@@ -106,20 +112,15 @@ def reconstruct_iter_snapshots(
     return snapshots
 
 
-import statistics
-
-
 def aggregate_session_metrics(
     task_metrics, *,
     branch: str, started_at: str, finished_at: str, git_commit: str,
     config_snapshot: dict, tool_unavailable_count: int,
-):
-    from eval.metrics.schema import SessionMetrics  # local: avoid circular
-
+) -> SessionMetrics:
     n = len(task_metrics)
     correct = sum(1 for t in task_metrics if t.is_correct)
     failed = sum(1 for t in task_metrics if t.failed)
-    runnable = n  # tool_unavailable excluded BEFORE this fn; n is the runnable pool
+    runnable = n
     accuracy = (correct / runnable) if runnable else 0.0
 
     def _q(vals, q):
@@ -153,18 +154,15 @@ def aggregate_session_metrics(
 
 def compare_sessions(master, cc):
     from eval.metrics.schema import ComparisonReport
-
     api_delta = cc.api_total_tokens_sum - master.api_total_tokens_sum
     api_pct = (100.0 * api_delta / master.api_total_tokens_sum) if master.api_total_tokens_sum else 0.0
-    # Per-task diff is built by run.py orchestrator (which has both task lists);
-    # if not pre-populated, leave empty
     return ComparisonReport(
         master=master, cc=cc,
         accuracy_delta=cc.accuracy - master.accuracy,
         peak_ratio_delta=cc.peak_ratio_overall - master.peak_ratio_overall,
         api_tokens_delta=api_delta, api_tokens_delta_pct=api_pct,
         overflow_delta=cc.overflow_count - master.overflow_count,
-        per_task_diffs=[],  # populated externally; see Task 6.4
+        per_task_diffs=[],
     )
 
 
@@ -192,6 +190,3 @@ def build_per_task_diffs(
             "cc_api_tokens": c.api_total_tokens if c else None,
         })
     return out
-
-
-
