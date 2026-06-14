@@ -57,3 +57,51 @@ def collect_task_metrics(
         iter_count=getattr(turn_stats, "iter_count", 0),
         wall_time_seconds=wall_time_seconds,
     )
+
+
+def reconstruct_iter_snapshots(
+    *,
+    messages: list[dict],
+    tools: list[dict] | None,
+    counter,                            # TokenCounter
+    compaction_per_iter: list,          # list[CompactionStats]; [] for master
+    context_window: int,
+    prefix_before_task: int,
+) -> list[IterSnapshot]:
+    """Walk messages from prefix_before_task forward; emit one snapshot per
+    assistant-message boundary (representing one ReAct iter completion).
+
+    For each assistant boundary, categorize the prefix-so-far into 6 buckets
+    via `counter.categorize`. If compaction_per_iter has an entry for that
+    iter, tier + tokens_saved come from it; else NONE / 0.
+    """
+    snapshots: list[IterSnapshot] = []
+    iter_idx = 0
+    for end_idx in range(prefix_before_task + 1, len(messages) + 1):
+        if messages[end_idx - 1].get("role") != "assistant":
+            continue
+        cats = counter.categorize(messages[:end_idx], tools=tools)
+        total = sum(cats.values())
+        # compaction stat for this iter (if any)
+        if iter_idx < len(compaction_per_iter):
+            comp = compaction_per_iter[iter_idx]
+            tier_name = comp.tier.name if comp.tier else "NONE"
+            saved = max(0, comp.before_tokens - comp.after_tokens)
+        else:
+            tier_name, saved = "NONE", 0
+        snapshots.append(IterSnapshot(
+            iter_index=iter_idx,
+            bucket_system_prompt=cats.get("system_prompt", 0),
+            bucket_user_input=cats.get("user_input", 0),
+            bucket_tool_calls=cats.get("tool_calls", 0),
+            bucket_llm_output=cats.get("llm_output", 0),
+            bucket_tool_definitions=cats.get("tool_definitions", 0),
+            bucket_summary=cats.get("summary", 0),
+            total_tokens=total,
+            ratio=total / context_window if context_window else 0.0,
+            compaction_tier=tier_name,
+            tokens_saved_this_iter=saved,
+        ))
+        iter_idx += 1
+    return snapshots
+

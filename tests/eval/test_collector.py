@@ -81,3 +81,33 @@ def test_collect_handles_master_without_compaction_field():
     assert tm.tier1_count == 0
     assert tm.compactions_in_task == 0
     assert tm.api_total_tokens == 700
+
+
+def test_reconstruct_snapshots_from_messages_only():
+    """Master branch: no per-iter compaction data. Snapshots derived from
+    walking messages and categorizing prefix-by-prefix.
+    """
+    from cc_harness.tokens import TokenCounter
+    from eval.metrics.collector import reconstruct_iter_snapshots
+
+    messages = [
+        {"role": "system", "content": "s"},
+        {"role": "user", "content": "q"},
+        {"role": "assistant", "content": "thinking",
+         "tool_calls": [{"id": "1", "type": "function",
+                         "function": {"name": "t", "arguments": "{}"}}]},
+        {"role": "tool", "tool_call_id": "1", "content": "result"},
+        {"role": "assistant", "content": "answer"},
+    ]
+    counter = TokenCounter()
+    snaps = reconstruct_iter_snapshots(
+        messages=messages, tools=[], counter=counter,
+        compaction_per_iter=[],     # master: empty
+        context_window=200_000,
+        prefix_before_task=2,       # system + user already in
+    )
+    # 2 assistant boundaries → 2 snapshots
+    assert len(snaps) == 2
+    # ratios increase
+    assert snaps[1].total_tokens >= snaps[0].total_tokens
+    assert all(s.compaction_tier == "NONE" for s in snaps)
