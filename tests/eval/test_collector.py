@@ -50,3 +50,34 @@ def test_collect_with_compaction_stats():
     assert tm.peak_total_tokens == 850
     assert tm.api_total_tokens == 700
     assert tm.bucket_user_input == 100
+
+
+def test_collect_handles_master_without_compaction_field():
+    """Master's TurnTokenStats has no 'compaction' / no 'summary' bucket.
+
+    We simulate by passing a SimpleNamespace lacking those fields.
+    """
+    from types import SimpleNamespace
+    stats = SimpleNamespace(
+        user_input=100, tool_calls=50, llm_output=80,
+        system_prompt=200, tool_definitions=170,
+        # no `summary`, no `compaction`
+        api_prompt_tokens=600, api_completion_tokens=100, api_total_tokens=700,
+        iter_count=3, api_reported=True,
+    )
+    snapshots = [IterSnapshot(
+        iter_index=0, bucket_system_prompt=200, bucket_user_input=100,
+        bucket_tool_calls=0, bucket_llm_output=0, bucket_tool_definitions=170,
+        bucket_summary=0, total_tokens=470, ratio=0.005,
+        compaction_tier="NONE", tokens_saved_this_iter=0,
+    )]
+    tm = collect_task_metrics(
+        task=_task(), task_index=0, branch="master",
+        turn_stats=stats, iter_snapshots=snapshots,
+        final_answer="42", is_correct=True, failed=False, failure_reason=None,
+        wall_time_seconds=5.0, context_window=200_000,
+    )
+    assert tm.bucket_summary == 0
+    assert tm.tier1_count == 0
+    assert tm.compactions_in_task == 0
+    assert tm.api_total_tokens == 700
