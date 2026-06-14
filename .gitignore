@@ -12,3 +12,6 @@ build/
 .idea/
 .DS_Store
 .worktrees/
+eval/runs/
+.eval-worktrees/
+~/.cache/gaia-eval/
