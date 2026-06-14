@@ -37,3 +37,16 @@ def test_scorer_robust_to_whitespace():
     from eval.grading.gaia_grader import question_scorer
     assert question_scorer("  Paris  \n", "Paris") is True
 
+
+def test_scorer_list_order_insensitive():
+    from eval.grading.gaia_grader import question_scorer
+    assert question_scorer("Paris, London", "London, Paris") is True
+    assert question_scorer("Paris", "London, Paris") is False  # missing
+    assert question_scorer("Paris, London, Berlin", "London, Paris") is False  # extra
+
+
+def test_scorer_list_with_normalization():
+    from eval.grading.gaia_grader import question_scorer
+    assert question_scorer("the Apple, an orange", "apple, orange") is True
+
+
