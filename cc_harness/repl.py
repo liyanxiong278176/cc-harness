@@ -106,6 +106,7 @@ async def run_repl(
     cwd: str,
     default_mode: str = "coding",
     design_dir: Path | None = None,
+    context_config: ContextConfig | None = None,
 ) -> None:
     """Run the interactive REPL.
 
@@ -120,7 +121,7 @@ async def run_repl(
         )
 
     console = Console()
-    state = ReplState(mode=default_mode)
+    state = ReplState(mode=default_mode, context_config=context_config or ContextConfig())
 
     n_tools = len(mcp.list_tools())
     print_info(console, "")
