@@ -21,3 +21,41 @@ def _normalize_str(s: str) -> str:
     s = s.translate(_PUNCT_TABLE)
     s = _WS_RE.sub(" ", s).strip()
     return s
+
+
+def _try_float(s: str) -> float | None:
+    """Parse 's' as float after stripping $/€/£/¥ and commas. Return None if NA."""
+    if not s:
+        return None
+    cleaned = re.sub(r"[$€£¥,]", "", s).strip()
+    try:
+        return float(cleaned)
+    except ValueError:
+        return None
+
+
+def question_scorer(model_answer: str, ground_truth: str) -> bool:
+    """Return True iff model_answer matches ground_truth.
+
+    Rules (in order):
+      1. If both parse as float: equal within 1% relative tolerance.
+      2. If ground_truth contains a comma: treat both as multisets of items,
+         normalized element-wise (order-insensitive, exact-element match).
+      3. Else: normalized string equality.
+    """
+    if model_answer is None:
+        return False
+    gt_f = _try_float(ground_truth)
+    ma_f = _try_float(model_answer)
+    if gt_f is not None and ma_f is not None:
+        if gt_f == 0:
+            return abs(ma_f) < 1e-9
+        return abs(ma_f - gt_f) / abs(gt_f) <= 0.01
+
+    if "," in ground_truth:
+        gt_items = {_normalize_str(x) for x in ground_truth.split(",") if x.strip()}
+        ma_items = {_normalize_str(x) for x in model_answer.split(",") if x.strip()}
+        return gt_items == ma_items
+
+    return _normalize_str(model_answer) == _normalize_str(ground_truth)
+
