@@ -105,3 +105,49 @@ def reconstruct_iter_snapshots(
         iter_idx += 1
     return snapshots
 
+
+import statistics
+
+
+def aggregate_session_metrics(
+    task_metrics, *,
+    branch: str, started_at: str, finished_at: str, git_commit: str,
+    config_snapshot: dict, tool_unavailable_count: int,
+):
+    from eval.metrics.schema import SessionMetrics  # local: avoid circular
+
+    n = len(task_metrics)
+    correct = sum(1 for t in task_metrics if t.is_correct)
+    failed = sum(1 for t in task_metrics if t.failed)
+    runnable = n  # tool_unavailable excluded BEFORE this fn; n is the runnable pool
+    accuracy = (correct / runnable) if runnable else 0.0
+
+    def _q(vals, q):
+        return statistics.quantiles(vals, n=100)[q - 1] if len(vals) >= 2 else (vals[0] if vals else 0)
+
+    peak_ratios = [t.peak_ratio for t in task_metrics] or [0.0]
+    saved = [t.tokens_saved_in_task for t in task_metrics] or [0]
+    peaks = [t.peak_total_tokens for t in task_metrics] or [0]
+
+    return SessionMetrics(
+        branch=branch, started_at=started_at, finished_at=finished_at,
+        git_commit=git_commit, config_snapshot=config_snapshot,
+        tasks_total=n, tasks_correct=correct, tasks_failed=failed,
+        tasks_tool_unavailable=tool_unavailable_count, accuracy=accuracy,
+        peak_total_tokens_overall=max(peaks),
+        peak_ratio_overall=max(peak_ratios),
+        overflow_count=sum(1 for t in task_metrics if t.overflow),
+        compactions_total=sum(t.compactions_in_task for t in task_metrics),
+        tier1_total=sum(t.tier1_count for t in task_metrics),
+        tier2_total=sum(t.tier2_count for t in task_metrics),
+        tier3_total=sum(t.tier3_count for t in task_metrics),
+        tokens_saved_total=sum(saved),
+        summarize_llm_overhead_total=sum(t.summarize_llm_overhead_tokens for t in task_metrics),
+        peak_ratio_p50=_q(peak_ratios, 50), peak_ratio_p95=_q(peak_ratios, 95),
+        tokens_saved_p50=int(_q(saved, 50)), tokens_saved_p95=int(_q(saved, 95)),
+        api_total_tokens_sum=sum(t.api_total_tokens for t in task_metrics),
+        iter_count_sum=sum(t.iter_count for t in task_metrics),
+        wall_time_seconds_total=sum(t.wall_time_seconds for t in task_metrics),
+    )
+
+
