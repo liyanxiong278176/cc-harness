@@ -71,3 +71,28 @@ def test_stratified_sample_limit_exceeds_pool():
     tasks = [GaiaTask(f"t-{i}", "q", 1, "a", None) for i in range(5)]
     out = stratified_sample(tasks, limit=10, seed=42)
     assert len(out) == 5  # cap at pool size
+
+def test_load_gaia_validation_constructs_tasks(monkeypatch):
+    """load_gaia_validation maps HF rows -> GaiaTask correctly."""
+    from eval.datasets import gaia_loader
+
+    fake_rows = [
+        {"task_id": "id1", "Question": "Q1", "Level": "1",
+         "Final answer": "42", "file_name": ""},
+        {"task_id": "id2", "Question": "Q2", "Level": "2",
+         "Final answer": "yes", "file_name": "data.csv"},
+    ]
+    class FakeSplit(list):
+        pass
+    monkeypatch.setattr(
+        gaia_loader, "_hf_load_dataset",
+        lambda: {"validation": FakeSplit(fake_rows)},
+    )
+
+    tasks = gaia_loader.load_gaia_validation()
+    assert len(tasks) == 2
+    assert tasks[0].task_id == "id1"
+    assert tasks[0].level == 1
+    assert tasks[0].file_name is None       # empty string -> None
+    assert tasks[1].file_name == "data.csv"
+    assert tasks[1].level == 2

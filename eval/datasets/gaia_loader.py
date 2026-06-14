@@ -87,3 +87,30 @@ def stratified_sample(
                 if remaining == 0:
                     break
     return picked[:limit]
+
+
+def _hf_load_dataset():
+    """Indirection so tests can monkeypatch without importing datasets."""
+    from datasets import load_dataset  # local import keeps test boot fast
+    return load_dataset("gaia-benchmark/GAIA", "2023_all")
+
+
+def load_gaia_validation() -> list[GaiaTask]:
+    """Fetch the GAIA validation split and map rows to GaiaTask.
+
+    Requires HF auth (HF_TOKEN env or `huggingface-cli login`).
+    Cached by HF under ~/.cache/huggingface/.
+    """
+    ds = _hf_load_dataset()
+    split = ds["validation"]
+    out: list[GaiaTask] = []
+    for row in split:
+        fname = row.get("file_name") or ""
+        out.append(GaiaTask(
+            task_id=str(row["task_id"]),
+            question=str(row["Question"]),
+            level=int(row["Level"]),
+            ground_truth=str(row["Final answer"]),
+            file_name=fname if fname else None,
+        ))
+    return out
