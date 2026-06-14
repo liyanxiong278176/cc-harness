@@ -151,3 +151,47 @@ def aggregate_session_metrics(
     )
 
 
+def compare_sessions(master, cc):
+    from eval.metrics.schema import ComparisonReport
+
+    api_delta = cc.api_total_tokens_sum - master.api_total_tokens_sum
+    api_pct = (100.0 * api_delta / master.api_total_tokens_sum) if master.api_total_tokens_sum else 0.0
+    # Per-task diff is built by run.py orchestrator (which has both task lists);
+    # if not pre-populated, leave empty
+    return ComparisonReport(
+        master=master, cc=cc,
+        accuracy_delta=cc.accuracy - master.accuracy,
+        peak_ratio_delta=cc.peak_ratio_overall - master.peak_ratio_overall,
+        api_tokens_delta=api_delta, api_tokens_delta_pct=api_pct,
+        overflow_delta=cc.overflow_count - master.overflow_count,
+        per_task_diffs=[],  # populated externally; see Task 6.4
+    )
+
+
+def build_per_task_diffs(
+    master_tms, cc_tms,
+) -> list[dict]:
+    """Pair task metrics by task_id; emit one dict per pair (or singleton if one branch missing)."""
+    by_id_master = {t.task_id: t for t in master_tms}
+    by_id_cc = {t.task_id: t for t in cc_tms}
+    all_ids = sorted(by_id_master.keys() | by_id_cc.keys())
+    out = []
+    for tid in all_ids:
+        m = by_id_master.get(tid)
+        c = by_id_cc.get(tid)
+        out.append({
+            "task_id": tid,
+            "level": (m or c).level,
+            "master_correct": m.is_correct if m else None,
+            "cc_correct": c.is_correct if c else None,
+            "master_failed": m.failed if m else None,
+            "cc_failed": c.failed if c else None,
+            "master_peak": m.peak_total_tokens if m else None,
+            "cc_peak": c.peak_total_tokens if c else None,
+            "master_api_tokens": m.api_total_tokens if m else None,
+            "cc_api_tokens": c.api_total_tokens if c else None,
+        })
+    return out
+
+
+
