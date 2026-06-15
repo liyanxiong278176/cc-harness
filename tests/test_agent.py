@@ -112,14 +112,43 @@ async def test_routes_final_answer_when_no_tool_calls(monkeypatch):
 @pytest.mark.asyncio
 async def test_routes_empty_turn_yellow_warn(monkeypatch, capfd):
     from cc_harness import agent as agent_mod
-    llm = FakeLLM(responses=[[
-        FakeStreamEvent(kind="done", content="", pending=[], finish_reason="stop"),
-    ]])
+    # 1-shot silent retry: two empty responses → second emits the warn and
+    # ends the turn with no assistant message added.
+    llm = FakeLLM(responses=[
+        [FakeStreamEvent(kind="done", content="", pending=[], finish_reason="stop")],
+        [FakeStreamEvent(kind="done", content="", pending=[], finish_reason="stop")],
+    ])
     mcp = FakeMCP(tools_spec=[], results={}, calls=[])
     messages = [{"role": "user", "content": "x"}]
     await agent_mod.run_turn(messages, llm, mcp, max_iter=5)
-    # No new assistant message added
+    # LLM was called twice (initial + 1 silent retry)
+    assert llm.call_count == 2
+    # No assistant message added — turn ended empty
     assert len(messages) == 1
+    # The "ending" warn fires on the second empty
+    out, _ = capfd.readouterr()
+    assert "empty LLM turn, ending" in out
+
+
+@pytest.mark.asyncio
+async def test_routes_empty_turn_retries_once_then_succeeds(monkeypatch, capfd):
+    """First LLM call returns empty (transient); retry succeeds — no warn."""
+    from cc_harness import agent as agent_mod
+    llm = FakeLLM(responses=[
+        [FakeStreamEvent(kind="done", content="", pending=[], finish_reason="stop")],
+        [FakeStreamEvent(kind="content", text="got it"),
+         FakeStreamEvent(kind="done", content="got it", pending=[], finish_reason="stop")],
+    ])
+    mcp = FakeMCP(tools_spec=[], results={}, calls=[])
+    messages = [{"role": "user", "content": "hello"}]
+    await agent_mod.run_turn(messages, llm, mcp, max_iter=5)
+    # Retry happened (2 calls) and second call produced a final answer
+    assert llm.call_count == 2
+    assert len(messages) == 2
+    assert messages[1] == {"role": "assistant", "content": "got it"}
+    # Silent retry — no "ending" warn
+    out, _ = capfd.readouterr()
+    assert "empty LLM turn" not in out
 
 
 @pytest.mark.asyncio

@@ -72,6 +72,7 @@ async def run_turn(
 
     console = Console()
     iter_count = 0
+    retried_empty = False  # one-shot silent retry for empty LLM turn (see below)
 
     if cwd is not None:
         _refresh_system_prompt(messages, cwd, mode)
@@ -266,6 +267,13 @@ async def run_turn(
                     print_info(console, f"已保存到 {saved}")
             return _stats()
         else:
+            # Transient API behavior: the model can return finish_reason="stop"
+            # with 0 content on the first call in a session (observed on
+            # DeepSeek) — a structurally identical retry succeeds. One silent
+            # retry; only the second empty turn is loud.
+            if not retried_empty:
+                retried_empty = True
+                continue
             print_warn(console, "empty LLM turn, ending")
             return _stats()
 
