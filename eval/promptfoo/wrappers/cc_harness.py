@@ -32,8 +32,33 @@ from pathlib import Path
 # This file lives at: <repo>/eval/promptfoo/wrappers/cc_harness.py
 # so the cc-harness root is 3 levels up.
 CC_HARNESS_ROOT = Path(__file__).resolve().parents[3]
-VENV_PYTHON = CC_HARNESS_ROOT / ".venv" / ("Scripts/python.exe" if sys.platform == "win32" else "bin/python")
 MAIN_PY = CC_HARNESS_ROOT / "main.py"
+
+
+def _resolve_python() -> str:
+    """Pick the Python interpreter to use for the cc-harness REPL subprocess.
+
+    Priority:
+      1. .venv at CC_HARNESS_ROOT (local dev: Windows .venv\\Scripts\\python.exe
+         or Linux .venv/bin/python)
+      2. sys.executable (the Python that ran THIS provider — what `pip install
+         -e .` would have installed cc-harness into in CI)
+      3. `python` on PATH
+    """
+    import shutil
+    venv_py = CC_HARNESS_ROOT / ".venv" / (
+        "Scripts/python.exe" if sys.platform == "win32" else "bin/python"
+    )
+    if venv_py.exists():
+        return str(venv_py)
+    # Fall back to whatever Python is running the provider (CI installs
+    # cc-harness into the system Python via `pip install -e .`).
+    return sys.executable or shutil.which("python") or "python"
+
+
+# Resolved at provider import time — used by call_api. (Doesn't re-resolve
+# per call, so cc-harness root changes mid-test won't be picked up.)
+PYTHON_BIN = _resolve_python()
 
 # Substring we look for in the agent's 4-phase output to extract the answer.
 _RESULT_MARKERS = ("结果：", "结果:")
@@ -50,8 +75,6 @@ async def call_api(prompt: str, options: dict, context: dict) -> dict:
 
     if mode not in ("coding", "plan", "design"):
         return {"output": "", "error": f"unknown mode: {mode}"}
-    if not VENV_PYTHON.exists():
-        return {"output": "", "error": f"python not found: {VENV_PYTHON}"}
     if not MAIN_PY.exists():
         return {"output": "", "error": f"main.py not found: {MAIN_PY}"}
 
@@ -62,7 +85,7 @@ async def call_api(prompt: str, options: dict, context: dict) -> dict:
     start = time.time()
     try:
         proc = await asyncio.create_subprocess_exec(
-            str(VENV_PYTHON), "-u", str(MAIN_PY), "--mode", mode,
+            PYTHON_BIN, "-u", str(MAIN_PY), "--mode", mode,
             cwd=str(workdir),
             stdin=asyncio.subprocess.PIPE,
             stdout=asyncio.subprocess.PIPE,
