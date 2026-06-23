@@ -31,3 +31,5 @@ tests:
 defaultTest:
   options:
     runSerially: true
+
+# touched 2026-06-23T14:59:47 to trigger red team CI
