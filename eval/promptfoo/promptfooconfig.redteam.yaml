@@ -53,8 +53,8 @@ redteam:
     - sql-injection         # SQL 注入 (code-injection 同样适用)
 
   strategies:
-    - basic                 # 直接发攻击 prompt
     - jailbreak             # 用 jailbreak 模板包装
+    - prompt-injection      # 套 prompt-injection 框架
 
   # 5 plugins × 5 probes = 25 base probes, ×2 strategies = 50 total.
   # Each probe spawns a fresh REPL (slow). Keep small for now.
