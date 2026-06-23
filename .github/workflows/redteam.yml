@@ -47,16 +47,21 @@ jobs:
         working-directory: eval/promptfoo
         run: npm ci
 
-      # Cache promptfoo's on-disk response cache (~/.promptfoo/cache).
-      # Hashes the files that affect what the LLM is called with; change
-      # those, the cache misses. Otherwise we restore from a previous run.
-      - name: Cache promptfoo
-        uses: actions/cache@v4
-        with:
-          path: ~/.promptfoo/cache
-          key: ${{ runner.os }}-promptfoo-v2-${{ hashFiles('eval/promptfoo/wrappers/cc_harness.py', 'eval/promptfoo/promptfooconfig.security.yaml', 'eval/promptfoo/attacks.yaml', 'eval/promptfoo/judges/attack_held_ground.txt') }}
-          restore-keys: |
-            ${{ runner.os }}-promptfoo-v2-
+      # Clear promptfoo's state directory before each run.
+      #
+      # Why: promptfoo 0.121's internal SQLite schema (eval tracking,
+      # telemetry) doesn't match what older versions created on disk.
+      # On a fresh runner, promptfoo's first run will try to insert into
+      # tables that don't exist yet → FOREIGN KEY constraint failure.
+      #
+      # We tried caching `~/.promptfoo/cache` and restoring it between
+      # runs, but the restored schema conflicts with the current
+      # binary. The simpler fix is: wipe state on every run. We lose
+      # the cross-run API response cache (slower) but gain reliability.
+      # Re-add caching once promptfoo's schema stabilizes.
+      - name: Clear promptfoo state
+        run: rm -rf ~/.promptfoo
+        continue-on-error: true
 
       - name: Build runtime env
         working-directory: eval/promptfoo
