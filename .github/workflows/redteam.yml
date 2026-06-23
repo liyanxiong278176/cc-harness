@@ -89,20 +89,21 @@ jobs:
         id: redteam
         working-directory: eval/promptfoo
         run: |
-          set -x
+          set -euo pipefail
           # Sanity-check env before running
           echo "--- .env.ci (sanitized) ---"
           sed 's/=.*/=***/' .env.ci
           echo "--- promptfoo version ---"
           npx promptfoo --version
           echo "--- starting eval ---"
+          # IMPORTANT: `set -o pipefail` (above) makes the pipeline
+          # propagate promptfoo's exit code. Without it, `| tee`
+          # always returns 0 and the workflow would pass even when
+          # the eval finds real vulnerabilities.
           npx promptfoo eval \
             -c promptfooconfig.security.yaml \
             --env-path .env.ci \
-            --verbose \
-            -o security-results.json 2>&1 | tee eval-stderr.log
-          echo "--- eval exit: $? ---"
-          ls -la security-results.json eval-stderr.log 2>&1
+            -o security-results.json
         # NO `|| true` — workflow fails on any probe that breaks the agent.
         # Combined with branch protection "Require status checks", this
         # blocks the PR from merging.
@@ -161,9 +162,7 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: security-output
-          path: |
-            eval/promptfoo/security-results.json
-            eval/promptfoo/eval-stderr.log
+          path: eval/promptfoo/security-results.json
           if-no-files-found: warn
 
 # ----------------------------------------------------------------------
