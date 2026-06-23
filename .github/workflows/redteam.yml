@@ -1,0 +1,162 @@
+name: cc-harness red team
+
+on:
+  pull_request:
+    paths:
+      - 'eval/promptfoo/**'
+      - 'cc_harness/**'
+      - 'main.py'
+      - '.github/workflows/redteam.yml'
+
+# Cancel previous runs on the same PR — only the latest matters.
+concurrency:
+  group: redteam-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  redteam:
+    runs-on: ubuntu-latest
+    permissions:
+      pull-requests: write   # to post the summary comment
+      contents: read
+    timeout-minutes: 30      # each PR gets at most 30 min for the full probe set
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+
+      - name: Cache pip
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/pip
+          key: ${{ runner.os }}-pip-${{ hashFiles('pyproject.toml') }}
+
+      - name: Install cc-harness deps
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e .
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Install promptfoo
+        working-directory: eval/promptfoo
+        run: npm ci
+
+      # Cache promptfoo's on-disk response cache (~/.promptfoo/cache).
+      # Without this, every PR reruns all 50 API probes from scratch.
+      # The cache key hashes only the files that affect what the LLM is
+      # called with — change those, the cache misses. Otherwise we restore.
+      - name: Cache promptfoo
+        uses: actions/cache@v4
+        with:
+          path: ~/.promptfoo/cache
+          key: ${{ runner.os }}-promptfoo-v1-${{ hashFiles('eval/promptfoo/wrappers/cc_harness.py', 'eval/promptfoo/promptfooconfig.redteam.yaml', 'eval/promptfoo/judges/attack_held_ground.txt') }}
+          restore-keys: |
+            ${{ runner.os }}-promptfoo-v1-
+
+      - name: Build runtime env
+        working-directory: eval/promptfoo
+        run: |
+          {
+            echo "OPENAI_API_KEY=${{ secrets.OPENAI_API_KEY }}"
+            echo "OPENAI_BASE_URL=https://api.deepseek.com/v1"
+            echo "OPENAI_MODEL=deepseek-v4-flash"
+            # For llm-rubric judge in compare.yaml; harmless if unused
+            echo "JUDGE_MODEL=deepseek-v4-flash"
+            # Embedding (memory) is not used by the eval, but config.py
+            # requires all three EMBEDDING_* vars when MEMORY_ENABLED is set
+            echo "EMBEDDING_BASE_URL=https://api.siliconflow.cn/v1"
+            echo "EMBEDDING_API_KEY=${{ secrets.EMBEDDING_API_KEY }}"
+            echo "EMBEDDING_MODEL=BAAI/bge-m3"
+            echo "EMBEDDING_DIM=1024"
+          } > .env.ci
+
+      - name: Run red team
+        id: redteam
+        working-directory: eval/promptfoo
+        run: |
+          npx promptfoo redteam run \
+            -c promptfooconfig.redteam.yaml \
+            --env-path .env.ci \
+            -o redteam-results.json
+        # NO `|| true` here — we want the workflow to FAIL on any probe that
+        # breaks the agent. Combined with the repo's branch protection
+        # "Require status checks" setting, this blocks the PR from merging.
+        # (See the bottom of this file for the manual GitHub UI steps.)
+
+      - name: Post PR comment
+        if: always() && github.event_name == 'pull_request'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            const path = 'eval/promptfoo/redteam-results.json';
+            if (!fs.existsSync(path)) {
+              await github.rest.issues.createComment({
+                owner: context.repo.owner, repo: context.repo.repo,
+                issue_number: context.issue.number,
+                body: '## 🛡️ Red Team\n\n⚠️ No `redteam-results.json` produced. Check the workflow logs.'
+              });
+              return;
+            }
+            const data = JSON.parse(fs.readFileSync(path, 'utf8'));
+            const summary = data.summary || data.results?.summary || {};
+            const total = summary.total ?? ((summary.passCount || 0) + (summary.failCount || 0));
+            const pass = summary.passCount || 0;     // agent held ground
+            const fail = summary.failCount || 0;     // agent broke
+            const err  = summary.errorCount || 0;
+            const rate = total ? (pass / total * 100).toFixed(1) : '0.0';
+            const emoji = fail > 0 ? '🚨' : '✅';
+            const body = `## ${emoji} cc-harness Red Team Results
+
+            | Metric | Value |
+            |---|---|
+            | Probes | ${total} |
+            | Held ground (pass) | ${pass} |
+            | Broke (fail) | **${fail}** |
+            | Errors | ${err} |
+            | Hold rate | ${rate}% |
+
+            ${fail > 0 ? '⚠️ Some attacks succeeded — review the artifact.' : '🎉 No attacks broke the agent.'}
+
+            📎 Full per-probe results in the workflow artifact (\`redteam-output\`).`;
+
+            await github.rest.issues.createComment({
+              owner: context.repo.owner, repo: context.repo.repo,
+              issue_number: context.issue.number,
+              body
+            });
+
+      - name: Upload results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: redteam-output
+          path: eval/promptfoo/redteam-results.json
+          if-no-files-found: warn
+
+# ----------------------------------------------------------------------
+# To complete the CI gate (one-time setup per repo, do it in GitHub UI):
+#
+#   1. Push this file to GitHub (e.g. `git push origin 2-memory`).
+#
+#   2. Repo → Settings → Branches → Add/Edit rule for `master` (and any
+#      other protected branch):
+#        ✅ Require a pull request before merging
+#        ✅ Require approvals (1+)
+#        ✅ Require status checks to pass before merging
+#        ✅ Require branches to be up to date before merging
+#        → Search and add: "redteam"  (the job name in this workflow)
+#
+#   3. Repo → Settings → Secrets and variables → Actions:
+#        OPENAI_API_KEY     (DeepSeek key)
+#        EMBEDDING_API_KEY  (SiliconFlow key for the memory system env)
+#
+#   4. Open a test PR that touches eval/promptfoo/** to confirm the
+#      workflow fires and the check shows up in the PR's status list.
+# ----------------------------------------------------------------------
