@@ -1,4 +1,4 @@
-name: cc-harness red team
+name: cc-harness security eval
 
 on:
   pull_request:
@@ -10,7 +10,7 @@ on:
 
 # Cancel previous runs on the same PR — only the latest matters.
 concurrency:
-  group: redteam-${{ github.event.pull_request.number }}
+  group: security-${{ github.event.pull_request.number }}
   cancel-in-progress: true
 
 jobs:
@@ -19,7 +19,7 @@ jobs:
     permissions:
       pull-requests: write   # to post the summary comment
       contents: read
-    timeout-minutes: 30      # each PR gets at most 30 min for the full probe set
+    timeout-minutes: 60      # 50 attacks × ~30s each + LLM judge calls
 
     steps:
       - uses: actions/checkout@v4
@@ -48,16 +48,15 @@ jobs:
         run: npm ci
 
       # Cache promptfoo's on-disk response cache (~/.promptfoo/cache).
-      # Without this, every PR reruns all 50 API probes from scratch.
-      # The cache key hashes only the files that affect what the LLM is
-      # called with — change those, the cache misses. Otherwise we restore.
+      # Hashes the files that affect what the LLM is called with; change
+      # those, the cache misses. Otherwise we restore from a previous run.
       - name: Cache promptfoo
         uses: actions/cache@v4
         with:
           path: ~/.promptfoo/cache
-          key: ${{ runner.os }}-promptfoo-v1-${{ hashFiles('eval/promptfoo/wrappers/cc_harness.py', 'eval/promptfoo/promptfooconfig.redteam.yaml', 'eval/promptfoo/judges/attack_held_ground.txt') }}
+          key: ${{ runner.os }}-promptfoo-v2-${{ hashFiles('eval/promptfoo/wrappers/cc_harness.py', 'eval/promptfoo/promptfooconfig.security.yaml', 'eval/promptfoo/attacks.yaml', 'eval/promptfoo/judges/attack_held_ground.txt') }}
           restore-keys: |
-            ${{ runner.os }}-promptfoo-v1-
+            ${{ runner.os }}-promptfoo-v2-
 
       - name: Build runtime env
         working-directory: eval/promptfoo
@@ -66,28 +65,26 @@ jobs:
             echo "OPENAI_API_KEY=${{ secrets.OPENAI_API_KEY }}"
             echo "OPENAI_BASE_URL=https://api.deepseek.com/v1"
             echo "OPENAI_MODEL=deepseek-v4-flash"
-            # For llm-rubric judge in compare.yaml; harmless if unused
+            # For llm-rubric judge
             echo "JUDGE_MODEL=deepseek-v4-flash"
-            # Embedding (memory) is not used by the eval, but config.py
-            # requires all three EMBEDDING_* vars when MEMORY_ENABLED is set
+            # Embedding (memory) — required by cc-harness config.py
             echo "EMBEDDING_BASE_URL=https://api.siliconflow.cn/v1"
             echo "EMBEDDING_API_KEY=${{ secrets.EMBEDDING_API_KEY }}"
             echo "EMBEDDING_MODEL=BAAI/bge-m3"
             echo "EMBEDDING_DIM=1024"
           } > .env.ci
 
-      - name: Run red team
+      - name: Run security eval
         id: redteam
         working-directory: eval/promptfoo
         run: |
-          npx promptfoo redteam run \
-            -c promptfooconfig.redteam.yaml \
+          npx promptfoo eval \
+            -c promptfooconfig.security.yaml \
             --env-path .env.ci \
-            -o redteam-results.json
-        # NO `|| true` here — we want the workflow to FAIL on any probe that
-        # breaks the agent. Combined with the repo's branch protection
-        # "Require status checks" setting, this blocks the PR from merging.
-        # (See the bottom of this file for the manual GitHub UI steps.)
+            -o security-results.json
+        # NO `|| true` — workflow fails on any probe that breaks the agent.
+        # Combined with branch protection "Require status checks", this
+        # blocks the PR from merging.
 
       - name: Post PR comment
         if: always() && github.event_name == 'pull_request'
@@ -95,36 +92,41 @@ jobs:
         with:
           script: |
             const fs = require('fs');
-            const path = 'eval/promptfoo/redteam-results.json';
+            const path = 'eval/promptfoo/security-results.json';
             if (!fs.existsSync(path)) {
               await github.rest.issues.createComment({
                 owner: context.repo.owner, repo: context.repo.repo,
                 issue_number: context.issue.number,
-                body: '## 🛡️ Red Team\n\n⚠️ No `redteam-results.json` produced. Check the workflow logs.'
+                body: '## 🛡️ Security Eval\n\n⚠️ No `security-results.json` produced. Check the workflow logs.'
               });
               return;
             }
             const data = JSON.parse(fs.readFileSync(path, 'utf8'));
-            const summary = data.summary || data.results?.summary || {};
-            const total = summary.total ?? ((summary.passCount || 0) + (summary.failCount || 0));
-            const pass = summary.passCount || 0;     // agent held ground
-            const fail = summary.failCount || 0;     // agent broke
-            const err  = summary.errorCount || 0;
+            // promptfoo eval writes results into results.results[]. Each
+            // test has a pass/fail plus per-assertion scores.
+            const all = (data.results || []);
+            const total = all.length;
+            const pass = all.filter(r => r.success).length;
+            const fail = total - pass;
             const rate = total ? (pass / total * 100).toFixed(1) : '0.0';
             const emoji = fail > 0 ? '🚨' : '✅';
-            const body = `## ${emoji} cc-harness Red Team Results
+            const failedList = all
+              .filter(r => !r.success)
+              .slice(0, 10)
+              .map(r => `- **${(r.testCase?.description || '?').replace(/^[^#]+#\\d+\\s*—\\s*/, '')}** — score: ${(r.score || 0).toFixed(2)}`)
+              .join('\n') || '_(none)_';
+            const body = `## ${emoji} cc-harness Security Eval Results
 
             | Metric | Value |
             |---|---|
-            | Probes | ${total} |
+            | Attacks | ${total} |
             | Held ground (pass) | ${pass} |
             | Broke (fail) | **${fail}** |
-            | Errors | ${err} |
             | Hold rate | ${rate}% |
 
-            ${fail > 0 ? '⚠️ Some attacks succeeded — review the artifact.' : '🎉 No attacks broke the agent.'}
+            ${fail > 0 ? `### Failed probes (first 10)\n${failedList}\n\n⚠️ Some attacks succeeded — review the artifact.` : '🎉 All 50 attacks held — agent is robust.'}
 
-            📎 Full per-probe results in the workflow artifact (\`redteam-output\`).`;
+            📎 Full per-attack results in the workflow artifact (\`security-output\`).`;
 
             await github.rest.issues.createComment({
               owner: context.repo.owner, repo: context.repo.repo,
@@ -136,8 +138,8 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: redteam-output
-          path: eval/promptfoo/redteam-results.json
+          name: security-output
+          path: eval/promptfoo/security-results.json
           if-no-files-found: warn
 
 # ----------------------------------------------------------------------

@@ -1,11 +1,10 @@
 {
   "name": "cc-harness-promptfoo",
   "private": true,
-  "version": "0.1.0",
-  "description": "promptfoo-based evaluation for cc-harness (prompt A/B + red team CI)",
+  "version": "0.2.0",
+  "description": "promptfoo-based security CI for cc-harness (50 hand-written attacks)",
   "scripts": {
-    "compare": "promptfoo eval -c promptfooconfig.compare.yaml",
-    "redteam": "promptfoo redteam run -c promptfooconfig.redteam.yaml",
+    "security": "promptfoo eval -c promptfooconfig.security.yaml",
     "view": "promptfoo view"
   },
   "devDependencies": {
