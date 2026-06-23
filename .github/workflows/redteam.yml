@@ -89,10 +89,20 @@ jobs:
         id: redteam
         working-directory: eval/promptfoo
         run: |
+          set -x
+          # Sanity-check env before running
+          echo "--- .env.ci (sanitized) ---"
+          sed 's/=.*/=***/' .env.ci
+          echo "--- promptfoo version ---"
+          npx promptfoo --version
+          echo "--- starting eval ---"
           npx promptfoo eval \
             -c promptfooconfig.security.yaml \
             --env-path .env.ci \
-            -o security-results.json
+            --verbose \
+            -o security-results.json 2>&1 | tee eval-stderr.log
+          echo "--- eval exit: $? ---"
+          ls -la security-results.json eval-stderr.log 2>&1
         # NO `|| true` — workflow fails on any probe that breaks the agent.
         # Combined with branch protection "Require status checks", this
         # blocks the PR from merging.
@@ -150,7 +160,9 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: security-output
-          path: eval/promptfoo/security-results.json
+          path: |
+            eval/promptfoo/security-results.json
+            eval/promptfoo/eval-stderr.log
           if-no-files-found: warn
 
 # ----------------------------------------------------------------------
