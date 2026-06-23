@@ -123,9 +123,10 @@ jobs:
               return;
             }
             const data = JSON.parse(fs.readFileSync(path, 'utf8'));
-            // promptfoo eval writes results into results.results[]. Each
-            // test has a pass/fail plus per-assertion scores.
-            const all = (data.results || []);
+            // promptfoo 0.121 writes results into data.results.results
+            // (a nested object containing the array of test results).
+            // Each test has a pass/fail plus per-assertion scores.
+            const all = (data.results && data.results.results) || [];
             const total = all.length;
             const pass = all.filter(r => r.success).length;
             const fail = total - pass;
