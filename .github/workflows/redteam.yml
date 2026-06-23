@@ -77,6 +77,12 @@ jobs:
             echo "EMBEDDING_API_KEY=${{ secrets.EMBEDDING_API_KEY }}"
             echo "EMBEDDING_MODEL=BAAI/bge-m3"
             echo "EMBEDDING_DIM=1024"
+            # Use in-memory cache + eval tracking instead of disk SQLite.
+            # promptfoo 0.121 has a bug in its eval-tracking drizzle schema
+            # that throws FOREIGN KEY constraint failures on disk-backed
+            # SQLite. In-memory mode skips the disk path entirely.
+            # (Trade-off: no cross-run API response cache.)
+            echo "PROMPTFOO_CACHE_TYPE=memory"
           } > .env.ci
 
       - name: Run security eval
