@@ -109,6 +109,14 @@ Known weakness: the 50 attacks are static. They:
 
 **Note on model**: `deepseek-v4-pro` is the user's stated choice. If it is unavailable (model not deployed, quota exhausted, auth failure), fall back to `deepseek-v4-flash` (already wired and proven in CI). Fallback is automatic with a logged warning — implementation step 1 verifies model availability before each batch.
 
+**Model resolution order** (in `generate_for_category`):
+
+1. CLI `--model` flag (highest priority — explicit user override)
+2. `OPENAI_MODEL` env var (already set in CI to `deepseek-v4-flash`)
+3. Hard-coded default `deepseek-v4-pro` (used in local dev where `OPENAI_MODEL` may not be set)
+
+This means CI naturally uses `deepseek-v4-flash` (via `.env.ci`'s `OPENAI_MODEL=deepseek-v4-flash`), and local dev uses `deepseek-v4-pro` (unless overridden). No silent ambiguity.
+
 **CLI**:
 
 ```bash
@@ -317,7 +325,7 @@ defaultTest:
 
 **Metadata note**: Static attacks in `attacks.yaml` deliberately **omit** `source: static`. The PR comment script buckets via `metadata.source !== 'dynamic'`. Do NOT backfill `source: static` — that would couple the two YAML files.
 
-**Implementation verification** (Step 2): Confirm promptfoo 0.121 accepts the list form for `tests:`. If it does not, the fallback is to have `generate_attacks.py` concatenate `attacks.yaml` content + new attacks into a single in-memory representation, or write a wrapper file.
+**Implementation verification** (Step 2): The existing config uses scalar form `tests: file://attacks.yaml`. The change to list form `tests: [file://attacks.yaml, file://dynamic_attacks.yaml]` is required — not optional. Confirm promptfoo 0.121 accepts the list form by reading one test from each file in a smoke run. If list form is unsupported (regression), the contingency is to have `generate_attacks.py` concatenate `attacks.yaml` content + new attacks into a single `dynamic_attacks.yaml` before eval (single file, both sources).
 
 ### 5.6 `package.json` (modify)
 
@@ -475,7 +483,7 @@ def safe_append_yaml(path: Path, content: str):
 - [ ] **F2**: Generated YAML is parseable by promptfoo (eval runs without error)
 - [ ] **F3**: `npm run security` runs both static + dynamic; PR comment total = 50 + N
 - [ ] **F4**: PR comment shows static vs dynamic split
-- [ ] **F5**: `npm run curate --dry-run` lists candidates that pass `score < 0.4` AND `sim < 0.85`
+- [ ] **F5**: `npm run curate -- --dry-run` lists candidates that pass `score < 0.4` AND `sim < 0.85`
 - [ ] **F6**: `npm run curate` appends candidates to `attacks.yaml` with `CURATED YYYY-MM-DD` header
 - [ ] **F7**: `git checkout attacks.yaml` cleanly reverts curate's append
 
@@ -497,7 +505,7 @@ def safe_append_yaml(path: Path, content: str):
 
 | Risk | Mitigation |
 |---|---|
-| `deepseek-v4-pro` temporarily unavailable | CI fails fast → temporary workaround: skip generation step |
+| `deepseek-v4-pro` temporarily unavailable | Switch `--model deepseek-v4-flash` in the CI generation command; section 5.1's automatic fallback also catches this |
 | Generated attacks expose many real vulnerabilities | This is the goal — coverage improvement, curate to lock in |
 | Curator admits low-quality attacks | Human review before commit; threshold adjustable |
 | `dynamic_attacks.yaml` accidentally committed | Add CI step checking `git status` for accidental inclusion |
