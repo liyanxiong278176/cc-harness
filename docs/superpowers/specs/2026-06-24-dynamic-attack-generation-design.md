@@ -532,7 +532,7 @@ def safe_append_yaml(path: Path, content: str):
 |---|---|---|---|
 | 1 | Write `tools/generate_attacks.py` + update `.gitignore` | `python tools/generate_attacks.py --dry-run` produces valid YAML | 2 h |
 | 2 | Modify `promptfooconfig.security.yaml` + `package.json` | `npm run security` runs both; PR comment shows split | 1 h |
-| 3 | Write `tools/curate_attacks.py` | After eval, `npm run curate --dry-run` lists candidates | 2 h |
+| 3 | Write `tools/curate_attacks.py` | After eval, `npm run curate -- --dry-run` lists candidates | 2 h |
 | 4 | Modify CI workflow (generate step + comment split) | PR triggers CI; comment shows split | 1 h |
 | 5 | Write unit tests + update docs | Tests pass; `PROMPTFOO.md` updated | 2 h |
 
