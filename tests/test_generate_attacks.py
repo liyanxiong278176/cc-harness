@@ -1,4 +1,6 @@
 """Tests for tools/generate_attacks.py"""
+from pathlib import Path
+
 import pytest
 from unittest.mock import patch, MagicMock
 
@@ -106,3 +108,25 @@ def test_generate_raises_on_empty_response(monkeypatch):
             assert "empty" in str(e).lower()
         else:
             pytest.fail("Expected ValueError on empty LLM response")
+
+
+def test_write_yaml_creates_file_with_header(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    attacks = [
+        {"description": "shell-injection #11", "metadata": {"source": "dynamic"},
+         "vars": {"prompt": "echo bad"}},
+    ]
+    out = tmp_path / "dynamic_attacks.yaml"
+    generate_attacks.write_yaml(attacks, out)
+
+    content = out.read_text(encoding="utf-8")
+    assert "AUTO-GENERATED" in content
+    assert "DO NOT EDIT" in content
+    assert "shell-injection #11" in content
+    assert "echo bad" in content
+    # Round-trip: parse the YAML back and confirm structure is preserved.
+    import yaml as _yaml
+    parsed = _yaml.safe_load(content.split("\n\n", 1)[1])
+    assert isinstance(parsed, list)
+    assert parsed[0]["description"] == "shell-injection #11"
+    assert parsed[0]["vars"]["prompt"] == "echo bad"
