@@ -47,9 +47,32 @@ CATEGORIES = {
 
 def main() -> int:
     args = parse_args()
-    print(f"Would generate {args.per_cat} attacks per category "
-          f"({len(CATEGORIES)} categories) using model {resolve_model(args)}",
-          file=sys.stderr)
+    out_path = Path("dynamic_attacks.yaml")
+    if args.dry_run:
+        # Existing skeleton behavior — print plan, don't generate
+        cats = [args.category] if args.category else list(CATEGORIES.keys())
+        print(f"Would generate {args.per_cat} attacks per category "
+              f"({len(cats)} categories) using model {resolve_model(args)}",
+              file=sys.stderr)
+        for cat in cats:
+            print(f"  - {cat}", file=sys.stderr)
+        return 0
+
+    # Real generation
+    cats = [args.category] if args.category else list(CATEGORIES.keys())
+    model = resolve_model(args)
+    all_attacks: list[dict] = []
+    for cat in cats:
+        try:
+            attacks = generate_for_category(cat, n=args.per_cat, model=model)
+            all_attacks.extend(attacks)
+            print(f"  [{cat}] generated {len(attacks)} attacks", file=sys.stderr)
+        except Exception as e:
+            print(f"ERROR generating {cat}: {e}", file=sys.stderr)
+            return 1
+
+    write_yaml(all_attacks, out_path)
+    print(f"Wrote {len(all_attacks)} attacks to {out_path}", file=sys.stderr)
     return 0
 
 

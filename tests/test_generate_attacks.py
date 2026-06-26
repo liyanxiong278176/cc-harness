@@ -130,3 +130,57 @@ def test_write_yaml_creates_file_with_header(tmp_path, monkeypatch):
     assert isinstance(parsed, list)
     assert parsed[0]["description"] == "shell-injection #11"
     assert parsed[0]["vars"]["prompt"] == "echo bad"
+
+
+def test_main_calls_generate_for_each_category_and_writes_yaml(tmp_path, monkeypatch):
+    """main() should iterate categories, call generate_for_category, and write the YAML."""
+    monkeypatch.chdir(tmp_path)
+    # Set env vars so resolve_model and embed work
+    monkeypatch.setenv("OPENAI_API_KEY", "sk-test")
+    monkeypatch.setenv("OPENAI_BASE_URL", "https://api.test/v1")
+    monkeypatch.setenv("OPENAI_MODEL", "test-model")
+
+    # Patch parse_args to return known args
+    from argparse import Namespace
+    fake_args = Namespace(per_cat=2, model=None, dry_run=False, category=None)
+    with patch("eval.promptfoo.tools.generate_attacks.parse_args", return_value=fake_args):
+        # Patch generate_for_category to return predictable output
+        with patch("eval.promptfoo.tools.generate_attacks.generate_for_category") as mock_gen:
+            mock_gen.side_effect = lambda cat, n, model: [
+                {"description": f"{cat} #{i}", "metadata": {"category": cat, "source": "dynamic"},
+                 "vars": {"prompt": f"prompt {i}"}}
+                for i in range(1, n + 1)
+            ]
+            rc = generate_attacks.main()
+
+    assert rc == 0
+    # generate_for_category called once per category
+    assert mock_gen.call_count == 5
+    # dynamic_attacks.yaml was written
+    out = tmp_path / "dynamic_attacks.yaml"
+    assert out.exists()
+    content = out.read_text(encoding="utf-8")
+    # 5 cats × 2 attacks = 10 total
+    assert content.count("description:") == 10
+    assert "shell-injection" in content
+    assert "hijacking" in content
+
+
+def test_main_dry_run_does_not_call_generate(capsys, tmp_path, monkeypatch):
+    """--dry-run should print the plan and exit, without calling LLM."""
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("OPENAI_API_KEY", "sk-test")
+    monkeypatch.setenv("OPENAI_BASE_URL", "https://api.test/v1")
+
+    from argparse import Namespace
+    fake_args = Namespace(per_cat=3, model=None, dry_run=True, category=None)
+    with patch("eval.promptfoo.tools.generate_attacks.parse_args", return_value=fake_args):
+        with patch("eval.promptfoo.tools.generate_attacks.generate_for_category") as mock_gen:
+            rc = generate_attacks.main()
+            mock_gen.assert_not_called()
+
+    assert rc == 0
+    # No dynamic_attacks.yaml written
+    assert not (tmp_path / "dynamic_attacks.yaml").exists()
+    captured = capsys.readouterr()
+    assert "Would generate 3 attacks per category" in captured.err
