@@ -68,9 +68,11 @@ Known gaps vs official best practices:
                 │  - strategies: [jailbreak]            │
                 │  - total: 55 base × 2 = 110 eval      │
                 │           (jailbreak wraps each)      │
+                │    (~5 min, 18 LLM calls for gen)     │
                 │  - llm-rubric 评判员:                  │
                 │    sees {{prompt}} {{output}} {{severity}}│
-                │    strictness varies by severity      │
+                │    severity is context ONLY;          │
+                │    judging uses uniform threshold 0.7 │
                 └──────────────┬───────────────────────┘
                                ↓
                      security-results.json
@@ -222,7 +224,7 @@ defaultTest:
       weight: 1
 ```
 
-**Total eval tasks**: (40 + 15) × 2 = 110. At ~30s each = 55 min. Within 60-min CI timeout.
+**Total eval tasks**: (40 + 15) × 2 = 110. At ~30s each = 55 min. Within 90-min CI timeout.
 
 ### 4. `generate_attacks.py` updates
 
@@ -532,7 +534,7 @@ await github.rest.issues.createComment({
 - [ ] `attacks.yaml` has 40 entries in 6 categories (no `sql-injection`)
 - [ ] Each attack has `metadata.severity` AND `vars.severity`
 - [ ] `promptfooconfig.security.yaml` has `strategies: [jailbreak]`
-- [ ] `judges/attack_held_ground.txt` mentions 4 severity levels with distinct criteria
+- [ ] `judges/attack_held_ground.txt` mentions severity as context only (no per-severity strictness variation; uniform criteria)
 - [ ] `.github/workflows/redteam.yml` has `schedule: '0 2 * * *'` trigger
 - [ ] `generate_attacks.py` SYSTEM_PROMPT asks LLM to output severity
 - [ ] PR comment groups failed probes by severity (🔴/🟠/🟡/🟢)
@@ -540,14 +542,14 @@ await github.rest.issues.createComment({
 
 ### Performance
 
-- [ ] Full eval (40 + 15 × 2) ≤ 60 minutes
+- [ ] Full eval (40 + 15 × 2) ≤ 90 minutes
 - [ ] Static attack count: 40, dynamic: 15
 
 ### Quality
 
 - [ ] 182 baseline tests + new tests pass
 - [ ] Manually label 10 attacks (3 critical, 3 high, 2 medium, 2 low) with expected pass/fail before merge; rubric on new version must agree on ≥9/10
-- [ ] Severity distribution looks reasonable (5 critical, 18 high, 12 medium, 5 low approx)
+- [ ] Severity distribution looks reasonable (derived from category defaults: ~15 critical, ~13 high, ~7 medium, ~5 low)
 
 ---
 
