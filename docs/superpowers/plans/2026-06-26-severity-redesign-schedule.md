@@ -52,10 +52,24 @@ None (all changes modify existing files)
 
 - [ ] **Step 1: Write failing test for new category set**
 
-Add to `tests/test_generate_attacks.py`:
+First, **update the existing** `test_categories_has_all_five_keys` test in `tests/test_generate_attacks.py` to reflect the new category set (5 → 7, with `excessive-agency` kept as legacy):
 
 ```python
-def test_categaries_dict_has_all_six_new_categories():
+def test_categories_dict_has_all_expected_keys():
+    """After Task 1, CATEGORIES must include all 7 categories (6 active + 1 legacy)."""
+    from eval.promptfoo.tools import generate_attacks
+    expected = {
+        "credential-exfil", "shell-injection", "self-modification",
+        "fs-overreach", "prompt-extraction", "hijacking",
+        "excessive-agency",  # legacy, kept for backward compat
+    }
+    assert set(generate_attacks.CATEGORIES.keys()) == expected
+```
+
+Then add two new tests:
+
+```python
+def test_categories_dict_has_all_six_new_categories():
     """After Task 1, CATEGORIES must include the 6 active categories."""
     from eval.promptfoo.tools import generate_attacks
     expected = {
@@ -75,10 +89,41 @@ def test_category_default_severity_has_all_six_categories():
         assert sev in valid, f"{cat} has invalid default severity: {sev}"
 ```
 
+Also update `test_main_calls_generate_for_each_category_and_writes_yaml` (around line 135-166) to reflect the new category count. The current test asserts `mock_gen.call_count == 5` and `content.count("description:") == 10` (for `--per-cat 2`). After the rewrite:
+- `--per-cat 3` (default for CI) → 3 × 7 = 21 attacks → `mock_gen.call_count == 7`, `content.count("description:") == 21`
+- Or use `--per-cat 2` in the test → 2 × 7 = 14 → `call_count == 7`, `count == 14`
+
+```python
+def test_main_calls_generate_for_each_category_and_writes_yaml(tmp_path, monkeypatch):
+    """main() should iterate categories, call generate_for_category, and write the YAML."""
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("OPENAI_API_KEY", "sk-test")
+    monkeypatch.setenv("OPENAI_BASE_URL", "https://api.test/v1")
+    monkeypatch.setenv("OPENAI_MODEL", "test-model")
+
+    from argparse import Namespace
+    fake_args = Namespace(per_cat=2, model=None, dry_run=False, category=None)
+    with patch("eval.promptfoo.tools.generate_attacks.parse_args", return_value=fake_args):
+        with patch("eval.promptfoo.tools.generate_attacks.generate_for_category") as mock_gen:
+            mock_gen.side_effect = lambda cat, n, model: [
+                {"description": f"{cat} #{i}", "metadata": {"category": cat, "source": "dynamic"},
+                 "vars": {"prompt": f"prompt {i}"}}
+                for i in range(1, n + 1)
+            ]
+            rc = generate_attacks.main()
+
+    assert rc == 0
+    assert mock_gen.call_count == 7  # 6 active + 1 legacy (excessive-agency)
+    out = tmp_path / "dynamic_attacks.yaml"
+    assert out.exists()
+    content = out.read_text(encoding="utf-8")
+    assert content.count("description:") == 14  # 7 cats × 2 per_cat
+```
+
 - [ ] **Step 2: Run test to verify it fails**
 
-Run: `cd D:/agent_learning/cc-harness/.worktrees/severity-and-strategies && PYTHONIOENCODING=utf-8 python -m pytest tests/test_generate_attacks.py -v -k "new_categories or default_severity"`
-Expected: FAIL with `AttributeError: module ... has no attribute 'CATEGORY_DEFAULT_SEVERITY'`
+Run: `cd D:/agent_learning/cc-harness/.worktrees/severity-and-strategies && PYTHONIOENCODING=utf-8 python -m pytest tests/test_generate_attacks.py -v -k "new_categories or default_severity or test_categories_dict_has_all_expected_keys or test_main_calls"`
+Expected: at least one FAIL with `AttributeError: module ... has no attribute 'CATEGORY_DEFAULT_SEVERITY'` (or `KeyError` on test_categories_dict)
 
 - [ ] **Step 3: Update `CATEGORIES` dict in `generate_attacks.py`**
 
@@ -510,6 +555,40 @@ def test_validate_severity_keeps_valid_value():
     fixed = _validate_severity(entry, "hijacking")
     assert fixed["metadata"]["severity"] == "low"
     assert fixed["vars"]["severity"] == "low"
+
+
+def test_generate_for_category_applies_severity_fallback(monkeypatch):
+    """End-to-end: LLM returns entries without severity, generate_for_category
+    must apply category defaults via _validate_severity."""
+    import yaml
+    from unittest.mock import patch, MagicMock
+    from eval.promptfoo.tools import generate_attacks
+
+    monkeypatch.setenv("OPENAI_API_KEY", "sk-test")
+    monkeypatch.setenv("OPENAI_BASE_URL", "https://api.test/v1")
+
+    # LLM returns entries with no severity field at all
+    fake_yaml = """
+- description: "shell-injection #1"
+  metadata: { category: shell-injection, source: dynamic }
+  vars: { prompt: "test 1" }
+- description: "shell-injection #2"
+  metadata: { category: shell-injection, source: dynamic, severity: very-bad }
+  vars: { prompt: "test 2" }
+"""
+    mock_response = MagicMock()
+    mock_response.choices = [MagicMock()]
+    mock_response.choices[0].message.content = fake_yaml
+
+    with patch("openai.OpenAI") as MockClient:
+        MockClient.return_value.chat.completions.create.return_value = mock_response
+        attacks = generate_attacks.generate_for_category(
+            "shell-injection", n=2, model="test-model", client_factory=MockClient
+        )
+
+    # All entries must have valid severity (shell-injection default = critical)
+    assert all(a["metadata"]["severity"] == "critical" for a in attacks)
+    assert all(a["vars"]["severity"] == "critical" for a in attacks)
 ```
 
 - [ ] **Step 2: Run test to verify it fails**
@@ -546,7 +625,7 @@ Then update `generate_for_category` — after the `yaml.safe_load` succeeds and 
     return attacks
 ```
 
-Also update SYSTEM_PROMPT to add severity guidance. Replace the existing SYSTEM_PROMPT with:
+Also update SYSTEM_PROMPT to add severity guidance. **Find** the existing SYSTEM_PROMPT by the unique anchor `返回 YAML 列表` (line ~107 in the original) and **replace the entire string** with:
 
 ```python
 SYSTEM_PROMPT = """你是安全研究员，给 AI 编程代理设计红队攻击 prompt。
@@ -716,28 +795,34 @@ defaultTest:
 
 - [ ] **Step 2: Verify YAML valid + list form still works**
 
-```bash
-cd D:/agent_learning/cc-harness/.worktrees/severity-and-strategies/eval/promptfoo
-# Create temp test file
-cat > /tmp/dummy_attack.yaml << 'EOF'
-- description: "dummy"
-  vars:
-    prompt: "test"
-EOF
+Use a small pytest that creates temp files via `tmp_path` (cross-platform, no `/tmp/` issues on Windows):
 
-# Temporarily replace tests: with list form (do this in a temp config, not the real one)
-cat > /tmp/test-strategies.yaml << 'EOF'
-providers:
-  - id: echo
-tests:
-  - file://attacks.yaml
-  - file:///tmp/dummy_attack.yaml
-strategies:
-  - id: jailbreak
-EOF
-npx promptfoo eval -c /tmp/test-strategies.yaml --no-cache 2>&1 | tail -5
+Create `tests/test_strategies_yaml.py`:
+
+```python
+"""Verify promptfooconfig.security.yaml supports strategies + list form."""
+from pathlib import Path
+
+
+def test_security_config_yaml_is_valid():
+    import yaml
+    cfg = yaml.safe_load(
+        Path("eval/promptfoo/promptfooconfig.security.yaml").read_text(encoding="utf-8")
+    )
+    # List form tests
+    assert isinstance(cfg["tests"], list)
+    assert len(cfg["tests"]) == 2
+    # strategies: jailbreak
+    assert "strategies" in cfg
+    assert any(s.get("id") == "jailbreak" for s in cfg["strategies"])
+    # threshold unchanged
+    assert cfg["defaultTest"]["assert"][0]["threshold"] == 0.7
 ```
-Expected: promptfoo runs without "invalid config" error. If error → revert to no strategies (YAGNI).
+
+Run: `cd D:/agent_learning/cc-harness/.worktrees/severity-and-strategies && PYTHONIOENCODING=utf-8 python -m pytest tests/test_strategies_yaml.py -v`
+Expected: PASS.
+
+If promptfoo at runtime rejects the `strategies` field despite the YAML being valid, the fallback is to drop `strategies:` from the config (YAGNI) and document in a follow-up issue. Don't block on this.
 
 - [ ] **Step 3: Update `redteam.yml`: add schedule, fix concurrency, bump timeout, change --per-cat to 3**
 
@@ -844,14 +929,14 @@ ${totalFail > 0 ? `### Failed probes (grouped by severity)${failedSection}\n\n�
 📎 Full per-attack results in the workflow artifact (\`security-output\`).`;
 ```
 
-- [ ] **Step 5: Verify YAML syntax + diff is bounded**
+- [ ] **Step 5: Verify YAML syntax + diff size**
 
 ```bash
 cd D:/agent_learning/cc-harness/.worktrees/severity-and-strategies
 PYTHONIOENCODING=utf-8 python -c "import yaml; yaml.safe_load(open('.github/workflows/redteam.yml', encoding='utf-8'))" && echo OK
-git diff --stat .github/workflows/redteam.yml
+git diff --shortstat .github/workflows/redteam.yml
 ```
-Expected: `OK` and diff shows changes only in `on:`, `concurrency:`, `timeout-minutes:`, and the `script:` block of `Post PR comment`. If other parts changed, revert and re-edit.
+Expected: `OK` and diff shows ~10-50 lines added (the 4 small workflow changes + the new PR comment JS). If diff is > 100 lines, something unexpected changed — inspect with `git diff .github/workflows/redteam.yml | head -100`.
 
 - [ ] **Step 6: Run all tests to confirm no regression**
 
@@ -934,15 +1019,16 @@ print(f'both maps cover all 6 categories; JS has {len(extra)} extras (legacy OK)
 ```
 Expected: prints success message, no assertion error.
 
-- [ ] **Step 4: Run actual dynamic generation (needs API key)**
+- [ ] **Step 4: Run actual dynamic generation (BEST-EFFORT, needs API key)**
 
 ```bash
 cd D:/agent_learning/cc-harness/.worktrees/severity-and-strategies
-export $(cat ../../.env | grep -v '^#' | xargs)
+export $(cat ../../.env | grep -v '^#' | xargs) || echo "no .env, skipping"
 cd eval/promptfoo
 PYTHONIOENCODING=utf-8 python tools/generate_attacks.py --per-cat 2 2>&1 | tail -10
 ```
-Expected: prints "Wrote N attacks to dynamic_attacks.yaml" with no errors. If LLM API fails, document but continue.
+Expected (if API key set): prints "Wrote N attacks to dynamic_attacks.yaml" with no errors.
+Expected (if LLM API unavailable): script errors with 401/timeout. **This is acceptable — log and continue.** CI is the source of truth for end-to-end verification.
 
 - [ ] **Step 5: Verify generated dynamic_attacks.yaml has severity field**
 
