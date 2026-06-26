@@ -1086,7 +1086,7 @@ If all 7 prior steps pass, Task 4 is done. Document any failures in the final re
 - [ ] Static attack count: 40, dynamic: 15
 
 ### Quality
-- [ ] 187 tests passing (182 baseline + 5 new)
+- [ ] 189 tests passing (182 baseline + 7 new: 2 in Task 1, 4 in Task 2, 1 in Task 3)
 - [ ] Manually label 10 attacks (3 critical, 3 high, 2 medium, 2 low) with expected pass/fail before merge; rubric on new version must agree on ≥9/10
 - [ ] Severity distribution looks reasonable (derived from category defaults: ~15 critical, ~13 high, ~7 medium, ~5 low)
 
