@@ -85,6 +85,27 @@ jobs:
             echo "PROMPTFOO_CACHE_TYPE=memory"
           } > .env.ci
 
+      - name: Generate dynamic attacks
+        id: generate
+        working-directory: eval/promptfoo
+        env:
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          OPENAI_BASE_URL: https://api.deepseek.com/v1
+          OPENAI_MODEL: deepseek-v4-flash
+          # Embedding (for downstream curate; generate itself doesn't need these,
+          # but we set them for consistency with eval step)
+          EMBEDDING_BASE_URL: https://api.siliconflow.cn/v1
+          EMBEDDING_API_KEY: ${{ secrets.EMBEDDING_API_KEY }}
+          EMBEDDING_MODEL: BAAI/bge-m3
+          EMBEDDING_DIM: "1024"
+        run: |
+          set -euo pipefail
+          python tools/generate_attacks.py --per-cat 5
+        # NOTE: no continue-on-error. Generation failure fails the build.
+        # Model resolution: --model > $OPENAI_MODEL > "deepseek-v4-pro".
+        # We set OPENAI_MODEL=deepseek-v4-flash in env above so CI uses flash
+        # (already proven in the eval step; pro is reserved for local dev).
+
       - name: Run security eval
         id: redteam
         working-directory: eval/promptfoo
@@ -125,29 +146,46 @@ jobs:
             }
             const data = JSON.parse(fs.readFileSync(path, 'utf8'));
             // promptfoo 0.121 writes results into data.results.results
-            // (a nested object containing the array of test results).
-            // Each test has a pass/fail plus per-assertion scores.
             const all = (data.results && data.results.results) || [];
-            const total = all.length;
-            const pass = all.filter(r => r.success).length;
-            const fail = total - pass;
-            const rate = total ? (pass / total * 100).toFixed(1) : '0.0';
-            const emoji = fail > 0 ? '🚨' : '✅';
+
+            // Split by source: dynamic attacks have metadata.source === 'dynamic';
+            // static attacks deliberately omit the field.
+            const dynamic = all.filter(r => r.testCase?.metadata?.source === 'dynamic');
+            const static_ = all.filter(r => r.testCase?.metadata?.source !== 'dynamic');
+
+            const stats = arr => ({
+              total: arr.length,
+              pass: arr.filter(r => r.success).length,
+              fail: arr.filter(r => !r.success).length,
+            });
+            const s = stats(static_);
+            const d = stats(dynamic);
+            const total = s.total + d.total;
+            const totalPass = s.pass + d.pass;
+            const totalFail = s.fail + d.fail;
+            const rate = total ? (totalPass / total * 100).toFixed(1) : '0.0';
+            const sRate = s.total ? (s.pass / s.total * 100).toFixed(1) : '0.0';
+            const dRate = d.total ? (d.pass / d.total * 100).toFixed(1) : '0.0';
+            const emoji = totalFail > 0 ? '🚨' : '✅';
             const failedList = all
               .filter(r => !r.success)
               .slice(0, 10)
-              .map(r => `- **${(r.testCase?.description || '?').replace(/^[^#]+#\\d+\\s*—\\s*/, '')}** — score: ${(r.score || 0).toFixed(2)}`)
+              .map(r => {
+                const desc = (r.testCase?.description || '?').replace(/^[^#]+#\d+\s*—\s*/, '');
+                const src = r.testCase?.metadata?.source === 'dynamic' ? '🆕 dynamic' : 'static';
+                return `- **${src}** ${desc} — score: ${(r.score || 0).toFixed(2)}`;
+              })
               .join('\n') || '_(none)_';
             const body = `## ${emoji} cc-harness Security Eval Results
 
-            | Metric | Value |
-            |---|---|
-            | Attacks | ${total} |
-            | Held ground (pass) | ${pass} |
-            | Broke (fail) | **${fail}** |
-            | Hold rate | ${rate}% |
+            | Metric | Static | Dynamic | Total |
+            |---|---|---|---|
+            | Attacks | ${s.total} | ${d.total} | ${total} |
+            | Held ground (pass) | ${s.pass} | ${d.pass} | ${totalPass} |
+            | Broke (fail) | **${s.fail}** | **${d.fail}** | **${totalFail}** |
+            | Hold rate | ${sRate}% | ${dRate}% | ${rate}% |
 
-            ${fail > 0 ? `### Failed probes (first 10)\n${failedList}\n\n⚠️ Some attacks succeeded — review the artifact.` : '🎉 All 50 attacks held — agent is robust.'}
+            ${totalFail > 0 ? `### Failed probes (first 10)\n${failedList}\n\n⚠️ Some attacks succeeded — review the artifact.` : '🎉 All attacks held — agent is robust.'}
 
             📎 Full per-attack results in the workflow artifact (\`security-output\`).`;
 

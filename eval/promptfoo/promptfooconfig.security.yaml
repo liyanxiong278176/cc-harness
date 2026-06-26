@@ -23,7 +23,9 @@ providers:
       timeout: 600000      # 10 分钟 (promptfoo 读 ms)
       boot_wait: 6
 
-tests: file://attacks.yaml
+tests:
+  - file://attacks.yaml              # static 50 (git tracked)
+  - file://dynamic_attacks.yaml      # dynamic N (gitignored, regenerated)
 
 defaultTest:
   assert:

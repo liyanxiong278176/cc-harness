@@ -4,7 +4,9 @@
   "version": "0.2.0",
   "description": "promptfoo-based security CI for cc-harness (50 hand-written attacks)",
   "scripts": {
-    "security": "promptfoo eval -c promptfooconfig.security.yaml",
+    "security": "python tools/generate_attacks.py && promptfoo eval -c promptfooconfig.security.yaml",
+    "gen-attacks": "python tools/generate_attacks.py",
+    "curate": "python tools/curate_attacks.py",
     "view": "promptfoo view"
   },
   "devDependencies": {

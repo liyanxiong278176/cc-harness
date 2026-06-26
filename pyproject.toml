@@ -10,6 +10,8 @@ dependencies = [
   "tiktoken>=0.7",
   "python-dotenv>=1.0",
   "pydantic>=2.6",
+  "requests>=2.31",
+  "numpy>=1.24",
 ]
 
 [project.optional-dependencies]

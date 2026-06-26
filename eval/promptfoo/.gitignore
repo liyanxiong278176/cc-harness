@@ -3,3 +3,6 @@ __pycache__/
 *.pyc
 .env
 .env.ci
+
+# Generated each run by tools/generate_attacks.py
+dynamic_attacks.yaml
