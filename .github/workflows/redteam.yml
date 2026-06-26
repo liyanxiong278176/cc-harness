@@ -22,7 +22,7 @@ jobs:
     permissions:
       pull-requests: write   # to post the summary comment
       contents: read
-    timeout-minutes: 90      # 40 static + ~15 dynamic + jailbreak wrappers + LLM judge calls
+    timeout-minutes: 240     # 4 OWASP plugins × ~64 probes/ea + 40 hand-written + 21 dynamic ≈ 256 probes @ concurrency 4
 
     steps:
       - uses: actions/checkout@v4
@@ -86,6 +86,10 @@ jobs:
             # SQLite. In-memory mode skips the disk path entirely.
             # (Trade-off: no cross-run API response cache.)
             echo "PROMPTFOO_CACHE_TYPE=memory"
+            # Required by OWASP plugins (owasp:llm:01/06/07/09) — see
+            # promptfooconfig.security.yaml. Without it the 4 plugins
+            # silently produce no probes.
+            echo "PROMPTFOO_API_KEY=${{ secrets.PROMPTFOO_API_KEY }}"
           } > .env.ci
 
       - name: Generate dynamic attacks
@@ -109,9 +113,13 @@ jobs:
         # We set OPENAI_MODEL=deepseek-v4-flash in env above so CI uses flash
         # (already proven in the eval step; pro is reserved for local dev).
 
-      - name: Run security eval
+      - name: Run security redteam (static + dynamic + OWASP)
         id: redteam
         working-directory: eval/promptfoo
+        env:
+          # Pass secret explicitly so `redteam run` sees it in process env
+          # (cloud-inference step reads process env directly, not --env-path).
+          PROMPTFOO_API_KEY: ${{ secrets.PROMPTFOO_API_KEY }}
         run: |
           set -euo pipefail
           # Sanity-check env before running
@@ -119,12 +127,13 @@ jobs:
           sed 's/=.*/=***/' .env.ci
           echo "--- promptfoo version ---"
           npx promptfoo --version
-          echo "--- starting eval ---"
-          # IMPORTANT: `set -o pipefail` (above) makes the pipeline
-          # propagate promptfoo's exit code. Without it, `| tee`
-          # always returns 0 and the workflow would pass even when
-          # the eval finds real vulnerabilities.
-          npx promptfoo eval \
+          echo "--- PROMPTFOO_API_KEY set: ${PROMPTFOO_API_KEY:+yes} ---"
+          echo "--- starting redteam ---"
+          # `redteam run` does both:
+          #   1. Generates dynamic attack probes via OWASP plugins (cloud)
+          #   2. Evaluates static (attacks.yaml) + dynamic (dynamic_attacks.yaml)
+          #      + OWASP-generated probes against cc-harness REPL
+          npx promptfoo redteam run \
             -c promptfooconfig.security.yaml \
             --env-path .env.ci \
             -o security-results.json
@@ -253,6 +262,8 @@ jobs:
 #   3. Repo → Settings → Secrets and variables → Actions:
 #        OPENAI_API_KEY     (DeepSeek key)
 #        EMBEDDING_API_KEY  (SiliconFlow key for the memory system env)
+#        PROMPTFOO_API_KEY  (promptfoo cloud — required for OWASP plugins
+#                            owasp:llm:01/06/07/09. Free tier 10k probes/month)
 #
 #   4. Open a test PR that touches eval/promptfoo/** to confirm the
 #      workflow fires and the check shows up in the PR's status list.
