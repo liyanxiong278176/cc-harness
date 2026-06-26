@@ -82,3 +82,18 @@ def test_compute_similarities_raises_on_shape_mismatch():
         mock_embed.side_effect = [static_embs, cand_embs]
         with pytest.raises(ValueError, match="dimension"):
             curate_attacks.compute_similarities(candidates, static)
+
+
+def test_compute_similarities_raises_on_empty_candidates():
+    """If candidates is empty, embed returns 1-D shape (0,) and ndim check catches it."""
+    candidates = []
+    static = [{"vars": {"prompt": "s1"}}]
+
+    # Simulate empty candidates embed: 1-D shape (0,) (which is what np.array([]) is)
+    with patch.object(curate_attacks, "embed") as mock_embed:
+        mock_embed.side_effect = [
+            np.array([[0.1, 0.2]]),  # static: non-empty, 2-D
+            np.array([]),            # candidates: empty → 1-D
+        ]
+        with pytest.raises(ValueError, match="expected 2-D"):
+            curate_attacks.compute_similarities(candidates, static)

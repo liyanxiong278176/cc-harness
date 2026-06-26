@@ -92,7 +92,12 @@ def compute_similarities(candidates: list[AttackCandidate],
     cand_texts = [c.prompt for c in candidates]
     cand_embs = embed(cand_texts)
 
-    # Defensive: if the embedding model changed between calls, dims may differ.
+    # Defensive: empty input, 1-D result, or dim mismatch all indicate malformed API response
+    if static_embs.ndim != 2 or cand_embs.ndim != 2:
+        raise ValueError(
+            f"expected 2-D embedding matrix, got static shape={static_embs.shape}, "
+            f"candidates shape={cand_embs.shape}"
+        )
     if static_embs.shape[1] != cand_embs.shape[1]:
         raise ValueError(
             f"embedding dimension mismatch: static={static_embs.shape[1]}, "
