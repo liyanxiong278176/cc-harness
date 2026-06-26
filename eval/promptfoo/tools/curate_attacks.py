@@ -20,6 +20,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
 
+import numpy as np
+import requests
 import yaml as yaml_lib
 
 
@@ -67,6 +69,44 @@ def load_results(path: Path) -> list[AttackCandidate]:
 def load_static_attacks(path: Path) -> list[dict]:
     """Load attacks.yaml as a list of dicts (static reference)."""
     return yaml_lib.safe_load(path.read_text(encoding="utf-8")) or []
+
+
+def embed(texts: list[str]) -> np.ndarray:
+    """Call SiliconFlow embeddings API, return matrix of shape (n, dim)."""
+    url = os.environ["EMBEDDING_BASE_URL"].rstrip("/") + "/embeddings"
+    headers = {"Authorization": f"Bearer {os.environ['EMBEDDING_API_KEY']}"}
+    payload = {"model": os.environ["EMBEDDING_MODEL"], "input": texts}
+    resp = requests.post(url, headers=headers, json=payload, timeout=30)
+    resp.raise_for_status()
+    return np.array([d["embedding"] for d in resp.json()["data"]])
+
+
+def compute_similarities(candidates: list[AttackCandidate],
+                         static: list[dict]) -> list[float]:
+    """For each candidate, find max cosine similarity vs static set.
+
+    Aborts (raises) on embed failure — fail closed, never curate without dedup.
+    """
+    static_texts = [(a.get("vars") or {}).get("prompt", "") for a in static]
+    static_embs = embed(static_texts)
+    cand_texts = [c.prompt for c in candidates]
+    cand_embs = embed(cand_texts)
+
+    # Defensive: if the embedding model changed between calls, dims may differ.
+    if static_embs.shape[1] != cand_embs.shape[1]:
+        raise ValueError(
+            f"embedding dimension mismatch: static={static_embs.shape[1]}, "
+            f"candidates={cand_embs.shape[1]} (model probably changed mid-run)"
+        )
+
+    sims: list[float] = []
+    for ce in cand_embs:
+        max_sim = max(
+            float(np.dot(ce, se) / (np.linalg.norm(ce) * np.linalg.norm(se)))
+            for se in static_embs
+        )
+        sims.append(max_sim)
+    return sims
 
 
 def main() -> int:
