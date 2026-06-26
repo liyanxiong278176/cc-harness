@@ -114,11 +114,120 @@ def compute_similarities(candidates: list[AttackCandidate],
     return sims
 
 
+def filter_candidates(candidates: list[AttackCandidate],
+                      threshold: float,
+                      max_sim: float) -> list[AttackCandidate]:
+    """Keep only candidates that pass BOTH score < threshold AND sim < max_sim."""
+    return [c for c in candidates
+            if c.score < threshold and c.max_similarity < max_sim]
+
+
+def append_to_static(candidates: list[AttackCandidate], path: Path) -> int:
+    """Atomically append curated candidates to attacks.yaml with section header.
+
+    Only persistent fields are serialized — runtime-only fields (max_similarity,
+    score, reason) are dropped so the appended static file stays clean.
+    """
+    if not candidates:
+        return 0
+    from datetime import datetime, timezone
+    timestamp = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    header = (
+        f"\n\n# === CURATED {timestamp} from dynamic run ===\n"
+        f"# (score < {DEFAULT_THRESHOLD} AND cosine_sim < {DEFAULT_MAX_SIM} vs static)\n"
+    )
+    # Drop runtime-only fields; keep only fields that belong in attacks.yaml.
+    # NOTE: `category` is also dropped from top level because static attacks.yaml
+    # uses metadata.category, not a top-level category field.
+    RUNTIME_ONLY = {"max_similarity", "score", "reason", "category"}
+    persistent = [
+        {k: v for k, v in c.__dict__.items() if k not in RUNTIME_ONLY}
+        for c in candidates
+    ]
+    # Inject metadata.source for the appended attacks (matches dynamic generator's shape)
+    for p in persistent:
+        p.setdefault("metadata", {})["source"] = "curated-dynamic"
+        # category was on the AttackCandidate (now dropped from top level);
+        # copy it into metadata.category to match static-attack shape
+        if "category" not in p["metadata"]:
+            p["metadata"]["category"] = next(
+                (c.category for c in candidates if c.description == p["description"]),
+                "?",
+            )
+    serialized = yaml_lib.dump(
+        persistent, allow_unicode=True, sort_keys=False, width=1000,
+    )
+    # Atomic write: write to .tmp, then rename
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    existing = path.read_text(encoding="utf-8") if path.exists() else ""
+    with open(tmp, "w", encoding="utf-8") as f:
+        f.write(existing)
+        if not existing.endswith("\n"):
+            f.write("\n")
+        f.write(header)
+        f.write(serialized)
+    os.replace(tmp, path)
+    return len(candidates)
+
+
 def main() -> int:
     args = parse_args()
-    print(f"Would curate from {args.results} with threshold={args.threshold}, "
-          f"max_sim={args.max_sim} (dry-run={args.dry_run})", file=sys.stderr)
+    # Resolve paths relative to promptfoo package root (not cwd) so the script
+    # works whether invoked from project root or from eval/promptfoo/.
+    if Path(args.results).is_absolute() or Path(args.results).exists():
+        results_path = Path(args.results)
+    else:
+        results_path = _DEFAULT_PROMPTFOO_ROOT / DEFAULT_RESULTS_PATH
+    static_path = _DEFAULT_PROMPTFOO_ROOT / DEFAULT_STATIC_PATH
+
+    if not results_path.exists():
+        print(f"ERROR: {results_path} not found. Run 'npm run security' first.",
+              file=sys.stderr)
+        return 1
+
+    candidates = load_results(results_path)
+    if not candidates:
+        print("No dynamic attacks in results (eval didn't include them, or all passed).",
+              file=sys.stderr)
+        return 0
+
+    static = load_static_attacks(static_path)
+    try:
+        sims = compute_similarities(candidates, static)
+    except Exception as e:
+        print(f"ERROR: dedup failed: {e}. Refusing to curate without dedup.",
+              file=sys.stderr)
+        return 1
+    for c, s in zip(candidates, sims):
+        c.max_similarity = s
+
+    kept = filter_candidates(candidates, args.threshold, args.max_sim)
+    print_candidates(kept, args.dry_run)
+
+    if args.dry_run:
+        return 0
+    if not kept:
+        print("No candidates passed the filter. Nothing to append.", file=sys.stderr)
+        return 0
+
+    n = append_to_static(kept, static_path)
+    print(f"Appended {n} attacks to {static_path}. "
+          f"Run 'git diff attacks.yaml' to review, then 'git commit'.",
+          file=sys.stderr)
     return 0
+
+
+def print_candidates(candidates: list[AttackCandidate], dry_run: bool) -> None:
+    label = "Curation candidates" if not dry_run else "Curation candidates (dry-run)"
+    print(f"=== {label} ({len(candidates)}) ===", file=sys.stderr)
+    for i, c in enumerate(candidates, 1):
+        print(f"\n[{i}] {c.description}", file=sys.stderr)
+        print(f"    category:   {c.category}", file=sys.stderr)
+        print(f"    score:      {c.score:.2f}", file=sys.stderr)
+        print(f"    similarity: {c.max_similarity:.2f} (max vs static)", file=sys.stderr)
+        print(f"    reason:     {c.reason}", file=sys.stderr)
+        prompt_preview = c.prompt[:100].replace("\n", " ")
+        print(f"    prompt:     | {prompt_preview}...", file=sys.stderr)
 
 
 def parse_args() -> argparse.Namespace:
