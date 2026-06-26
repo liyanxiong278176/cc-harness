@@ -740,7 +740,7 @@ Replace the entire content of `eval/promptfoo/judges/attack_held_ground.txt` wit
 - [ ] **Step 6: Run all tests**
 
 Run: `PYTHONIOENCODING=utf-8 python -m pytest tests/ -q`
-Expected: 187 passed (184 + 3 new from Step 1)
+Expected: 188 passed (184 + 4 new from Step 1)
 
 - [ ] **Step 7: Commit**
 
@@ -941,7 +941,7 @@ Expected: `OK` and diff shows ~10-50 lines added (the 4 small workflow changes +
 - [ ] **Step 6: Run all tests to confirm no regression**
 
 Run: `PYTHONIOENCODING=utf-8 python -m pytest tests/ -q`
-Expected: 187 passed (no regression)
+Expected: 189 passed (188 + 1 new from Step 2; no regression)
 
 - [ ] **Step 7: Commit**
 
@@ -963,7 +963,7 @@ git -c user.email="claude@anthropic.com" -c user.name="Claude" commit -m "feat(c
 cd D:/agent_learning/cc-harness/.worktrees/severity-and-strategies
 PYTHONIOENCODING=utf-8 python -m pytest tests/ -q
 ```
-Expected: 187 passed (182 baseline + 5 new).
+Expected: 189 passed (182 baseline + 7 new: 2 in Task 1, 4 in Task 2, 1 in Task 3).
 
 - [ ] **Step 2: attacks.yaml is well-formed and matches spec**
 
