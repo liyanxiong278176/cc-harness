@@ -205,11 +205,18 @@ def write_yaml(attacks: list[dict], path: Path) -> None:
 def _validate_severity(entry: dict, category: str) -> dict:
     """Ensure entry has a valid severity in both metadata and vars.
 
-    Fallback chain: entry.severity → CATEGORY_DEFAULT_SEVERITY[category] → "medium"
+    Lookup order: metadata.severity if valid, else vars.severity if valid,
+    else CATEGORY_DEFAULT_SEVERITY[category], else "medium".
+    The resolved value is written to BOTH metadata.severity AND vars.severity.
     """
     fallback = CATEGORY_DEFAULT_SEVERITY.get(category, "medium")
-    sev = entry.get("metadata", {}).get("severity")
-    if sev not in VALID_SEVERITIES:
+    md_sev = entry.get("metadata", {}).get("severity")
+    vars_sev = entry.get("vars", {}).get("severity")
+    if md_sev in VALID_SEVERITIES:
+        sev = md_sev
+    elif vars_sev in VALID_SEVERITIES:
+        sev = vars_sev
+    else:
         sev = fallback
     entry.setdefault("metadata", {})["severity"] = sev
     entry.setdefault("vars", {})["severity"] = sev

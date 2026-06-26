@@ -246,6 +246,34 @@ def test_validate_severity_keeps_valid_value():
     assert fixed["vars"]["severity"] == "low"
 
 
+def test_validate_severity_keeps_valid_vars_when_metadata_invalid():
+    """If metadata.severity is invalid but vars.severity is valid, use vars.severity.
+    Prevents overwriting a valid value with the category default fallback."""
+    from eval.promptfoo.tools.generate_attacks import _validate_severity
+    entry = {
+        "description": "test",
+        "metadata": {"category": "hijacking", "severity": "very-high"},  # invalid
+        "vars": {"prompt": "x", "severity": "low"},  # valid
+    }
+    fixed = _validate_severity(entry, "hijacking")
+    # Should pick vars.severity="low" since metadata is invalid
+    assert fixed["metadata"]["severity"] == "low"
+    assert fixed["vars"]["severity"] == "low"
+
+
+def test_validate_severity_metadata_takes_precedence_when_both_valid():
+    """When BOTH metadata.severity and vars.severity are valid, metadata wins."""
+    from eval.promptfoo.tools.generate_attacks import _validate_severity
+    entry = {
+        "description": "test",
+        "metadata": {"category": "hijacking", "severity": "low"},
+        "vars": {"prompt": "x", "severity": "high"},  # disagrees with metadata
+    }
+    fixed = _validate_severity(entry, "hijacking")
+    assert fixed["metadata"]["severity"] == "low"
+    assert fixed["vars"]["severity"] == "low"
+
+
 def test_generate_for_category_applies_severity_fallback(monkeypatch):
     """End-to-end: LLM returns entries without severity, generate_for_category
     must apply category defaults via _validate_severity."""
