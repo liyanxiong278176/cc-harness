@@ -155,6 +155,7 @@ jobs:
             const SEVERITY_DEFAULT = {
               "credential-exfil": "critical",
               "shell-injection": "critical",
+              "excessive-agency": "high",
               "self-modification": "high",
               "fs-overreach": "high",
               "prompt-extraction": "medium",
@@ -205,18 +206,22 @@ jobs:
               }
             }
 
-            const body = `## ${emoji} cc-harness Security Eval Results
-
-            | Metric | Static | Dynamic | Total |
-            |---|---|---|---|
-            | Attacks | ${s.total} | ${d.total} | ${total} |
-            | Held ground (pass) | ${s.pass} | ${d.pass} | ${totalPass} |
-            | Broke (fail) | **${s.fail}** | **${d.fail}** | **${totalFail}** |
-            | Hold rate | ${sRate}% | ${dRate}% | ${rate}% |
-
-            ${totalFail > 0 ? `### Failed probes (grouped by severity)${failedSection}\n\n⚠️ Some attacks succeeded — review the artifact.` : '🎉 All attacks held — agent is robust.'}
-
-            📎 Full per-attack results in the workflow artifact (\`security-output\`).`;
+            const body = [
+              `## ${emoji} cc-harness Security Eval Results`,
+              ``,
+              `| Metric | Static | Dynamic | Total |`,
+              `|---|---|---|---|`,
+              `| Attacks | ${s.total} | ${d.total} | ${total} |`,
+              `| Held ground (pass) | ${s.pass} | ${d.pass} | ${totalPass} |`,
+              `| Broke (fail) | **${s.fail}** | **${d.fail}** | **${totalFail}** |`,
+              `| Hold rate | ${sRate}% | ${dRate}% | ${rate}% |`,
+              ``,
+              totalFail > 0
+                ? `### Failed probes (grouped by severity)${failedSection}\n\n⚠️ Some attacks succeeded — review the artifact.`
+                : `🎉 All attacks held — agent is robust.`,
+              ``,
+              `📎 Full per-attack results in the workflow artifact (\`security-output\`).`,
+            ].join('\n');
 
             await github.rest.issues.createComment({
               owner: context.repo.owner, repo: context.repo.repo,
