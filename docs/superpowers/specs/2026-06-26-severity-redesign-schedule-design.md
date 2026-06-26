@@ -323,7 +323,8 @@ Apply this to each parsed entry before returning.
 
 **Source of truth**: `eval/promptfoo/tools/generate_attacks.py` `CATEGORY_DEFAULT_SEVERITY` dict.
 **Duplicated here**: necessary because the workflow JS can't import Python at runtime.
-**Mitigation**: Task 4 verification asserts all 6 categories in `attacks.yaml` have a corresponding entry in both maps.
+**Asymmetry note**: Python `CATEGORY_DEFAULT_SEVERITY` has 7 entries (includes legacy `'excessive-agency'` for backward-compat). JS `SEVERITY_DEFAULT` has only the 6 active categories. The legacy entry is not consumed by the new `attacks.yaml` and is kept only for forward-compat with potential rollback.
+**Mitigation**: Task 4 verification asserts all 6 active categories in `attacks.yaml` have a corresponding entry in both maps.
 
 ```javascript
 // In PR comment script:
