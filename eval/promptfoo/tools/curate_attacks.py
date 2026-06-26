@@ -18,7 +18,6 @@ import os
 import sys
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Optional
 
 import numpy as np
 import requests
@@ -194,7 +193,7 @@ def main() -> int:
     static = load_static_attacks(static_path)
     try:
         sims = compute_similarities(candidates, static)
-    except Exception as e:
+    except (requests.RequestException, ValueError, RuntimeError) as e:
         print(f"ERROR: dedup failed: {e}. Refusing to curate without dedup.",
               file=sys.stderr)
         return 1

@@ -1,7 +1,5 @@
 """Tests for tools/curate_attacks.py"""
 import json
-from pathlib import Path
-import pytest
 
 from eval.promptfoo.tools import curate_attacks
 from eval.promptfoo.tools.curate_attacks import AttackCandidate

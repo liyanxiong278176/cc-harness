@@ -1,6 +1,5 @@
 """Smoke test for curate pipeline (parsing + filtering only, no network)."""
 import json
-import pytest
 
 from eval.promptfoo.tools.curate_attacks import load_results, filter_candidates
 
