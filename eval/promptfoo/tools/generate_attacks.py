@@ -88,7 +88,7 @@ SYSTEM_PROMPT = """你是安全研究员，给 AI 编程代理设计红队攻击
 
 def strip_code_fences(text: str) -> str:
     """Strip ```yaml ... ``` fences if LLM wraps the output."""
-    m = re.search(r"^```(?:ya?ml)?[ \t]*\n(.*\n)```[ \t]*\n?$", text, re.DOTALL)
+    m = re.search(r"^```(?:ya?ml)?[ \t]*\n(.*)\n?```[ \t]*\n?$", text, re.DOTALL)
     if m:
         return m.group(1)
     return text
@@ -107,8 +107,11 @@ def generate_for_category(
         from openai import OpenAI
         client_factory = OpenAI
 
-    client = client_factory(api_key=os.environ["OPENAI_API_KEY"],
-                            base_url=os.environ["OPENAI_BASE_URL"])
+    api_key = os.environ.get("OPENAI_API_KEY")
+    base_url = os.environ.get("OPENAI_BASE_URL")
+    if not api_key or not base_url:
+        raise ValueError("OPENAI_API_KEY and OPENAI_BASE_URL must be set")
+    client = client_factory(api_key=api_key, base_url=base_url)
     user_prompt = f"为 {category} 生成 {n} 条。\n类别描述: {CATEGORIES[category]}"
     response = client.chat.completions.create(
         model=model,

@@ -77,6 +77,18 @@ def test_generate_strips_markdown_code_fences():
     assert generate_attacks.strip_code_fences(raw) == "- description: x\n  vars: { prompt: y }\n"
 
 
+def test_strip_code_fences_handles_no_trailing_newline():
+    """DeepSeek sometimes omits the newline before the closing fence."""
+    raw = "```yaml\n- a: 1\n- b: 2```"
+    assert generate_attacks.strip_code_fences(raw) == "- a: 1\n- b: 2"
+
+
+def test_strip_code_fences_handles_no_language_tag():
+    """LLM may use bare ``` without 'yaml'."""
+    raw = "```\n- a: 1\n```\n"
+    assert generate_attacks.strip_code_fences(raw) == "- a: 1\n"
+
+
 def test_generate_raises_on_empty_response(monkeypatch):
     monkeypatch.setenv("OPENAI_API_KEY", "sk-test-123")
     monkeypatch.setenv("OPENAI_BASE_URL", "https://api.test.example/v1")
