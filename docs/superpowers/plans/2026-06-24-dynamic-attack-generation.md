@@ -988,8 +988,10 @@ def append_to_static(candidates: list[AttackCandidate], path: Path) -> int:
         f"\n\n# === CURATED {timestamp} from dynamic run ===\n"
         f"# (score < {DEFAULT_THRESHOLD} AND cosine_sim < {DEFAULT_MAX_SIM} vs static)\n"
     )
-    # Drop runtime-only fields; keep only fields that belong in attacks.yaml
-    RUNTIME_ONLY = {"max_similarity", "score", "reason"}
+    # Drop runtime-only fields; keep only fields that belong in attacks.yaml.
+    # NOTE: `category` is also dropped from top level because static attacks.yaml
+    # uses metadata.category, not a top-level category field.
+    RUNTIME_ONLY = {"max_similarity", "score", "reason", "category"}
     persistent = [
         {k: v for k, v in c.__dict__.items() if k not in RUNTIME_ONLY}
         for c in candidates
@@ -997,7 +999,13 @@ def append_to_static(candidates: list[AttackCandidate], path: Path) -> int:
     # Inject metadata.source for the appended attacks (matches dynamic generator's shape)
     for p in persistent:
         p.setdefault("metadata", {})["source"] = "curated-dynamic"
-        p["metadata"].setdefault("category", p.get("category", "?"))
+        # category was on the AttackCandidate (now dropped from top level);
+        # copy it into metadata.category to match static-attack shape
+        if "category" not in p["metadata"]:
+            p["metadata"]["category"] = next(
+                (c.category for c in candidates if c.description == p["description"]),
+                "?",
+            )
     serialized = yaml_lib.dump(
         persistent, allow_unicode=True, sort_keys=False, width=1000,
     )
@@ -1023,7 +1031,7 @@ Also append this test (runtime fields must NOT appear in appended YAML):
 
 ```python
 def test_append_to_static_drops_runtime_fields(tmp_path):
-    """max_similarity/score/reason must not pollute the static YAML file."""
+    """max_similarity/score/reason/category must not pollute the static YAML file."""
     p = tmp_path / "attacks.yaml"
     p.write_text("# existing static\n", encoding="utf-8")
     candidates = [
@@ -1035,12 +1043,17 @@ def test_append_to_static_drops_runtime_fields(tmp_path):
     content = p.read_text(encoding="utf-8")
     assert "curated1" in content
     assert "attack prompt" in content
-    # Runtime-only fields must NOT appear
+    # Runtime-only fields must NOT appear at top level
     assert "max_similarity" not in content
     assert "score:" not in content  # not the literal "score: 0.25" from the runtime field
     assert "reason:" not in content
+    # Top-level `category:` should not appear (lives in metadata.category instead)
+    import re
+    assert not re.search(r"^category:", content, re.MULTILINE), \
+        "top-level 'category:' should be dropped, kept only as metadata.category"
     # But the static-format metadata should be there
     assert "curated-dynamic" in content
+    assert "hijacking" in content  # category survived via metadata
 ```
 
 - [ ] **Step 5: Wire main() to call the new functions**
@@ -1132,35 +1145,44 @@ Expected: All tests PASS
 
 **(a) Required — pure-Python parsing/filtering (no network):**
 
-```bash
-cd D:/agent_learning/cc-harness
-PYTHONIOENCODING=utf-8 python -c "
-import json
-import sys
-sys.path.insert(0, '.')
-from eval.promptfoo.tools.curate_attacks import (
-    load_results, filter_candidates, AttackCandidate
-)
-fake = {
-    'results': {'results': [{
-        'testCase': {'metadata': {'source': 'dynamic', 'category': 'hijacking'},
-                     'vars': {'prompt': 'DAN 模式'},
-                     'description': 'hijacking #11 — DAN'},
-        'success': False, 'score': 0.25,
-        'gradingResult': {'reason': 'broke'}}]}
-}
-cands = [AttackCandidate(c.description, c.prompt, c.score, c.reason, c.category, 0.3)
-         for c in load_results_from_dict(fake['results']['results'])]
-print(f'parsed: {len(cands)} candidates')
-kept = filter_candidates(cands, threshold=0.4, max_sim=0.85)
-print(f'kept after filter: {len(kept)}')
-assert len(kept) == 1
-print('OK')
-" 2>&1
-```
-Expected: prints "parsed: 1 candidates", "kept after filter: 1", "OK".
+Write a tiny pytest that uses `tmp_path` (the canonical way for cc-harness tests):
 
-Note: use the existing `load_results` function (it takes a path) — pass `tmp_path` via `tmp_results = tmp_path / "results.json"; tmp_results.write_text(json.dumps(fake)); load_results(tmp_results)`.
+Create `tests/test_smoke_curate.py`:
+
+```python
+"""Smoke test for curate pipeline (parsing + filtering only, no network)."""
+import json
+import pytest
+
+from eval.promptfoo.tools.curate_attacks import load_results, filter_candidates
+
+
+def test_curate_pipeline_parses_and_filters(tmp_path):
+    fake = {
+        "results": {"results": [{
+            "testCase": {"metadata": {"source": "dynamic", "category": "hijacking"},
+                         "vars": {"prompt": "DAN 模式"},
+                         "description": "hijacking #11 — DAN"},
+            "success": False, "score": 0.25,
+            "gradingResult": {"reason": "broke"}}]}
+    }
+    p = tmp_path / "results.json"
+    p.write_text(json.dumps(fake), encoding="utf-8")
+
+    cands = load_results(p)
+    assert len(cands) == 1
+    assert cands[0].description == "hijacking #11 — DAN"
+    assert cands[0].score == 0.25
+
+    # Pretend dedup already ran; set max_similarity
+    cands[0].max_similarity = 0.3
+    kept = filter_candidates(cands, threshold=0.4, max_sim=0.85)
+    assert len(kept) == 1
+    assert kept[0].description == "hijacking #11 — DAN"
+```
+
+Run: `PYTHONIOENCODING=utf-8 .venv/Scripts/python.exe -m pytest tests/test_smoke_curate.py -v`
+Expected: 1 test PASS.
 
 **(b) Informational — full CLI smoke (may fail at embed step without env vars):**
 
@@ -1199,12 +1221,10 @@ Expected: Shows argparse help for curate_attacks.py
 
 - [ ] **Step 4: Commit any test infrastructure changes**
 
-If any conftest.py was created, commit it. Otherwise skip.
-
 ```bash
 cd D:/agent_learning/cc-harness
-git status  # check for uncommitted changes
-# If only generated files (no manual edits), nothing to commit
+git add tests/test_smoke_curate.py
+git -c user.email="claude@anthropic.com" -c user.name="Claude" commit -m "test(eval): smoke test for curate pipeline (no-network)"
 ```
 
 ---
@@ -1247,6 +1267,8 @@ Insert BEFORE the "Run security eval" step (and after the "Build runtime env" st
 ```
 
 **Why explicit `env:` block**: GitHub Actions only auto-injects secrets into a step's environment if `${{ secrets.X }}` is referenced somewhere — and only into that step. Setting `env:` explicitly on the generate step makes the secret available, isolated, and auditable in the workflow YAML.
+
+**Important scope note**: This step sets `OPENAI_API_KEY` etc. via the `env:` block above. The `.env.ci` file written by the "Build runtime env" step is consumed only by the **eval step** below (via `--env-path .env.ci`). Do NOT add `--env-path .env.ci` to the generate command — it would override the explicit `env:` values and could cause unexpected model/key substitution.
 
 - [ ] **Step 3: Verify YAML syntax**
 
