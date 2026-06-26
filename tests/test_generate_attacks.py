@@ -6,14 +6,35 @@ from unittest.mock import patch, MagicMock
 from eval.promptfoo.tools import generate_attacks
 
 
-def test_categories_has_all_five_keys():
-    assert set(generate_attacks.CATEGORIES.keys()) == {
-        "shell-injection",
-        "prompt-extraction",
-        "excessive-agency",
-        "hijacking",
-        "sql-injection",
+def test_categories_dict_has_all_expected_keys():
+    """After Task 1, CATEGORIES must include all 7 categories (6 active + 1 legacy)."""
+    from eval.promptfoo.tools import generate_attacks
+    expected = {
+        "credential-exfil", "shell-injection", "self-modification",
+        "fs-overreach", "prompt-extraction", "hijacking",
+        "excessive-agency",  # legacy, kept for backward compat
     }
+    assert set(generate_attacks.CATEGORIES.keys()) == expected
+
+
+def test_categories_dict_has_all_six_new_categories():
+    """After Task 1, CATEGORIES must include the 6 active categories."""
+    from eval.promptfoo.tools import generate_attacks
+    expected = {
+        "credential-exfil", "shell-injection", "self-modification",
+        "fs-overreach", "prompt-extraction", "hijacking",
+    }
+    assert expected.issubset(set(generate_attacks.CATEGORIES.keys()))
+
+
+def test_category_default_severity_has_all_six_categories():
+    """CATEGORY_DEFAULT_SEVERITY must map each active category to a valid severity."""
+    from eval.promptfoo.tools import generate_attacks
+    valid = {"critical", "high", "medium", "low"}
+    for cat in ["credential-exfil", "shell-injection", "self-modification",
+                "fs-overreach", "prompt-extraction", "hijacking"]:
+        sev = generate_attacks.CATEGORY_DEFAULT_SEVERITY.get(cat)
+        assert sev in valid, f"{cat} has invalid default severity: {sev}"
 
 
 def test_categories_values_are_nonempty_strings():
@@ -153,16 +174,17 @@ def test_main_calls_generate_for_each_category_and_writes_yaml(tmp_path, monkeyp
             rc = generate_attacks.main()
 
     assert rc == 0
-    # generate_for_category called once per category
-    assert mock_gen.call_count == 5
+    # generate_for_category called once per category (6 active + 1 legacy)
+    assert mock_gen.call_count == 7
     # dynamic_attacks.yaml was written
     out = tmp_path / "dynamic_attacks.yaml"
     assert out.exists()
     content = out.read_text(encoding="utf-8")
-    # 5 cats × 2 attacks = 10 total
-    assert content.count("description:") == 10
+    # 7 cats × 2 attacks = 14 total
+    assert content.count("description:") == 14
     assert "shell-injection" in content
     assert "hijacking" in content
+    assert "credential-exfil" in content
 
 
 def test_main_dry_run_does_not_call_generate(capsys, tmp_path, monkeypatch):
