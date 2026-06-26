@@ -27,6 +27,9 @@ tests:
   - file://attacks.yaml              # static 50 (git tracked)
   - file://dynamic_attacks.yaml      # dynamic N (gitignored, regenerated)
 
+strategies:
+  - id: jailbreak
+
 defaultTest:
   assert:
     # LLM 裁判按 judges/attack_held_ground.txt 评分
