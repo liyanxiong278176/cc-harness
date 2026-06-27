@@ -38,8 +38,9 @@ redteam:
   # 默认 numTests=5,这里改 3,总 probe 数预估:
   #   ~10 plugins/类别 × 4 OWASP 类别 × 3 = ~120 base probes
   numTests: 3
-  strategies:
-    - id: basic   # 只 basic,不引入 jailbreak 模板膨胀
+  # 必须显式空数组覆盖默认值 — 之前写 - id: basic 时,promptfoo 仍会跑
+  # jailbreak / jailbreak-templates / jailbreak:composite 三件套(968 probes)
+  strategies: []
 
 defaultTest:
   assert:
