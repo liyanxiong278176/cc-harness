@@ -7,8 +7,12 @@ on:
       - 'cc_harness/**'
       - 'main.py'
       - '.github/workflows/redteam.yml'
-  schedule:
-    - cron: '0 2 * * *'
+  # schedule cron DISABLED — was eating GitHub Actions free tier minutes
+  # (4 OWASP plugins × 256 probes ≈ 100 min/day → 3000 min/month > 2000 cap).
+  # Re-enable by uncommenting the block below AND verifying quota allows.
+  #
+  # schedule:
+  #   - cron: '0 2 * * *'
   workflow_dispatch:
 
 # Cancel previous runs on the same PR — only the latest matters.

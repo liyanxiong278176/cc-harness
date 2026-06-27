@@ -99,6 +99,69 @@ def test_generate_strips_markdown_code_fences():
     assert generate_attacks.strip_code_fences(raw) == "- description: x\n  vars: { prompt: y }\n"
 
 
+def test_extract_yaml_block_handles_whole_text():
+    """Strategy 1: valid YAML directly parseable as whole text."""
+    raw = "- description: test\n  vars: { prompt: hi }\n"
+    result = generate_attacks.extract_yaml_block(raw)
+    assert isinstance(result, list)
+    assert result[0]["description"] == "test"
+
+
+def test_extract_yaml_block_handles_fenced_yaml_block():
+    """Strategy 2: extract first ```yaml ... ``` fenced block."""
+    raw = (
+        "Here you go:\n\n"
+        "```yaml\n"
+        "- description: t1\n  vars: { prompt: hi }\n"
+        "- description: t2\n  vars: { prompt: bye }\n"
+        "```\n\n"
+        "Let me know if you need more!\n"
+    )
+    result = generate_attacks.extract_yaml_block(raw)
+    assert isinstance(result, list)
+    assert len(result) == 2
+    assert result[0]["description"] == "t1"
+
+
+def test_extract_yaml_block_handles_fenced_no_language():
+    """Strategy 2b: bare ``` ... ``` (no 'yaml' tag)."""
+    raw = "```\n- description: t1\n  vars: { prompt: hi }\n```"
+    result = generate_attacks.extract_yaml_block(raw)
+    assert isinstance(result, list)
+    assert result[0]["description"] == "t1"
+
+
+def test_extract_yaml_block_handles_yaml_document_marker():
+    """Strategy 3: extract content between --- and ... (or end)."""
+    raw = "---\n- description: t1\n  vars: { prompt: hi }\n...\n"
+    result = generate_attacks.extract_yaml_block(raw)
+    assert isinstance(result, list)
+    assert result[0]["description"] == "t1"
+
+
+def test_extract_yaml_block_handles_document_marker_without_end():
+    """Strategy 3b: --- ... without trailing ... marker (LLM truncation)."""
+    raw = "---\n- description: t1\n  vars: { prompt: hi }\n"
+    result = generate_attacks.extract_yaml_block(raw)
+    assert isinstance(result, list)
+    assert result[0]["description"] == "t1"
+
+
+def test_extract_yaml_block_returns_none_on_unparseable():
+    """None of the strategies work → returns None."""
+    raw = "this is not yaml at all { broken : : :"
+    assert generate_attacks.extract_yaml_block(raw) is None
+
+
+def test_extract_yaml_block_recovers_from_inline_mapping_with_special_chars():
+    """The motivating failure case: inline flow mapping with backticks/colons
+    breaks naive yaml.safe_load. extract_yaml_block may not recover (the YAML
+    is genuinely broken), but the function must not raise — caller logs raw."""
+    raw = '- description: bad\n  vars: { prompt: `rm -rf /` and `chmod 777 /etc` }\n'
+    result = generate_attacks.extract_yaml_block(raw)
+    assert result is None or isinstance(result, list)
+
+
 def test_strip_code_fences_handles_no_trailing_newline():
     """DeepSeek sometimes omits the newline before the closing fence."""
     raw = "```yaml\n- a: 1\n- b: 2```"
