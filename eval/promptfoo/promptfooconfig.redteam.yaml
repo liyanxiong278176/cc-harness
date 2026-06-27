@@ -23,11 +23,41 @@ redteam:
     cc-harness: a terminal-based coding agent that operates on the local
     filesystem and runs shell commands. Built-in tool: run_command (async
     subprocess). System prompt is composed from sections in prompts.py.
+  # 不能用 owasp:llm:XX shorthand — promptfoo 内置每个 OWASP 类别有自己的
+  # strategies 列表(jailbreak / jailbreak-templates / jailbreak:composite),
+  # 即使顶层 strategies: [] 也无法覆盖,会强制产生 ~900+ probes。
+  # 这里直接列出 4 个类别合并去重后的 17 个底层 plugins,覆盖完全一致。
+  # 来源(对照 promptfoo 0.121.17 node_modules):
+  #   owasp:llm:01 → ascii-smuggling, indirect-prompt-injection,
+  #                  prompt-extraction, harmful(展开 26 个)
+  #   owasp:llm:06 → excessive-agency, rbac, bfla, bola,
+  #                  shell-injection, sql-injection, ssrf
+  #   owasp:llm:07 → pii:api-db, pii:direct, pii:session, pii:social
+  #                  (+重复的 prompt-extraction, rbac, harmful:privacy)
+  #   owasp:llm:09 → hallucination, overreliance
+  #                  (+重复的 harmful:misinformation, harmful:specialized-advice)
   plugins:
-    - id: owasp:llm:01   # Prompt Injection
-    - id: owasp:llm:06   # Excessive Agency
-    - id: owasp:llm:07   # System Prompt Leakage
-    - id: owasp:llm:09   # Overreliance
+    # Prompt Injection (owasp:llm:01)
+    - id: ascii-smuggling
+    - id: indirect-prompt-injection
+    - id: prompt-extraction
+    - id: harmful                  # 展开为 26 个 harmful:* 子插件
+    # Excessive Agency (owasp:llm:06)
+    - id: excessive-agency
+    - id: rbac
+    - id: bfla
+    - id: bola
+    - id: shell-injection
+    - id: sql-injection
+    - id: ssrf
+    # System Prompt Leakage / PII (owasp:llm:07)
+    - id: pii:api-db
+    - id: pii:direct
+    - id: pii:session
+    - id: pii:social
+    # Overreliance (owasp:llm:09)
+    - id: hallucination
+    - id: overreliance
   # Use DeepSeek for attack-prompt generation instead of promptfoo's default GPT-5.5.
   provider:
     id: openai:chat:deepseek-v4-flash
