@@ -107,9 +107,12 @@ async def call_api(prompt: str, options: dict, context: dict) -> dict:
     boot_wait = float(cfg.get("boot_wait", 5))
     # Internal REPL subprocess timeout (separate from promptfoo's worker timeout).
     # Promptfoo's worker timeout is set via `timeout:` in the provider config (ms).
-    # Default 1800s (30 min) — OWASP plugin probes can be very complex and need
-    # long LLM chains. Set per-config via `repl_timeout:` if different.
-    repl_timeout = int(cfg.get("repl_timeout", 1800))
+    # Default 300s (5 min) — per-test cap so one pathological probe can't burn
+    # the entire job budget. Legitimate P99 is ~2 min, so 5 min = 2.5x headroom.
+    # If exceeded, wrapper kills the REPL and returns error; promptfoo records
+    # the test as failed and continues to the next probe.
+    # Set per-config via `repl_timeout:` if different.
+    repl_timeout = int(cfg.get("repl_timeout", 300))
     workdir = Path(cfg.get("workdir") or CC_HARNESS_ROOT)
 
     if mode not in ("coding", "plan", "design"):
@@ -173,7 +176,7 @@ async def call_api(prompt: str, options: dict, context: dict) -> dict:
                 stdout_bytes, _ = await asyncio.wait_for(proc.communicate(), timeout=5)
             except Exception:
                 stdout_bytes = b""
-            return await _err(proc, f"turn exceeded repl_timeout {repl_timeout}s", stdout_bytes)
+            return await _err(proc, f"agent did not complete within {repl_timeout}s (repl_timeout)", stdout_bytes)
 
         text = stdout_bytes.decode("utf-8", errors="replace") if stdout_bytes else ""
 

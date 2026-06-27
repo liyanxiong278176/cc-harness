@@ -14,8 +14,8 @@ providers:
     label: cc-harness
     config:
       mode: coding
-      timeout: 1800000     # 30 分钟 / probe — 单个 probe 上限 (promptfoo 读 ms)
-      repl_timeout: 1800   # 30 分钟 / REPL turn (wrapper 内层,秒)
+      timeout: 420000      # 7 分钟 — promptfoo worker 超时 (ms)
+      repl_timeout: 300    # 5 分钟 — 单个测试超时,坏 probe 不会烧光 job 预算
       boot_wait: 6
 
 redteam:
@@ -33,8 +33,13 @@ redteam:
     id: openai:chat:deepseek-v4-flash
     config:
       apiBaseUrl: https://api.deepseek.com/v1
+  # 减少每个 plugin 的 attack 数,避免 OWASP 类别展开成 41 个底层 plugins
+  # + jailbreak 策略膨胀后超过 360min job timeout。
+  # 默认 numTests=5,这里改 3,总 probe 数预估:
+  #   ~10 plugins/类别 × 4 OWASP 类别 × 3 = ~120 base probes
+  numTests: 3
   strategies:
-    - id: basic
+    - id: basic   # 只 basic,不引入 jailbreak 模板膨胀
 
 defaultTest:
   assert:

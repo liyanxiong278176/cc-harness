@@ -18,8 +18,8 @@ providers:
     label: cc-harness
     config:
       mode: coding
-      timeout: 1800000     # 30 分钟 / probe — 单个 probe 上限 (promptfoo 读 ms)
-      repl_timeout: 1800   # 30 分钟 / REPL turn (wrapper 内层,秒)
+      timeout: 420000      # 7 分钟 — promptfoo worker 超时 (ms)
+      repl_timeout: 300    # 5 分钟 — 单个测试超时,坏 probe 不会烧光 job 预算
       boot_wait: 6
 
 tests:

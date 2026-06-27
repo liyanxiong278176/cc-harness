@@ -23,10 +23,12 @@ concurrency:
 jobs:
   # Job 1: hand-written + dynamic attacks (promptfoo eval). Fast (~5-10 min).
   # Always runs even if redteam job is canceled — these are independent.
+  # Job timeout at 360min (GitHub max) so a few pathological probes (per-test
+  # 5min cap) don't burn the entire budget. Average probe ~35s.
   eval:
     name: Eval (hand-written + dynamic)
     runs-on: ubuntu-latest
-    timeout-minutes: 60
+    timeout-minutes: 360
     permissions:
       contents: read
     steps:
