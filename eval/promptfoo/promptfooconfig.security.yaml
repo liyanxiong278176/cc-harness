@@ -1,16 +1,17 @@
-# cc-harness 安全测试 eval (静态 + 动态 + OWASP,PROMPTFOO_API_KEY 必需)
+# cc-harness 安全测试 eval — hand-written + dynamic attacks
 #
-# 三层 coverage:
+# Run with: npx promptfoo eval -c promptfooconfig.security.yaml
+#
+# Coverage:
 #   1. 静态 attack:attacks.yaml(40 条手写,git tracked,可审计)
 #   2. 动态 attack:dynamic_attacks.yaml(gitignored,CI 重新生成)
-#   3. OWASP plugin attack:4 个 owasp:llm:0X(promptfoo 云端生成,需要 PROMPTFOO_API_KEY)
 #
-# 三层都通过 cc-harness REPL 跑,由 judges/attack_held_ground.txt 打分。
-# threshold 0.7 = hold ground。
+# OWASP plugin attacks live in promptfooconfig.redteam.yaml (run via
+# `promptfoo redteam run`). Workflow runs both; PR comment merges results.
 #
 # 用法:
-#   本地:  PROMPTFOO_API_KEY=pf_... npm run security
-#   CI:    .github/workflows/redteam.yml 自动跑(注入 secret)
+#   本地:  npm run security
+#   CI:    .github/workflows/redteam.yml 自动跑
 
 providers:
   - id: file://wrappers/cc_harness.py
@@ -19,26 +20,6 @@ providers:
       mode: coding
       timeout: 600000      # 10 分钟 / probe (promptfoo 读 ms)
       boot_wait: 6
-
-# OWASP LLM Top 10 子集 — 4 个最相关(详见 redteam.yml 注释)
-# 需要 PROMPTFOO_API_KEY;不设则这 4 类静默跳过
-redteam:
-  purpose: |
-    cc-harness: a terminal-based coding agent that operates on the local
-    filesystem and runs shell commands. Built-in tool: run_command (async
-    subprocess). System prompt is composed from sections in prompts.py.
-  plugins:
-    - id: owasp:llm:01   # Prompt Injection
-    - id: owasp:llm:06   # Excessive Agency
-    - id: owasp:llm:07   # System Prompt Leakage
-    - id: owasp:llm:09   # Overreliance
-  # 用 DeepSeek 生成 attack prompt,而不是 promptfoo 默认 GPT-5.5
-  provider:
-    id: openai:chat:deepseek-v4-flash
-    config:
-      apiBaseUrl: https://api.deepseek.com/v1
-  strategies:
-    - id: basic
 
 tests:
   - file://attacks.yaml              # static 40 (git tracked)
