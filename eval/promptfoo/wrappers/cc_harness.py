@@ -107,7 +107,9 @@ async def call_api(prompt: str, options: dict, context: dict) -> dict:
     boot_wait = float(cfg.get("boot_wait", 5))
     # Internal REPL subprocess timeout (separate from promptfoo's worker timeout).
     # Promptfoo's worker timeout is set via `timeout:` in the provider config (ms).
-    repl_timeout = int(cfg.get("repl_timeout", 90))
+    # Default 1800s (30 min) — OWASP plugin probes can be very complex and need
+    # long LLM chains. Set per-config via `repl_timeout:` if different.
+    repl_timeout = int(cfg.get("repl_timeout", 1800))
     workdir = Path(cfg.get("workdir") or CC_HARNESS_ROOT)
 
     if mode not in ("coding", "plan", "design"):

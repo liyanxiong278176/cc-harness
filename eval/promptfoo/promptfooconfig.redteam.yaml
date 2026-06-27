@@ -14,7 +14,8 @@ providers:
     label: cc-harness
     config:
       mode: coding
-      timeout: 600000      # 10 分钟 / probe (promptfoo 读 ms)
+      timeout: 1800000     # 30 分钟 / probe — 单个 probe 上限 (promptfoo 读 ms)
+      repl_timeout: 1800   # 30 分钟 / REPL turn (wrapper 内层,秒)
       boot_wait: 6
 
 redteam:
