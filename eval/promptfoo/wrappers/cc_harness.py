@@ -28,11 +28,48 @@ import re
 import sys
 import time
 from pathlib import Path
+from typing import Optional
 
 # This file lives at: <repo>/eval/promptfoo/wrappers/cc_harness.py
-# so the cc-harness root is 3 levels up.
-CC_HARNESS_ROOT = Path(__file__).resolve().parents[3]
-MAIN_PY = CC_HARNESS_ROOT / "main.py"
+# so the cc-harness root is 3 levels up. We search a few candidates
+# upward because promptfoo may invoke us from a context where parents[3]
+# resolves to a path without main.py (observed in CI as
+# "main.py not found" failures — root cause unclear).
+def _resolve_main_py_search(start: Optional[Path] = None) -> Optional[Path]:
+    """Search upward from `start` for the first existing main.py.
+
+    Returns the Path to main.py, or None if not found within 6 levels.
+    Used both at module import and by tests via the `_resolve_main_py`
+    alias below.
+    """
+    if start is None:
+        start = Path(__file__).resolve().parent
+    base = start
+    for _ in range(6):  # try this dir + 5 ancestors
+        candidate = base / "main.py"
+        if candidate.exists() and candidate.is_file():
+            return candidate
+        parent = base.parent
+        if parent == base:  # hit filesystem root
+            break
+        base = parent
+    return None
+
+
+def _resolve_main_py() -> Optional[Path]:
+    """Public alias for the search function (used by tests)."""
+    return _resolve_main_py_search()
+
+
+_RESOLVED_MAIN_PY = _resolve_main_py_search()
+if _RESOLVED_MAIN_PY is None:
+    # Fall back to the original computation; call_api() will surface a
+    # descriptive error including the candidates we searched.
+    CC_HARNESS_ROOT = Path(__file__).resolve().parents[3]
+    MAIN_PY = CC_HARNESS_ROOT / "main.py"
+else:
+    MAIN_PY = _RESOLVED_MAIN_PY
+    CC_HARNESS_ROOT = MAIN_PY.parent
 
 
 def _resolve_python() -> str:
@@ -76,7 +113,15 @@ async def call_api(prompt: str, options: dict, context: dict) -> dict:
     if mode not in ("coding", "plan", "design"):
         return {"output": "", "error": f"unknown mode: {mode}"}
     if not MAIN_PY.exists():
-        return {"output": "", "error": f"main.py not found: {MAIN_PY}"}
+        # Show what we searched so debugging is easier in CI.
+        candidates = [
+            Path(__file__).resolve().parent,
+            Path(__file__).resolve().parents[1],
+            Path(__file__).resolve().parents[2],
+            Path(__file__).resolve().parents[3],
+        ]
+        searched = " ".join(str(p / "main.py") for p in candidates)
+        return {"output": "", "error": f"main.py not found at {MAIN_PY}. Searched: {searched}"}
 
     env = os.environ.copy()
     env["PYTHONIOENCODING"] = "utf-8"
