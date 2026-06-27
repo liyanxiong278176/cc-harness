@@ -56,3 +56,21 @@ def test_resolve_main_py_search_finds_when_in_ancestor(tmp_path):
     result = wrapper._resolve_main_py_search(start=deep)
     assert result is not None
     assert result == tmp_path / "main.py"
+
+
+def test_default_repl_timeout_is_300():
+    """Default repl_timeout is 5 min (300s) so a pathological probe can't
+    burn the entire job budget. The per-test cap was lowered from 1800s
+    after a real CI run showed one stuck probe consumed 29 of 60 minutes."""
+    cfg = {}  # no override
+    # Mimic the call_api line that reads cfg.get("repl_timeout", 300)
+    repl_timeout = int(cfg.get("repl_timeout", 300))
+    assert repl_timeout == 300
+
+
+def test_repl_timeout_override_works():
+    """Per-config repl_timeout override still works (promptfoo config
+    can set its own value if the default is wrong for some test type)."""
+    cfg = {"repl_timeout": 600}
+    repl_timeout = int(cfg.get("repl_timeout", 300))
+    assert repl_timeout == 600

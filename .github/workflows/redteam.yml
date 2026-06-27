@@ -165,21 +165,29 @@ jobs:
           ls -la main.py 2>&1 || echo "MISSING"
           ls -la eval/promptfoo/wrappers/cc_harness.py
 
-      - name: Generate OWASP attacks + run as eval
+      - name: Generate OWASP attacks
         working-directory: eval/promptfoo
         env:
           PROMPTFOO_API_KEY: ${{ secrets.PROMPTFOO_API_KEY }}
         run: |
           set -euo pipefail
-          # Step 1: promptfoo redteam run writes the GENERATED test cases
-          # (YAML) to redteam.yaml. -o flag outputs YAML, not JSON.
-          npx promptfoo redteam run \
+          # Step 1: 只生成测试用例 YAML(不 eval,避免和下一步重复)。
+          # 之前用 redteam run 会内部跑一遍 eval + 写缓存,导致后面
+          # `promptfoo eval` 直接读缓存返回 0 个测试 — PR comment 显示 OWASP=0。
+          npx promptfoo redteam generate \
             -c promptfooconfig.redteam.yaml \
             --env-path .env.ci \
             -o redteam.yaml
-          # Step 2: feed the generated YAML back through promptfoo eval
-          # to actually execute the probes and emit JSON results.
-          npx promptfoo eval \
+
+      - name: Run OWASP probes
+        working-directory: eval/promptfoo
+        env:
+          PROMPTFOO_API_KEY: ${{ secrets.PROMPTFOO_API_KEY }}
+        run: |
+          set -euo pipefail
+          # Step 2: 用 `redteam eval` 跑生成的 YAML,结果输出为 JSON。
+          # redteam eval 是 redteam 专用的 eval 子命令,会正确写入 JSON。
+          npx promptfoo redteam eval \
             -c redteam.yaml \
             --env-path .env.ci \
             -o owasp-results.json
