@@ -21,25 +21,20 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  redteam:
+  # Job 1: hand-written + dynamic attacks (promptfoo eval). Fast (~5-10 min).
+  # Always runs even if redteam job is canceled — these are independent.
+  eval:
+    name: Eval (hand-written + dynamic)
     runs-on: ubuntu-latest
+    timeout-minutes: 60
     permissions:
-      pull-requests: write   # to post the summary comment
       contents: read
-    timeout-minutes: 360     # GitHub max — eval + OWASP sequentially, ~100min each
-
     steps:
       - uses: actions/checkout@v4
 
       - uses: actions/setup-python@v5
         with:
           python-version: '3.13'
-
-      - name: Cache pip
-        uses: actions/cache@v4
-        with:
-          path: ~/.cache/pip
-          key: ${{ runner.os }}-pip-${{ hashFiles('pyproject.toml') }}
 
       - name: Install cc-harness deps
         run: |
@@ -54,46 +49,23 @@ jobs:
         working-directory: eval/promptfoo
         run: npm ci
 
-      # Clear promptfoo's state directory before each run.
-      #
-      # Why: promptfoo 0.121's internal SQLite schema (eval tracking,
-      # telemetry) doesn't match what older versions created on disk.
-      # On a fresh runner, promptfoo's first run will try to insert into
-      # tables that don't exist yet → FOREIGN KEY constraint failure.
-      #
-      # We tried caching `~/.promptfoo/cache` and restoring it between
-      # runs, but the restored schema conflicts with the current
-      # binary. The simpler fix is: wipe state on every run. We lose
-      # the cross-run API response cache (slower) but gain reliability.
-      # Re-add caching once promptfoo's schema stabilizes.
       - name: Clear promptfoo state
         run: rm -rf ~/.promptfoo
         continue-on-error: true
 
-      - name: Build runtime env
+      - name: Build runtime env (no PROMPTFOO_API_KEY needed for eval)
         working-directory: eval/promptfoo
         run: |
           {
             echo "OPENAI_API_KEY=${{ secrets.OPENAI_API_KEY }}"
             echo "OPENAI_BASE_URL=https://api.deepseek.com/v1"
             echo "OPENAI_MODEL=deepseek-v4-flash"
-            # For llm-rubric judge
             echo "JUDGE_MODEL=deepseek-v4-flash"
-            # Embedding (memory) — required by cc-harness config.py
             echo "EMBEDDING_BASE_URL=https://api.siliconflow.cn/v1"
             echo "EMBEDDING_API_KEY=${{ secrets.EMBEDDING_API_KEY }}"
             echo "EMBEDDING_MODEL=BAAI/bge-m3"
             echo "EMBEDDING_DIM=1024"
-            # Use in-memory cache + eval tracking instead of disk SQLite.
-            # promptfoo 0.121 has a bug in its eval-tracking drizzle schema
-            # that throws FOREIGN KEY constraint failures on disk-backed
-            # SQLite. In-memory mode skips the disk path entirely.
-            # (Trade-off: no cross-run API response cache.)
             echo "PROMPTFOO_CACHE_TYPE=memory"
-            # Required by OWASP plugins (owasp:llm:01/06/07/09) — see
-            # promptfooconfig.security.yaml. Without it the 4 plugins
-            # silently produce no probes.
-            echo "PROMPTFOO_API_KEY=${{ secrets.PROMPTFOO_API_KEY }}"
           } > .env.ci
 
       # Debug step: confirms wrapper can find main.py in CI checkout.
@@ -101,24 +73,16 @@ jobs:
       # (eval/promptfoo/wrappers/cc_harness.py) needs to look harder.
       - name: Debug repo state
         run: |
-          echo "--- pwd ---"
           pwd
-          echo "--- repo root main.py ---"
           ls -la main.py 2>&1 || echo "MISSING"
-          echo "--- wrapper exists ---"
           ls -la eval/promptfoo/wrappers/cc_harness.py
-          echo "--- promptfoo version ---"
-          npx promptfoo --version
 
       - name: Generate dynamic attacks
-        id: generate
         working-directory: eval/promptfoo
         env:
           OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
           OPENAI_BASE_URL: https://api.deepseek.com/v1
           OPENAI_MODEL: deepseek-v4-flash
-          # Embedding (for downstream curate; generate itself doesn't need these,
-          # but we set them for consistency with eval step)
           EMBEDDING_BASE_URL: https://api.siliconflow.cn/v1
           EMBEDDING_API_KEY: ${{ secrets.EMBEDDING_API_KEY }}
           EMBEDDING_MODEL: BAAI/bge-m3
@@ -126,60 +90,145 @@ jobs:
         run: |
           set -euo pipefail
           python tools/generate_attacks.py --per-cat 3
-        # NOTE: no continue-on-error. Generation failure fails the build.
-        # Model resolution: --model > $OPENAI_MODEL > "deepseek-v4-pro".
-        # We set OPENAI_MODEL=deepseek-v4-flash in env above so CI uses flash
-        # (already proven in the eval step; pro is reserved for local dev).
 
-      - name: Run security eval (hand-written + dynamic)
-        id: eval_run
+      - name: Run security eval
         working-directory: eval/promptfoo
         run: |
           set -euo pipefail
-          echo "--- starting eval (hand-written + dynamic) ---"
           npx promptfoo eval \
             -c promptfooconfig.security.yaml \
             --env-path .env.ci \
             -o eval-results.json
-        # NO `|| true` — workflow fails on any probe that breaks the agent.
 
-      - name: Run security redteam (OWASP)
-        id: redteam_run
+      - name: Upload eval results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: eval-results
+          path: eval/promptfoo/eval-results.json
+          if-no-files-found: warn
+
+  # Job 2: OWASP plugin attacks (promptfoo redteam run + eval). Slow (~30-60 min).
+  # Runs in PARALLEL with eval job — total wall-clock time is max(eval, redteam)
+  # instead of sum. Independent failures: each job's exit code is its own.
+  redteam:
+    name: Redteam (OWASP)
+    runs-on: ubuntu-latest
+    timeout-minutes: 360     # GitHub max — OWASP plugin probes can be slow
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+
+      - name: Install cc-harness deps
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e .
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Install promptfoo
+        working-directory: eval/promptfoo
+        run: npm ci
+
+      - name: Clear promptfoo state
+        run: rm -rf ~/.promptfoo
+        continue-on-error: true
+
+      - name: Build runtime env (with PROMPTFOO_API_KEY for OWASP)
+        working-directory: eval/promptfoo
+        run: |
+          {
+            echo "OPENAI_API_KEY=${{ secrets.OPENAI_API_KEY }}"
+            echo "OPENAI_BASE_URL=https://api.deepseek.com/v1"
+            echo "OPENAI_MODEL=deepseek-v4-flash"
+            echo "JUDGE_MODEL=deepseek-v4-flash"
+            echo "EMBEDDING_BASE_URL=https://api.siliconflow.cn/v1"
+            echo "EMBEDDING_API_KEY=${{ secrets.EMBEDDING_API_KEY }}"
+            echo "EMBEDDING_MODEL=BAAI/bge-m3"
+            echo "EMBEDDING_DIM=1024"
+            echo "PROMPTFOO_CACHE_TYPE=memory"
+            echo "PROMPTFOO_API_KEY=${{ secrets.PROMPTFOO_API_KEY }}"
+          } > .env.ci
+
+      - name: Debug repo state
+        run: |
+          pwd
+          ls -la main.py 2>&1 || echo "MISSING"
+          ls -la eval/promptfoo/wrappers/cc_harness.py
+
+      - name: Generate OWASP attacks + run as eval
         working-directory: eval/promptfoo
         env:
-          # Pass secret explicitly so `redteam run` sees it in process env
-          # (cloud-inference step reads process env directly, not --env-path).
           PROMPTFOO_API_KEY: ${{ secrets.PROMPTFOO_API_KEY }}
         run: |
           set -euo pipefail
-          echo "--- starting redteam (OWASP) step 1/2: generate attacks ---"
           # Step 1: promptfoo redteam run writes the GENERATED test cases
           # (YAML) to redteam.yaml. -o flag outputs YAML, not JSON.
           npx promptfoo redteam run \
             -c promptfooconfig.redteam.yaml \
             --env-path .env.ci \
             -o redteam.yaml
-          echo "--- starting redteam (OWASP) step 2/2: run as eval ---"
           # Step 2: feed the generated YAML back through promptfoo eval
-          # to actually execute the probes and emit JSON results that
-          # the PR comment JS can read.
+          # to actually execute the probes and emit JSON results.
           npx promptfoo eval \
             -c redteam.yaml \
             --env-path .env.ci \
             -o owasp-results.json
-        # NO `|| true` — workflow fails on any probe that breaks the agent.
+
+      - name: Upload redteam results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: owasp-results
+          path: eval/promptfoo/owasp-results.json
+          if-no-files-found: warn
+
+  # Job 3: Post PR comment. Depends on BOTH eval and redteam (so artifacts
+  # are available). Runs even if either upstream failed (if: always()) so
+  # the PR still gets a comment explaining what went wrong.
+  comment:
+    name: Post PR comment
+    needs: [eval, redteam]
+    if: always() && github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      pull-requests: write
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download eval results
+        uses: actions/download-artifact@v4
+        with:
+          name: eval-results
+          path: eval-artifacts/
+        continue-on-error: true
+
+      - name: Download redteam results
+        uses: actions/download-artifact@v4
+        with:
+          name: owasp-results
+          path: owasp-artifacts/
+        continue-on-error: true
 
       - name: Post PR comment
-        if: always() && github.event_name == 'pull_request'
         uses: actions/github-script@v7
         with:
           script: |
             const fs = require('fs');
 
-            // Read BOTH result files. Each is produced by a separate job
-            // (eval + redteam) so either may be missing if its step failed.
-            const evalPath = 'eval/promptfoo/eval-results.json';
-            const owaspPath = 'eval/promptfoo/owasp-results.json';
+            // Read both result files (downloaded as artifacts). Either
+            // may be missing if its job failed.
+            const evalPath = 'eval-artifacts/eval-results.json';
+            const owaspPath = 'owasp-artifacts/owasp-results.json';
             const readResults = (path) => {
               if (!fs.existsSync(path)) return [];
               try {
@@ -195,7 +244,7 @@ jobs:
               await github.rest.issues.createComment({
                 owner: context.repo.owner, repo: context.repo.repo,
                 issue_number: context.issue.number,
-                body: '## 🛡️ Security Eval\n\n⚠️ No `eval-results.json` or `owasp-results.json` produced. Check workflow logs.'
+                body: '## 🛡️ Security Eval\n\n⚠️ Neither eval-results.json nor owasp-results.json was produced. Both jobs may have failed. Check workflow logs.'
               });
               return;
             }
@@ -220,9 +269,6 @@ jobs:
               || "medium";
 
             // Classify each probe into one of 3 sources.
-            // OWASP: promptfoo plugin (has pluginId)
-            // Dynamic: local LLM-generated (has source: 'dynamic')
-            // Static: hand-written (everything else)
             const classify = (r) => {
               const md = r.testCase?.metadata || {};
               if (md.pluginId) return 'owasp';
@@ -291,7 +337,7 @@ jobs:
                 ? `### Failed probes (grouped by severity)${failedSection}\n\n⚠️ Some attacks succeeded — review the artifact.`
                 : `🎉 All attacks held — agent is robust.`,
               ``,
-              `📎 Full per-attack results in the workflow artifact (\`security-output\`).`,
+              `📎 Full per-attack results in the workflow artifacts (\`eval-results\` + \`owasp-results\`).`,
             ].join('\n');
 
             await github.rest.issues.createComment({
@@ -299,16 +345,6 @@ jobs:
               issue_number: context.issue.number,
               body
             });
-
-      - name: Upload results
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: security-output
-          path: |
-            eval/promptfoo/eval-results.json
-            eval/promptfoo/owasp-results.json
-          if-no-files-found: warn
 
 # ----------------------------------------------------------------------
 # To complete the CI gate (one-time setup per repo, do it in GitHub UI):
@@ -320,8 +356,9 @@ jobs:
 #        ✅ Require a pull request before merging
 #        ✅ Require approvals (1+)
 #        ✅ Require status checks to pass before merging
-#        ✅ Require branches to be up to date before merging
-#        → Search and add: "redteam"  (the job name in this workflow)
+#        → Search and add: "Eval (hand-written + dynamic)"  (PR gate)
+#        → Search and add: "Redteam (OWASP)"               (PR gate)
+#        (Do NOT require "Post PR comment" — it's cosmetic.)
 #
 #   3. Repo → Settings → Secrets and variables → Actions:
 #        OPENAI_API_KEY     (DeepSeek key)
@@ -330,5 +367,5 @@ jobs:
 #                            owasp:llm:01/06/07/09. Free tier 10k probes/month)
 #
 #   4. Open a test PR that touches eval/promptfoo/** to confirm the
-#      workflow fires and the check shows up in the PR's status list.
+#      workflow fires and the checks show up in the PR's status list.
 # ----------------------------------------------------------------------
