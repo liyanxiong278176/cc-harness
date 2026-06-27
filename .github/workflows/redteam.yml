@@ -26,7 +26,7 @@ jobs:
     permissions:
       pull-requests: write   # to post the summary comment
       contents: read
-    timeout-minutes: 240     # 4 OWASP plugins × ~64 probes/ea + 40 hand-written + 21 dynamic ≈ 256 probes @ concurrency 4
+    timeout-minutes: 360     # GitHub max — eval + OWASP sequentially, ~100min each
 
     steps:
       - uses: actions/checkout@v4
@@ -96,6 +96,20 @@ jobs:
             echo "PROMPTFOO_API_KEY=${{ secrets.PROMPTFOO_API_KEY }}"
           } > .env.ci
 
+      # Debug step: confirms wrapper can find main.py in CI checkout.
+      # If this ever shows MISSING, the wrapper's fallback path search
+      # (eval/promptfoo/wrappers/cc_harness.py) needs to look harder.
+      - name: Debug repo state
+        run: |
+          echo "--- pwd ---"
+          pwd
+          echo "--- repo root main.py ---"
+          ls -la main.py 2>&1 || echo "MISSING"
+          echo "--- wrapper exists ---"
+          ls -la eval/promptfoo/wrappers/cc_harness.py
+          echo "--- promptfoo version ---"
+          npx promptfoo --version
+
       - name: Generate dynamic attacks
         id: generate
         working-directory: eval/promptfoo
@@ -117,8 +131,20 @@ jobs:
         # We set OPENAI_MODEL=deepseek-v4-flash in env above so CI uses flash
         # (already proven in the eval step; pro is reserved for local dev).
 
-      - name: Run security redteam (static + dynamic + OWASP)
-        id: redteam
+      - name: Run security eval (hand-written + dynamic)
+        id: eval_run
+        working-directory: eval/promptfoo
+        run: |
+          set -euo pipefail
+          echo "--- starting eval (hand-written + dynamic) ---"
+          npx promptfoo eval \
+            -c promptfooconfig.security.yaml \
+            --env-path .env.ci \
+            -o eval-results.json
+        # NO `|| true` — workflow fails on any probe that breaks the agent.
+
+      - name: Run security redteam (OWASP)
+        id: redteam_run
         working-directory: eval/promptfoo
         env:
           # Pass secret explicitly so `redteam run` sees it in process env
@@ -126,24 +152,12 @@ jobs:
           PROMPTFOO_API_KEY: ${{ secrets.PROMPTFOO_API_KEY }}
         run: |
           set -euo pipefail
-          # Sanity-check env before running
-          echo "--- .env.ci (sanitized) ---"
-          sed 's/=.*/=***/' .env.ci
-          echo "--- promptfoo version ---"
-          npx promptfoo --version
-          echo "--- PROMPTFOO_API_KEY set: ${PROMPTFOO_API_KEY:+yes} ---"
-          echo "--- starting redteam ---"
-          # `redteam run` does both:
-          #   1. Generates dynamic attack probes via OWASP plugins (cloud)
-          #   2. Evaluates static (attacks.yaml) + dynamic (dynamic_attacks.yaml)
-          #      + OWASP-generated probes against cc-harness REPL
+          echo "--- starting redteam (OWASP) ---"
           npx promptfoo redteam run \
-            -c promptfooconfig.security.yaml \
+            -c promptfooconfig.redteam.yaml \
             --env-path .env.ci \
-            -o security-results.json
+            -o owasp-results.json
         # NO `|| true` — workflow fails on any probe that breaks the agent.
-        # Combined with branch protection "Require status checks", this
-        # blocks the PR from merging.
 
       - name: Post PR comment
         if: always() && github.event_name == 'pull_request'
@@ -151,20 +165,33 @@ jobs:
         with:
           script: |
             const fs = require('fs');
-            const path = 'eval/promptfoo/security-results.json';
-            if (!fs.existsSync(path)) {
+
+            // Read BOTH result files. Each is produced by a separate job
+            // (eval + redteam) so either may be missing if its step failed.
+            const evalPath = 'eval/promptfoo/eval-results.json';
+            const owaspPath = 'eval/promptfoo/owasp-results.json';
+            const readResults = (path) => {
+              if (!fs.existsSync(path)) return [];
+              try {
+                const data = JSON.parse(fs.readFileSync(path, 'utf8'));
+                return (data.results && data.results.results) || [];
+              } catch (e) {
+                return [];
+              }
+            };
+            const all = [...readResults(evalPath), ...readResults(owaspPath)];
+
+            if (all.length === 0) {
               await github.rest.issues.createComment({
                 owner: context.repo.owner, repo: context.repo.repo,
                 issue_number: context.issue.number,
-                body: '## 🛡️ Security Eval\n\n⚠️ No `security-results.json` produced. Check the workflow logs.'
+                body: '## 🛡️ Security Eval\n\n⚠️ No `eval-results.json` or `owasp-results.json` produced. Check workflow logs.'
               });
               return;
             }
-            const data = JSON.parse(fs.readFileSync(path, 'utf8'));
-            const all = (data.results && data.results.results) || [];
 
-            // Severity defaults per category (kept in sync with
-            // eval/promptfoo/tools/generate_attacks.py CATEGORY_DEFAULT_SEVERITY)
+            // Severity defaults — kept in sync with
+            // eval/promptfoo/tools/generate_attacks.py CATEGORY_DEFAULT_SEVERITY
             const SEVERITY_DEFAULT = {
               "credential-exfil": "critical",
               "shell-injection": "critical",
@@ -182,25 +209,42 @@ jobs:
               || SEVERITY_DEFAULT[r.testCase?.metadata?.category]
               || "medium";
 
-            const dynamic = all.filter(r => r.testCase?.metadata?.source === 'dynamic');
-            const static_ = all.filter(r => r.testCase?.metadata?.source !== 'dynamic');
+            // Classify each probe into one of 3 sources.
+            // OWASP: promptfoo plugin (has pluginId)
+            // Dynamic: local LLM-generated (has source: 'dynamic')
+            // Static: hand-written (everything else)
+            const classify = (r) => {
+              const md = r.testCase?.metadata || {};
+              if (md.pluginId) return 'owasp';
+              if (md.source === 'dynamic') return 'dynamic';
+              return 'static';
+            };
 
-            const stats = arr => ({
+            const stats = (arr) => ({
               total: arr.length,
               pass: arr.filter(r => r.success).length,
               fail: arr.filter(r => !r.success).length,
             });
-            const s = stats(static_);
-            const d = stats(dynamic);
-            const total = s.total + d.total;
-            const totalPass = s.pass + d.pass;
-            const totalFail = s.fail + d.fail;
+            const buckets = {
+              static: all.filter(r => classify(r) === 'static'),
+              dynamic: all.filter(r => classify(r) === 'dynamic'),
+              owasp: all.filter(r => classify(r) === 'owasp'),
+            };
+            const s = stats(buckets.static);
+            const d = stats(buckets.dynamic);
+            const o = stats(buckets.owasp);
+            const total = s.total + d.total + o.total;
+            const totalPass = s.pass + d.pass + o.pass;
+            const totalFail = s.fail + d.fail + o.fail;
             const rate = total ? (totalPass / total * 100).toFixed(1) : '0.0';
             const sRate = s.total ? (s.pass / s.total * 100).toFixed(1) : '0.0';
             const dRate = d.total ? (d.pass / d.total * 100).toFixed(1) : '0.0';
+            const oRate = o.total ? (o.pass / o.total * 100).toFixed(1) : '0.0';
             const emoji = totalFail > 0 ? '🚨' : '✅';
 
-            // Group failed probes by severity
+            // Build failed-section grouped by severity. Show error details
+            // (truncated to first line, 80 chars) for each failed probe so
+            // the PR comment is debuggable, not just "static ?".
             const failed = all.filter(r => !r.success).slice(0, 10);
             const bySeverity = {};
             for (const r of failed) {
@@ -213,21 +257,25 @@ jobs:
               if (!list || list.length === 0) continue;
               failedSection += `\n### ${SEVERITY_EMOJI[sev]} ${sev.toUpperCase()} (${list.length})\n`;
               for (const r of list) {
-                const desc = (r.testCase?.description || '?').replace(/^[^#]+#\d+\s*—\s*/, '');
-                const src = r.testCase?.metadata?.source === 'dynamic' ? '🆕 dynamic' : 'static';
-                failedSection += `- **${src}** ${desc} — score: ${(r.score || 0).toFixed(2)}\n`;
+                const src = classify(r);
+                const md = r.testCase?.metadata || {};
+                const desc = (r.testCase?.description || md.pluginId || '?')
+                  .replace(/^[^#]+#\d+\s*—\s*/, '');
+                const err = (r.response?.error || '').split('\n')[0].slice(0, 80);
+                const errTag = err ? ` — ❗ \`${err}\`` : '';
+                failedSection += `- **${src}** ${desc} — score: ${(r.score || 0).toFixed(2)}${errTag}\n`;
               }
             }
 
             const body = [
               `## ${emoji} cc-harness Security Eval Results`,
               ``,
-              `| Metric | Static | Dynamic | Total |`,
-              `|---|---|---|---|`,
-              `| Attacks | ${s.total} | ${d.total} | ${total} |`,
-              `| Held ground (pass) | ${s.pass} | ${d.pass} | ${totalPass} |`,
-              `| Broke (fail) | **${s.fail}** | **${d.fail}** | **${totalFail}** |`,
-              `| Hold rate | ${sRate}% | ${dRate}% | ${rate}% |`,
+              `| Metric | Static | Dynamic | OWASP | Total |`,
+              `|---|---|---|---|---|`,
+              `| Attacks | ${s.total} | ${d.total} | ${o.total} | ${total} |`,
+              `| Held ground (pass) | ${s.pass} | ${d.pass} | ${o.pass} | ${totalPass} |`,
+              `| Broke (fail) | **${s.fail}** | **${d.fail}** | **${o.fail}** | **${totalFail}** |`,
+              `| Hold rate | ${sRate}% | ${dRate}% | ${oRate}% | ${rate}% |`,
               ``,
               totalFail > 0
                 ? `### Failed probes (grouped by severity)${failedSection}\n\n⚠️ Some attacks succeeded — review the artifact.`
@@ -247,7 +295,9 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: security-output
-          path: eval/promptfoo/security-results.json
+          path: |
+            eval/promptfoo/eval-results.json
+            eval/promptfoo/owasp-results.json
           if-no-files-found: warn
 
 # ----------------------------------------------------------------------
