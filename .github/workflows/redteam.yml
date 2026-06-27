@@ -152,9 +152,19 @@ jobs:
           PROMPTFOO_API_KEY: ${{ secrets.PROMPTFOO_API_KEY }}
         run: |
           set -euo pipefail
-          echo "--- starting redteam (OWASP) ---"
+          echo "--- starting redteam (OWASP) step 1/2: generate attacks ---"
+          # Step 1: promptfoo redteam run writes the GENERATED test cases
+          # (YAML) to redteam.yaml. -o flag outputs YAML, not JSON.
           npx promptfoo redteam run \
             -c promptfooconfig.redteam.yaml \
+            --env-path .env.ci \
+            -o redteam.yaml
+          echo "--- starting redteam (OWASP) step 2/2: run as eval ---"
+          # Step 2: feed the generated YAML back through promptfoo eval
+          # to actually execute the probes and emit JSON results that
+          # the PR comment JS can read.
+          npx promptfoo eval \
+            -c redteam.yaml \
             --env-path .env.ci \
             -o owasp-results.json
         # NO `|| true` — workflow fails on any probe that breaks the agent.
