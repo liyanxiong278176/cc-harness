@@ -12,6 +12,20 @@ INIT_TIMEOUT_S = 30.0
 CALL_TIMEOUT_S = 30.0
 
 
+def _failure_msg(name: str, exc: BaseException) -> str:
+    """Build a never-empty per-server failure message.
+
+    Many transport exceptions (``asyncio.CancelledError``, bare ``OSError``
+    subclasses, anyio's cancel-scope noise) stringify to ``""``, which used to
+    render as ``server X failed to start:`` with no reason. Using the exception
+    type name + ``repr`` guarantees the user can always see *something*
+    actionable, even when ``str(exc)`` is empty.
+
+    Pure function so it can be unit-tested without a rich Console.
+    """
+    return f"server {name} failed to start: {type(exc).__name__}: {exc!r}"
+
+
 @dataclass
 class ToolResult:
     is_error: bool = False
@@ -40,84 +54,116 @@ class MCPClient:
         self._tools: list[dict] = []
 
     async def start(self, init_timeout_s: float = INIT_TIMEOUT_S) -> None:
-        """Connect to all servers, initialize sessions, list tools.
+        """Connect to all servers concurrently, initialize sessions, list tools.
 
-        Per-server failures are isolated: a single bad server is logged and
-        skipped, the rest still come up. ``init_timeout_s`` is exposed for tests
-        so they can use a shorter value; production code uses the default.
-
-        Each server gets its own ``AsyncExitStack`` so that a failed server's
-        anyio task-group cleanup does not leak cancellation into the next
-        server's setup.
+        Servers boot in parallel via ``asyncio.gather``, so startup time tracks
+        the slowest server rather than the sum of all of them. Per-server
+        failures stay isolated: each server runs in its own coroutine with its
+        own ``AsyncExitStack`` and catches every error it can raise, so a bad
+        server is logged and skipped without aborting the boot or cancelling
+        its siblings (``gather`` never sees an exception from ``_start_one``,
+        so it never propagates one server's failure into a cancellation of the
+        rest). ``init_timeout_s`` is exposed for tests so they can use a shorter
+        value; production code uses the default.
         """
-        for name, cfg in self._servers.items():
-            # Per-server stack: if this server fails we close the stack
-            # (which tears down the transport and its background tasks
-            # cleanly) and the next server starts with a fresh stack.
-            local = AsyncExitStack()
-            try:
-                if cfg.transport_type == "stdio":
-                    params = StdioServerParameters(
-                        command=cfg.command,  # type: ignore[arg-type]
-                        args=cfg.args,
-                        env=cfg.env or None,
-                    )
-                    cm = stdio_client(params)
-                    read, write = await asyncio.wait_for(
-                        local.enter_async_context(cm),
-                        timeout=init_timeout_s,
-                    )
-                elif cfg.transport_type == "sse":
-                    from mcp.client.sse import sse_client
-                    url = cfg.url  # type: ignore[assignment]
-                    read, write = await asyncio.wait_for(
-                        local.enter_async_context(sse_client(url)),
-                        timeout=init_timeout_s,
-                    )
-                else:  # http
-                    from mcp.client.streamable_http import streamablehttp_client
-                    url = cfg.url  # type: ignore[assignment]
-                    cm = streamablehttp_client(url)
-                    read, write, _ = await asyncio.wait_for(
-                        local.enter_async_context(cm),
-                        timeout=init_timeout_s,
-                    )
+        # gather preserves input order, so tools land in dict-insertion order —
+        # matching what the old serial loop produced.
+        results = await asyncio.gather(
+            *(
+                self._start_one(name, cfg, init_timeout_s)
+                for name, cfg in self._servers.items()
+            ),
+        )
+        for _name, tools in results:
+            self._tools.extend(tools)
 
-                session = await local.enter_async_context(ClientSession(read, write))
-                await asyncio.wait_for(session.initialize(), timeout=init_timeout_s)
-                self._sessions[name] = session
+    async def _start_one(
+        self, name: str, cfg: MCPServerConfig, init_timeout_s: float,
+    ) -> tuple[str, list[dict]]:
+        """Boot a single server. Never raises — failures are logged and skipped.
 
-                listed = await session.list_tools()
-                for tool in listed.tools:
-                    self._tools.append({
-                        "type": "function",
-                        "function": {
-                            "name": f"mcp__{name}__{tool.name}",
-                            "description": f"[server: {name}] {tool.description or ''}".strip(),
-                            "parameters": tool.inputSchema,
-                        },
-                    })
-
-                # Success: hand the local stack's contexts over to the main
-                # stack so shutdown() will tear them down later.
-                self._stack.push_async_exit(local)
-            except asyncio.CancelledError:
-                # CancelledError is a BaseException, not an Exception, so the
-                # ``except Exception`` below would not catch it. anyio's task
-                # groups (used by sse_client / streamable_http_client) can
-                # surface a "Cancelled via cancel scope" here when the previous
-                # server's TaskGroup teardown leaks into the next server's
-                # setup. Treat it as a per-server failure so the boot continues.
-                await self._close_silently(local)
-                from rich.console import Console
-                Console().print(
-                    f"[red]server {name} failed to start: init timed out[/red]"
+        Returns ``(name, tools)``; ``tools`` is empty on failure. Owns a private
+        ``AsyncExitStack`` so a failed server's transport teardown (and anyio
+        cancel-scope noise) cannot leak into a sibling's setup — the guarantee
+        the old serial loop relied on, now under concurrent startup.
+        """
+        # Per-server stack: if this server fails we close the stack (which
+        # tears down the transport and its background tasks cleanly); servers
+        # booting in parallel each have their own, so they don't affect each
+        # other.
+        local = AsyncExitStack()
+        try:
+            if cfg.transport_type == "stdio":
+                params = StdioServerParameters(
+                    command=cfg.command,  # type: ignore[arg-type]
+                    args=cfg.args,
+                    env=cfg.env or None,
                 )
-            except Exception as e:
-                # Per spec: continue starting other servers, print red warning.
-                await self._close_silently(local)
-                from rich.console import Console
-                Console().print(f"[red]server {name} failed to start: {e}[/red]")
+                cm = stdio_client(params)
+                read, write = await asyncio.wait_for(
+                    local.enter_async_context(cm),
+                    timeout=init_timeout_s,
+                )
+            elif cfg.transport_type == "sse":
+                from mcp.client.sse import sse_client
+                url = cfg.url  # type: ignore[assignment]
+                read, write = await asyncio.wait_for(
+                    local.enter_async_context(sse_client(url)),
+                    timeout=init_timeout_s,
+                )
+            else:  # http
+                from mcp.client.streamable_http import streamablehttp_client
+                url = cfg.url  # type: ignore[assignment]
+                cm = streamablehttp_client(url)
+                read, write, _ = await asyncio.wait_for(
+                    local.enter_async_context(cm),
+                    timeout=init_timeout_s,
+                )
+
+            session = await local.enter_async_context(ClientSession(read, write))
+            await asyncio.wait_for(session.initialize(), timeout=init_timeout_s)
+            self._sessions[name] = session
+
+            listed = await session.list_tools()
+            tools: list[dict] = []
+            for tool in listed.tools:
+                tools.append({
+                    "type": "function",
+                    "function": {
+                        "name": f"mcp__{name}__{tool.name}",
+                        "description": f"[server: {name}] {tool.description or ''}".strip(),
+                        "parameters": tool.inputSchema,
+                    },
+                })
+
+            # Success: hand the local stack's contexts over to the main stack
+            # so shutdown() will tear them down later.
+            self._stack.push_async_exit(local)
+            return name, tools
+        except asyncio.CancelledError:
+            # CancelledError is a BaseException, not an Exception, so the
+            # ``except Exception`` below would not catch it. anyio's task
+            # groups (used by sse_client / streamable_http_client) can surface
+            # a "Cancelled via cancel scope" if a transport teardown races with
+            # setup. Treat it as a per-server failure so boot continues.
+            await self._close_silently(local)
+            from rich.console import Console
+            Console().print(
+                f"[red]server {name} failed to start: init timed out[/red]"
+            )
+            return name, []
+        except Exception as e:
+            # Per spec: continue starting other servers, print red warning.
+            # Use type+repr so the reason is NEVER empty: many transport
+            # exceptions (CancelledError surfaced through ExceptionGroups, bare
+            # OSError subclasses, etc.) stringify to "", leaving the user with
+            # "server filesystem failed to start:" and no clue why.
+            await self._close_silently(local)
+            from rich.console import Console
+            Console().print(
+                f"[red]{_failure_msg(name, e)}[/red]"
+            )
+            return name, []
 
     async def shutdown(self) -> None:
         try:

@@ -2,7 +2,7 @@ import sys
 from pathlib import Path
 import pytest
 from cc_harness.config import MCPServerConfig
-from cc_harness.mcp_client import MCPClient, ToolResult
+from cc_harness.mcp_client import MCPClient, ToolResult, _failure_msg
 
 FAKE_SERVER = str(Path(__file__).parent / "fake_mcp_server.py")
 
@@ -83,3 +83,117 @@ async def test_start_skips_unreachable_servers_without_raising():
         assert client.list_tools() == []
     finally:
         await client.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_start_boots_all_servers_when_some_are_slow():
+    """Concurrent startup must register every server, slow ones included.
+
+    Three servers each sleep 0.5s before answering initialize(). Under parallel
+    startup all three should still register their tools — guards against a
+    regression where a slow server gets dropped or left to time out. There is
+    deliberately no wall-clock assertion here: the real startup time is
+    reported by main.py at boot, not asserted against a magic threshold.
+    """
+    slow = MCPServerConfig(
+        type="stdio",
+        command=sys.executable,
+        args=[FAKE_SERVER],
+        env={"FAKE_MCP_BOOT_DELAY": "0.5"},
+    )
+    client = MCPClient({"slow-a": slow, "slow-b": slow, "slow-c": slow})
+    try:
+        await client.start(init_timeout_s=10.0)
+        # All three still came up despite the delay.
+        names = {t["function"]["name"] for t in client.list_tools()}
+        assert "mcp__slow-a__echo" in names
+        assert "mcp__slow-b__echo" in names
+        assert "mcp__slow-c__echo" in names
+    finally:
+        await client.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_start_boots_good_server_alongside_a_bad_one():
+    """A healthy server must still come up when a sibling fails (parallel form).
+
+    The good stdio server shares boot with an unreachable SSE server. The SSE
+    one fails fast and is skipped; the stdio one must still register its tools.
+    This guards the per-server isolation guarantee under concurrent startup.
+    """
+    good = MCPServerConfig(type="stdio", command=sys.executable, args=[FAKE_SERVER])
+    bad = MCPServerConfig(type="sse", url="http://127.0.0.1:1/never_listens")
+    client = MCPClient({"good": good, "bad": bad})
+    try:
+        await client.start(init_timeout_s=2.0)
+        names = {t["function"]["name"] for t in client.list_tools()}
+        assert "mcp__good__echo" in names
+        # The bad server contributed nothing.
+        assert not any(n.startswith("mcp__bad__") for n in names)
+    finally:
+        await client.shutdown()
+
+
+class _EmptyStrException(Exception):
+    """Mimics transport exceptions that stringify to empty (e.g. asyncio.TimeoutError)."""
+
+    def __str__(self) -> str:  # noqa: D401 - intentionally empty
+        return ""
+
+
+def test_failure_msg_never_empty_when_str_is_empty():
+    """Regression: a failed server must always report a non-empty reason.
+
+    Before the fix, ``server X failed to start: {e}`` rendered as
+    ``server X failed to start:`` with no reason whenever ``str(e) == ""``
+    (real case: ``asyncio.TimeoutError()`` from the stdio transport hitting the
+    init timeout). ``_failure_msg`` must always surface the type name + repr so
+    the reason is actionable.
+    """
+    # Empty-str exception: the original bug.
+    msg = _failure_msg("filesystem", _EmptyStrException())
+    assert "filesystem" in msg
+    # The reason is non-empty and carries the type name.
+    assert msg.rstrip().endswith(":") is False
+    assert "_EmptyStrException" in msg
+    assert "_EmptyStrException()" in msg
+
+    # Sanity-check the real-world exception that triggered this: TimeoutError
+    # stringifies to "" too.
+    import asyncio
+    msg2 = _failure_msg("filesystem", asyncio.TimeoutError())
+    assert "TimeoutError" in msg2
+    # No trailing colon with nothing after it.
+    assert not msg2.endswith("failed to start:")
+
+
+@pytest.mark.asyncio
+async def test_start_surfaces_failure_reason_for_empty_str_exception(capsys):
+    """End-to-end: a transport raising an empty-str exception must still print
+    a meaningful, non-empty failure reason to the user.
+
+    We construct a stdio config whose command does not exist so ``stdio_client``
+    raises a FileNotFoundError-equivalent; to pin the exact regression (empty
+    str), we instead point at a non-existent executable which yields an OSError
+    subclass on spawn. The key assertion: the printed reason is never the bare
+    ``server X failed to start:`` form.
+    """
+    # non-existent executable -> spawn-time OSError
+    bad = MCPServerConfig(type="stdio", command="definitely-not-a-real-cmd-xyz",
+                         args=[])
+    client = MCPClient({"ghost": bad})
+    try:
+        await client.start(init_timeout_s=2.0)
+        # Failure was handled per-server-isolation style: no tools registered.
+        assert client.list_tools() == []
+    finally:
+        await client.shutdown()
+
+    out = capsys.readouterr().out
+    # The failure message names the server and carries a non-empty reason
+    # (type name + repr). Critically, it must NOT be the old empty form.
+    assert "server ghost failed to start" in out
+    # The reason portion after the final ": " is non-empty.
+    line = next(l for l in out.splitlines() if "ghost failed to start" in l)
+    after = line.split("failed to start:", 1)[1]
+    assert after.strip() != "", "failure reason must not be empty"
