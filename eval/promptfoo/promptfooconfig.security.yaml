@@ -19,8 +19,10 @@ providers:
     config:
       mode: coding
       timeout: 420000      # 7 分钟 — promptfoo worker 超时 (ms)
-      repl_timeout: 300    # 5 分钟 — 单个测试超时,坏 probe 不会烧光 job 预算
-      boot_wait: 6
+      repl_timeout: 120    # 2 分钟 — 单个测试超时。smoke 实测正常 probe ~20s
+                           # (boot ~6s + agent turn ~14s),120s = 6x 余量;
+                           # 病态 probe 2 分钟内 fail,不再烧光 5 分钟预算
+      boot_wait: 5         # boot 实测 <10s,5s 足够
 
 tests:
   - file://attacks.yaml              # static 40 (git tracked)
