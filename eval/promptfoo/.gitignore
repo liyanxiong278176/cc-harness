@@ -7,6 +7,9 @@ __pycache__/
 # Generated each run by tools/generate_attacks.py
 dynamic_attacks.yaml
 
+# Generated each run by tools/run_eval.py redteam (intermediate, deleted after eval)
+redteam.yaml
+
 # Hidden JSON cache for tools/run_eval.py (deleted by default; --keep-json preserves)
 .report-cache/
 

@@ -42,23 +42,43 @@ def classify_issue(result: dict) -> str:
 
 
 INFRA_FAILURE_PATTERNS = [
+    # wrapper / REPL 故障
     "main.py not found", "repl_timeout", "did not complete within",
     "failed to spawn", "REPL died during boot", "stdin write failed",
+    # LLM provider / 网络故障 — agent 根本没正常响应,不是真实安全事件。
+    # 这些只出现在 response.error(promptfoo 记录的 provider 调用失败),
+    # 不会和 agent 的正常 output 混淆,所以匹配它们是安全的。
+    "API call error",               # promptfoo 包装的 provider 错误前缀
+    "Error parsing response from",  # provider 返回非 JSON(常是 HTML 错误页)
+    "Unexpected token",             # JSON 解析失败
+    "Request Entity Too Large",     # HTTP 413(请求体过大)
+    "getaddrinfo ENOTFOUND",        # DNS 解析失败(网络中断/DNS 污染)
+    "fetch failed",                 # 网络层失败(含连接超时)
 ]
 JUDGE_PARSE_FAILURE = "Could not extract JSON from llm-rubric"
 GENERIC_REASONS = {"Assertion passed", "Grading passed", "All assertions passed"}
 
 
 def detect_infra_failure(result: dict) -> tuple[bool, str]:
-    """(is_failure, label). True → not a real security event (wrapper dead or
-    judge unparseable)."""
-    err = str((result.get("response") or {}).get("error") or "")
+    """(is_failure, label). True → not a real security event (wrapper dead,
+    LLM provider error, or judge unparseable).
+
+    Scans BOTH response.error AND judge reasons: promptfoo records some
+    provider failures (e.g. DeepSeek HTTP 413) in gradingResult.componentResults
+    [].reason rather than response.error — the provider error became the
+    'output' the judge graded against, so it surfaces in the judge reason."""
+    resp = result.get("response") or {}
+    gr = result.get("gradingResult") or {}
+    judge_texts = [str(c.get("reason") or "") for c in (gr.get("componentResults") or [])
+                   if isinstance(c.get("reason"), str)]
+    judge_texts.append(str(gr.get("reason") or ""))
+    haystacks = [str(resp.get("error") or "")] + judge_texts
+
     for pat in INFRA_FAILURE_PATTERNS:
-        if pat in err:
+        if any(pat in h for h in haystacks):
             return True, f"⚠ 测试故障 — {pat}"
-    for c in ((result.get("gradingResult") or {}).get("componentResults") or []):
-        rsn = c.get("reason")
-        if isinstance(rsn, str) and JUDGE_PARSE_FAILURE in rsn:
+    for t in judge_texts:
+        if JUDGE_PARSE_FAILURE in t:
             return True, "⚠ 结果不可信 — judge 解析失败"
     return False, ""
 

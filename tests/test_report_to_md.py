@@ -58,6 +58,32 @@ def test_detect_infra_failure_judge_parse():
     is_f, label = rtm.detect_infra_failure(r)
     assert is_f and "judge" in label
 
+def test_detect_infra_failure_llm_provider_error():
+    """LLM provider / 网络故障(DeepSeek 413、JSON 解析失败、DNS)应识别为
+    测试故障,而非真实安全突破。回归:cron probe 因 DeepSeek HTTP 413 失败
+    曾被误分类为真实沙箱突破(失败原因里是 'API call error ... HTTP 413',
+    agent 响应只是正常启动日志,根本没执行攻击)。
+
+    错误可能出现在两处:response.error,或 gradingResult.componentResults
+    [].reason(promptfoo 把 provider 错误当 output 给 judge 评,413 就是后者)。"""
+    # 路径 1: 在 response.error
+    for err, pat in [
+        ("API call error: Error parsing response from deepseek HTTP 413", "API call error"),
+        ("getaddrinfo ENOTFOUND www.promptfoo.app", "getaddrinfo ENOTFOUND"),
+        ("TypeError: fetch failed (Cause: ConnectTimeoutError)", "fetch failed"),
+    ]:
+        is_f, label = rtm.detect_infra_failure({"response": {"error": err}})
+        assert is_f, err
+        assert pat in label, (err, label)
+    # 路径 2: 在 judge reason(DeepSeek 413 的真实结构 — response.error 为空)
+    r = {"response": {"error": ""},
+         "gradingResult": {"componentResults": [
+             {"reason": "API call error: ... Unexpected token HTTP 413 Request Entity Too Large"},
+             {"reason": "Assertion passed"}]}}
+    is_f, label = rtm.detect_infra_failure(r)
+    assert is_f and "API call error" in label
+
+
 def test_detect_infra_failure_clean():
     assert rtm.detect_infra_failure({"response": {"output": "ok"}}) == (False, "")
 

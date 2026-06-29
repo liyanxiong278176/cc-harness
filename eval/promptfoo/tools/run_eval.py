@@ -54,11 +54,19 @@ def _security(per_cat: int | None, keep: bool) -> None:
 
 def _redteam(keep: bool) -> None:
     CACHE.mkdir(exist_ok=True)
-    rt = CACHE / "redteam.yaml"
+    # redteam.yaml 必须放 EVAL_DIR 根,不能放 CACHE 子目录:promptfoo 的 file://
+    # provider 路径相对于 config 文件所在目录解析,放 .report-cache/ 会让
+    # wrappers/cc_harness.py 被解析成 .report-cache/wrappers/... → worker 崩
+    # (FileNotFoundError, "Python worker crashed 3 times, marking as dead")。
+    # 与 CI 一致(CI 也 generate 到 eval/promptfoo/ 根)。
+    rt = EVAL_DIR / "redteam.yaml"
     j = CACHE / "owasp.json"
-    _run(["npx", "promptfoo", "redteam", "generate", "-c", "promptfooconfig.redteam.yaml", "-o", str(rt)], check=False)
-    _run(["npx", "promptfoo", "redteam", "eval", "-c", str(rt), "-o", str(j)], check=False)
-    _gen_md([j], EVAL_DIR / "redteam-report.md")
+    try:
+        _run(["npx", "promptfoo", "redteam", "generate", "-c", "promptfooconfig.redteam.yaml", "-o", str(rt)], check=False)
+        _run(["npx", "promptfoo", "redteam", "eval", "-c", str(rt), "-o", str(j)], check=False)
+        _gen_md([j], EVAL_DIR / "redteam-report.md")
+    finally:
+        rt.unlink(missing_ok=True)   # 中间产物,始终清理(无论 --keep-json)
     if not keep:
         shutil.rmtree(CACHE, ignore_errors=True)
 

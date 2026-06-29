@@ -138,3 +138,41 @@ def test_security_with_per_cat_calls_generate_attacks(fake_run, monkeypatch, tmp
                 and "promptfooconfig.security.yaml" in c]
     assert sec_call, (
         f"promptfoo eval for security config still expected, got {fake_run.calls}")
+
+
+# ---------------------------------------------------------------------------
+# Test 4: _redteam writes redteam.yaml to EVAL_DIR root (NOT .report-cache/).
+# Regression: writing to CACHE/redteam.yaml made promptfoo resolve the file://
+# wrapper to .report-cache/wrappers/cc_harness.py → worker crashed
+# ("FileNotFoundError ... Python worker crashed 3 times, marking as dead").
+# ---------------------------------------------------------------------------
+def test_redteam_writes_yaml_to_eval_dir_not_cache(fake_run, monkeypatch, tmp_path):
+    monkeypatch.setattr(run_eval, "EVAL_DIR", tmp_path)
+    monkeypatch.setattr(run_eval, "CACHE", tmp_path / ".report-cache")
+    monkeypatch.setattr(run_eval, "_gen_md", lambda *a, **kw: None)
+
+    run_eval._redteam(keep=True)
+
+    gen_calls = [c for c in fake_run.calls if "redteam" in c and "generate" in c]
+    assert gen_calls, f"expected redteam generate, got {fake_run.calls}"
+    gen_call = gen_calls[0]
+    # the -o target must be EVAL_DIR/redteam.yaml, NOT .report-cache/redteam.yaml
+    o_targets = [str(p) for p in gen_call if "redteam.yaml" in str(p)]
+    assert o_targets, f"missing -o redteam.yaml in {gen_call}"
+    assert all(".report-cache" not in t for t in o_targets), (
+        f"redteam.yaml must live in EVAL_DIR root, not .report-cache/: {gen_call}")
+
+
+def test_redteam_cleans_up_intermediate_yaml(fake_run, monkeypatch, tmp_path):
+    """The intermediate redteam.yaml must be deleted after eval (try/finally),
+    even though owasp.json stays (governed by --keep-json)."""
+    monkeypatch.setattr(run_eval, "EVAL_DIR", tmp_path)
+    monkeypatch.setattr(run_eval, "CACHE", tmp_path / ".report-cache")
+    monkeypatch.setattr(run_eval, "_gen_md", lambda *a, **kw: None)
+    # simulate the generate step having written the yaml
+    rt = tmp_path / "redteam.yaml"
+    rt.write_text("dummy", encoding="utf-8")
+
+    run_eval._redteam(keep=True)
+
+    assert not rt.exists(), "intermediate redteam.yaml must be cleaned up"

@@ -74,3 +74,81 @@ def test_repl_timeout_override_works():
     cfg = {"repl_timeout": 600}
     repl_timeout = int(cfg.get("repl_timeout", 300))
     assert repl_timeout == 600
+
+
+# --- self-modification guard ---
+# call_api snapshots cc_harness/*.py + main.py before each probe, reverts any
+# post-probe change, and injects a SECURITY BREACH marker so the judge fails
+# self-modification attacks. Regression: a "replace the system prompt" probe
+# was judged PASS even though agent.py was actually overwritten — the judge
+# only saw the agent's text, not the file change. The guard closes that blind spot.
+
+def test_guard_files_includes_core_sources():
+    """守卫面必须覆盖 main.py + cc_harness 核心源码(is_dangerous / system prompt 所在)。"""
+    names = {f.name for f in wrapper._guard_files()}
+    assert "main.py" in names
+    assert "tools.py" in names    # cc_harness/tools.py — is_dangerous 所在
+    assert "agent.py" in names    # cc_harness/agent.py — system prompt 所在
+
+
+def test_detect_and_revert_no_change(tmp_path):
+    f = tmp_path / "x.py"
+    f.write_bytes(b"original")
+    assert wrapper._detect_and_revert_breach({f: b"original"}) == []
+
+
+def test_detect_and_revert_modification(tmp_path):
+    """文件被改 → 返回路径 + 内容写回原状(防污染后续 probe)。"""
+    f = tmp_path / "tools.py"
+    f.write_bytes(b"original")
+    f.write_bytes(b"TAMPERED")                 # 模拟 agent 改了
+    breach = wrapper._detect_and_revert_breach({f: b"original"})
+    assert len(breach) == 1
+    assert f.read_bytes() == b"original"       # 已恢复
+
+
+def test_detect_and_revert_deletion(tmp_path):
+    """文件被删 → 返回路径 + 重新创建原内容。"""
+    f = tmp_path / "tools.py"
+    f.write_bytes(b"original")
+    f.unlink()                                 # 模拟 agent 删了
+    breach = wrapper._detect_and_revert_breach({f: b"original"})
+    assert len(breach) == 1
+    assert f.read_bytes() == b"original"       # 已恢复
+
+
+def test_call_api_injects_breach_marker_and_reverts(monkeypatch, tmp_path):
+    """agent 改了守卫文件 → call_api 注入 SECURITY BREACH 标记 + 恢复文件。"""
+    import asyncio
+    guarded = tmp_path / "g.py"
+    guarded.write_bytes(b"orig")
+    monkeypatch.setattr(wrapper, "_guard_files", lambda: [guarded])
+
+    async def fake_inner(prompt, options, context):
+        guarded.write_bytes(b"TAMPERED")       # 模拟 self-modification 攻击
+        return {"output": "看起来一切正常", "error": ""}
+
+    monkeypatch.setattr(wrapper, "_call_api_inner", fake_inner)
+    result = asyncio.run(wrapper.call_api("attack", {}, {}))
+
+    assert "SECURITY BREACH" in result["output"]
+    assert "self-modification" in result["output"]
+    assert guarded.read_bytes() == b"orig"             # 守卫已恢复
+    assert "看起来一切正常" in result["output"]         # 原输出保留在标记之前
+
+
+def test_call_api_no_marker_when_clean(monkeypatch, tmp_path):
+    """agent 没改文件 → 输出原样,无标记(正常拒绝不被误判)。"""
+    import asyncio
+    guarded = tmp_path / "g.py"
+    guarded.write_bytes(b"orig")
+    monkeypatch.setattr(wrapper, "_guard_files", lambda: [guarded])
+
+    async def fake_inner(prompt, options, context):
+        return {"output": "我拒绝执行该操作", "error": ""}
+
+    monkeypatch.setattr(wrapper, "_call_api_inner", fake_inner)
+    result = asyncio.run(wrapper.call_api("attack", {}, {}))
+
+    assert "SECURITY BREACH" not in result["output"]
+    assert result["output"] == "我拒绝执行该操作"

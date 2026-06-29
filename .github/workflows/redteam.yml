@@ -22,7 +22,9 @@ concurrency:
 
 jobs:
   # Job 1: hand-written + dynamic attacks (promptfoo eval). Fast (~5-10 min).
-  # Always runs even if redteam job is canceled — these are independent.
+  # Runs FIRST in the serial chain (redteam needs: [eval] after this). Its
+  # expected non-zero exit (promptfoo 100 on any failed probe) does NOT block
+  # redteam, which runs under if: always().
   # Job timeout at 360min (GitHub max) so a few pathological probes (per-test
   # 5min cap) don't burn the entire budget. Average probe ~35s.
   eval:
@@ -97,10 +99,16 @@ jobs:
         working-directory: eval/promptfoo
         run: |
           set -euo pipefail
+          # promptfoo exits 100 when ANY probe fails — that's EXPECTED in
+          # red-team (real breakthroughs = failed probes). Tolerate non-zero
+          # exit; the only real failure is a missing/empty result file, which
+          # means promptfoo crashed before writing anything. (Mirrors the
+          # check=False behavior in tools/run_eval.py.)
           npx promptfoo eval \
             -c promptfooconfig.security.yaml \
             --env-path .env.ci \
-            -o eval-results.json
+            -o eval-results.json || true
+          test -s eval-results.json
 
       - name: Upload eval results
         if: always()
@@ -111,10 +119,18 @@ jobs:
           if-no-files-found: warn
 
   # Job 2: OWASP plugin attacks (promptfoo redteam run + eval). Slow (~30-60 min).
-  # Runs in PARALLEL with eval job — total wall-clock time is max(eval, redteam)
-  # instead of sum. Independent failures: each job's exit code is its own.
+  # SERIALIZED after eval (needs: [eval]) — NOT parallel. Both jobs share one
+  # DeepSeek API secret; parallel = 8 concurrent probes vs one account quota →
+  # 429 risk, and cc-harness has no 429 backoff, so a rate-limit would fail
+  # probes outright and randomly block merges. Serial keeps total concurrency
+  # at 4. Trade-off: wall-clock is sum instead of max (~+10 min).
+  # if: always() is REQUIRED: promptfoo exits 100 whenever ANY probe fails,
+  # and red-team runs legitimately have failed probes (real breakthroughs), so
+  # eval's expected non-zero exit must NOT skip redteam.
   redteam:
     name: Redteam (OWASP)
+    needs: [eval]
+    if: always()
     runs-on: ubuntu-latest
     timeout-minutes: 360     # GitHub max — OWASP plugin probes can be slow
     permissions:
@@ -174,10 +190,13 @@ jobs:
           # Step 1: 只生成测试用例 YAML(不 eval,避免和下一步重复)。
           # 之前用 redteam run 会内部跑一遍 eval + 写缓存,导致后面
           # `promptfoo eval` 直接读缓存返回 0 个测试 — PR comment 显示 OWASP=0。
+          # `|| true` + test: 容忍部分插件生成失败(exit 非零),只要求 YAML
+          # 真的生成了(没生成才是真错误)。
           npx promptfoo redteam generate \
             -c promptfooconfig.redteam.yaml \
             --env-path .env.ci \
-            -o redteam.yaml
+            -o redteam.yaml || true
+          test -s redteam.yaml
 
       - name: Run OWASP probes
         working-directory: eval/promptfoo
@@ -187,10 +206,13 @@ jobs:
           set -euo pipefail
           # Step 2: 用 `redteam eval` 跑生成的 YAML,结果输出为 JSON。
           # redteam eval 是 redteam 专用的 eval 子命令,会正确写入 JSON。
+          # `|| true` + test: 容忍 exit 100(OWASP 突破 = 失败 probe,正常),
+          # 只要求 JSON 真的生成了。
           npx promptfoo redteam eval \
             -c redteam.yaml \
             --env-path .env.ci \
-            -o owasp-results.json
+            -o owasp-results.json || true
+          test -s owasp-results.json
 
       - name: Upload redteam results
         if: always()
