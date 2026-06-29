@@ -229,131 +229,41 @@ jobs:
           path: owasp-artifacts/
         continue-on-error: true
 
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+
+      - name: Generate report.md + pr-comment.md
+        # Classification lives ONLY in eval/promptfoo/tools/report_to_md.py
+        # (single source of truth — no JS/Python split). The || fallback
+        # keeps the comment job green if an artifact is missing.
+        run: |
+          pip install -e .
+          python eval/promptfoo/tools/report_to_md.py \
+            eval-artifacts/eval-results.json \
+            owasp-artifacts/owasp-results.json \
+            -o report.md \
+            --comment-out pr-comment.md || echo "report gen failed (artifact missing?)"
+
+      - name: Upload report.md
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: security-report-md
+          path: report.md
+          if-no-files-found: warn
+
       - name: Post PR comment
         uses: actions/github-script@v7
         with:
           script: |
             const fs = require('fs');
-
-            // Read both result files (downloaded as artifacts). Either
-            // may be missing if its job failed.
-            const evalPath = 'eval-artifacts/eval-results.json';
-            const owaspPath = 'owasp-artifacts/owasp-results.json';
-            const readResults = (path) => {
-              if (!fs.existsSync(path)) return [];
-              try {
-                const data = JSON.parse(fs.readFileSync(path, 'utf8'));
-                return (data.results && data.results.results) || [];
-              } catch (e) {
-                return [];
-              }
-            };
-            const all = [...readResults(evalPath), ...readResults(owaspPath)];
-
-            if (all.length === 0) {
-              await github.rest.issues.createComment({
-                owner: context.repo.owner, repo: context.repo.repo,
-                issue_number: context.issue.number,
-                body: '## 🛡️ Security Eval\n\n⚠️ Neither eval-results.json nor owasp-results.json was produced. Both jobs may have failed. Check workflow logs.'
-              });
-              return;
-            }
-
-            // Severity defaults — kept in sync with
-            // eval/promptfoo/tools/generate_attacks.py CATEGORY_DEFAULT_SEVERITY
-            const SEVERITY_DEFAULT = {
-              "credential-exfil": "critical",
-              "shell-injection": "critical",
-              "excessive-agency": "high",
-              "self-modification": "high",
-              "fs-overreach": "high",
-              "prompt-extraction": "medium",
-              "hijacking": "low",
-            };
-            const SEVERITY_EMOJI = { critical: "🔴", high: "🟠", medium: "🟡", low: "🟢" };
-            const SEVERITY_ORDER = ["critical", "high", "medium", "low"];
-
-            const getSeverity = r =>
-              r.testCase?.metadata?.severity
-              || SEVERITY_DEFAULT[r.testCase?.metadata?.category]
-              || "medium";
-
-            // Classify each probe into one of 3 sources.
-            const classify = (r) => {
-              const md = r.testCase?.metadata || {};
-              if (md.pluginId) return 'owasp';
-              if (md.source === 'dynamic') return 'dynamic';
-              return 'static';
-            };
-
-            const stats = (arr) => ({
-              total: arr.length,
-              pass: arr.filter(r => r.success).length,
-              fail: arr.filter(r => !r.success).length,
-            });
-            const buckets = {
-              static: all.filter(r => classify(r) === 'static'),
-              dynamic: all.filter(r => classify(r) === 'dynamic'),
-              owasp: all.filter(r => classify(r) === 'owasp'),
-            };
-            const s = stats(buckets.static);
-            const d = stats(buckets.dynamic);
-            const o = stats(buckets.owasp);
-            const total = s.total + d.total + o.total;
-            const totalPass = s.pass + d.pass + o.pass;
-            const totalFail = s.fail + d.fail + o.fail;
-            const rate = total ? (totalPass / total * 100).toFixed(1) : '0.0';
-            const sRate = s.total ? (s.pass / s.total * 100).toFixed(1) : '0.0';
-            const dRate = d.total ? (d.pass / d.total * 100).toFixed(1) : '0.0';
-            const oRate = o.total ? (o.pass / o.total * 100).toFixed(1) : '0.0';
-            const emoji = totalFail > 0 ? '🚨' : '✅';
-
-            // Build failed-section grouped by severity. Show error details
-            // (truncated to first line, 80 chars) for each failed probe so
-            // the PR comment is debuggable, not just "static ?".
-            const failed = all.filter(r => !r.success).slice(0, 10);
-            const bySeverity = {};
-            for (const r of failed) {
-              const sev = getSeverity(r);
-              (bySeverity[sev] = bySeverity[sev] || []).push(r);
-            }
-            let failedSection = "";
-            for (const sev of SEVERITY_ORDER) {
-              const list = bySeverity[sev];
-              if (!list || list.length === 0) continue;
-              failedSection += `\n### ${SEVERITY_EMOJI[sev]} ${sev.toUpperCase()} (${list.length})\n`;
-              for (const r of list) {
-                const src = classify(r);
-                const md = r.testCase?.metadata || {};
-                const desc = (r.testCase?.description || md.pluginId || '?')
-                  .replace(/^[^#]+#\d+\s*—\s*/, '');
-                const err = (r.response?.error || '').split('\n')[0].slice(0, 80);
-                const errTag = err ? ` — ❗ \`${err}\`` : '';
-                failedSection += `- **${src}** ${desc} — score: ${(r.score || 0).toFixed(2)}${errTag}\n`;
-              }
-            }
-
-            const body = [
-              `## ${emoji} cc-harness Security Eval Results`,
-              ``,
-              `| Metric | Static | Dynamic | OWASP | Total |`,
-              `|---|---|---|---|---|`,
-              `| Attacks | ${s.total} | ${d.total} | ${o.total} | ${total} |`,
-              `| Held ground (pass) | ${s.pass} | ${d.pass} | ${o.pass} | ${totalPass} |`,
-              `| Broke (fail) | **${s.fail}** | **${d.fail}** | **${o.fail}** | **${totalFail}** |`,
-              `| Hold rate | ${sRate}% | ${dRate}% | ${oRate}% | ${rate}% |`,
-              ``,
-              totalFail > 0
-                ? `### Failed probes (grouped by severity)${failedSection}\n\n⚠️ Some attacks succeeded — review the artifact.`
-                : `🎉 All attacks held — agent is robust.`,
-              ``,
-              `📎 Full per-attack results in the workflow artifacts (\`eval-results\` + \`owasp-results\`).`,
-            ].join('\n');
-
+            const body = fs.existsSync('pr-comment.md')
+              ? fs.readFileSync('pr-comment.md', 'utf8')
+              : '## 🛡️ cc-harness Security Eval\n\n⚠️ pr-comment.md was not generated — check the "Generate report.md + pr-comment.md" step logs.';
             await github.rest.issues.createComment({
               owner: context.repo.owner, repo: context.repo.repo,
-              issue_number: context.issue.number,
-              body
+              issue_number: context.issue.number, body
             });
 
 # ----------------------------------------------------------------------
@@ -369,6 +279,13 @@ jobs:
 #        → Search and add: "Eval (hand-written + dynamic)"  (PR gate)
 #        → Search and add: "Redteam (OWASP)"               (PR gate)
 #        (Do NOT require "Post PR comment" — it's cosmetic.)
+#
+#      YELLOW-COLUMN CLEANUP: if an OLD "redteam" check is still listed
+#      under Required status checks (left over from before this file was
+#      split into 3 jobs), REMOVE it — keep only "Eval (hand-written +
+#      dynamic)" and "Redteam (OWASP)". Go to Settings → Branches → edit
+#      the rule → Required status checks → delete the stale "redteam"
+#      entry. Stale checks that no longer run block the PR indefinitely.
 #
 #   3. Repo → Settings → Secrets and variables → Actions:
 #        OPENAI_API_KEY     (DeepSeek key)
