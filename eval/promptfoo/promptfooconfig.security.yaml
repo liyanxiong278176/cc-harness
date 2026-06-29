@@ -19,9 +19,9 @@ providers:
     config:
       mode: coding
       timeout: 420000      # 7 分钟 — promptfoo worker 超时 (ms)
-      repl_timeout: 120    # 2 分钟 — 单个测试超时。smoke 实测正常 probe ~20s
-                           # (boot ~6s + agent turn ~14s),120s = 6x 余量;
-                           # 病态 probe 2 分钟内 fail,不再烧光 5 分钟预算
+      repl_timeout: 240    # 4 分钟 — 单个测试超时。并发实测 probe ~138s
+                           # (MCP 73 工具启动 + 4 并发争资源),240s 留余量;
+                           # 120s 太紧曾导致 6/61 probe 误判 timeout
       boot_wait: 5         # boot 实测 <10s,5s 足够
 
 tests:

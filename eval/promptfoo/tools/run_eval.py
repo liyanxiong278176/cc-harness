@@ -18,14 +18,17 @@ EVAL_DIR = Path(__file__).resolve().parents[1]   # eval/promptfoo
 CACHE = EVAL_DIR / ".report-cache"
 
 
-def _run(cmd: list[str]) -> None:
+def _run(cmd: list[str], *, check: bool = True) -> None:
     print(f"$ {' '.join(cmd)}", flush=True)
     # Windows: npx/node are .cmd/.exe shims — shutil.which resolves them (with
     # the .cmd suffix via PATHEXT) so CreateProcess can launch them. On Unix,
     # cmd[0] is returned unchanged. (Absolute paths like sys.executable pass
     # through unchanged too.)
     executable = shutil.which(cmd[0]) or cmd[0]
-    subprocess.run([executable] + cmd[1:], cwd=str(EVAL_DIR), check=True)
+    # check=False for promptfoo: red-team runs legitimately have failed/error
+    # probes, so promptfoo exits non-zero (100) even when it wrote the JSON.
+    # We tolerate that; _gen_md will error clearly if the output is missing.
+    subprocess.run([executable] + cmd[1:], cwd=str(EVAL_DIR), check=check)
 
 
 def _gen_md(json_paths: list[Path], out: Path) -> None:
@@ -43,7 +46,7 @@ def _security(per_cat: int | None, keep: bool) -> None:
     j = CACHE / "eval.json"
     if per_cat is not None:
         _run([sys.executable, "tools/generate_attacks.py", "--per-cat", str(per_cat)])
-    _run(["npx", "promptfoo", "eval", "-c", "promptfooconfig.security.yaml", "-o", str(j)])
+    _run(["npx", "promptfoo", "eval", "-c", "promptfooconfig.security.yaml", "-o", str(j)], check=False)
     _gen_md([j], EVAL_DIR / "security-report.md")
     if not keep:
         shutil.rmtree(CACHE, ignore_errors=True)
@@ -53,8 +56,8 @@ def _redteam(keep: bool) -> None:
     CACHE.mkdir(exist_ok=True)
     rt = CACHE / "redteam.yaml"
     j = CACHE / "owasp.json"
-    _run(["npx", "promptfoo", "redteam", "generate", "-c", "promptfooconfig.redteam.yaml", "-o", str(rt)])
-    _run(["npx", "promptfoo", "redteam", "eval", "-c", str(rt), "-o", str(j)])
+    _run(["npx", "promptfoo", "redteam", "generate", "-c", "promptfooconfig.redteam.yaml", "-o", str(rt)], check=False)
+    _run(["npx", "promptfoo", "redteam", "eval", "-c", str(rt), "-o", str(j)], check=False)
     _gen_md([j], EVAL_DIR / "redteam-report.md")
     if not keep:
         shutil.rmtree(CACHE, ignore_errors=True)
