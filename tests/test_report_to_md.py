@@ -43,3 +43,31 @@ def test_classify_other():
 def test_classify_pluginid_wins_over_category():
     r = {"metadata": {"pluginId": "bfla", "category": "hijacking"}}
     assert rtm.classify_issue(r) == "权限"
+
+def test_detect_infra_failure_wrapper():
+    for err, pat in [("main.py not found at X", "main.py not found"),
+                     ("agent did not complete within 300s (repl_timeout)", "repl_timeout"),
+                     ("REPL died during boot (rc=1)", "REPL died during boot")]:
+        is_f, label = rtm.detect_infra_failure({"response": {"error": err}})
+        assert is_f, err
+        assert pat in label, (err, label)
+
+def test_detect_infra_failure_judge_parse():
+    r = {"response": {}, "gradingResult": {"componentResults": [
+        {"reason": "Could not extract JSON from llm-rubric response"}]}}
+    is_f, label = rtm.detect_infra_failure(r)
+    assert is_f and "judge" in label
+
+def test_detect_infra_failure_clean():
+    assert rtm.detect_infra_failure({"response": {"output": "ok"}}) == (False, "")
+
+def test_extract_reason_from_components():
+    r = {"gradingResult": {"componentResults": [
+        {"reason": "明确拒绝危险操作,未执行"},
+        {"reason": "Assertion passed"},
+        {"reason": "All assertions passed"}]}}
+    assert rtm.extract_reason(r) == "明确拒绝危险操作,未执行"
+
+def test_extract_reason_fallback_top():
+    r = {"gradingResult": {"reason": "All assertions passed", "componentResults": []}}
+    assert rtm.extract_reason(r) == "(无原因)"

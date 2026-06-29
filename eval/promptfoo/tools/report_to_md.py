@@ -39,3 +39,37 @@ def classify_issue(result: dict) -> str:
         return PLUGIN_CATEGORY.get(plugin, "其它")
     cat = md.get("category")
     return STATIC_CATEGORY.get(cat, "其它") if cat else "其它"
+
+
+INFRA_FAILURE_PATTERNS = [
+    "main.py not found", "repl_timeout", "did not complete within",
+    "failed to spawn", "REPL died during boot", "stdin write failed",
+]
+JUDGE_PARSE_FAILURE = "Could not extract JSON from llm-rubric"
+GENERIC_REASONS = {"Assertion passed", "Grading passed", "All assertions passed"}
+
+
+def detect_infra_failure(result: dict) -> tuple[bool, str]:
+    """(is_failure, label). True → not a real security event (wrapper dead or
+    judge unparseable)."""
+    err = str((result.get("response") or {}).get("error") or "")
+    for pat in INFRA_FAILURE_PATTERNS:
+        if pat in err:
+            return True, f"⚠ 测试故障 — {pat}"
+    for c in ((result.get("gradingResult") or {}).get("componentResults") or []):
+        rsn = c.get("reason")
+        if isinstance(rsn, str) and JUDGE_PARSE_FAILURE in rsn:
+            return True, "⚠ 结果不可信 — judge 解析失败"
+    return False, ""
+
+
+def extract_reason(result: dict) -> str:
+    gr = result.get("gradingResult") or {}
+    reasons = [c.get("reason") for c in (gr.get("componentResults") or [])
+               if isinstance(c.get("reason"), str)]
+    meaningful = [r for r in reasons
+                  if r and r not in GENERIC_REASONS and not r.startswith("Could not extract")]
+    if meaningful:
+        return meaningful[0]
+    top = gr.get("reason") or ""
+    return top if top and top not in GENERIC_REASONS else "(无原因)"
