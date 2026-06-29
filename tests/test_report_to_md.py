@@ -97,3 +97,11 @@ def test_generate_report_marks_infra_failure():
          "response": {"error": "main.py not found at /x"}}
     md = rtm.generate_report([[r]])
     assert "测试故障" in md
+
+def test_generate_pr_comment_has_summary_and_category():
+    r = {"success": False, "vars": {"prompt": "x"}, "metadata": {"severity": "high", "pluginId": "bfla"},
+         "response": {"output": "d"}, "gradingResult": {"componentResults": [{"reason": "越权"}]}}
+    p = {"success": True, "vars": {"prompt": "y"}, "metadata": {"severity": "low"}}
+    c = rtm.generate_pr_comment([[r, p]])
+    assert "Security Eval" in c and "权限" in c and "artifact" in c
+    assert "真实突破 1" in c

@@ -141,3 +141,50 @@ def generate_report(results_list: list[list[dict]]) -> str:
         lines.append(f"| {f['severity']} | {f['category']} | "
                      f"{_md_escape(f['prompt'])[:80]} | {_md_escape(f['reason'])[:80]} |")
     return "\n".join(lines) + "\n"
+
+
+def generate_pr_comment(results_list: list[list[dict]]) -> str:
+    """CI PR-comment 摘要。分类逻辑与 generate_report 同源,不重复实现。"""
+    fields = [extract_fields(r) for results in results_list for r in results]
+    total = len(fields)
+    n_pass = sum(1 for f in fields if f["success"])
+    failed = sorted([f for f in fields if not f["success"]],
+                    key=lambda f: SEVERITY_ORDER.get(f["severity"], 9))
+    n_real = sum(1 for f in failed if not f["is_infra"])
+    n_infra = sum(1 for f in failed if f["is_infra"])
+    emoji = "🚨" if n_real > 0 else "✅"
+    L = [f"## {emoji} cc-harness Security Eval",
+         f"总数 {total} ｜ 通过 {n_pass} ｜ 失败 {len(failed)}"
+         f"(真实突破 {n_real} / ⚠测试故障 {n_infra})", ""]
+    if failed:
+        L.append("### 失败 top-10(按严重度)")
+        for f in failed[:10]:
+            tag = f["infra_label"] if f["is_infra"] else f"原因: {f['reason'][:60]}"
+            L.append(f"- **[{f['category']}]** {f['severity']}·{f['source']} — "
+                     f"{_md_escape(f['prompt'])[:60]} — {tag}")
+    L.append("\n📎 完整报告见 artifact `security-report-md/report.md`")
+    return "\n".join(L) + "\n"
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser(description=__doc__)
+    ap.add_argument("inputs", nargs="+", help="promptfoo result JSON(s)")
+    ap.add_argument("-o", "--output", default="report.md")
+    ap.add_argument("--comment-out", default=None,
+                    help="also write CI PR-comment summary here")
+    args = ap.parse_args()
+    results_list = []
+    for path in args.inputs:
+        data = json.loads(Path(path).read_text(encoding="utf-8"))
+        results_list.append((data.get("results") or {}).get("results") or [])
+    Path(args.output).write_text(generate_report(results_list), encoding="utf-8")
+    print(f"wrote {args.output} ({sum(len(r) for r in results_list)} probes)")
+    if args.comment_out:
+        Path(args.comment_out).write_text(
+            generate_pr_comment(results_list), encoding="utf-8")
+        print(f"wrote {args.comment_out}")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
