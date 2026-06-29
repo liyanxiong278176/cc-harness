@@ -9,3 +9,9 @@ dynamic_attacks.yaml
 
 # Hidden JSON cache for tools/run_eval.py (deleted by default; --keep-json preserves)
 .report-cache/
+
+# Generated reports (tools/report_to_md.py / run_eval.py)
+report.md
+pr-comment.md
+security-report.md
+redteam-report.md
