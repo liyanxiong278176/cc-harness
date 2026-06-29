@@ -73,3 +73,71 @@ def extract_reason(result: dict) -> str:
         return meaningful[0]
     top = gr.get("reason") or ""
     return top if top and top not in GENERIC_REASONS else "(无原因)"
+
+
+SEVERITY_ORDER = {"critical": 0, "high": 1, "medium": 2, "low": 3}
+
+
+def extract_fields(result: dict) -> dict:
+    md = _metadata(result)
+    vars_ = result.get("vars") or {}
+    resp = result.get("response") or {}
+    is_infra, infra_label = detect_infra_failure(result)
+    return {
+        "success": bool(result.get("success")),
+        "prompt": str(vars_.get("prompt") or "").strip(),
+        "severity": md.get("severity") or "medium",
+        "source": ("owasp" if md.get("pluginId")
+                   else "dynamic" if md.get("source") == "dynamic" else "static"),
+        "category": classify_issue(result),
+        "is_infra": is_infra,
+        "infra_label": infra_label,
+        "reason": extract_reason(result),
+        "error": str(resp.get("error") or ""),
+        "agent_response": str(resp.get("output") or ""),
+    }
+
+
+def _md_escape(s: str) -> str:
+    return (s or "").replace("|", "\\|").replace("\n", " ")
+
+
+def generate_report(results_list: list[list[dict]]) -> str:
+    probes = [r for results in results_list for r in results]
+    fields = [extract_fields(r) for r in probes]
+    passed = [f for f in fields if f["success"]]
+    failed = sorted([f for f in fields if not f["success"]],
+                    key=lambda f: SEVERITY_ORDER.get(f["severity"], 9))
+    real_fail = [f for f in failed if not f["is_infra"]]
+    infra = [f for f in failed if f["is_infra"]]
+
+    lines = ["# 红队评估报告", ""]
+    lines.append(f"- 总数 **{len(fields)}** ｜ 通过 **{len(passed)}** ｜ "
+                 f"失败 **{len(failed)}**(真实突破 **{len(real_fail)}** / "
+                 f"⚠测试故障 **{len(infra)}**)")
+    from collections import Counter
+    cats = Counter(f["category"] for f in real_fail)
+    if cats:
+        lines.append("- 真实突破分类:" + " ".join(f"`{k}`×{v}" for k, v in cats.items()))
+    lines.append("")
+    lines.append("## 二、失败(按严重度 critical→low)")
+    for f in failed:
+        lines.append(f"### [{f['category']}] {f['severity']} · {f['source']}")
+        lines.append(f"- 攻击内容: {f['prompt']}")
+        lines.append("- 是否通过: ❌ 未通过")
+        if f["is_infra"]:
+            lines.append(f"- {f['infra_label']}")
+            if f["error"]:
+                lines.append(f"  - error: `{_md_escape(f['error'])[:200]}`")
+        else:
+            lines.append(f"- 不通过原因: {f['reason']}")
+            if f["agent_response"]:
+                lines.append(f"- agent 实际响应: {_md_escape(f['agent_response'])[:300]}")
+        lines.append("")
+    lines.append("## 三、通过")
+    lines.append("| 严重度 | 分类 | 攻击内容 | 通过原因 |")
+    lines.append("|---|---|---|---|")
+    for f in passed:
+        lines.append(f"| {f['severity']} | {f['category']} | "
+                     f"{_md_escape(f['prompt'])[:80]} | {_md_escape(f['reason'])[:80]} |")
+    return "\n".join(lines) + "\n"

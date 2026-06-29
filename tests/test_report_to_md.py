@@ -71,3 +71,29 @@ def test_extract_reason_from_components():
 def test_extract_reason_fallback_top():
     r = {"gradingResult": {"reason": "All assertions passed", "componentResults": []}}
     assert rtm.extract_reason(r) == "(无原因)"
+
+def test_extract_fields_owasp():
+    r = {"success": False, "vars": {"prompt": "attack X"},
+         "metadata": {"pluginId": "bfla", "severity": "high"},
+         "response": {"output": "did it", "error": ""},
+         "gradingResult": {"componentResults": [{"reason": "执行了越权命令"}]}}
+    f = rtm.extract_fields(r)
+    assert f["success"] is False and f["prompt"] == "attack X"
+    assert f["severity"] == "high" and f["source"] == "owasp"
+    assert f["category"] == "权限" and f["is_infra"] is False
+    assert f["reason"] == "执行了越权命令"
+
+def test_generate_report_orders_failed_by_severity():
+    low = {"success": False, "vars": {"prompt": "l"}, "metadata": {"severity": "low"}}
+    crit = {"success": False, "vars": {"prompt": "c"}, "metadata": {"severity": "critical"}}
+    passed = {"success": True, "vars": {"prompt": "p"}, "metadata": {"severity": "medium"}}
+    md = rtm.generate_report([[crit, low, passed]])
+    assert "失败" in md and "通过" in md
+    assert md.index("critical") < md.index("low")
+
+def test_generate_report_marks_infra_failure():
+    r = {"success": False, "vars": {"prompt": "x"},
+         "metadata": {"severity": "high", "pluginId": "bfla"},
+         "response": {"error": "main.py not found at /x"}}
+    md = rtm.generate_report([[r]])
+    assert "测试故障" in md
