@@ -99,16 +99,16 @@ jobs:
         working-directory: eval/promptfoo
         run: |
           set -euo pipefail
-          # promptfoo exits 100 when ANY probe fails — that's EXPECTED in
-          # red-team (real breakthroughs = failed probes). Tolerate non-zero
-          # exit; the only real failure is a missing/empty result file, which
-          # means promptfoo crashed before writing anything. (Mirrors the
-          # check=False behavior in tools/run_eval.py.)
+          # STRICT mode: promptfoo exits 100 when ANY probe fails — and in
+          # red-team, failed probes ARE real breakthroughs. Let that exit code
+          # propagate so the check goes RED on breakthroughs (blocks merge until
+          # the vuln is fixed). The result JSON is written before exit, so the
+          # upload step (if: always) + PR comment still report what broke.
+          # To go back to "green despite breakthroughs", re-add `|| true` + `test -s`.
           npx promptfoo eval \
             -c promptfooconfig.security.yaml \
             --env-path .env.ci \
-            -o eval-results.json || true
-          test -s eval-results.json
+            -o eval-results.json
 
       - name: Upload eval results
         if: always()
@@ -190,13 +190,12 @@ jobs:
           # Step 1: 只生成测试用例 YAML(不 eval,避免和下一步重复)。
           # 之前用 redteam run 会内部跑一遍 eval + 写缓存,导致后面
           # `promptfoo eval` 直接读缓存返回 0 个测试 — PR comment 显示 OWASP=0。
-          # `|| true` + test: 容忍部分插件生成失败(exit 非零),只要求 YAML
-          # 真的生成了(没生成才是真错误)。
+          # STRICT: generate 失败(非零,如 harmful 插件网络抖动)也让 check 红,
+          # 提示生成阶段有问题需修(不是安全突破,但是 CI/环境问题,重跑或修网络)。
           npx promptfoo redteam generate \
             -c promptfooconfig.redteam.yaml \
             --env-path .env.ci \
-            -o redteam.yaml || true
-          test -s redteam.yaml
+            -o redteam.yaml
 
       - name: Run OWASP probes
         working-directory: eval/promptfoo
@@ -206,13 +205,12 @@ jobs:
           set -euo pipefail
           # Step 2: 用 `redteam eval` 跑生成的 YAML,结果输出为 JSON。
           # redteam eval 是 redteam 专用的 eval 子命令,会正确写入 JSON。
-          # `|| true` + test: 容忍 exit 100(OWASP 突破 = 失败 probe,正常),
-          # 只要求 JSON 真的生成了。
+          # STRICT: exit 100(OWASP 突破 = 失败 probe)→ check 红,阻塞合并
+          # 直到修防护。JSON 仍在退出前写入,PR 评论照常报告突破详情。
           npx promptfoo redteam eval \
             -c redteam.yaml \
             --env-path .env.ci \
-            -o owasp-results.json || true
-          test -s owasp-results.json
+            -o owasp-results.json
 
       - name: Upload redteam results
         if: always()
