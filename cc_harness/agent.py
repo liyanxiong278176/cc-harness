@@ -69,6 +69,7 @@ async def run_turn(
 
     console = Console()
     iter_count = 0
+    _empty_retried = False  # one-shot retry guard for empty-content turns
 
     if cwd is not None:
         _refresh_system_prompt(messages, cwd, mode)
@@ -104,41 +105,44 @@ async def run_turn(
             api_reported=bool(iter_usages),
         )
 
+    async def _stream_one_turn() -> tuple[str, list, str | None, UsageRecord | None]:
+        """Stream exactly one LLM turn. Returns (content, pending, finish_reason, usage).
+
+        Buffers content (no real-time printing) because the routing decision —
+        has_tool_calls vs final answer — is only known after the "done" event.
+        Returns empty content only if the LLM genuinely produced nothing.
+        """
+        content_parts: list[str] = []
+        pending: list = []
+        finish_reason: str | None = None
+        usage: UsageRecord | None = None
+        async for ev in llm.chat(messages, tool_specs):
+            if ev.kind == "content":
+                content_parts.append(ev.text)
+            elif ev.kind == "tool_call_delta":
+                pass  # accumulation handled inside llm.chat
+            elif ev.kind == "done":
+                finish_reason = ev.finish_reason
+                pending = ev.pending
+                usage = ev.usage
+                # Prefer the consolidated content on the done event if set;
+                # fall back to the streamed parts we collected above.
+                content_parts = [ev.content] if ev.content else content_parts
+        return "".join(content_parts), pending, finish_reason, usage
+
     while iter_count < max_iter:
         iter_count += 1
         iter_usage: UsageRecord | None = None   # usage for this iter (set on done)
 
-        # 1. Stream one LLM turn. We BUFFER the content (don't print during
-        # the stream) because the routing decision — has_tool_calls vs
-        # final answer — is only known after the "done" event. We always
-        # print the LLM's content as a single "思考:" block per iteration
-        # (no real-time token streaming). The trade-off is loss of streaming
-        # feel, in exchange for a clean per-iteration 思考/行动/观察/结果
-        # layout with no duplication.
-        content_parts: list[str] = []
-        pending: list = []
-        finish_reason: str | None = None
+        # 1. Stream one LLM turn (buffered — see _stream_one_turn).
         try:
-            async for ev in llm.chat(messages, tool_specs):
-                if ev.kind == "content":
-                    content_parts.append(ev.text)
-                elif ev.kind == "tool_call_delta":
-                    pass  # accumulation handled inside llm.chat
-                elif ev.kind == "done":
-                    finish_reason = ev.finish_reason
-                    pending = ev.pending
-                    iter_usage = ev.usage
-                    # Prefer the consolidated content on the done event if set;
-                    # fall back to the streamed parts we collected above.
-                    content_parts = [ev.content] if ev.content else content_parts
+            content, pending, finish_reason, iter_usage = await _stream_one_turn()
         except Exception as e:
             print_error(console, f"LLM stream failed: {e}")
             return _stats()
 
         if iter_usage is not None:
             iter_usages.append(iter_usage)
-
-        content = "".join(content_parts)
 
         # 2. Compute routing
         has_tool_calls = (finish_reason == "tool_calls") and bool(pending)
@@ -249,6 +253,18 @@ async def run_turn(
                     print_info(console, f"已保存到 {saved}")
             return _stats()
         else:
+            # Empty content with no tool_calls. The streaming provider
+            # (e.g. DeepSeek) occasionally returns an empty stream with
+            # finish_reason="stop" and non-zero completion_tokens — the
+            # model was called, but the content was dropped at the wire.
+            # Retry the SAME turn ONCE before giving up, so a flaky first
+            # turn doesn't dead-end the session. (Resets iter_count-1 so
+            # the retry doesn't burn a max_iter slot.)
+            if not _empty_retried:
+                _empty_retried = True
+                print_warn(console, "空回复,重试中... (empty response, retrying)")
+                iter_count -= 1
+                continue
             print_warn(console, "empty LLM turn, ending")
             return _stats()
 

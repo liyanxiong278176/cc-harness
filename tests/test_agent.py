@@ -111,15 +111,64 @@ async def test_routes_final_answer_when_no_tool_calls(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_routes_empty_turn_yellow_warn(monkeypatch, capfd):
+    """Two consecutive empty responses: agent retries once, then gives up."""
     from cc_harness import agent as agent_mod
-    llm = FakeLLM(responses=[[
-        FakeStreamEvent(kind="done", content="", pending=[], finish_reason="stop"),
-    ]])
+    llm = FakeLLM(responses=[
+        [FakeStreamEvent(kind="done", content="", pending=[], finish_reason="stop")],
+        [FakeStreamEvent(kind="done", content="", pending=[], finish_reason="stop")],
+    ])
     mcp = FakeMCP(tools_spec=[], results={}, calls=[])
     messages = [{"role": "user", "content": "x"}]
     await agent_mod.run_turn(messages, llm, mcp, max_iter=5)
-    # No new assistant message added
+    # No new assistant message added (both attempts empty)
     assert len(messages) == 1
+    # The retry warning was emitted
+    captured = capfd.readouterr()
+    assert "retrying" in captured.out.lower() or "retrying" in captured.err.lower()
+
+
+@pytest.mark.asyncio
+async def test_empty_first_turn_retries_then_succeeds(monkeypatch, capfd):
+    """DeepSeek-style flakiness: first turn empty, retry produces real output.
+
+    Regression for the 'empty LLM turn' bug where a fresh session's first
+    reply came back empty (API returned finish_reason='stop' with empty
+    content despite non-zero completion_tokens). The agent must retry once
+    and NOT dead-end the session.
+    """
+    from cc_harness import agent as agent_mod
+    llm = FakeLLM(responses=[
+        # First turn: empty content, finish_reason=stop (the bug)
+        [FakeStreamEvent(kind="done", content="", pending=[], finish_reason="stop")],
+        # Retry turn: real answer
+        [FakeStreamEvent(kind="done", content="你好!", pending=[], finish_reason="stop")],
+    ])
+    mcp = FakeMCP(tools_spec=[], results={}, calls=[])
+    messages = [{"role": "user", "content": "你好"}]
+    await agent_mod.run_turn(messages, llm, mcp, max_iter=5)
+
+    # Agent RETRIED and produced the real answer (NOT "empty LLM turn")
+    assert llm.call_count == 2, "agent must have retried the empty turn"
+    assert len(messages) == 2
+    assert messages[1] == {"role": "assistant", "content": "你好!"}
+    captured = capfd.readouterr()
+    assert "retrying" in captured.out.lower() or "retrying" in captured.err.lower()
+
+
+@pytest.mark.asyncio
+async def test_empty_retry_only_once(monkeypatch):
+    """The retry guard fires at most once per turn (no infinite loop)."""
+    from cc_harness import agent as agent_mod
+    llm = FakeLLM(responses=[
+        [FakeStreamEvent(kind="done", content="", pending=[], finish_reason="stop")],
+        [FakeStreamEvent(kind="done", content="", pending=[], finish_reason="stop")],
+        [FakeStreamEvent(kind="done", content="", pending=[], finish_reason="stop")],
+    ])
+    mcp = FakeMCP(tools_spec=[], results={}, calls=[])
+    messages = [{"role": "user", "content": "x"}]
+    await agent_mod.run_turn(messages, llm, mcp, max_iter=5)
+    # Only 2 LLM calls: original + one retry, even with 3 empties programmed
+    assert llm.call_count == 2
 
 
 @pytest.mark.asyncio
