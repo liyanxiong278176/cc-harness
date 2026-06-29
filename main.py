@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import sys
+import time
 from pathlib import Path
 from rich.console import Console
 from cc_harness.config import load_config, ConfigError
@@ -42,6 +43,7 @@ def _parse_args() -> argparse.Namespace:
 def main() -> None:
     args = _parse_args()
     console = Console()
+    boot_start = time.monotonic()
     try:
         cfg = load_config(
             env_path=PROJECT_ROOT / ".env",
@@ -61,6 +63,12 @@ def main() -> None:
         mcp = MCPClient(cfg.mcp_servers)
         try:
             await mcp.start()
+            # Report the real startup time (config load + parallel MCP boot).
+            # This is the source of truth for "how long did boot take" — no
+            # test threshold, just the measured number on every launch.
+            console.print(
+                f"[dim]startup: {time.monotonic() - boot_start:.2f}s[/dim]"
+            )
             await run_repl(
                 llm, mcp,
                 cwd=str(PROJECT_ROOT),

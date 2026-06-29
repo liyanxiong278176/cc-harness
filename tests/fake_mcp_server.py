@@ -7,6 +7,7 @@ Speaks JSON-RPC over stdio. Exposes:
   - one tool 'slow' that sleeps 0.2s
 """
 import asyncio
+import os
 from mcp.server import Server
 from mcp.server.stdio import stdio_server
 from mcp.types import Tool, TextContent
@@ -46,6 +47,13 @@ async def call_tool(name: str, arguments: dict):
     raise ValueError(f"unknown tool {name}")
 
 async def main():
+    # Optional artificial boot delay for tests that exercise parallel startup.
+    # Reads FAKE_MCP_BOOT_DELAY seconds (default 0 → no delay, no behaviour
+    # change for existing tests). The sleep happens before stdio_server so the
+    # client's initialize() call blocks until the delay elapses.
+    delay = float(os.environ.get("FAKE_MCP_BOOT_DELAY", "0"))
+    if delay > 0:
+        await asyncio.sleep(delay)
     async with stdio_server() as (read, write):
         await server.run(read, write, server.create_initialization_options())
 
