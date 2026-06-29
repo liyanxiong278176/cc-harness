@@ -6,3 +6,6 @@ __pycache__/
 
 # Generated each run by tools/generate_attacks.py
 dynamic_attacks.yaml
+
+# Hidden JSON cache for tools/run_eval.py (deleted by default; --keep-json preserves)
+.report-cache/
