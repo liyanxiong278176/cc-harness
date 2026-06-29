@@ -20,7 +20,12 @@ CACHE = EVAL_DIR / ".report-cache"
 
 def _run(cmd: list[str]) -> None:
     print(f"$ {' '.join(cmd)}", flush=True)
-    subprocess.run(cmd, cwd=str(EVAL_DIR), check=True)
+    # Windows: npx/node are .cmd/.exe shims — shutil.which resolves them (with
+    # the .cmd suffix via PATHEXT) so CreateProcess can launch them. On Unix,
+    # cmd[0] is returned unchanged. (Absolute paths like sys.executable pass
+    # through unchanged too.)
+    executable = shutil.which(cmd[0]) or cmd[0]
+    subprocess.run([executable] + cmd[1:], cwd=str(EVAL_DIR), check=True)
 
 
 def _gen_md(json_paths: list[Path], out: Path) -> None:
