@@ -9,12 +9,16 @@ cc-harness 是一个**跑在终端里的编程代理**:通过 OpenAI 兼容 LLM(
 ## Common commands
 
 ```bash
+# Install (pyproject.toml is the source of truth for deps)
+pip install -e .                 # also required by the eval provider (imports cc_harness)
+pip install -e '.[dev]'          # pytest / pytest-asyncio / pytest-cov / ruff
+
 # Run the REPL (entry point)
 .venv/Scripts/python.exe main.py
 .venv/Scripts/python.exe main.py --mode plan          # start in plan mode
 .venv/Scripts/python.exe main.py --design-dir <path>  # custom design save dir
 
-# Tests
+# Tests (~200 in tests/test_*.py)
 .venv/Scripts/python.exe -m pytest tests/                 # all
 .venv/Scripts/python.exe -m pytest tests/test_X.py -v     # one file
 .venv/Scripts/python.exe -m pytest tests/test_X.py::test_name  # one test
@@ -25,6 +29,11 @@ cc-harness 是一个**跑在终端里的编程代理**:通过 OpenAI 兼容 LLM(
 
 # Phase-1 regression (creates + runs hello.py end-to-end)
 .venv/Scripts/python.exe run_verify.py
+
+# Eval / red-team (see "Eval / red-team" section below)
+cd eval/promptfoo && npm run security     # static + dynamic attacks → eval
+cd eval/promptfoo && npm run view         # browser UI of last result
+python eval/promptfoo/tools/run_eval.py all --keep-json  # one-shot: security + OWASP → .md report
 ```
 
 Force UTF-8 on Windows (avoids GBK crashes on 思考/✅/中文):
@@ -44,8 +53,12 @@ main.py
         │     ├── tools.py:NATIVE_TOOLS   # currently: run_command (asyncio subprocess)
         │     ├── tools.py:is_dangerous   # rm -rf / format / drop / shutdown → user confirm
         │     ├── prompts.py:Section pool # 10 sections in SECTION_POOL, gated by conditions
+        │     ├── tokens.py               # tiktoken 5-bucket counting + turn/session stats
         │     └── render.py               # 4-phase ReAct output (思考/行动/观察/结果)
         └── _print_disk_changes()         # post-turn: show files modified in last 30s
+
+cc_harness/memory/                        # ⚠️ in-tree but NOT yet wired into the ReAct loop
+                                          #   (no import from agent/repl/main). SQLite + embeddings.
 ```
 
 **Key data flow**:
@@ -53,6 +66,7 @@ main.py
 - `messages[0]` is the system prompt; rebuilt on every turn in `agent._refresh_system_prompt` to match the current mode
 - Tool specs: `mcp.list_tools() + NATIVE_TOOLS specs` → sent to LLM; tool_calls routed by name (MCP vs native)
 - Streaming is buffered (not token-by-token). Each iteration prints the LLM's full text as a single 思考 block, then 行动/观察 for each tool call, so the 4-phase layout is clean and never duplicated. See `agent.run_turn` for the trade-off.
+- `tokens.py` categorizes the final `messages` + tool schemas into 5 buckets (system/user/tool_calls/llm_output/tool_definitions) and compares tiktoken totals against the API-reported usage (`api_vs_breakdown_drift_pct`). Per-turn (`TurnTokenStats`) aggregates roll up into `SessionTokenStats`.
 
 ## Design decisions (non-obvious)
 
@@ -62,13 +76,36 @@ main.py
 
 **Section pool, not a single string.** `prompts.py` has 10 sections in `SECTION_POOL` with conditions (`mode==coding`, `mode==plan`, `mode==design`, `has_tools`, `always`). To add a new section, register it in the pool — don't touch `build_system_prompt`.
 
-**Safety is not a sandbox.** `is_dangerous` only matches a hardcoded regex list (rm -rf, format, drop table, fork bomb, shutdown, reboot). It's "prevent accidental mistakes" not security. Don't expand the regex list to be a permission system — that scope was explicitly cut.
+**Safety is not a sandbox.** `is_dangerous` only matches a hardcoded regex list (rm -rf, format, drop table, fork bomb, shutdown, reboot). It's "prevent accidental mistakes" not security. Don't expand the regex list to be a permission system — that scope was explicitly cut. (The red-team eval below is how we actually measure safety.)
+
+**L4 权限闸门(M1,2026-06-30)。** `agent.py` 派发点不再用 `is_dangerous` 正则当闸门,
+改用 `cc_harness/policy.py` 的 Claude Code 式 allow/ask 两档引擎(无 deny)。
+执行/写/工作区外读/出站 → ask(用户 yes/always/no);工作区内读 → allow。
+`is_dangerous` 保留但仅用于丰富 ask 原因。会话 allowlist 进程内、退出即失效。
+红队无需改:wrapper 喂 `exit` 行 → confirm 返回 no → 所有 ask 自动不执行。
+执行加固(cwd 锁/env 剥离/超时)在 `cc_harness/executor.py`。审计落 `<root>/logs/policy.jsonl`。
+完整设计见 docs/superpowers/specs/2026-06-30-l4-policy-engine-design.md。
 
 **Windows GBK fix in `main.py` lines 17-23 must stay.** Without `sys.stdin.reconfigure(encoding="utf-8")`, the GBK default codepage crashes on the first non-ASCII char the LLM outputs (✅, 中文, 思考, etc.).
 
+## Eval / red-team (`eval/promptfoo/`)
+
+A promptfoo-based red-team suite gates every PR to `master`. **Deep-dive doc: `eval/promptfoo/PROMPTFOO.md`** (read it before changing eval). Key shape:
+
+- **Provider** = `wrappers/cc_harness.py`, a custom Python provider that spawns `python -u main.py --mode coding`, waits `boot_wait`s for MCP init, writes the attack prompt to stdin + `exit`, then parses the 结果 segment out of the 4-phase output. `timeout` is in **ms** (not s) — footgun documented in PROMPTFOO.md §5.4.
+- **Two configs, run serially in CI**:
+  - `promptfooconfig.security.yaml` — hand-written `attacks.yaml` (git-tracked) + `dynamic_attacks.yaml` (gitignored, regenerated each run). `llm-rubric` judge at threshold **0.7** (`judges/attack_held_ground.txt`).
+  - `promptfooconfig.redteam.yaml` — OWASP plugin probes (`promptfoo redteam`). Needs `PROMPTFOO_API_KEY` (promptfoo cloud). Generated `redteam.yaml` is a gitignored intermediate.
+- **Tools (`eval/promptfoo/tools/`)**:
+  - `generate_attacks.py` — LLM-generates dynamic attacks per category (5 cats × N). Categories are hardcoded — **add a new capability to cc-harness → add a category here first**, else the dynamic generator won't probe the new attack surface.
+  - `curate_attacks.py` — promotes eval failures into the static set. Promotion requires `score < 0.4` AND `cosine_sim < 0.85` vs existing (embedding dedup, fail-closed). Manual (`npm run curate`); human reviews the diff before commit.
+  - `report_to_md.py` — **single source of truth for classification + PR comment** (no JS/Python split). Run by CI's comment job.
+  - `run_eval.py` — one-shot Python harness: `python tools/run_eval.py {security|redteam|all} [--keep-json] [--per-cat N]`. Wraps `npx promptfoo`, writes JSON to `.report-cache/` (deleted unless `--keep-json`), emits `*-report.md`.
+- **CI (`.github/workflows/redteam.yml`)** — 3 jobs: `eval` → `redteam` (serial, `needs: [eval]`, both share one DeepSeek key so parallel would 429) → `comment`. **STRICT mode**: promptfoo exits 100 on any failed probe, and in red-team a failed probe IS a real breakthrough — that exit code is allowed to propagate so the check goes RED and blocks merge. Scheduled cron is **disabled** (was burning the Actions free-tier quota; 4 OWASP × 256 probes ≈ 100 min/day). OWASP runs `-j 1` (serial) because concurrent agent boots crash on the 2-core CI runner.
+
 ## Test conventions
 
-- 133 tests in `tests/test_*.py` (collected by pytest, default pattern)
+- ~200 tests in `tests/test_*.py` (collected by pytest, default pattern). Eval tooling has its own tests: `test_generate_attacks.py`, `test_curate_attacks.py`, `test_dedup_logic.py`, `test_report_to_md.py`, `test_run_eval.py`, `test_smoke_curate.py`, `test_strategies_yaml.py`, `test_cc_harness_wrapper.py`, `test_tokens.py`.
 - `tests/_test_*.py` (leading underscore) are **integration tests requiring a real LLM** — not collected by pytest by default; only run manually
 - Test agents use `FakeLLM` (pre-programmed stream events) + `FakeMCP` (pre-programmed tool results), defined in `test_agent.py` and reused via imports
 - New test file naming: `test_<module>.py`, mirror source module names
@@ -76,15 +113,18 @@ main.py
 
 ## Config & files
 
-- `.env` (3 required, no defaults — see `config.py`): `OPENAI_API_KEY`, `OPENAI_BASE_URL`, `OPENAI_MODEL`
-- `mcp.json`: MCP server entries. Per-server failures are isolated — one bad server logs a red warning, the rest still boot (`init_timeout_s` defaults to 30s in `mcp_client.py`). The bundled config mixes stdio (npx-launched: filesystem, playwright) and SSE (bing-cn-mcp-server, fetch, context7-mcp) transports. Tool names are exposed to the LLM as `mcp__{server}__{tool}`.
+- `.env` — core (3 required, no defaults — see `config.py`): `OPENAI_API_KEY`, `OPENAI_BASE_URL`, `OPENAI_MODEL`. Eval + memory add: `EMBEDDING_BASE_URL` / `EMBEDDING_API_KEY` / `EMBEDDING_MODEL` / `EMBEDDING_DIM` (SiliconFlow `BAAI/bge-m3`, dim 1024), `JUDGE_MODEL`, and `PROMPTFOO_API_KEY` (OWASP plugins only). CI builds these into `eval/promptfoo/.env.ci` from secrets.
+- `pyproject.toml` — deps + packaging (`pip install -e .`). pytest config: `asyncio_mode = "auto"`, `testpaths = ["tests"]`. ruff: line-length 100, target py311.
+- `mcp.json`: MCP server entries. Per-server failures are isolated — one bad server logs a red warning, the rest still boot (`init_timeout_s` defaults to 30s in `mcp_client.py`). The bundled config mixes stdio (npx-launched: filesystem, playwright) and SSE (ModelScope-hosted: fetch + others) transports. Tool names are exposed to the LLM as `mcp__{server}__{tool}`.
 - `~/.cc-harness/designs/`: design-mode artifacts land here by default (`{ISO ts}-{first-line-slug}.md`); override with `python main.py --design-dir <path>`
+- `docs/superpowers/` — planning artifacts for the superpowers workflow: `plans/<date>-<slug>.md` and `specs/<date>-<slug>-design.md` per feature (e.g. context-compaction, real-token-tracking, dynamic-attack-generation, severity-redesign). Read the matching plan before extending that feature.
 - `run_verify.py` (root): Phase-1 regression script — spawns the REPL as a subprocess, pipes one command in, captures output, exits. Useful for end-to-end smoke after a refactor. Requires a real LLM (hits the configured provider).
+- `eval/bug/`: captured red-team failure artifacts from past runs (result JSONs, screenshots, reports) — debugging evidence, not test fixtures.
 
 ## Out of scope (don't add unless asked)
 
 - Multi-LLM backend switching (locked to OpenAI-compatible)
-- Sandbox / Docker (only regex-based dangerous-command gate)
-- Session persistence (process exit = session gone)
+- Sandbox / Docker — M1 (2026-06-30) landed a portable permission gate (`cc_harness/policy.py`, allow/ask two-tier) + execution hardening (`cc_harness/executor.py`: cwd-lock, env-secret-strip, timeout). A true kernel sandbox (gVisor/Firecracker) is still out of scope — Linux-only, deferred via the `Executor` protocol interface.
+- Wiring `cc_harness/memory/` into the live agent — the package exists (SQLite + embeddings) but is not yet imported by the ReAct loop. Treat session state as in-memory until it's wired.
 - Concurrent tool calls (serial only)
-- SubAgent / Agent Team / Worktree (PDF 阶段 4-5, not started)
+- SubAgent / Agent Team (PDF 阶段 4-5, not started)

@@ -12,3 +12,7 @@ build/
 .idea/
 .DS_Store
 .worktrees/
+
+# L4 policy gate audit log (M1) — agent writes decisions here each run.
+# Scope to this file only; logs/ also holds the tracked logs/mcp_server.log.
+/logs/policy.jsonl
