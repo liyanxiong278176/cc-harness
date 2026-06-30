@@ -67,3 +67,20 @@ def load_config(env_path: Path, mcp_json_path: Path) -> AppConfig:
         openai_model=model,
         mcp_servers=servers,
     )
+
+
+class PolicyConfig(BaseModel):
+    """权限闸门配置。M1 只暴露 enabled(杀手开关)。
+    审计路径固定 <项目根>/logs/policy.jsonl(agent 写死),不在此配置。"""
+    enabled: bool = True
+
+    model_config = {"extra": "ignore"}
+
+
+def load_policy_config(path: Path) -> PolicyConfig:
+    """从可选 policy.yaml 加载;文件不存在返回默认。"""
+    if not path.exists():
+        return PolicyConfig()
+    import yaml
+    raw = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
+    return PolicyConfig(**raw)

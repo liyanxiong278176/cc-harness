@@ -99,3 +99,17 @@ def test_load_config_missing_mcp_json_raises(tmp_path: Path, monkeypatch: pytest
     monkeypatch.setenv("OPENAI_MODEL", "m")
     with pytest.raises(ConfigError, match="mcp.json"):
         load_config(env_path=tmp_path / ".env", mcp_json_path=tmp_path / "missing.json")
+
+
+def test_policyconfig_defaults():
+    from cc_harness.config import PolicyConfig
+    pc = PolicyConfig()
+    assert pc.enabled is True
+
+
+def test_load_policy_from_yaml(tmp_path):
+    from cc_harness.config import load_policy_config
+    y = tmp_path / "policy.yaml"
+    y.write_text("enabled: false\n", encoding="utf-8")
+    pc = load_policy_config(y)
+    assert pc.enabled is False
