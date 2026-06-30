@@ -1,10 +1,7 @@
-import pytest
-
 from cc_harness.tools import (
     is_dangerous,
     run_command,
     RUN_COMMAND_SPEC,
-    RUN_COMMAND_TIMEOUT_S,
 )
 
 
@@ -96,37 +93,6 @@ def test_run_command_non_string_command_returns_error():
     assert "string" in result.llm_text
 
 
-def test_run_command_dangerous_blocked_by_user(monkeypatch):
-    """If is_dangerous matches AND user rejects, returns user-rejected error."""
-    import asyncio
-    from cc_harness import tools
-    monkeypatch.setattr(tools, "confirm", lambda prompt: False)
-    result = asyncio.run(run_command(
-        {"command": "rm -rf /tmp/should_not_run"},
-        cwd=".",
-    ))
-    assert result.is_error is True
-    assert "rejected" in result.llm_text.lower()
-
-
-def test_run_command_dangerous_allowed_by_user(monkeypatch):
-    """If is_dangerous matches AND user confirms, command runs."""
-    import asyncio
-    from cc_harness import tools
-    monkeypatch.setattr(tools, "confirm", lambda prompt: True)
-    # Use `echo` (not dangerous itself) wrapped in a dangerous pattern to
-    # confirm the gate is the only thing standing between us and execution.
-    # Easier: just use a non-dangerous command; the dangerous flow is covered
-    # by the "blocked" test above. Here we verify confirm=False path is
-    # unrelated to non-dangerous commands.
-    result = asyncio.run(run_command(
-        {"command": "echo safe"},
-        cwd=".",
-    ))
-    assert result.is_error is False
-    assert "safe" in result.llm_text
-
-
 def test_run_command_timeout(monkeypatch):
     """A command that exceeds the timeout returns a timeout error."""
     import asyncio
@@ -156,6 +122,34 @@ def test_run_command_spec_is_openai_function_format():
     assert params["type"] == "object"
     assert "command" in params["properties"]
     assert "command" in params["required"]
+
+
+# --- confirm_tool (3-way L4 gate) ---
+
+def test_confirm_tool_yes(monkeypatch):
+    from cc_harness.tools import confirm_tool
+    monkeypatch.setattr("builtins.input", lambda *a, **k: "y")
+    assert confirm_tool("run_command", {"command": "ls"}) == "yes"
+
+
+def test_confirm_tool_always(monkeypatch):
+    from cc_harness.tools import confirm_tool
+    monkeypatch.setattr("builtins.input", lambda *a, **k: "always")
+    assert confirm_tool("run_command", {"command": "ls"}) == "always"
+
+
+def test_confirm_tool_no_default(monkeypatch):
+    from cc_harness.tools import confirm_tool
+    monkeypatch.setattr("builtins.input", lambda *a, **k: "")  # Enter = default no
+    assert confirm_tool("run_command", {"command": "ls"}) == "no"
+
+
+def test_confirm_tool_eof_is_no(monkeypatch):
+    from cc_harness.tools import confirm_tool
+    def _raise(*a, **k):
+        raise EOFError
+    monkeypatch.setattr("builtins.input", _raise)
+    assert confirm_tool("run_command", {"command": "ls"}) == "no"
 
 
 # --- helpers ---

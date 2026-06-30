@@ -1,7 +1,7 @@
 """Dangerous-command detection + user confirmation prompt + built-in tools."""
 from __future__ import annotations
-import asyncio
 import re
+from pathlib import Path
 from cc_harness.mcp_client import ToolResult
 
 # 体验级安全 — 不是安全边界。真正安全要靠沙箱和权限控制,这里只是防误操作的提示。
@@ -23,7 +23,12 @@ DANGEROUS_PATTERNS: list[re.Pattern[str]] = [
 _SHELL_TOOL_SUFFIX_RE = re.compile(r"__(bash|run_command|shell|execute)$")
 
 def is_dangerous(tool_name: str, arguments: dict) -> bool:
-    """Return True if this tool call is dangerous and needs user confirmation.
+    """Return True if this tool call matches a known dangerous pattern.
+
+    NOTE: This is NO LONGER a gate. The L4 policy engine (policy.py) decides
+    allow/ask; this function is only used to enrich the ask reason (e.g.
+    "执行 shell 命令需用户确认(命中危险命令模式)"). Kept because policy.py
+    imports it for that purpose, and the existing is_dangerous tests stay.
 
     Scans only the 'command' field of shell-class tools. write_file content is
     never scanned (see spec § 危险命令匹配).
@@ -49,6 +54,23 @@ def confirm(prompt: str) -> bool:
     return answer == "y"
 
 
+def confirm_tool(tool_name: str, args: dict) -> str:
+    """3-way confirmation for the L4 policy gate. Returns 'yes' / 'always' / 'no'.
+
+    Default is 'no' (Enter = no). EOF / Ctrl-C → 'no' (fail-closed).
+    """
+    prompt = f"允许执行 {tool_name}?(yes / always / [no])"
+    try:
+        answer = input(f"{prompt}: ").strip().lower()
+    except (EOFError, KeyboardInterrupt):
+        return "no"
+    if answer in ("y", "yes"):
+        return "yes"
+    if answer in ("a", "always"):
+        return "always"
+    return "no"
+
+
 # --- Built-in tools (registered as native functions, not via MCP) ---
 
 # Per-call timeout for run_command. Long enough for most builds/tests,
@@ -57,68 +79,17 @@ RUN_COMMAND_TIMEOUT_S = 30
 
 
 async def run_command(args: dict, *, cwd: str = ".") -> ToolResult:
-    """Built-in tool: execute a shell command and return its stdout.
+    """Built-in shell tool. Execution hardening (cwd-lock / env-strip / timeout)
+    lives in NativeExecutor.
 
-    Uses asyncio subprocess (non-blocking) so the event loop stays responsive.
-    Subject to the same is_dangerous + confirm gate as MCP shell tools —
-    dangerous patterns (rm -rf, format, drop database, etc.) require explicit
-    user confirmation before execution.
-
-    Returns ToolResult with stdout on success, or a descriptive error message
-    on non-zero exit / timeout / exception.
+    The permission decision (allow/ask) is made by the agent-layer PolicyEngine
+    BEFORE dispatch; this function no longer gates. timeout_s is read at CALL
+    TIME from this module's RUN_COMMAND_TIMEOUT_S (so tests can monkeypatch it).
     """
-    command = args.get("command", "")
-    if not isinstance(command, str) or not command.strip():
-        return ToolResult.error(
-            display="'command' must be a non-empty string",
-            llm="[Tool Error] 'command' must be a non-empty string",
-        )
-
-    if is_dangerous("run_command", args):
-        if not confirm("Confirm execution?"):
-            return ToolResult.error(
-                display="user rejected dangerous command",
-                llm=f"[Tool Error] user rejected dangerous command: {command}",
-            )
-
-    try:
-        proc = await asyncio.create_subprocess_shell(
-            command,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-            cwd=cwd,
-        )
-        try:
-            stdout_b, stderr_b = await asyncio.wait_for(
-                proc.communicate(),
-                timeout=RUN_COMMAND_TIMEOUT_S,
-            )
-        except asyncio.TimeoutError:
-            try:
-                proc.kill()
-                await proc.wait()
-            except ProcessLookupError:
-                pass
-            return ToolResult.error(
-                display=f"timeout after {RUN_COMMAND_TIMEOUT_S}s",
-                llm=f"[Tool Error] timeout after {RUN_COMMAND_TIMEOUT_S}s",
-            )
-    except Exception as e:
-        return ToolResult.error(
-            display=f"raised: {e}",
-            llm=f"[Tool Error] {type(e).__name__}: {e}",
-        )
-
-    stdout = stdout_b.decode("utf-8", errors="replace") if stdout_b else ""
-    stderr = stderr_b.decode("utf-8", errors="replace") if stderr_b else ""
-
-    if proc.returncode != 0:
-        combined = (stdout + stderr).strip() or f"(no output, exit {proc.returncode})"
-        return ToolResult.error(
-            display=f"exit {proc.returncode}: {combined[:200]}",
-            llm=f"[Tool Error] exit {proc.returncode}\nstdout: {stdout}\nstderr: {stderr}",
-        )
-    return ToolResult.success(stdout if stdout else "(no output)")
+    from cc_harness.executor import NativeExecutor
+    return await NativeExecutor(
+        project_root=Path(cwd), timeout_s=RUN_COMMAND_TIMEOUT_S,
+    ).run(args, cwd=Path(cwd))
 
 
 # OpenAI function-calling spec for run_command — matches the shape produced
