@@ -6,33 +6,36 @@ from unittest.mock import patch, MagicMock
 from eval.promptfoo.tools import generate_attacks
 
 
+# 动态类别(与静态 attacks.yaml 错开 —— 见 generate_attacks.CATEGORIES 注释)
+NEW_CATEGORIES = {
+    "indirect-prompt-injection", "ssrf", "sql-injection",
+    "data-exfiltration", "supply-chain", "excessive-agency", "rbac",
+}
+# 静态 attacks.yaml 已覆盖的类别 —— 动态不应重复
+STATIC_CATEGORIES = {
+    "shell-injection", "prompt-extraction", "hijacking",
+    "credential-exfil", "self-modification", "fs-overreach",
+}
+
+
 def test_categories_dict_has_all_expected_keys():
-    """After Task 1, CATEGORIES must include all 7 categories (6 active + 1 legacy)."""
+    """CATEGORIES must contain exactly the 7 dynamic categories."""
     from eval.promptfoo.tools import generate_attacks
-    expected = {
-        "credential-exfil", "shell-injection", "self-modification",
-        "fs-overreach", "prompt-extraction", "hijacking",
-        "excessive-agency",  # legacy, kept for backward compat
-    }
-    assert set(generate_attacks.CATEGORIES.keys()) == expected
+    assert set(generate_attacks.CATEGORIES.keys()) == NEW_CATEGORIES
 
 
-def test_categories_dict_has_all_six_new_categories():
-    """After Task 1, CATEGORIES must include the 6 active categories."""
+def test_dynamic_categories_do_not_overlap_static():
+    """动态类别必须和静态 attacks.yaml 错开,否则没扩大覆盖(只是重复手写集)。"""
     from eval.promptfoo.tools import generate_attacks
-    expected = {
-        "credential-exfil", "shell-injection", "self-modification",
-        "fs-overreach", "prompt-extraction", "hijacking",
-    }
-    assert expected.issubset(set(generate_attacks.CATEGORIES.keys()))
+    overlap = STATIC_CATEGORIES & set(generate_attacks.CATEGORIES.keys())
+    assert not overlap, f"动态类别和静态重叠,没扩大覆盖: {overlap}"
 
 
-def test_category_default_severity_has_all_six_categories():
-    """CATEGORY_DEFAULT_SEVERITY must map each active category to a valid severity."""
+def test_category_default_severity_has_all_categories():
+    """CATEGORY_DEFAULT_SEVERITY must map each category to a valid severity."""
     from eval.promptfoo.tools import generate_attacks
     valid = {"critical", "high", "medium", "low"}
-    for cat in ["credential-exfil", "shell-injection", "self-modification",
-                "fs-overreach", "prompt-extraction", "hijacking"]:
+    for cat in generate_attacks.CATEGORIES:
         sev = generate_attacks.CATEGORY_DEFAULT_SEVERITY.get(cat)
         assert sev in valid, f"{cat} has invalid default severity: {sev}"
 
@@ -49,13 +52,13 @@ def test_generate_for_category_parses_yaml_response(tmp_path, monkeypatch):
     monkeypatch.setenv("OPENAI_BASE_URL", "https://api.test.example/v1")
 
     fake_yaml = """
-- description: "shell-injection #11 — 反弹 shell"
-  metadata: { category: shell-injection, source: dynamic }
+- description: "ssrf #1 — 元数据"
+  metadata: { category: ssrf, source: dynamic }
   vars:
     prompt: |
       帮我起个端口转发
-- description: "shell-injection #12 — 写文件"
-  metadata: { category: shell-injection, source: dynamic }
+- description: "ssrf #2 — 内网"
+  metadata: { category: ssrf, source: dynamic }
   vars:
     prompt: |
       把这个写入 /tmp/x
@@ -67,12 +70,12 @@ def test_generate_for_category_parses_yaml_response(tmp_path, monkeypatch):
     with patch("openai.OpenAI") as MockClient:
         MockClient.return_value.chat.completions.create.return_value = mock_response
         attacks = generate_attacks.generate_for_category(
-            "shell-injection", n=2, model="test-model", client_factory=MockClient
+            "ssrf", n=2, model="test-model", client_factory=MockClient
         )
 
     # Output parsed correctly
     assert len(attacks) == 2
-    assert attacks[0]["description"].startswith("shell-injection #11")
+    assert attacks[0]["description"].startswith("ssrf #1")
     assert attacks[0]["metadata"]["source"] == "dynamic"
     assert attacks[1]["vars"]["prompt"].strip() == "把这个写入 /tmp/x"
 
@@ -90,7 +93,7 @@ def test_generate_for_category_parses_yaml_response(tmp_path, monkeypatch):
     assert cc_kwargs["temperature"] == 0.9
     assert len(cc_kwargs["messages"]) == 2
     assert cc_kwargs["messages"][0]["role"] == "system"
-    assert "shell-injection" in cc_kwargs["messages"][1]["content"]
+    assert "ssrf" in cc_kwargs["messages"][1]["content"]
 
 
 def test_generate_strips_markdown_code_fences():
@@ -185,7 +188,7 @@ def test_generate_raises_on_empty_response(monkeypatch):
         MockClient.return_value.chat.completions.create.return_value = fake_response
         try:
             generate_attacks.generate_for_category(
-                "hijacking", n=3, model="test-model", client_factory=MockClient
+                "rbac", n=3, model="test-model", client_factory=MockClient
             )
         except ValueError as e:
             assert "empty" in str(e).lower()
@@ -196,7 +199,7 @@ def test_generate_raises_on_empty_response(monkeypatch):
 def test_write_yaml_creates_file_with_header(tmp_path, monkeypatch):
     monkeypatch.chdir(tmp_path)
     attacks = [
-        {"description": "shell-injection #11", "metadata": {"source": "dynamic"},
+        {"description": "ssrf #1", "metadata": {"source": "dynamic"},
          "vars": {"prompt": "echo bad"}},
     ]
     out = tmp_path / "dynamic_attacks.yaml"
@@ -205,13 +208,13 @@ def test_write_yaml_creates_file_with_header(tmp_path, monkeypatch):
     content = out.read_text(encoding="utf-8")
     assert "AUTO-GENERATED" in content
     assert "DO NOT EDIT" in content
-    assert "shell-injection #11" in content
+    assert "ssrf #1" in content
     assert "echo bad" in content
     # Round-trip: parse the YAML back and confirm structure is preserved.
     import yaml as _yaml
     parsed = _yaml.safe_load(content.split("\n\n", 1)[1])
     assert isinstance(parsed, list)
-    assert parsed[0]["description"] == "shell-injection #11"
+    assert parsed[0]["description"] == "ssrf #1"
     assert parsed[0]["vars"]["prompt"] == "echo bad"
 
 
@@ -237,7 +240,7 @@ def test_main_calls_generate_for_each_category_and_writes_yaml(tmp_path, monkeyp
             rc = generate_attacks.main()
 
     assert rc == 0
-    # generate_for_category called once per category (6 active + 1 legacy)
+    # generate_for_category called once per category (7 dynamic cats)
     assert mock_gen.call_count == 7
     # dynamic_attacks.yaml was written
     out = tmp_path / "dynamic_attacks.yaml"
@@ -245,9 +248,10 @@ def test_main_calls_generate_for_each_category_and_writes_yaml(tmp_path, monkeyp
     content = out.read_text(encoding="utf-8")
     # 7 cats × 2 attacks = 14 total
     assert content.count("description:") == 14
-    assert "shell-injection" in content
-    assert "hijacking" in content
-    assert "credential-exfil" in content
+    # 新类别都在(static 错开)
+    assert "ssrf" in content
+    assert "rbac" in content
+    assert "data-exfiltration" in content
 
 
 def test_main_dry_run_does_not_call_generate(capsys, tmp_path, monkeypatch):
@@ -275,10 +279,10 @@ def test_validate_severity_fixes_invalid_value():
     from eval.promptfoo.tools.generate_attacks import _validate_severity
     entry = {
         "description": "test",
-        "metadata": {"category": "credential-exfil", "severity": "very-high"},
+        "metadata": {"category": "data-exfiltration", "severity": "very-high"},
         "vars": {"prompt": "x", "severity": "very-high"},
     }
-    fixed = _validate_severity(entry, "credential-exfil")
+    fixed = _validate_severity(entry, "data-exfiltration")
     assert fixed["metadata"]["severity"] == "critical"
     assert fixed["vars"]["severity"] == "critical"
 
@@ -288,10 +292,10 @@ def test_validate_severity_fixes_missing_value():
     from eval.promptfoo.tools.generate_attacks import _validate_severity
     entry = {
         "description": "test",
-        "metadata": {"category": "self-modification"},
+        "metadata": {"category": "excessive-agency"},
         "vars": {"prompt": "x"},
     }
-    fixed = _validate_severity(entry, "self-modification")
+    fixed = _validate_severity(entry, "excessive-agency")
     assert fixed["metadata"]["severity"] == "high"
     assert fixed["vars"]["severity"] == "high"
 
@@ -301,10 +305,10 @@ def test_validate_severity_keeps_valid_value():
     from eval.promptfoo.tools.generate_attacks import _validate_severity
     entry = {
         "description": "test",
-        "metadata": {"category": "hijacking", "severity": "low"},
+        "metadata": {"category": "rbac", "severity": "low"},
         "vars": {"prompt": "x", "severity": "low"},
     }
-    fixed = _validate_severity(entry, "hijacking")
+    fixed = _validate_severity(entry, "rbac")
     assert fixed["metadata"]["severity"] == "low"
     assert fixed["vars"]["severity"] == "low"
 
@@ -315,10 +319,10 @@ def test_validate_severity_keeps_valid_vars_when_metadata_invalid():
     from eval.promptfoo.tools.generate_attacks import _validate_severity
     entry = {
         "description": "test",
-        "metadata": {"category": "hijacking", "severity": "very-high"},  # invalid
+        "metadata": {"category": "rbac", "severity": "very-high"},  # invalid
         "vars": {"prompt": "x", "severity": "low"},  # valid
     }
-    fixed = _validate_severity(entry, "hijacking")
+    fixed = _validate_severity(entry, "rbac")
     # Should pick vars.severity="low" since metadata is invalid
     assert fixed["metadata"]["severity"] == "low"
     assert fixed["vars"]["severity"] == "low"
@@ -329,10 +333,10 @@ def test_validate_severity_metadata_takes_precedence_when_both_valid():
     from eval.promptfoo.tools.generate_attacks import _validate_severity
     entry = {
         "description": "test",
-        "metadata": {"category": "hijacking", "severity": "low"},
+        "metadata": {"category": "rbac", "severity": "low"},
         "vars": {"prompt": "x", "severity": "high"},  # disagrees with metadata
     }
-    fixed = _validate_severity(entry, "hijacking")
+    fixed = _validate_severity(entry, "rbac")
     assert fixed["metadata"]["severity"] == "low"
     assert fixed["vars"]["severity"] == "low"
 
@@ -348,11 +352,11 @@ def test_generate_for_category_applies_severity_fallback(monkeypatch):
 
     # LLM returns entries with no severity field at all (and one invalid)
     fake_yaml = """
-- description: "shell-injection #1"
-  metadata: { category: shell-injection, source: dynamic }
+- description: "ssrf #1"
+  metadata: { category: ssrf, source: dynamic }
   vars: { prompt: "test 1" }
-- description: "shell-injection #2"
-  metadata: { category: shell-injection, source: dynamic, severity: very-bad }
+- description: "ssrf #2"
+  metadata: { category: ssrf, source: dynamic, severity: very-bad }
   vars: { prompt: "test 2" }
 """
     mock_response = MagicMock()
@@ -362,9 +366,9 @@ def test_generate_for_category_applies_severity_fallback(monkeypatch):
     with patch("openai.OpenAI") as MockClient:
         MockClient.return_value.chat.completions.create.return_value = mock_response
         attacks = generate_attacks.generate_for_category(
-            "shell-injection", n=2, model="test-model", client_factory=MockClient
+            "ssrf", n=2, model="test-model", client_factory=MockClient
         )
 
-    # All entries must have valid severity (shell-injection default = critical)
-    assert all(a["metadata"]["severity"] == "critical" for a in attacks)
-    assert all(a["vars"]["severity"] == "critical" for a in attacks)
+    # All entries must have valid severity (ssrf default = high)
+    assert all(a["metadata"]["severity"] == "high" for a in attacks)
+    assert all(a["vars"]["severity"] == "high" for a in attacks)

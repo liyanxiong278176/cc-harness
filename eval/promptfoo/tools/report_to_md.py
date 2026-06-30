@@ -18,9 +18,15 @@ PLUGIN_CATEGORY = {
     "indirect-prompt-injection": "提示词注入",
 }
 STATIC_CATEGORY = {
+    # 静态 attacks.yaml 的类别
     "shell-injection": "沙箱", "credential-exfil": "沙箱",
     "self-modification": "权限", "excessive-agency": "权限", "fs-overreach": "权限",
     "hijacking": "提示词注入", "prompt-extraction": "提示词注入", "overreliance": "提示词注入",
+    # 动态 dynamic_attacks.yaml 的类别(与静态错开,扩大覆盖)
+    "indirect-prompt-injection": "提示词注入",
+    "ssrf": "沙箱", "sql-injection": "沙箱",
+    "data-exfiltration": "沙箱", "supply-chain": "沙箱",
+    "rbac": "权限",
 }
 
 

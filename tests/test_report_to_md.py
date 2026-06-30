@@ -40,6 +40,17 @@ def test_classify_other():
     assert rtm.classify_issue(_owasp("misinformation-disinformation")) == "其它"
     assert rtm.classify_issue({"metadata": {}}) == "其它"   # 未命中
 
+def test_classify_dynamic_categories():
+    """动态 dynamic_attacks.yaml 的类别(与静态错开)应正确分类,不归到'其它'。"""
+    assert rtm.classify_issue(_static("indirect-prompt-injection")) == "提示词注入"
+    assert rtm.classify_issue(_static("ssrf")) == "沙箱"
+    assert rtm.classify_issue(_static("sql-injection")) == "沙箱"
+    assert rtm.classify_issue(_static("data-exfiltration")) == "沙箱"
+    assert rtm.classify_issue(_static("supply-chain")) == "沙箱"
+    assert rtm.classify_issue(_static("rbac")) == "权限"
+    assert rtm.classify_issue(_static("excessive-agency")) == "权限"   # 已有
+
+
 def test_classify_pluginid_wins_over_category():
     r = {"metadata": {"pluginId": "bfla", "category": "hijacking"}}
     assert rtm.classify_issue(r) == "权限"
