@@ -17,6 +17,8 @@ import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from rich.console import Console
+from cc_harness.config import load_policy_config
+from cc_harness.policy import PolicyEngine
 from cc_harness.render import print_info, print_warn, print_token_summary
 from cc_harness.tokens import TokenCounter, SessionTokenStats
 
@@ -119,6 +121,12 @@ async def run_repl(
     console = Console()
     state = ReplState(mode=default_mode)
 
+    # Construct ONE PolicyEngine for the whole session. policy.yaml is optional
+    # (missing → default enabled=True). project_root is the REPL's cwd so path
+    # containment checks anchor to the project, not wherever the process drifts.
+    policy_cfg = load_policy_config(Path("policy.yaml"))
+    policy = PolicyEngine(project_root=Path(cwd), enabled=policy_cfg.enabled)
+
     n_tools = len(mcp.list_tools())
     print_info(console, "")
     print_info(console, f"  cc-harness ready  |  tools: {n_tools}  |  mode: {default_mode.upper()}")
@@ -158,6 +166,7 @@ async def run_repl(
             cwd=cwd,
             design_dir=design_dir,
             token_counter=state.token_counter,
+            policy=policy,
         )
         state.session_stats.add(turn_stats)
 
