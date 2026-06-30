@@ -79,3 +79,41 @@ def test_allowlist_miss_still_ask():
     eng.allowlist.add("run_command", {"command": "make test"})
     d = eng.evaluate("run_command", {"command": "make build"}, {"project_root": ROOT})
     assert d.action is Action.ASK
+
+
+# --- 分类绕过加固:docs/git_read 带工作区外 path → ask ---
+
+def test_docs_tool_with_outside_path_is_ask():
+    """mcp__context7__read_creds(path=~/.ssh/id_rsa) 不能因子串命中 docs 而绕过。"""
+    d = _engine().evaluate(
+        "mcp__context7__read_creds",
+        {"path": str(Path.home() / ".ssh/id_rsa")},
+        {"project_root": ROOT},
+    )
+    assert d.action is Action.ASK
+
+
+def test_docs_tool_without_path_still_allow():
+    """正常 context7 查询(无 path 参数)仍 allow。"""
+    d = _engine().evaluate(
+        "mcp__context7__query-docs",
+        {"query": "react hooks", "libraryId": "/react/react"},
+        {"project_root": ROOT},
+    )
+    assert d.action is Action.ALLOW
+
+
+def test_git_read_with_outside_path_is_ask():
+    """mcp__git__show(path=~/.ssh/id_rsa) 不能因 git_read 而绕过。"""
+    d = _engine().evaluate(
+        "mcp__git__show",
+        {"path": str(Path.home() / ".ssh/id_rsa")},
+        {"project_root": ROOT},
+    )
+    assert d.action is Action.ASK
+
+
+def test_git_read_without_path_still_allow():
+    """正常 git read(无 path)仍 allow。"""
+    d = _engine().evaluate("mcp__git__log", {"ref": "HEAD"}, {"project_root": ROOT})
+    assert d.action is Action.ALLOW

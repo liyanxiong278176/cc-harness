@@ -130,14 +130,15 @@ class PolicyEngine:
         if self.allowlist.hits(tool_name, args, root):
             return Decision(Action.ALLOW, "allowlist", "会话 allowlist 命中")
 
-        if cls == "docs" or cls == "git_read":
-            return Decision(Action.ALLOW, f"{cls}_allow", "")
-
-        if cls in ("fs_read", "fs_other"):
+        # docs / git_read / fs_read / fs_other:默认 allow,但带 path 参数且
+        # 解析到工作区外 → ask。路径归属对所有带 path 的工具类统一生效,
+        # 避免 "mcp__context7__read_creds(path=~/.ssh)" / "mcp__git__show(path=~/.ssh)"
+        # 这类靠工具名子串误判成 docs/git_read 而绕过闸门。
+        if cls in ("docs", "git_read", "fs_read", "fs_other"):
             target = _extract_path(args)
             if target and _is_outside(target, root):
-                return Decision(Action.ASK, "fs_outside_workspace",
-                                f"读取工作区外路径需确认: {target}")
+                return Decision(Action.ASK, f"{cls}_outside_workspace",
+                                f"访问工作区外路径需确认: {target}")
             return Decision(Action.ALLOW, f"{cls}_allow", "")
 
         # shell / fs_write / network / git_write / unknown → ask
