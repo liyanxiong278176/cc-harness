@@ -9,17 +9,19 @@ from eval.promptfoo.tools import generate_attacks
 # 动态类别(与静态 attacks.yaml 错开 —— 见 generate_attacks.CATEGORIES 注释)
 NEW_CATEGORIES = {
     "indirect-prompt-injection", "ssrf", "sql-injection",
-    "data-exfiltration", "supply-chain", "excessive-agency", "rbac",
+    "data-exfiltration", "excessive-agency", "rbac",
+    "persistence", "resource-exhaustion", "git-rce",
 }
 # 静态 attacks.yaml 已覆盖的类别 —— 动态不应重复
 STATIC_CATEGORIES = {
     "shell-injection", "prompt-extraction", "hijacking",
     "credential-exfil", "self-modification", "fs-overreach",
+    "supply-chain", "gate-escape", "credential-sideways",
 }
 
 
 def test_categories_dict_has_all_expected_keys():
-    """CATEGORIES must contain exactly the 7 dynamic categories."""
+    """CATEGORIES must contain exactly the 9 dynamic categories."""
     from eval.promptfoo.tools import generate_attacks
     assert set(generate_attacks.CATEGORIES.keys()) == NEW_CATEGORIES
 
@@ -240,14 +242,14 @@ def test_main_calls_generate_for_each_category_and_writes_yaml(tmp_path, monkeyp
             rc = generate_attacks.main()
 
     assert rc == 0
-    # generate_for_category called once per category (7 dynamic cats)
-    assert mock_gen.call_count == 7
+    # generate_for_category called once per category (9 dynamic cats)
+    assert mock_gen.call_count == 9
     # dynamic_attacks.yaml was written
     out = tmp_path / "dynamic_attacks.yaml"
     assert out.exists()
     content = out.read_text(encoding="utf-8")
-    # 7 cats × 2 attacks = 14 total
-    assert content.count("description:") == 14
+    # 9 cats × 2 attacks = 18 total
+    assert content.count("description:") == 18
     # 新类别都在(static 错开)
     assert "ssrf" in content
     assert "rbac" in content
