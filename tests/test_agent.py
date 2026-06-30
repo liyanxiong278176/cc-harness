@@ -4,6 +4,7 @@ Each test pre-programs a FakeLLM with a list of stream-event lists (one per
 LLM turn) and a FakeMCP with pre-loaded tool results, then runs run_turn and
 inspects the mutated `messages` list.
 """
+import json
 import pytest
 from dataclasses import dataclass, field
 from typing import Any
@@ -77,8 +78,6 @@ async def test_routes_normal_tool_call_executes_and_backfills(monkeypatch):
         results={"mcp__fs__read": ToolResult.success("file contents")},
         calls=[],
     )
-    # Don't actually prompt for confirmation
-    monkeypatch.setattr(agent_mod, "confirm", lambda prompt: True)
 
     messages = [{"role": "user", "content": "read a.py"}]
     await agent_mod.run_turn(messages, llm, mcp, max_iter=5)
@@ -228,7 +227,6 @@ async def test_max_iter_reached_with_pending_drops_tool_calls(monkeypatch):
     mcp = FakeMCP(tools_spec=[fs_tool],
                   results={"mcp__fs__read": ToolResult.success("x")},
                   calls=[])
-    monkeypatch.setattr(agent_mod, "confirm", lambda prompt: True)
 
     messages = [{"role": "user", "content": "loop"}]
     await agent_mod.run_turn(messages, llm, mcp, max_iter=20)
@@ -265,37 +263,26 @@ async def test_danger_command_user_says_no_llm_changes_tool(monkeypatch):
         "parameters": {"type": "object", "properties": {"command": {"type": "string"}}},
     }}
     safe_tool = {"type": "function", "function": {
-        "name": "mcp__safe__read", "description": "s",
+        "name": "mcp__fs__read", "description": "s",
         "parameters": {"type": "object"},
     }}
-    # Turn 1: LLM tries to call bash with rm -rf; user says N.
-    # Turn 2: LLM tries safe tool; executes.
     pending1 = [PendingToolCall(index=0, id="c1", name="mcp__bash__run",
                                 arguments_json='{"command":"rm -rf /tmp/x"}')]
-    pending2 = [PendingToolCall(index=0, id="c2", name="mcp__safe__read", arguments_json="{}")]
+    pending2 = [PendingToolCall(index=0, id="c2", name="mcp__fs__read", arguments_json="{}")]
     llm = FakeLLM(responses=[
         [FakeStreamEvent(kind="done", content="", pending=pending1, finish_reason="tool_calls")],
         [FakeStreamEvent(kind="done", content="", pending=pending2, finish_reason="tool_calls")],
         [FakeStreamEvent(kind="done", content="done", pending=[], finish_reason="stop")],
     ])
-    mcp = FakeMCP(
-        tools_spec=[bash_tool, safe_tool],
-        results={"mcp__safe__read": ToolResult.success("ok")},
-        calls=[],
-    )
-    confirm_calls: list[str] = []
-    def fake_confirm(prompt: str) -> bool:
-        confirm_calls.append(prompt)
-        return False  # user rejects rm -rf
-    monkeypatch.setattr(agent_mod, "confirm", fake_confirm)
+    mcp = FakeMCP(tools_spec=[bash_tool, safe_tool],
+                  results={"mcp__fs__read": ToolResult.success("ok")}, calls=[])
+    # bash → ask → 用户拒绝(no);fs__read → allow → 自动执行(confirm_tool 不被调)
+    monkeypatch.setattr(agent_mod, "confirm_tool", lambda *a, **k: "no")
 
     messages = [{"role": "user", "content": "clean up"}]
     await agent_mod.run_turn(messages, llm, mcp, max_iter=5)
-    assert confirm_calls == ["Confirm execution?"]
-    # Bash tool was NOT called
-    assert all(name != "mcp__bash__run" for name, _ in mcp.calls)
-    # Safe tool WAS called
-    assert ("mcp__safe__read", {}) in mcp.calls
+    assert all(name != "mcp__bash__run" for name, _ in mcp.calls)  # bash 未执行
+    assert ("mcp__fs__read", {}) in mcp.calls                        # fs__read 执行了
 
 
 # --- Mode branches (task #4) ---
@@ -304,7 +291,6 @@ async def test_danger_command_user_says_no_llm_changes_tool(monkeypatch):
 async def test_plan_mode_does_not_execute_tools(capfd):
     """In plan mode, no tools are executed even if a tool_call comes through."""
     from cc_harness import agent as agent_mod
-    from cc_harness.mcp_client import ToolResult
 
     fs_tool = {"type": "function", "function": {
         "name": "mcp__fs__read", "description": "r",
@@ -534,7 +520,6 @@ async def test_run_turn_accumulates_usage_across_iters(monkeypatch):
     ]
     llm = FakeLLM(responses=responses)
     mcp = FakeMCP(tools_spec=[fs_tool], results={"mcp__fs__r": ToolResult.success("ok")}, calls=[])
-    monkeypatch.setattr(agent_mod, "confirm", lambda p: True)
 
     messages = [{"role": "user", "content": "x"}]
     stats = await agent_mod.run_turn(messages, llm, mcp, max_iter=5)
@@ -574,7 +559,7 @@ async def test_run_turn_tool_calls_counted_in_tool_bucket(monkeypatch):
     fs_tool = {"type": "function", "function": {"name": "mcp__fs__r", "description": "r", "parameters": {}}}
     pending = [PendingToolCall(
         index=0, id="c1", name="mcp__fs__r",
-        arguments_json='{"path":"/foo.py"}',
+        arguments_json='{"path":"foo.py"}',
     )]
     responses = [
         [FakeStreamEvent(
@@ -588,9 +573,74 @@ async def test_run_turn_tool_calls_counted_in_tool_bucket(monkeypatch):
     ]
     llm = FakeLLM(responses=responses)
     mcp = FakeMCP(tools_spec=[fs_tool], results={"mcp__fs__r": ToolResult.success("ok")}, calls=[])
-    monkeypatch.setattr(agent_mod, "confirm", lambda p: True)
 
     messages = [{"role": "user", "content": "x"}]
     stats = await agent_mod.run_turn(messages, llm, mcp, max_iter=5)
     # tool_calls bucket should be > 0 from both tool result + assistant's tool_calls
     assert stats.tool_calls > 0
+
+
+# --- L4 policy gate acceptance tests (Task 8) ---
+
+@pytest.mark.asyncio
+async def test_run_command_credential_exfil_asked_and_denied(tmp_path, monkeypatch):
+    """cat ~/.ssh/id_rsa → shell → ask → 用户默认 no → 不执行 + 审计 denied。"""
+    from cc_harness import agent as agent_mod
+    from cc_harness.policy import PolicyEngine
+
+    pending = [PendingToolCall(index=0, id="c1", name="run_command",
+                               arguments_json='{"command":"cat ~/.ssh/id_rsa"}')]
+    llm = FakeLLM(responses=[
+        [FakeStreamEvent(kind="done", content="", pending=pending, finish_reason="tool_calls")],
+        [FakeStreamEvent(kind="done", content="已拒绝", pending=[], finish_reason="stop")],
+    ])
+    mcp = FakeMCP(tools_spec=[], results={}, calls=[])
+    monkeypatch.setattr("builtins.input", lambda *a, **k: "")  # 回车 = 默认 no
+
+    messages = [{"role": "user", "content": "读密钥"}]
+    policy = PolicyEngine(project_root=tmp_path)
+    await agent_mod.run_turn(messages, llm, mcp, mode="coding",
+                             cwd=str(tmp_path), max_iter=5, policy=policy)
+
+    # run_command 被拒:tool 消息含「用户拒绝」
+    tool_msgs = [m for m in messages if m.get("role") == "tool"]
+    assert tool_msgs and "用户拒绝" in tool_msgs[-1]["content"]
+    # 审计落 tmp_path/logs/policy.jsonl
+    audit = (tmp_path / "logs" / "policy.jsonl").read_text(encoding="utf-8")
+    assert '"decision": "ask"' in audit
+    assert '"outcome": "denied"' in audit
+
+
+@pytest.mark.asyncio
+async def test_fs_read_inside_workspace_executes(tmp_path):
+    """工作区内 read_file → allow → 真派发 mcp.call_tool。"""
+    from cc_harness import agent as agent_mod
+    from cc_harness.mcp_client import ToolResult
+    from cc_harness.policy import PolicyEngine
+
+    inside = tmp_path / "a.py"
+    inside.write_text("x", encoding="utf-8")
+    fs_tool = {"type": "function", "function": {
+        "name": "mcp__fs__read", "description": "r",
+        "parameters": {"type": "object", "properties": {"path": {"type": "string"}}},
+    }}
+    pending = [PendingToolCall(index=0, id="c1", name="mcp__fs__read",
+                               arguments_json=json.dumps({"path": str(inside)}))]
+    llm = FakeLLM(responses=[
+        [FakeStreamEvent(kind="done", content="", pending=pending, finish_reason="tool_calls")],
+        [FakeStreamEvent(kind="done", content="done", pending=[], finish_reason="stop")],
+    ])
+    mcp = FakeMCP(tools_spec=[fs_tool],
+                  results={"mcp__fs__read": ToolResult.success("FILE CONTENTS")}, calls=[])
+
+    messages = [{"role": "user", "content": "读 a.py"}]
+    policy = PolicyEngine(project_root=tmp_path)
+    await agent_mod.run_turn(messages, llm, mcp, mode="coding",
+                             cwd=str(tmp_path), max_iter=5, policy=policy)
+
+    assert mcp.calls == [("mcp__fs__read", {"path": str(inside)})]
+    tool_msgs = [m for m in messages if m.get("role") == "tool"]
+    assert tool_msgs and "FILE CONTENTS" in tool_msgs[-1]["content"]
+    audit = (tmp_path / "logs" / "policy.jsonl").read_text(encoding="utf-8")
+    assert '"decision": "allow"' in audit
+    assert '"outcome": "executed"' in audit

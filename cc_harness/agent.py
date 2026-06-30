@@ -22,7 +22,10 @@ from cc_harness.render import (
     print_thought, print_action, print_observation, print_result,
     print_warn, print_error, print_info,
 )
-from cc_harness.tools import is_dangerous, confirm, run_command, RUN_COMMAND_SPEC
+from cc_harness.policy import PolicyEngine
+from cc_harness.schema import validate_native, validate_mcp, set_mcp_schemas
+from cc_harness.audit import log_decision
+from cc_harness.tools import confirm_tool, run_command, RUN_COMMAND_SPEC
 from cc_harness.tokens import TokenCounter, TurnTokenStats, UsageRecord
 
 _VALID_MODES = ("coding", "plan", "design")
@@ -49,6 +52,7 @@ async def run_turn(
     cwd: str | None = None,
     design_dir: Path | None = None,
     token_counter: TokenCounter | None = None,
+    policy: PolicyEngine | None = None,
 ) -> TurnTokenStats:
     """Run one user turn in the given mode.
 
@@ -73,6 +77,20 @@ async def run_turn(
 
     if cwd is not None:
         _refresh_system_prompt(messages, cwd, mode)
+
+    # --- L4 policy gate setup ---
+    project_root = Path(cwd or ".").resolve()
+    if policy is None:
+        policy = PolicyEngine(project_root=project_root)
+    # Inject MCP schemas so schema.validate_mcp can check MCP tool args.
+    try:
+        set_mcp_schemas({
+            t["function"]["name"]: t["function"].get("parameters", {})
+            for t in (mcp.list_tools() or [])
+        })
+    except Exception:
+        pass
+    audit_path = project_root / "logs" / "policy.jsonl"
 
     # In plan/design mode, the LLM should not see any tool definitions, so
     # it physically cannot emit tool_calls. In coding mode, expose both the
@@ -203,35 +221,69 @@ async def run_turn(
                     })
                     continue
 
-                # Danger check — same as before, but show the rejection as 观察
-                if is_dangerous(p.name, args):
-                    print_warn(console, f"dangerous command detected: {p.name} {args}")
-                    if not confirm("Confirm execution?"):
-                        error_text = f"[Tool Error] user rejected dangerous command: {p.name}"
+                # schema 校验
+                if p.name in NATIVE_TOOLS:
+                    ok, msg = validate_native(p.name, args)
+                else:
+                    ok, msg = validate_mcp(p.name, args)
+                if not ok:
+                    error_text = f"[Tool Error] 参数校验失败: {msg}"
+                    print_observation(console, error_text)
+                    messages.append({
+                        "role": "tool",
+                        "tool_call_id": p.id or f"unknown_{i}",
+                        "content": error_text,
+                    })
+                    continue
+
+                # 权限决策
+                ctx = {"project_root": project_root}
+                decision = policy.evaluate(p.name, args, ctx)
+
+                if decision.allow:
+                    print_action(console, p.name, args)
+                    log_decision(audit_path, iter_n=iter_count, tool=p.name, args=args,
+                                 action=decision.action.value, outcome="executed",
+                                 rule_id=decision.rule_id, reason=decision.reason, mode=mode)
+                    result = (await NATIVE_TOOLS[p.name]["handler"](args, cwd=str(project_root))
+                              if p.name in NATIVE_TOOLS
+                              else await mcp.call_tool(p.name, args))
+                    print_observation(console, result.llm_text)
+                    messages.append({
+                        "role": "tool",
+                        "tool_call_id": p.id or f"unknown_{i}",
+                        "content": result.llm_text,
+                    })
+                else:  # ask
+                    print_warn(console, f"[需确认] {p.name} {decision.reason}")
+                    choice = confirm_tool(p.name, args)
+                    if choice in ("yes", "always"):
+                        if choice == "always":
+                            policy.allowlist.add(p.name, args, project_root)
+                        print_action(console, p.name, args)
+                        log_decision(audit_path, iter_n=iter_count, tool=p.name, args=args,
+                                     action=decision.action.value, outcome="executed",
+                                     rule_id=decision.rule_id, reason=decision.reason, mode=mode)
+                        result = (await NATIVE_TOOLS[p.name]["handler"](args, cwd=str(project_root))
+                                  if p.name in NATIVE_TOOLS
+                                  else await mcp.call_tool(p.name, args))
+                        print_observation(console, result.llm_text)
+                        messages.append({
+                            "role": "tool",
+                            "tool_call_id": p.id or f"unknown_{i}",
+                            "content": result.llm_text,
+                        })
+                    else:
+                        error_text = f"[未执行:用户拒绝] {p.name} — {decision.reason}"
                         print_observation(console, error_text)
+                        log_decision(audit_path, iter_n=iter_count, tool=p.name, args=args,
+                                     action=decision.action.value, outcome="denied",
+                                     rule_id=decision.rule_id, reason=decision.reason, mode=mode)
                         messages.append({
                             "role": "tool",
                             "tool_call_id": p.id or f"unknown_{i}",
                             "content": error_text,
                         })
-                        continue
-
-                print_action(console, p.name, args)
-                if p.name in NATIVE_TOOLS:
-                    # Native (built-in) tool — call the handler directly.
-                    result = await NATIVE_TOOLS[p.name]["handler"](
-                        args, cwd=cwd or "."
-                    )
-                else:
-                    result = await mcp.call_tool(p.name, args)
-                # 观察 shows what the LLM actually sees (llm_text, not display_text,
-                # so error markers like "[Tool Error]" are visible).
-                print_observation(console, result.llm_text)
-                messages.append({
-                    "role": "tool",
-                    "tool_call_id": p.id or f"unknown_{i}",
-                    "content": result.llm_text,
-                })
 
             # 5. Continue the loop — feed tool results back to LLM
             continue
