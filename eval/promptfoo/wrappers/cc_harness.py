@@ -169,6 +169,46 @@ async def call_api(prompt: str, options: dict, context: dict) -> dict:
     return result
 
 
+async def _spawn_and_boot(mode: str, workdir, env: dict, boot_wait: float,
+                          boot_retries: int):
+    """Spawn the REPL and wait out boot_wait. RETRY on boot-time crash: under
+    CI 4-way concurrency a fresh agent can OOM / fork-fail on first spawn
+    (rc=1, no output) — a retry after a short backoff usually succeeds. Returns
+    (proc, None) once the process survives boot_wait, or (None, error_dict)
+    after boot_retries+1 failed attempts."""
+    last_err = ""
+    for attempt in range(boot_retries + 1):
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                PYTHON_BIN, "-u", str(MAIN_PY), "--mode", mode,
+                cwd=str(workdir),
+                stdin=asyncio.subprocess.PIPE,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.STDOUT,
+                env=env,
+            )
+        except OSError as e:
+            last_err = f"failed to spawn REPL: {e}"
+            if attempt < boot_retries:
+                await asyncio.sleep(2)
+                continue
+            return None, {"output": "", "error": last_err}
+        await asyncio.sleep(boot_wait)
+        if proc.returncode is None:
+            return proc, None                          # survived boot
+        # crashed during boot — drain its output, then retry or give up
+        last_err = f"REPL died during boot (rc={proc.returncode})"
+        try:
+            await asyncio.wait_for(proc.communicate(), timeout=2)
+        except Exception:
+            pass
+        if attempt < boot_retries:
+            await asyncio.sleep(2)
+            continue
+        return None, await _err(proc, f"{last_err} after {boot_retries + 1} attempts", b"")
+    return None, {"output": "", "error": last_err or "spawn failed"}
+
+
 async def _call_api_inner(prompt: str, options: dict, context: dict) -> dict:
     cfg = options.get("config") or {}
     mode = cfg.get("mode", "coding")
@@ -201,24 +241,13 @@ async def _call_api_inner(prompt: str, options: dict, context: dict) -> dict:
     env["PYTHONUNBUFFERED"] = "1"
 
     start = time.time()
-    try:
-        proc = await asyncio.create_subprocess_exec(
-            PYTHON_BIN, "-u", str(MAIN_PY), "--mode", mode,
-            cwd=str(workdir),
-            stdin=asyncio.subprocess.PIPE,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.STDOUT,
-            env=env,
-        )
-    except OSError as e:
-        return {"output": "", "error": f"failed to spawn REPL: {e}"}
+    proc, boot_err = await _spawn_and_boot(
+        mode, workdir, env, boot_wait, int(cfg.get("boot_retries", 2)))
+    if boot_err is not None:
+        return boot_err
 
     try:
-        # Phase 1: let boot complete (MCP + memory init + banner)
-        await asyncio.sleep(boot_wait)
-        if proc.returncode is not None:
-            return await _err(proc, f"REPL died during boot (rc={proc.returncode})", b"")
-
+        # boot already survived in _spawn_and_boot — go straight to the prompt.
         # Phase 2: send prompt + "exit"
         try:
             assert proc.stdin is not None

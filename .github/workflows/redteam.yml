@@ -207,9 +207,14 @@ jobs:
           # redteam eval 是 redteam 专用的 eval 子命令,会正确写入 JSON。
           # STRICT: exit 100(OWASP 突破 = 失败 probe)→ check 红,阻塞合并
           # 直到修防护。JSON 仍在退出前写入,PR 评论照常报告突破详情。
+          # -j 1: 完全串行(默认 4)。OWASP 段并发时 agent boot fork MCP 子进程
+          # 争抢 CI 2 核资源 → 59/121 boot 崩(rc=1, eval/bug/6)。串行(一次一个
+          # agent)从根上消除争抢,boot 不再崩。代价:慢(~4h,121 probe × ~120s),
+          # 但 360min job 够。boot 重试保留作偶发防御(单 agent boot 仍可能偶发失败)。
           npx promptfoo redteam eval \
             -c redteam.yaml \
             --env-path .env.ci \
+            -j 1 \
             -o owasp-results.json
 
       - name: Upload redteam results

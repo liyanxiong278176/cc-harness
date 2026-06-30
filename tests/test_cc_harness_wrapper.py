@@ -8,6 +8,7 @@ main.py. The fallback search walks up to 6 ancestor levels.
 These tests verify the search returns the real main.py in the project
 layout and returns None when no candidate exists.
 """
+import asyncio
 import importlib.util
 import sys
 from pathlib import Path
@@ -152,3 +153,59 @@ def test_call_api_no_marker_when_clean(monkeypatch, tmp_path):
 
     assert "SECURITY BREACH" not in result["output"]
     assert result["output"] == "我拒绝执行该操作"
+
+
+# --- boot retry (_spawn_and_boot) ---
+# Regression: CI owasp segment had 59 "REPL died during boot (rc=1, no output)"
+# under 4-way concurrency. The wrapper now re-spawns on boot crash.
+
+class _FakeProc:
+    def __init__(self, rc):
+        self.returncode = rc
+    async def communicate(self):
+        return (b"", None)
+    def kill(self):
+        pass
+
+
+def _patch_spawn(monkeypatch, rcs):
+    """Make create_subprocess_exec return procs with the given returncodes,
+    one per call. Also no-op asyncio.sleep so tests don't wait the backoff."""
+    calls = {"n": 0}
+    rcs_iter = list(rcs)
+    async def fake_spawn(*a, **kw):
+        i = min(calls["n"], len(rcs_iter) - 1)
+        calls["n"] += 1
+        return _FakeProc(rcs_iter[i])
+    async def fake_sleep(s):
+        return
+    monkeypatch.setattr(wrapper.asyncio, "create_subprocess_exec", fake_spawn)
+    monkeypatch.setattr(wrapper.asyncio, "sleep", fake_sleep)
+    return calls
+
+
+def test_spawn_and_boot_retries_after_boot_crash(monkeypatch):
+    """第一次 boot 崩(rc=1)→ 重 spawn,第二次存活 → 返回 proc,无 error。"""
+    calls = _patch_spawn(monkeypatch, [1, None])
+    proc, err = asyncio.run(wrapper._spawn_and_boot("coding", None, {}, 0.01, 2))
+    assert err is None, f"应成功,但 err={err}"
+    assert proc is not None and proc.returncode is None
+    assert calls["n"] == 2                  # spawn 了 2 次(首次崩 + 重试)
+
+
+def test_spawn_and_boot_gives_up_after_max_retries(monkeypatch):
+    """连续 boot 崩超过 boot_retries → 返回 error,标注总尝试次数。"""
+    _patch_spawn(monkeypatch, [1, 1, 1])    # 总是崩
+    proc, err = asyncio.run(wrapper._spawn_and_boot("coding", None, {}, 0.01, 2))
+    assert proc is None
+    assert err is not None
+    assert "REPL died during boot" in err["error"]
+    assert "after 3 attempts" in err["error"]    # boot_retries(2) + 1
+
+
+def test_spawn_and_boot_succeeds_first_try(monkeypatch):
+    """boot 一次成功(returncode None)→ 不重试,直接返回。"""
+    calls = _patch_spawn(monkeypatch, [None])
+    proc, err = asyncio.run(wrapper._spawn_and_boot("coding", None, {}, 0.01, 2))
+    assert err is None and proc is not None
+    assert calls["n"] == 1                   # 没重试

@@ -63,7 +63,9 @@ def _redteam(keep: bool) -> None:
     j = CACHE / "owasp.json"
     try:
         _run(["npx", "promptfoo", "redteam", "generate", "-c", "promptfooconfig.redteam.yaml", "-o", str(rt)], check=False)
-        _run(["npx", "promptfoo", "redteam", "eval", "-c", str(rt), "-o", str(j)], check=False)
+        # -j 1: OWASP 段完全串行(默认 4)—— CI 2 核上并发 boot 崩,串行从根消除。
+        # 慢但稳(本地与 CI 一致)。
+        _run(["npx", "promptfoo", "redteam", "eval", "-c", str(rt), "-j", "1", "-o", str(j)], check=False)
         _gen_md([j], EVAL_DIR / "redteam-report.md")
     finally:
         rt.unlink(missing_ok=True)   # 中间产物,始终清理(无论 --keep-json)
