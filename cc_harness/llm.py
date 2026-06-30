@@ -90,6 +90,7 @@ class LLMClient:
 
         pending: list[PendingToolCall] = []
         content_parts: list[str] = []
+        reasoning_parts: list[str] = []
         finish_reason: str | None = None
         usage: UsageRecord | None = None
 
@@ -105,6 +106,13 @@ class LLMClient:
             if delta.content:
                 content_parts.append(delta.content)
                 yield StreamEvent(kind="content", text=delta.content)
+
+            # DeepSeek reasoning models (e.g. deepseek-v4-flash) emit
+            # delta.reasoning_content separately from delta.content. Capture it
+            # so we can fall back when content ends up empty (see done event).
+            reasoning = getattr(delta, "reasoning_content", None)
+            if reasoning:
+                reasoning_parts.append(reasoning)
 
             if delta.tool_calls:
                 for tc in delta.tool_calls:
@@ -124,10 +132,18 @@ class LLMClient:
             if choice.finish_reason:
                 finish_reason = choice.finish_reason
 
+        content_str = "".join(content_parts)
+        if not content_str and reasoning_parts:
+            # DeepSeek reasoning models sometimes emit the entire answer in
+            # reasoning_content with empty content (non-deterministic, more
+            # often with tools). Without this fallback the turn looks 'empty'
+            # and the agent gives up / retries into the same wall. When content
+            # is absent, the reasoning IS the answer — surface it.
+            content_str = "".join(reasoning_parts)
         yield StreamEvent(
             kind="done",
             finish_reason=finish_reason,
             pending=pending,
-            content="".join(content_parts),
+            content=content_str,
             usage=usage,
         )

@@ -34,9 +34,11 @@ def test_accumulate_delta_concat_arguments():
     assert pending[0].arguments_json == '{"a": 1}'
 
 class _FakeChoiceDelta:
-    def __init__(self, content=None, tool_calls=None):
+    def __init__(self, content=None, tool_calls=None, reasoning=None):
         self.content = content
         self.tool_calls = tool_calls
+        # DeepSeek reasoning models emit delta.reasoning_content separately.
+        self.reasoning_content = reasoning
 
 class _FakeChoice:
     def __init__(self, delta, finish_reason=None):
@@ -155,3 +157,41 @@ async def test_chat_usage_none_when_no_usage_chunk():
             final = ev
     assert final is not None
     assert final.usage is None
+
+
+@pytest.mark.asyncio
+async def test_chat_reasoning_content_used_when_content_empty():
+    """DeepSeek reasoning models (e.g. deepseek-v4-flash) sometimes emit the
+    whole answer in delta.reasoning_content with empty delta.content. Without
+    a fallback the turn looks 'empty' and the agent gives up. The done event
+    must surface reasoning_content as content in that case."""
+    chunks = [
+        _FakeChunk(_FakeChoiceDelta(reasoning="你好！我是 cc-harness")),
+        _FakeChunk(_FakeChoiceDelta(reasoning="，一个编程代理")),
+        _FakeChunk(_FakeChoiceDelta(), finish_reason="stop"),
+        _FakeUsageChunk(_FakeUsage(100, 50, 150)),
+    ]
+    client = _make_client(chunks)
+    final = None
+    async for ev in client.chat(messages=[{"role": "user", "content": "hello"}], tools=[]):
+        if ev.kind == "done":
+            final = ev
+    assert final is not None
+    assert final.content == "你好！我是 cc-harness，一个编程代理"
+
+
+@pytest.mark.asyncio
+async def test_chat_content_preferred_over_reasoning_when_both_present():
+    """When both content and reasoning_content are present, content wins
+    (reasoning is internal thinking and must not pollute the answer)."""
+    chunks = [
+        _FakeChunk(_FakeChoiceDelta(reasoning="(internal thinking...)", content="ANSWER")),
+        _FakeChunk(_FakeChoiceDelta(), finish_reason="stop"),
+    ]
+    client = _make_client(chunks)
+    final = None
+    async for ev in client.chat(messages=[{"role": "user", "content": "x"}], tools=[]):
+        if ev.kind == "done":
+            final = ev
+    assert final is not None
+    assert final.content == "ANSWER"
