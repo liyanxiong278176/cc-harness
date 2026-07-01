@@ -13,13 +13,17 @@ System prompt is refreshed at messages[0] on every turn to reflect the mode.
 """
 from __future__ import annotations
 import asyncio
+import os
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
+from openai import AsyncOpenAI
 from rich.console import Console
-from cc_harness.config import load_policy_config
+from cc_harness.audit import log_decision
+from cc_harness.config import load_l2_config, load_policy_config
+from cc_harness.l2 import REFUSAL_TEMPLATE, scan_user_input
 from cc_harness.policy import PolicyEngine
-from cc_harness.render import print_info, print_warn, print_token_summary
+from cc_harness.render import print_info, print_result, print_warn, print_token_summary
 from cc_harness.tokens import TokenCounter, SessionTokenStats
 
 _VALID_MODES = ("coding", "plan", "design")
@@ -127,6 +131,19 @@ async def run_repl(
     policy_cfg = load_policy_config(Path("policy.yaml"))
     policy = PolicyEngine(project_root=Path(cwd), enabled=policy_cfg.enabled)
 
+    # L2 输入防御:heuristic 命中即 BLOCK(不走 judge);否则 judge 判。
+    # client 仅在 l2 启用 且 有 API key 时构造(空 key 时 SDK 会抛 OpenAIError;
+    # heuristic 不需要 client,无 key 时仍可作为第一道防线)。
+    l2_cfg = load_l2_config(Path("policy.yaml"))
+    l2_api_key = os.getenv("OPENAI_API_KEY")
+    l2_client = (
+        AsyncOpenAI(api_key=l2_api_key, base_url=os.getenv("OPENAI_BASE_URL"))
+        if l2_cfg.enabled and l2_api_key
+        else None
+    )
+    l2_model = os.getenv("JUDGE_MODEL") or os.getenv("OPENAI_MODEL") or ""
+    l2_audit_path = Path(cwd) / "logs" / "l2.jsonl"
+
     n_tools = len(mcp.list_tools())
     print_info(console, "")
     print_info(console, f"  cc-harness ready  |  tools: {n_tools}  |  mode: {default_mode.upper()}")
@@ -156,7 +173,27 @@ async def run_repl(
             # Unknown slash command — warn but let it through to the LLM
             print_warn(console, f"未知命令: {raw!r}(当作普通消息处理)")
 
-        state.messages.append({"role": "user", "content": raw})
+        # L2 输入防御:命中即阻断,不进 run_turn、不入历史
+        if l2_cfg.enabled:
+            scan = await scan_user_input(
+                raw, l2_cfg=l2_cfg, client=l2_client, model=l2_model,
+            )
+            if not scan.allowed:
+                import hashlib
+                log_decision(
+                    l2_audit_path,
+                    iter_n=state.session_stats.turns, tool="user_input",
+                    args={"input_hash": hashlib.sha256(raw.encode("utf-8")).hexdigest()[:16]},
+                    action="l2_block", outcome="blocked",
+                    rule_id=scan.reason, reason="", mode=state.mode,
+                )
+                print_result(console, REFUSAL_TEMPLATE)  # 走 print_result → 带 结果: 头
+                continue                                   # 不 append、不 run_turn
+            user_content = scan.wrapped_text
+        else:
+            user_content = raw
+
+        state.messages.append({"role": "user", "content": user_content})
         turn_start = time.time()
         from cc_harness.agent import run_turn
         turn_stats = await run_turn(
