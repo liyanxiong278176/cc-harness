@@ -190,6 +190,14 @@ async def run_repl(
                 print_result(console, REFUSAL_TEMPLATE)  # 走 print_result → 带 结果: 头
                 continue                                   # 不 append、不 run_turn
             user_content = scan.wrapped_text
+            if scan.reason.startswith("judge_error"):
+                log_decision(
+                    l2_audit_path,
+                    iter_n=state.session_stats.turns, tool="user_input",
+                    args={"input_hash": hashlib.sha256(raw.encode("utf-8")).hexdigest()[:16]},
+                    action="l2_allow", outcome="judge_fail_open",
+                    rule_id=scan.reason, reason="", mode=state.mode,
+                )
         else:
             user_content = raw
 

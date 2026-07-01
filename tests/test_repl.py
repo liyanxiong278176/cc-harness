@@ -571,6 +571,39 @@ async def test_l2_block_skips_run_turn_and_prints_refusal(monkeypatch):
     assert printed[0] == REFUSAL_TEMPLATE          # 模糊拒绝模板,经 print_result
 
 
+@pytest.mark.asyncio
+async def test_l2_judge_error_allow_is_audited(monkeypatch, tmp_path):
+    """judge fail-open allow(无 key/judge 异常)必须落审计(G5 + M4 监控钩子)。"""
+    from cc_harness import repl as repl_mod
+    from cc_harness.repl import run_repl
+    from cc_harness.l2 import ScanResult
+    import json as _json
+
+    inputs = iter(["一个可能触发 judge 的普通输入", "exit"])
+    monkeypatch.setattr(repl_mod, "_read_user", _fake_read_user(inputs))
+
+    # 强制 scan 走 judge_error fail-open allow 路径
+    async def _fake_scan(raw, *, l2_cfg, client, model):
+        return ScanResult(allowed=True, reason="judge_error:AttributeError",
+                          wrapped_text=f"<user_input>{raw}</user_input>")
+    monkeypatch.setattr(repl_mod, "scan_user_input", _fake_scan)
+
+    # run_turn 仍被调(allow 路径)
+    async def _spy(*a, **kw):
+        return TurnTokenStats()
+    monkeypatch.setattr("cc_harness.agent.run_turn", _spy)
+
+    await run_repl(_StoppingLLM(), _NoopMCP(), cwd=str(tmp_path))
+
+    audit = tmp_path / "logs" / "l2.jsonl"
+    assert audit.exists(), "judge_error allow 应写 l2.jsonl 审计"
+    entries = [_json.loads(line) for line in audit.read_text(encoding="utf-8").strip().splitlines()]
+    assert any(e.get("decision") == "l2_allow" and e.get("outcome") == "judge_fail_open" for e in entries), \
+        "judge_error allow 应记 decision=l2_allow, outcome=judge_fail_open"
+    assert any("judge_error" in e.get("rule_id", "") for e in entries), \
+        "rule_id 应含 judge_error:<type>"
+
+
 # --- Token tracking tests (Task 4) ---
 
 @pytest.mark.asyncio
