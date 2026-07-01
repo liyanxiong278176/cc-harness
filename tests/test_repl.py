@@ -544,7 +544,7 @@ async def test_run_repl_empty_input_does_not_call_llm(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_l2_block_skips_run_turn_and_prints_refusal(monkeypatch, capsys):
+async def test_l2_block_skips_run_turn_and_prints_refusal(monkeypatch):
     """L2 heuristic 命中 → run_turn 不被调 + 经 print_result 打模糊拒绝(带 结果: 头)。"""
     from cc_harness import repl as repl_mod
     from cc_harness.repl import run_repl
@@ -555,16 +555,20 @@ async def test_l2_block_skips_run_turn_and_prints_refusal(monkeypatch, capsys):
     called = {"n": 0}
     async def _spy(*a, **kw):
         called["n"] += 1
-        from cc_harness.tokens import TurnTokenStats
         return TurnTokenStats()
     monkeypatch.setattr("cc_harness.agent.run_turn", _spy)  # repl 每轮 `from cc_harness.agent import run_turn` 重新绑定,patch 模块属性生效
 
+    printed = []
+    def _pr_spy(console, text):
+        printed.append(text)
+    monkeypatch.setattr(repl_mod, "print_result", _pr_spy)
+
     await run_repl(_StoppingLLM(), _NoopMCP(), cwd="/x")
 
-    assert called["n"] == 0                    # BLOCK 轮没进 run_turn
-    out = capsys.readouterr().out
-    assert "无法处理该请求" in out              # 模糊拒绝文本
-    assert "结果" in out                        # print_result 的 `结果:` 头
+    assert called["n"] == 0                    # BLOCK 轮没进 run_turn(load-bearing:不依赖输出捕获)
+    from cc_harness.l2 import REFUSAL_TEMPLATE
+    assert len(printed) == 1
+    assert printed[0] == REFUSAL_TEMPLATE          # 模糊拒绝模板,经 print_result
 
 
 # --- Token tracking tests (Task 4) ---

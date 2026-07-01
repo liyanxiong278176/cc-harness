@@ -13,6 +13,7 @@ System prompt is refreshed at messages[0] on every turn to reflect the mode.
 """
 from __future__ import annotations
 import asyncio
+import hashlib
 import os
 import time
 from dataclasses import dataclass, field
@@ -179,7 +180,6 @@ async def run_repl(
                 raw, l2_cfg=l2_cfg, client=l2_client, model=l2_model,
             )
             if not scan.allowed:
-                import hashlib
                 log_decision(
                     l2_audit_path,
                     iter_n=state.session_stats.turns, tool="user_input",
