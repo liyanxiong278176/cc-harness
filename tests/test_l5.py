@@ -1,8 +1,4 @@
-import pytest  # noqa: F401  (spec'd public-API surface for downstream tasks)
-
-from cc_harness.l5 import (  # noqa: F401  (Finding/L5Engine/ScanOutcome kept as API doc)
-    Finding, KeyRegexLayer, L5Engine, ScanOutcome, sanitize, build_l5_engine,
-)
+from cc_harness.l5 import KeyRegexLayer, sanitize, build_l5_engine
 from cc_harness.config import L5Config
 
 

@@ -61,7 +61,8 @@ class ScanOutcome:
 
 
 def _merge_and_redact(text: str, findings: list[Finding]) -> tuple[str, dict[str, int]]:
-    """合并 spans,重叠取最早开始的(丢嵌套/后到的),倒序 replace 成 [REDACTED:type]。
+    """合并 spans,重叠取最早开始的(丢嵌套/后到的;同起点取较长 span,多捕敏感内容),
+    倒序 replace 成 [REDACTED:type]。
     Layer A 与 Layer B 命中重叠时,先到的胜出(确定性,审计计数可复现)。
     返回 (redacted_text, {type: count})。"""
     if not findings:
