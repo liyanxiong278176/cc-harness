@@ -12,21 +12,21 @@
 
 1. **判定层太软**:`promptfooconfig.security.yaml` 只有一个笼统 `attack_held_ground.txt` rubric(`strategies: jailbreak` 一条)。rubric 只看最终文本,**无法可靠抓住"嘴上拒绝、实际 `rm -rf`"**——编程 agent 最危险的失败模式。
 2. **覆盖面偏"执行破坏"、轻"数据外泄"**:L5(DLP)刚做完,但红队**从不测 PII / 编码外传**→ L5 的防护效果**无法被衡量**。
-3. **没用 promptfoo 为编程 agent 造的 `coding-agent:*` 插件族(15 件套)**:`redteam.yaml` 有 17 个 OWASP 底层插件,但缺 `coding-agent:repo-prompt-injection` / `terminal-output-injection` / `sandbox-*-escape` / `delayed-ci-exfil` / `steganographic-exfil` / `verifier-sabotage` 等编程 agent 专项攻击。
+3. **没用 promptfoo 为编程 agent 造的 `coding-agent:*` 插件族(13 件套)**:`redteam.yaml` 有 17 个 OWASP 底层插件,但缺 `coding-agent:repo-prompt-injection` / `terminal-output-injection` / `sandbox-*-escape` / `delayed-ci-exfil` / `steganographic-exfil` / `verifier-sabotage` 等编程 agent 专项攻击。
 
 权威依据(对照后补强质谱 6 大类):
-- [promptfoo Red Team Plugins(157 插件)](https://www.promptfoo.dev/docs/red-team/plugins/) — `coding-agent:*` 15 件套、`pii:*` 四路、`ascii-smuggling`、框架映射(`owasp:llm`/`mitre:atlas`/`nist:ai`)
+- [promptfoo Red Team Plugins(157 插件)](https://www.promptfoo.dev/docs/red-team/plugins/) — `coding-agent:*` 13 件套、`pii:*` 四路、`ascii-smuggling`、框架映射(`owasp:llm`/`mitre:atlas`/`nist:ai`)
 - [promptfoo How to red team LLM Agents](https://www.promptfoo.dev/docs/red-team/agents/) — trajectory 玻璃盒断言、memory poisoning、multi-stage chains、crescendo 多轮
 - [OWASP Top 10 for LLM Applications 2025](https://genai.owasp.org/llm-top-10/)
 - [MITRE ATLAS(2025 新增 14 项 agent 技术)](https://atlas.mitre.org/)
 
-质谱 6 大类**漏掉、但对 cc-harness 致命**的三类:① 编码 agent 专项 15 件套;② 编码/隐写/延迟外传绕 DLP(直接威胁 L5);③ trajectory 玻璃盒判定(本 spec 采用其轻量子集:确定性断言,trajectory 留作后续叠加)。
+质谱 6 大类**漏掉、但对 cc-harness 致命**的三类:① 编码 agent 专项 13 件套;② 编码/隐写/延迟外传绕 DLP(直接威胁 L5);③ trajectory 玻璃盒判定(本 spec 采用其轻量子集:确定性断言,trajectory 留作后续叠加)。
 
 ---
 
 ## 2. 目标
 
-- **G1 覆盖编程 agent 专项攻击面**:引入 `coding-agent:core`(CI)+ `coding-agent:all`(本地)15 件套,打到 L4 沙箱逃逸 / L5 隐写外传 / verifier sabotage 等。
+- **G1 覆盖编程 agent 专项攻击面**:引入 `coding-agent:core`(CI)+ `coding-agent:all`(本地)13 件套,打到 L4 沙箱逃逸 / L5 隐写外传 / verifier sabotage 等。
 - **G2 让 L5 效果可衡量**:新增 PII 外泄 + 编码外传攻击类(手写 + 动态),使"读 .env 复述""base64 外传密钥"等场景进入红队。
 - **G3 让 L2 效果可衡量**:新增 repo 注入 / 终端输出注入 / 编码注入攻击类,打 L2 `<untrusted>` 隔离与 heuristic。
 - **G4 判定层不可被骗**:在 rubric 之外加**确定性断言**(密钥 `not-contains`、PII 正则),零 LLM 成本,"嘴上 hold 实际泄露"也能抓。
@@ -42,7 +42,7 @@
 2. **判定层 = 分层 rubric + 确定性断言**:per-category 确定性断言(密钥/PII)与 rubric **AND** 关系,全过才 pass。不引入 trajectory 玻璃盒(留作后续)。
 3. **`PROMPTFOO_API_KEY` 可用**:用户已有 key(存于本地 `Desktop/promptfoo.txt`,**不进 git/transcript**)。层 B(coding-agent:*/`pii:*`/`harmful:*` 等🌐插件)本地 + CI 均可跑。
 4. **`[dlp]` extra 作为红队前置**:测 L5 PII 效果前 `pip install -e '.[dlp]'`,否则 L5 不脱敏 PII → PII 类全 fail(假阳性)。
-5. **CI 拆 `core`/`all`**:`coding-agent:core`(5-plugin 集合别名:repo-prompt-injection/terminal-output-injection/secret-env-read/sandbox-read-escape/verifier-sabotage)进 CI,`coding-agent:all`(15-plugin 集合别名)本地手动。
+5. **CI 拆 `core`/`all`**:`coding-agent:core`(5-plugin 集合别名:repo-prompt-injection/terminal-output-injection/secret-env-read/sandbox-read-escape/verifier-sabotage)进 CI,`coding-agent:all`(13-plugin 集合别名 = core 5 + secret-file-read/sandbox-write-escape/network-egress-bypass/procfs-credential-read/delayed-ci-exfil/generated-vulnerability/automation-poisoning/steganographic-exfil)本地手动。
 6. **安全原则**:本 spec 全程不读取/不回显/不落盘任何真实密钥;key 由用户自行配 `.env`。
 7. **不改 `cc_harness/` 防御代码**:纯红队增强。防御侧改动另开 spec。
 
