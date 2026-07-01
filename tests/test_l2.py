@@ -3,7 +3,7 @@ import pytest
 from unittest.mock import AsyncMock, MagicMock
 
 from cc_harness.l2 import (
-    heuristic_check, judge_check, scan_user_input, REFUSAL_TEMPLATE, MAX_INPUT_LEN,
+    heuristic_check, judge_check, scan_user_input, REFUSAL_TEMPLATE,
 )
 from cc_harness.config import L2Config
 
@@ -62,8 +62,10 @@ async def test_judge_returns_label():
 @pytest.mark.asyncio
 async def test_judge_malformed_json_fails_open():
     mock = MagicMock()
-    msg = MagicMock(); msg.message.content = "not json at all"
-    choice = MagicMock(); choice.message = msg.message
+    msg = MagicMock()
+    msg.message.content = "not json at all"
+    choice = MagicMock()
+    choice.message = msg.message
     mock.chat.completions.create = AsyncMock(return_value=MagicMock(choices=[choice]))
     label, reason, conf = await judge_check("x", client=mock, model="m")
     assert label == "benign"                    # fail-open
