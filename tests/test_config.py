@@ -113,3 +113,29 @@ def test_load_policy_from_yaml(tmp_path):
     y.write_text("enabled: false\n", encoding="utf-8")
     pc = load_policy_config(y)
     assert pc.enabled is False
+
+
+def test_l2config_defaults():
+    from cc_harness.config import L2Config
+    c = L2Config()
+    assert c.enabled is True
+    assert c.heuristic_on is True
+
+
+def test_load_l2_config_reads_l2_section(tmp_path):
+    from cc_harness.config import load_l2_config
+    y = tmp_path / "policy.yaml"
+    y.write_text(
+        "enabled: false\n"          # L4 顶层 enabled,不影响 L2
+        "l2:\n  enabled: false\n  heuristic_on: false\n",
+        encoding="utf-8",
+    )
+    c = load_l2_config(y)
+    assert c.enabled is False        # L2 独立
+    assert c.heuristic_on is False
+
+
+def test_load_l2_config_missing_file_returns_defaults(tmp_path):
+    from cc_harness.config import load_l2_config
+    c = load_l2_config(tmp_path / "nope.yaml")
+    assert c.enabled is True and c.heuristic_on is True

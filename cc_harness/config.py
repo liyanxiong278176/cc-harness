@@ -84,3 +84,20 @@ def load_policy_config(path: Path) -> PolicyConfig:
     import yaml
     raw = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
     return PolicyConfig(**raw)
+
+
+class L2Config(BaseModel):
+    """L2 输入防御配置。从 policy.yaml 的 `l2:` 段读;缺省全开。"""
+    enabled: bool = True
+    heuristic_on: bool = True
+
+    model_config = {"extra": "ignore"}
+
+
+def load_l2_config(path: Path) -> L2Config:
+    """读 policy.yaml 的 `l2:` 子段(与 L4 的 PolicyConfig 独立)。文件/段缺失→默认。"""
+    if not path.exists():
+        return L2Config()
+    import yaml
+    raw = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
+    return L2Config(**(raw.get("l2") or {}))
