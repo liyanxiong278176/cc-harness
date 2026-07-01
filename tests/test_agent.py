@@ -698,3 +698,94 @@ async def test_tool_error_NOT_wrapped(tmp_path):
     assert tool_msgs
     assert "<untrusted>" not in tool_msgs[-1]["content"]  # 错误串不包
     assert "[Tool Error]" in tool_msgs[-1]["content"]
+
+
+@pytest.mark.asyncio
+async def test_l5_redacts_thought_segment_in_history(tmp_path):
+    """思考段(推理文本)含密钥 → messages 历史(assistant.content)脱敏;明文不入历史。"""
+    from cc_harness import agent as agent_mod
+    from cc_harness.mcp_client import ToolResult
+    from cc_harness.l5 import L5Engine, KeyRegexLayer
+    from cc_harness.policy import PolicyEngine
+
+    secret = "sk-" + "a" * 48
+    inside = tmp_path / "a.py"; inside.write_text("x", encoding="utf-8")
+    fs_tool = {"type": "function", "function": {
+        "name": "mcp__fs__read", "description": "r",
+        "parameters": {"type": "object", "properties": {"path": {"type": "string"}}},
+    }}
+    pending = [PendingToolCall(index=0, id="c1", name="mcp__fs__read",
+                               arguments_json=json.dumps({"path": str(inside)}))]
+    llm = FakeLLM(responses=[
+        [FakeStreamEvent(kind="done", content=f"thinking about {secret}",
+                         pending=pending, finish_reason="tool_calls")],
+        [FakeStreamEvent(kind="done", content="done", pending=[], finish_reason="stop")],
+    ])
+    mcp = FakeMCP(tools_spec=[fs_tool],
+                  results={"mcp__fs__read": ToolResult.success("c")}, calls=[])
+    eng = L5Engine(layers=[KeyRegexLayer()], pii_active=False)
+    messages = [{"role": "user", "content": "read"}]
+    await agent_mod.run_turn(messages, llm, mcp, mode="coding", cwd=str(tmp_path),
+                             max_iter=5, policy=PolicyEngine(project_root=tmp_path), l5=eng)
+    asst = [m for m in messages if m.get("role") == "assistant"]
+    assert "[REDACTED:api_key]" in asst[0]["content"]            # 思考段脱敏
+    assert all(secret not in (m.get("content") or "") for m in messages)  # 明文不入历史
+
+
+@pytest.mark.asyncio
+async def test_l5_redacts_result_segment_in_history(tmp_path):
+    """结果段(最终答案)含 AWS key → messages + 屏幕均脱敏。"""
+    from cc_harness import agent as agent_mod
+    from cc_harness.l5 import L5Engine, KeyRegexLayer
+    secret = "AKIA" + "B" * 16
+    llm = FakeLLM(responses=[
+        [FakeStreamEvent(kind="done", content=f"final {secret}", pending=[], finish_reason="stop")],
+    ])
+    eng = L5Engine(layers=[KeyRegexLayer()], pii_active=False)
+    messages = [{"role": "user", "content": "x"}]
+    await agent_mod.run_turn(messages, llm, FakeMCP(tools_spec=[], results={}, calls=[]),
+                             mode="plan", cwd=str(tmp_path), max_iter=5, l5=eng)
+    asst = [m for m in messages if m.get("role") == "assistant"]
+    assert asst and "[REDACTED:aws_access_key]" in asst[-1]["content"]
+    assert secret not in asst[-1]["content"]
+
+
+@pytest.mark.asyncio
+async def test_l5_none_engine_passthrough(tmp_path):
+    """l5=None(等价 disabled)→ 密钥明文入历史,未脱敏。"""
+    from cc_harness import agent as agent_mod
+    secret = "sk-" + "a" * 48
+    llm = FakeLLM(responses=[
+        [FakeStreamEvent(kind="done", content=f"final {secret}", pending=[], finish_reason="stop")],
+    ])
+    messages = [{"role": "user", "content": "x"}]
+    await agent_mod.run_turn(messages, llm, FakeMCP(tools_spec=[], results={}, calls=[]),
+                             mode="plan", cwd=str(tmp_path), max_iter=5)   # 不传 l5
+    asst = [m for m in messages if m.get("role") == "assistant"]
+    assert asst and secret in asst[-1]["content"]
+
+
+@pytest.mark.asyncio
+async def test_l5_redact_audited_without_plaintext(tmp_path):
+    """命中 → logs/l5.jsonl 有 l5_redact 条目,且不含明文密钥。"""
+    from cc_harness import agent as agent_mod
+    from cc_harness.l5 import L5Engine, KeyRegexLayer
+    from cc_harness.policy import PolicyEngine
+    import json as _json
+    secret = "sk-" + "a" * 48
+    llm = FakeLLM(responses=[
+        [FakeStreamEvent(kind="done", content=f"final {secret}", pending=[], finish_reason="stop")],
+    ])
+    eng = L5Engine(layers=[KeyRegexLayer()], pii_active=False)
+    messages = [{"role": "user", "content": "x"}]
+    await agent_mod.run_turn(messages, llm, FakeMCP(tools_spec=[], results={}, calls=[]),
+                             mode="plan", cwd=str(tmp_path), max_iter=5,
+                             policy=PolicyEngine(project_root=tmp_path), l5=eng)
+    logf = tmp_path / "logs" / "l5.jsonl"
+    assert logf.exists()
+    lines = logf.read_text(encoding="utf-8").strip().splitlines()
+    entry = _json.loads(lines[-1])
+    assert entry["decision"] == "l5_redact"     # audit.py 把 action 序列化成 "decision" 字段
+    assert entry["outcome"] == "redacted"
+    assert "api_key" in entry["rule_id"]
+    assert secret not in logf.read_text(encoding="utf-8")   # 审计绝不记明文

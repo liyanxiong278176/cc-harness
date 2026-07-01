@@ -25,6 +25,7 @@ from cc_harness.render import (
 from cc_harness.policy import PolicyEngine
 from cc_harness.schema import validate_native, validate_mcp, set_mcp_schemas
 from cc_harness.audit import log_decision
+from cc_harness.l5 import L5Engine
 from cc_harness.tools import confirm_tool, run_command, RUN_COMMAND_SPEC
 from cc_harness.tokens import TokenCounter, TurnTokenStats, UsageRecord
 
@@ -53,6 +54,7 @@ async def run_turn(
     design_dir: Path | None = None,
     token_counter: TokenCounter | None = None,
     policy: PolicyEngine | None = None,
+    l5: L5Engine | None = None,
 ) -> TurnTokenStats:
     """Run one user turn in the given mode.
 
@@ -91,6 +93,22 @@ async def run_turn(
     except Exception:
         pass
     audit_path = project_root / "logs" / "policy.jsonl"
+    l5_audit_path = project_root / "logs" / "l5.jsonl"
+
+    def _redact(text: str, stage: str) -> str:
+        """L5 脱敏 + 审计。stage ∈ {'thought','result'}。engine=None/非 str/空 → 原文直通。
+        命中即审计(只记类型计数,绝不记明文)。"""
+        if l5 is None or not isinstance(text, str) or not text:
+            return text
+        out = l5.scan(text)
+        if out.findings:
+            log_decision(
+                l5_audit_path, iter_n=iter_count, tool=f"llm_{stage}",
+                args={"findings": out.findings, "text_len": len(text)},
+                action="l5_redact", outcome="redacted",
+                rule_id=",".join(sorted(out.findings)), reason="", mode=mode,
+            )
+        return out.sanitized_text
 
     # In plan/design mode, the LLM should not see any tool definitions, so
     # it physically cannot emit tool_calls. In coding mode, expose both the
@@ -171,6 +189,7 @@ async def run_turn(
                 # Max-iter guard: drop the tool_calls, fall back to final.
                 print_warn(console, "max iterations reached with pending tool calls, forcing stop")
                 if content:
+                    content = _redact(content, "result")
                     messages.append({"role": "assistant", "content": content})
                     print_result(console, content)
                 else:
@@ -180,6 +199,8 @@ async def run_turn(
                 return _stats()
 
             # 3. Build assistant message (with tool_calls; content may be None)
+            if content:
+                content = _redact(content, "thought")
             assistant_msg: dict = {
                 "role": "assistant",
                 "content": content if content else None,
@@ -299,6 +320,7 @@ async def run_turn(
 
         if content:
             # Final. Print "结果:" + the FULL content as the LLM's answer.
+            content = _redact(content, "result")
             messages.append({"role": "assistant", "content": content})
             print_result(console, content)
             if mode == "design":
@@ -328,6 +350,7 @@ async def run_turn(
     # appended an assistant message and never returned).
     print_warn(console, "max iterations reached")
     if content:
+        content = _redact(content, "result")
         messages.append({"role": "assistant", "content": content})
         print_result(console, content)
     return _stats()
