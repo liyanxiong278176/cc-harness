@@ -139,3 +139,39 @@ def test_load_l2_config_missing_file_returns_defaults(tmp_path):
     from cc_harness.config import load_l2_config
     c = load_l2_config(tmp_path / "nope.yaml")
     assert c.enabled is True and c.heuristic_on is True
+
+
+def test_l5config_defaults():
+    from cc_harness.config import L5Config
+    c = L5Config()
+    assert c.enabled is True
+    assert c.keys_on is True
+    assert c.pii_on is True
+
+
+def test_load_l5_config_reads_l5_section(tmp_path):
+    from cc_harness.config import load_l5_config
+    y = tmp_path / "policy.yaml"
+    y.write_text(
+        "l2:\n  enabled: false\n"                       # l2 section, doesn't affect l5
+        "l5:\n  enabled: false\n  keys_on: false\n  pii_on: false\n",
+        encoding="utf-8",
+    )
+    c = load_l5_config(y)
+    assert c.enabled is False        # l5 independent of l2
+    assert c.keys_on is False
+    assert c.pii_on is False
+
+
+def test_load_l5_config_independent_from_l2(tmp_path):
+    from cc_harness.config import load_l5_config
+    y = tmp_path / "policy.yaml"
+    y.write_text("l2:\n  enabled: false\n", encoding="utf-8")  # only l2 configured
+    c = load_l5_config(y)
+    assert c.enabled is True and c.keys_on is True   # l5 section missing → defaults
+
+
+def test_load_l5_config_missing_file_returns_defaults(tmp_path):
+    from cc_harness.config import load_l5_config
+    c = load_l5_config(tmp_path / "nope.yaml")
+    assert c.keys_on is True and c.pii_on is True

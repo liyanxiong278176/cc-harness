@@ -101,3 +101,21 @@ def load_l2_config(path: Path) -> L2Config:
     import yaml
     raw = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
     return L2Config(**(raw.get("l2") or {}))
+
+
+class L5Config(BaseModel):
+    """L5 输出 DLP 配置。从 policy.yaml 的 `l5:` 段读;缺省全开。"""
+    enabled: bool = True
+    keys_on: bool = True    # Layer A 密钥正则(零依赖)
+    pii_on: bool = True     # Layer B Presidio PII(可选;失败自动退化)
+
+    model_config = {"extra": "ignore"}
+
+
+def load_l5_config(path: Path) -> L5Config:
+    """读 policy.yaml 的 `l5:` 子段(与 L2/L4 独立)。文件/段缺失→默认。"""
+    if not path.exists():
+        return L5Config()
+    import yaml
+    raw = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
+    return L5Config(**(raw.get("l5") or {}))
