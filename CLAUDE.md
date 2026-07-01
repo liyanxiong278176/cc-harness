@@ -86,6 +86,18 @@ cc_harness/memory/                        # ⚠️ in-tree but NOT yet wired int
 执行加固(cwd 锁/env 剥离/超时)在 `cc_harness/executor.py`。审计落 `<root>/logs/policy.jsonl`。
 完整设计见 docs/superpowers/specs/2026-06-30-l4-policy-engine-design.md。
 
+**L2 输入防御(M2,2026-07-01)。** `repl.py` 读入用户输入后、进 `run_turn` 前过两道:
+① `cc_harness/l2.py:heuristic_check`(传统正则,命中即拦,零延迟);
+② DeepSeek judge(复用 provider,结构化 JSON 分类 benign/injection/jailbreak)。
+命中即**硬阻断**:不进主 LLM、不调工具、**不入 messages 历史**(切断上下文传播),
+经 `print_result` 打模糊拒绝模板(不透露检测原因,避免帮攻击者迭代)。真实原因落 `<root>/logs/l2.jsonl`。
+指令层级(`prompts.py:instruction_hierarchy`,始终生效):`<user_input>` 包用户输入、
+`<untrusted>` 包外部工具输出(`agent.py` 仅成功回填处),声明开发者>用户>工具返回。
+judge 失败 fail-open(`judge_error` 审计,L4 兜底)。kill-switch:`policy.yaml` 的 `l2.enabled=false`。
+**无 key 退化**:judge 仅在配置了 `OPENAI_API_KEY` 时构造 client;无 key 时 `l2_client=None`,
+judge 路径 fail-open(等价 heuristic-only,审计记 `judge_error:AttributeError`),heuristic 第一道仍生效。
+完整设计见 docs/superpowers/specs/2026-07-01-l2-input-defense-design.md。
+
 **Windows GBK fix in `main.py` lines 17-23 must stay.** Without `sys.stdin.reconfigure(encoding="utf-8")`, the GBK default codepage crashes on the first non-ASCII char the LLM outputs (✅, 中文, 思考, etc.).
 
 ## Eval / red-team (`eval/promptfoo/`)

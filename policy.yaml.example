@@ -1,3 +1,6 @@
 # cc-harness 权限闸门配置(M1,L4)。留空/不创建文件 = 用内置默认。
 # 复制为 policy.yaml 放项目根以覆盖。
-enabled: true            # false = 完全关闭闸门(等同旧行为,仅 run_command 内部加固)
+enabled: true            # L4 权限闸门:false=关闭(等同旧行为,仅 run_command 内部加固)
+l2:
+  enabled: true          # L2 输入防御:false=关闭(只留 L4)
+  heuristic_on: true     # L2 第一道传统预过滤:false=只靠 judge
