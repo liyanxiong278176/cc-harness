@@ -249,10 +249,11 @@ async def run_turn(
                               if p.name in NATIVE_TOOLS
                               else await mcp.call_tool(p.name, args))
                     print_observation(console, result.llm_text)
+                    _external = f"<untrusted>{result.llm_text}</untrusted>"
                     messages.append({
                         "role": "tool",
                         "tool_call_id": p.id or f"unknown_{i}",
-                        "content": result.llm_text,
+                        "content": _external,
                     })
                 else:  # ask
                     print_warn(console, f"[需确认] {p.name} {decision.reason}")
@@ -268,10 +269,11 @@ async def run_turn(
                                   if p.name in NATIVE_TOOLS
                                   else await mcp.call_tool(p.name, args))
                         print_observation(console, result.llm_text)
+                        _external = f"<untrusted>{result.llm_text}</untrusted>"
                         messages.append({
                             "role": "tool",
                             "tool_call_id": p.id or f"unknown_{i}",
-                            "content": result.llm_text,
+                            "content": _external,
                         })
                     else:
                         error_text = f"[未执行:用户拒绝] {p.name} — {decision.reason}"

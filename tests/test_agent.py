@@ -644,3 +644,57 @@ async def test_fs_read_inside_workspace_executes(tmp_path):
     audit = (tmp_path / "logs" / "policy.jsonl").read_text(encoding="utf-8")
     assert '"decision": "allow"' in audit
     assert '"outcome": "executed"' in audit
+
+
+# --- L2 input defense: <untrusted> wrapping (Task 4) ---
+
+@pytest.mark.asyncio
+async def test_tool_success_result_wrapped_in_untrusted(tmp_path):
+    """外部工具输出成功回填时,内容要包 <untrusted> 标签(指令层级隔离)。"""
+    from cc_harness import agent as agent_mod
+    from cc_harness.mcp_client import ToolResult
+    from cc_harness.policy import PolicyEngine
+
+    inside = tmp_path / "a.py"
+    inside.write_text("x", encoding="utf-8")
+    fs_tool = {"type": "function", "function": {
+        "name": "mcp__fs__read", "description": "r",
+        "parameters": {"type": "object", "properties": {"path": {"type": "string"}}},
+    }}
+    pending = [PendingToolCall(index=0, id="c1", name="mcp__fs__read",
+                               arguments_json=json.dumps({"path": str(inside)}))]
+    llm = FakeLLM(responses=[
+        [FakeStreamEvent(kind="done", content="", pending=pending, finish_reason="tool_calls")],
+        [FakeStreamEvent(kind="done", content="done", pending=[], finish_reason="stop")],
+    ])
+    mcp = FakeMCP(tools_spec=[fs_tool],
+                  results={"mcp__fs__read": ToolResult.success("WEB CONTENT FROM TOOL")}, calls=[])
+    messages = [{"role": "user", "content": "read"}]
+    await agent_mod.run_turn(messages, llm, mcp, mode="coding",
+                             cwd=str(tmp_path), max_iter=5,
+                             policy=PolicyEngine(project_root=tmp_path))
+    tool_msgs = [m for m in messages if m.get("role") == "tool"]
+    assert tool_msgs
+    assert tool_msgs[-1]["content"] == "<untrusted>WEB CONTENT FROM TOOL</untrusted>"
+
+
+@pytest.mark.asyncio
+async def test_tool_error_NOT_wrapped(tmp_path):
+    """harness 自身生成的错误串(JSON 解析错)不是外部数据,不包 <untrusted>。"""
+    from cc_harness import agent as agent_mod
+    from cc_harness.policy import PolicyEngine
+    # arguments_json 故意写坏 → JSON parse error 分支
+    pending = [PendingToolCall(index=0, id="c1", name="mcp__fs__read", arguments_json="not json{")]
+    llm = FakeLLM(responses=[
+        [FakeStreamEvent(kind="done", content="", pending=pending, finish_reason="tool_calls")],
+        [FakeStreamEvent(kind="done", content="done", pending=[], finish_reason="stop")],
+    ])
+    mcp = FakeMCP(tools_spec=[], results={}, calls=[])
+    messages = [{"role": "user", "content": "x"}]
+    await agent_mod.run_turn(messages, llm, mcp, mode="coding",
+                             cwd=str(tmp_path), max_iter=5,
+                             policy=PolicyEngine(project_root=tmp_path))
+    tool_msgs = [m for m in messages if m.get("role") == "tool"]
+    assert tool_msgs
+    assert "<untrusted>" not in tool_msgs[-1]["content"]  # 错误串不包
+    assert "[Tool Error]" in tool_msgs[-1]["content"]
