@@ -247,6 +247,22 @@ def test_composed_prompt_preserves_all_12_legacy_rules():
         assert needle in out, f"missing rule concept: {needle!r}"
 
 
+def test_instruction_hierarchy_renders_in_all_modes():
+    """G1: 始终生效。coding/plan/design 都应含指令层级段。"""
+    from cc_harness.prompts import build_system_prompt
+    for mode in ("coding", "plan", "design"):
+        p = build_system_prompt("/x", mode=mode)
+        assert "指令层级与不可信数据" in p, f"mode={mode} 缺指令层级"
+        assert "<untrusted>" in p
+        assert "<user_input>" in p
+
+
+def test_instruction_hierarchy_explains_priority():
+    from cc_harness.prompts import build_system_prompt
+    p = build_system_prompt("/x", mode="coding")
+    assert "开发者" in p and "用户输入" in p and "工具返回" in p
+
+
 def test_composed_prompt_does_not_leak_unresolved_placeholders():
     """After rendering, no stray {placeholders} (other than intended ones
     in section bodies) should remain."""
