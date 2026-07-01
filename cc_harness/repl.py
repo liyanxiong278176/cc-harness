@@ -21,8 +21,9 @@ from pathlib import Path
 from openai import AsyncOpenAI
 from rich.console import Console
 from cc_harness.audit import log_decision
-from cc_harness.config import load_l2_config, load_policy_config
+from cc_harness.config import load_l2_config, load_l5_config, load_policy_config
 from cc_harness.l2 import REFUSAL_TEMPLATE, scan_user_input
+from cc_harness.l5 import build_l5_engine
 from cc_harness.policy import PolicyEngine
 from cc_harness.render import print_info, print_result, print_warn, print_token_summary
 from cc_harness.tokens import TokenCounter, SessionTokenStats
@@ -145,6 +146,10 @@ async def run_repl(
     l2_model = os.getenv("JUDGE_MODEL") or os.getenv("OPENAI_MODEL") or ""
     l2_audit_path = Path(cwd) / "logs" / "l2.jsonl"
 
+    # L5 输出 DLP:思考/结果段脱敏。无 [dlp] extra 时退化 Layer A(密钥正则)only。
+    l5_cfg = load_l5_config(Path("policy.yaml"))
+    l5 = build_l5_engine(l5_cfg)
+
     n_tools = len(mcp.list_tools())
     print_info(console, "")
     print_info(console, f"  cc-harness ready  |  tools: {n_tools}  |  mode: {default_mode.upper()}")
@@ -212,6 +217,7 @@ async def run_repl(
             design_dir=design_dir,
             token_counter=state.token_counter,
             policy=policy,
+            l5=l5,
         )
         state.session_stats.add(turn_stats)
 

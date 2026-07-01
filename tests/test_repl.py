@@ -683,3 +683,25 @@ class _CapturingLLM:
         yield StreamEvent(
             kind="done", content="ok", pending=[], finish_reason="stop"
         )
+
+
+@pytest.mark.asyncio
+async def test_repl_passes_l5_engine_to_run_turn(monkeypatch):
+    """repl 构造 build_l5_engine 并把 l5 传给 run_turn(default enabled → 非 None)。"""
+    from cc_harness import repl as repl_mod
+    from cc_harness.repl import run_repl
+
+    inputs = iter(["hi", "exit"])
+    monkeypatch.setattr(repl_mod, "_read_user", _fake_read_user(inputs))
+
+    captured = {}
+
+    async def _spy(*a, **kw):
+        captured["l5"] = kw.get("l5")
+        from cc_harness.tokens import TurnTokenStats
+        return TurnTokenStats()
+
+    monkeypatch.setattr("cc_harness.agent.run_turn", _spy)
+    await run_repl(_StoppingLLM(), _NoopMCP(), cwd="/x")
+
+    assert captured["l5"] is not None        # build_l5_engine 返回引擎(default enabled)
