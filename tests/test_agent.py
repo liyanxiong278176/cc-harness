@@ -709,7 +709,8 @@ async def test_l5_redacts_thought_segment_in_history(tmp_path):
     from cc_harness.policy import PolicyEngine
 
     secret = "sk-" + "a" * 48
-    inside = tmp_path / "a.py"; inside.write_text("x", encoding="utf-8")
+    inside = tmp_path / "a.py"
+    inside.write_text("x", encoding="utf-8")
     fs_tool = {"type": "function", "function": {
         "name": "mcp__fs__read", "description": "r",
         "parameters": {"type": "object", "properties": {"path": {"type": "string"}}},
