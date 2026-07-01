@@ -98,6 +98,17 @@ judge 失败 fail-open(`judge_error` 审计,L4 兜底)。kill-switch:`policy.yam
 judge 路径 fail-open(等价 heuristic-only,审计记 `judge_error:AttributeError`),heuristic 第一道仍生效。
 完整设计见 docs/superpowers/specs/2026-07-01-l2-input-defense-design.md。
 
+**L5 输出 DLP(M3,2026-07-01)。** 与 M2(L2 输入)对称,守**输出**:`agent.py:run_turn`
+在 LLM 主动产生的文本(思考段 + 结果段)被 `print_*` / `messages.append` 之前过 `cc_harness/l5.py`。
+分层检测:① Layer A 密钥正则(`KeyRegexLayer`,零依赖,永远在,已知格式:OpenAI/AWS/GitHub/GitLab/Slack/Google/PEM/JWT);
+② Layer B Presidio PII(`PresidioLayer`,可选 `pip install -e '.[dlp]'`,邮箱 + 中文手机/身份证 custom recognizer)。
+命中替换为 `[REDACTED:<type>]`,**历史也存脱敏版**(切断"思考读到→结果复述"二段泄露)。
+原则:**宁漏勿误**——不做泛化高熵串检测(会误伤 SHA256/UUID/base64/commit hash)。
+fail-soft:Presidio 不可用 → 自动只跑 Layer A(密钥仍护);scan 异常 → 原文返回(DLP 不把 Agent 弄哑)。
+静默脱敏 + 审计落 `<root>/logs/l5.jsonl`(`action=l5_redact`,只记类型计数,**绝不记明文**)。
+kill-switch:`policy.yaml` 的 `l5.enabled=false`。工具观察段不扫(M2 已用 `<untrusted>` 隔离;脱敏它破坏 coding)。
+完整设计见 docs/superpowers/specs/2026-07-01-l5-output-dlp-design.md。
+
 **Windows GBK fix in `main.py` lines 17-23 must stay.** Without `sys.stdin.reconfigure(encoding="utf-8")`, the GBK default codepage crashes on the first non-ASCII char the LLM outputs (✅, 中文, 思考, etc.).
 
 ## Eval / red-team (`eval/promptfoo/`)

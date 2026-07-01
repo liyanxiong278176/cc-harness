@@ -4,3 +4,7 @@ enabled: true            # L4 权限闸门:false=关闭(等同旧行为,仅 run_
 l2:
   enabled: true          # L2 输入防御:false=关闭(只留 L4)
   heuristic_on: true     # L2 第一道传统预过滤:false=只靠 judge
+l5:
+  enabled: true          # L5 输出 DLP:false=关闭(只留 L4+L2)
+  keys_on: true          # Layer A 密钥正则(零依赖):false=不扫密钥
+  pii_on: true           # Layer B Presidio PII(需 pip install -e '.[dlp]'):false=不扫 PII
