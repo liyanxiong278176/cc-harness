@@ -112,9 +112,68 @@ def sanitize(text: str, engine: L5Engine | None) -> str:
     return engine.scan(text).sanitized_text
 
 
+def _build_cn_recognizers() -> list:
+    """中文 custom recognizer(Presidio PatternRecognizer)。需 presidio_analyzer 已 import。"""
+    from presidio_analyzer import Pattern, PatternRecognizer
+    cn_phone = PatternRecognizer(
+        supported_entity="CN_PHONE",
+        patterns=[Pattern(r"\b1[3-9]\d{9}\b", 0.9)],
+    )
+    cn_id = PatternRecognizer(
+        supported_entity="CN_ID_CARD",
+        # 18 位:6 地区码 + 4 年 + 2 月 + 2 日 + 3 序号 + 1 校验(X/x)
+        patterns=[Pattern(
+            r"\b[1-9]\d{5}(?:19|20)\d{2}(?:0[1-9]|1[0-2])(?:0[1-9]|[12]\d|3[01])\d{3}[\dXx]\b",
+            0.85,
+        )],
+    )
+    return [cn_phone, cn_id]
+
+
+# Presidio entity type → L5 type 标签
+_PII_TYPE_MAP = {
+    "EMAIL_ADDRESS": "email",
+    "PHONE_NUMBER": "phone",
+    "CN_PHONE": "cn_phone",
+    "CN_ID_CARD": "cn_id_card",
+}
+
+
+class PresidioLayer(Layer):
+    """Layer B:Presidio PII(邮箱 + 中文手机/身份证)。
+    build 失败(无 presidio / 无 spacy 模型 / 初始化抛错)→ 工厂退化 Layer A only。
+    NER(姓名/地址)不强制:无 spacy 模型时内置正则 recognizer 仍覆盖邮箱/手机/身份证。"""
+
+    def __init__(self) -> None:
+        from presidio_analyzer import AnalyzerEngine
+        # 默认 AnalyzerEngine:无 spacy 模型时 Presidio 打印 warning 但仍跑 regex recognizer。
+        self._analyzer = AnalyzerEngine()
+        for r in _build_cn_recognizers():
+            self._analyzer.registry.add_recognizer(r)
+        self._entities = ["EMAIL_ADDRESS", "PHONE_NUMBER", "CN_PHONE", "CN_ID_CARD"]
+
+    def find(self, text: str) -> list[Finding]:
+        if not isinstance(text, str) or not text:
+            return []
+        results = self._analyzer.analyze(
+            text=text, entities=self._entities, language="en",
+        )
+        out: list[Finding] = []
+        for r in results:
+            typ = _PII_TYPE_MAP.get(r.entity_type, r.entity_type.lower())
+            out.append(Finding(r.start, r.end, typ, float(r.score)))
+        return out
+
+
 def _maybe_build_pii_layer(cfg: L5Config) -> Layer | None:
-    """Layer B (Presidio PII) — Task 3 实现。本任务 stub:始终返回 None。"""
-    return None
+    """Layer B 可选。pii_on=False 或 presidio 导入/初始化失败 → None(Layer A 仍护,G5)。"""
+    if not cfg.pii_on:
+        return None
+    try:
+        return PresidioLayer()
+    except Exception:
+        # fail-soft:任何 presidio 相关异常(ImportError / spacy 模型 / init)→ 退化。
+        return None
 
 
 def build_l5_engine(cfg: L5Config) -> L5Engine | None:

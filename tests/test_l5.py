@@ -159,3 +159,64 @@ def test_build_pii_active_false_when_presidio_missing(monkeypatch):
     assert eng.pii_active is False
     # Layer A 仍工作
     assert eng.scan("sk-" + "a" * 48).findings == {"api_key": 1}
+
+
+# --- Task 3: Layer B (Presidio PII) + _maybe_build_pii_layer fail-soft ---
+
+def test_maybe_pii_layer_returns_none_when_disabled():
+    from cc_harness.l5 import _maybe_build_pii_layer
+    assert _maybe_build_pii_layer(L5Config(pii_on=False)) is None
+
+
+def test_maybe_pii_layer_fails_soft_when_presidio_missing(monkeypatch):
+    """presidio_analyzer 不可用 → _maybe_build_pii_layer 返回 None,不抛。"""
+    import sys
+    monkeypatch.setitem(sys.modules, "presidio_analyzer", None)
+    from cc_harness import l5 as l5_mod
+    # 清掉可能缓存的 PresidioLayer 引用,强制重新走 import 路径
+    assert l5_mod._maybe_build_pii_layer(L5Config(pii_on=True)) is None
+
+
+def test_presidio_layer_find_maps_to_findings():
+    """mock AnalyzerEngine → 验证 PresidioLayer.find 把 entity 映射成 Finding(不依赖真实 presidio)。"""
+    from cc_harness import l5 as l5_mod
+
+    class _FakeResult:
+        def __init__(self, start, end, entity_type, score):
+            self.start, self.end, self.entity_type, self.score = start, end, entity_type, score
+
+    class _FakeRegistry:
+        def add_recognizer(self, r):  # noqa: ARG002
+            pass
+
+    class _FakeAnalyzer:
+        def __init__(self):
+            self.registry = _FakeRegistry()
+
+        def analyze(self, *, text, entities, language):  # noqa: ARG002
+            return [_FakeResult(0, 9, "EMAIL_ADDRESS", 0.9),
+                    _FakeResult(20, 31, "CN_PHONE", 0.9)]
+
+    # 绕过 __init__(它会真 import presidio),直接注入 fake analyzer
+    layer = l5_mod.PresidioLayer.__new__(l5_mod.PresidioLayer)
+    layer._analyzer = _FakeAnalyzer()      # type: ignore[attr-defined]
+    layer._entities = ["EMAIL_ADDRESS", "CN_PHONE"]  # type: ignore[attr-defined]
+
+    findings = layer.find("a@b.com and 13800138000")
+    types = sorted(f.type for f in findings)
+    assert types == ["cn_phone", "email"]
+    assert findings[0].start == 0 and findings[0].end == 9
+
+
+def test_build_engine_pii_active_when_layer_constructs(monkeypatch):
+    """_maybe_build_pii_layer 返回非 None 时,engine.pii_active=True。"""
+    from cc_harness import l5 as l5_mod
+    from cc_harness.l5 import KeyRegexLayer
+
+    class _DummyLayer(KeyRegexLayer):  # 复用 KeyRegexLayer 作占位(实现 Layer 协议)
+        pass
+
+    monkeypatch.setattr(l5_mod, "_maybe_build_pii_layer", lambda cfg: _DummyLayer())
+    eng = l5_mod.build_l5_engine(L5Config())
+    assert eng.pii_active is True
+    assert len(eng.layers) == 2
