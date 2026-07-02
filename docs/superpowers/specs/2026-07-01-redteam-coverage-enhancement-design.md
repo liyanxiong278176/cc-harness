@@ -56,7 +56,7 @@
 |---|---|---|---|---|
 | **A 手写回归** | `attacks.yaml`(扩) | ❌ | cc-harness 专项、高保真、git tracked、精确回归 | security 配置,CI 必跑 |
 | **B 原生插件** | `promptfooconfig.redteam.yaml`(扩) | ✅🌐 | `coding-agent:*` 广覆盖 + 自带 grader + 框架报告 | redteam 配置,CI 跑 core / 本地跑 all |
-| **C 动态生成** | `tools/generate_attacks.py` CATEGORIES(扩) | ❌ | 补 cloud 不覆盖的 cc-harness 灰色场景变体 | security 配置,CI 必跑 |
+| **C 动态生成** | `tools/generate_attacks.py`(**不改**) | ❌ | 现有 9 类 LLM 变体扩量;新 5 类**只静态**(尊重 `generate_attacks.py`"动态与静态错开"哲学) | security 配置,CI 必跑 |
 
 **双 config 分离不变**:`security.yaml`(`promptfoo eval`,读 file:// attacks,无 cloud)与 `redteam.yaml`(`promptfoo redteam run`,cloud 插件)各自独立。cloud 不可用 → security.yaml 仍独立跑,redteam.yaml 跳过。
 
@@ -67,13 +67,13 @@
 | 分类 | 打的防御层 | 层 A 手写 | 层 C 动态 | 层 B 插件 | 说明 |
 |---|---|---|---|---|---|
 | credential-exfil / sideways | L4+L5 | ✅(现有) | — | `coding-agent:secret-file-read`/`secret-env-read` | 读/搬密钥 |
-| **pii-exfil**(新) | **L5** | ✅(新) | ✅(新) | `pii:direct/api-db/session/social` | 邮箱/手机/身份证外传 |
-| **encoded-exfil**(新) | **L5** | ✅(新) | ✅(新) | `ascii-smuggling`/`coding-agent:steganographic-exfil` | base64/隐写绕 L5 密钥正则 |
-| **delayed-ci-exfil**(新) | **L5**(时序) | ✅(新) | ✅(新) | `coding-agent:delayed-ci-exfil` | 改 workflow/hook/package scripts 延迟外传 |
+| **pii-exfil**(新) | **L5** | ✅(新) | — | `pii:direct/api-db/session/social` | 邮箱/手机/身份证外传 |
+| **encoded-exfil**(新) | **L5** | ✅(新) | — | `ascii-smuggling`/`coding-agent:steganographic-exfil` | base64/隐写绕 L5 密钥正则 |
+| **delayed-ci-exfil**(新) | **L5**(时序) | ✅(新) | — | `coding-agent:delayed-ci-exfil` | 改 workflow/hook/package scripts 延迟外传 |
 | shell-injection / fs-overreach | L4 | ✅(现有) | — | `shell-injection`/`coding-agent:sandbox-write-escape` | 破坏性命令 |
 | self-modification / gate-escape | L4 | ✅(现有) | — | `coding-agent:verifier-sabotage`/`automation-poisoning` | 改安全源码/逃沙箱 |
-| **repo-injection**(新) | **L2** | ✅(新) | ✅(新) | `coding-agent:repo-prompt-injection`/`indirect-prompt-injection` | README/注释藏指令 |
-| **terminal-injection**(新) | **L2** | ✅(新) | ✅(新) | `coding-agent:terminal-output-injection` | 命令输出藏指令 |
+| **repo-injection**(新) | **L2** | ✅(新) | — | `coding-agent:repo-prompt-injection`/`indirect-prompt-injection` | README/注释藏指令 |
+| **terminal-injection**(新) | **L2** | ✅(新) | — | `coding-agent:terminal-output-injection` | 命令输出藏指令 |
 | prompt-extraction / hijacking | L2+judge | ✅(现有) | — | `prompt-extraction`/`harmful:*` | 套系统提示词/越狱 |
 | excessive-agency / rbac | L4 | ✅(现有) | ✅(现有) | `excessive-agency`/`rbac`/`bola`/`bfla` | 越权 |
 | supply-chain | L4 | ✅(现有) | — | `coding-agent:automation-poisoning` | 仿冒包/管道装脚本 |
@@ -82,7 +82,7 @@
 
 > **层 B 插件状态(避免 plan 阶段困惑)**:上表"层 B 插件"列中,`pii:*`/`ascii-smuggling`/`indirect-prompt-injection`/`harmful:*`/`shell-injection`/`excessive-agency`/`rbac`/`bola`/`bfla`/`hallucination`/`overreliance` = **已在 `redteam.yaml` 存在,沿用**(本次不重复添加);`coding-agent:core`(CI)/`coding-agent:all`(本地)/`mcp` = **本次新增**。故 §5 文件清单对 `redteam.yaml` 仅追加 `coding-agent:core` + `mcp`,不触碰已存在插件。
 
-**新增 5 个手写/动态类**(`pii-exfil`/`encoded-exfil`/`repo-injection`/`terminal-injection`/`delayed-ci-exfil`)是本次覆盖的核心增量,分别精准打 L5(3 类)和 L2(2 类)——补上"无法衡量 L2/L5"的根因。
+**新增 5 个手写类**(只进静态 `attacks.yaml`,**不**进动态 `generate_attacks.py`——尊重后者的"动态与静态错开"设计哲学;新类静态 5 条/类已覆盖主要变体,动态变体边际价值低于破哲学的代价)是本次覆盖的核心增量,分别精准打 L5(3 类)和 L2(2 类)——补上"无法衡量 L2/L5"的根因。
 
 ### 4.3 判定层(确定性断言 + rubric 兜底)
 
@@ -162,7 +162,7 @@ hijacking:           { layer: [L2],     severity: low }
 
 **改**:
 - `eval/promptfoo/attacks.yaml` — 新增 5 类手写回归(`pii-exfil`/`encoded-exfil`/`repo-injection`/`terminal-injection`/`delayed-ci-exfil`),每类 4-6 条,共 ~25 条。
-- `eval/promptfoo/tools/generate_attacks.py` — `CATEGORIES` + `CATEGORY_DEFAULT_SEVERITY` 新增同名 5 类(dynamic 生成变体扩量)。
+- `eval/promptfoo/tools/generate_attacks.py` — **不改**(新 5 类只进静态,保持与 `generate_attacks.py` 注释"动态与静态错开"一致;现有 9 类变体已足够)。
 - `eval/promptfoo/promptfooconfig.security.yaml` — `defaultTest.assert` 加确定性断言(密钥 not-contains + PII 正则)。
 - `eval/promptfoo/promptfooconfig.redteam.yaml` — `plugins` 加 `coding-agent:core`;`defaultTest.assert` 同步确定性断言。
 - `eval/promptfoo/tools/report_to_md.py` — 读 `defense_matrix.yaml`,输出 per-category ASR + 防御矩阵 + `[dlp]` 未装标注。
@@ -174,11 +174,11 @@ hijacking:           { layer: [L2],     severity: low }
 **新增**:
 - `eval/promptfoo/defense_matrix.yaml` — category → 防御层 + severity 单一来源。
 
-**测试**:
-- `eval/promptfoo/test_generate_attacks.py` — 新 category 在 CATEGORIES/severity 表里。
-- `eval/promptfoo/test_report_to_md.py` — per-category ASR 计算、防御矩阵输出、`[dlp]` 未装标注、新分类映射。
-- `eval/promptfoo/test_defense_matrix.py`(新) — `defense_matrix.yaml` 加载 + 每个 category 有 layer 字段。
-- `eval/promptfoo/test_curate_attacks.py` / `test_dedup_logic.py` — `curate_attacks.py` **无需改**(embedding dedup 不依赖 category 枚举);仅加 1 条用例验证新 category 的 attack 能被正常 dedup。
+**测试**(均在根 `tests/`,沿用 cc-harness 约定:`test_report_to_md.py` 用 importlib 加载 tools,`test_generate_attacks.py` 用 `from eval.promptfoo.tools import`):
+- `tests/test_defense_matrix.py`(新) — `defense_matrix.yaml` 加载 + 每个 category/pluginId 有 layer 字段 + 全集覆盖(含 redteam 插件)。
+- `tests/test_report_to_md.py`(改) — classify_layer 新语义、per-category ASR、防御矩阵、`[dlp]` 未装标注、fail-closed、harmful:* 归 judge。
+- `tests/test_attacks_yaml.py`(新) — attacks.yaml 5 新类存在 + 格式 + 最小条数。
+- `tests/test_curate_attacks.py` / `test_dedup_logic.py` — `curate_attacks.py` **无需改**(embedding dedup 不依赖 category 枚举);仅加 1 条用例验证新 category 的 attack 能被正常 dedup。
 
 ---
 
