@@ -16,10 +16,10 @@ def _load():
 VALID_LAYERS = {"L2", "L4", "L5", "judge"}
 VALID_SEV = {"critical", "high", "medium", "low"}
 
-# 静态 9 + 动态 9 + 新增 5
+# 静态 8 + 动态 9 + 新增 5(prompt-extraction 仅插件,见 REQUIRED_PLUGINS)
 REQUIRED_CATEGORIES = {
     "credential-exfil", "shell-injection", "self-modification", "fs-overreach",
-    "prompt-extraction", "hijacking", "supply-chain", "gate-escape", "credential-sideways",
+    "hijacking", "supply-chain", "gate-escape", "credential-sideways",
     "indirect-prompt-injection", "ssrf", "sql-injection", "data-exfiltration",
     "excessive-agency", "rbac", "persistence", "resource-exhaustion", "git-rce",
     "pii-exfil", "encoded-exfil", "repo-injection", "terminal-injection", "delayed-ci-exfil",

@@ -169,7 +169,6 @@ providers:
 | 类别 | 攻击角度 |
 |---|---|
 | `shell-injection` | rm -rf、反弹 shell、chmod 777、磁盘覆盖、藏在代码里 |
-| `prompt-extraction` | 索要 system prompt、绕圈子问隐藏规则 |
 | `excessive-agency` | 让 agent 改自己源码、关安全检查、外泄数据 |
 | `hijacking` | DAN / 开发者模式 / 邪恶模式 / 角色替换 |
 | `sql-injection` | `OR 1=1`, UNION, DROP TABLE, 注释截断 |
@@ -576,7 +575,6 @@ python tools/report_to_md.py security-results.json owasp-results.json --gate
 | Category | 角度 |
 |---|---|
 | `shell-injection` | rm -rf, chmod 777, ssh key, firewall |
-| `prompt-extraction` | system prompt / 隐藏规则 |
 | `excessive-agency` | 删文件 / 改自己源码 / 禁安全检查 |
 | `hijacking` | DAN / developer mode / pirate / 邪恶模式 |
 | `sql-injection` | OR 1=1, UNION, DROP, 注释截断 |

@@ -22,7 +22,7 @@ from typing import Callable, Optional
 import yaml as yaml_lib
 
 # 动态类别与 attacks.yaml(静态)错开 —— 静态已覆盖 shell-injection /
-# prompt-extraction / hijacking / credential-exfil / self-modification / fs-overreach /
+# hijacking / credential-exfil / self-modification / fs-overreach /
 # supply-chain / gate-escape / credential-sideways(后三类为编程 agent 灰色判定,手写)。
 # 动态只生成静态没有的类别,真正扩大覆盖面,而不是重复手写集(之前的 6 类和静态
 # 高度雷同 —— 见 eval/bug/6 对比)。persistence / resource-exhaustion / git-rce
