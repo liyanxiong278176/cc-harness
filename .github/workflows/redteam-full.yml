@@ -1,0 +1,108 @@
+name: cc-harness full coding-agent redteam
+
+# 编程 agent 全 13 件深度扫描(门禁 redteam.yml 只跑 coding-agent:core 5 件)。
+# 不卡合并:无 PR 触发、无 required status check。手动跑看结果。
+# 为何独立:coding-agent:all 进门禁会让 OWASP job probe 126→165、串行 ~330min
+# 贴 360min job 上限(实测首个 probe cold-start 吃 70min,极可能超时)。
+# 全 13 件作为深度扫描,发版前 / 大改 prompts.py|agent.py 后手动跑一次。
+
+on:
+  # 手动触发:GitHub Actions → 本 workflow → Run workflow
+  workflow_dispatch:
+  # schedule cron DISABLED — 省 Actions 额度(同 redteam.yml 哲学,2000min/月上限)。
+  # 需定期跑再取消注释并核对额度(~90min/次 × N 次 < 2000min/月)。
+  # schedule:
+  #   - cron: '7 3 * * 1'   # 每周一 ~11:00 UTC(避开整点)
+
+concurrency:
+  group: redteam-full
+  cancel-in-progress: true
+
+jobs:
+  redteam-full:
+    name: Redteam full (coding-agent:all)
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+
+      - name: Install cc-harness deps
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e '.[dlp]'      # [dlp]=presidio-analyzer,让 pii 类计入 L5 ASR
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Install promptfoo
+        working-directory: eval/promptfoo
+        run: npm ci
+
+      - name: Clear promptfoo state
+        run: rm -rf ~/.promptfoo
+        continue-on-error: true
+
+      - name: Verify PII layer (presidio usable)
+        run: |
+          python -c "from cc_harness.l5 import _maybe_build_pii_layer; from cc_harness.config import L5Config; \
+          assert _maybe_build_pii_layer(L5Config()) is not None, \
+          'presidio init failed — pii-exfil 会假阴性不计 L5 ASR'"
+
+      - name: Build runtime env (with PROMPTFOO_API_KEY for coding-agent plugins)
+        working-directory: eval/promptfoo
+        run: |
+          {
+            echo "OPENAI_API_KEY=${{ secrets.OPENAI_API_KEY }}"
+            echo "OPENAI_BASE_URL=https://api.deepseek.com/v1"
+            echo "OPENAI_MODEL=deepseek-v4-flash"
+            echo "JUDGE_MODEL=deepseek-v4-flash"
+            echo "EMBEDDING_BASE_URL=https://api.siliconflow.cn/v1"
+            echo "EMBEDDING_API_KEY=${{ secrets.EMBEDDING_API_KEY }}"
+            echo "EMBEDDING_MODEL=BAAI/bge-m3"
+            echo "EMBEDDING_DIM=1024"
+            echo "PROMPTFOO_CACHE_TYPE=memory"
+            echo "PROMPTFOO_API_KEY=${{ secrets.PROMPTFOO_API_KEY }}"
+          } > .env.ci
+
+      - name: Generate coding-agent:all attacks
+        working-directory: eval/promptfoo
+        env:
+          PROMPTFOO_API_KEY: ${{ secrets.PROMPTFOO_API_KEY }}
+        run: |
+          set -euo pipefail
+          # 只生成 YAML(不 eval),避免 redteam run 内部 eval 写缓存导致下一步空跑。
+          npx promptfoo redteam generate \
+            -c promptfooconfig.redteam-full.yaml \
+            --env-path .env.ci \
+            -o redteam-full.yaml
+
+      - name: Run coding-agent:all probes
+        working-directory: eval/promptfoo
+        env:
+          PROMPTFOO_API_KEY: ${{ secrets.PROMPTFOO_API_KEY }}
+        run: |
+          set -euo pipefail
+          # -j 1 串行:并发 boot fork MCP 子进程争 CI 2 核 → boot 崩(eval/bug/6)。
+          # ~44 probe × ~120s ≈ 90min,360min job 余量足。
+          # STRICT: exit 100(突破 = 失败 probe)→ check 红(手动跑无妨,人工看 artifact)。
+          # JSON 在 exit 前写入,upload step(if: always)照常上传。
+          npx promptfoo redteam eval \
+            -c redteam-full.yaml \
+            --env-path .env.ci \
+            -j 1 \
+            -o redteam-full-results.json
+
+      - name: Upload results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: redteam-full-results
+          path: eval/promptfoo/redteam-full-results.json
+          if-no-files-found: warn
