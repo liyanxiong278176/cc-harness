@@ -196,12 +196,31 @@ jobs:
           # Step 1: 只生成测试用例 YAML(不 eval,避免和下一步重复)。
           # 之前用 redteam run 会内部跑一遍 eval + 写缓存,导致后面
           # `promptfoo eval` 直接读缓存返回 0 个测试 — PR comment 显示 OWASP=0。
-          # STRICT: generate 失败(非零,如 harmful 插件网络抖动)也让 check 红,
-          # 提示生成阶段有问题需修(不是安全突破,但是 CI/环境问题,重跑或修网络)。
-          npx promptfoo redteam generate \
-            -c promptfooconfig.redteam.yaml \
-            --env-path .env.ci \
-            -o redteam.yaml
+          #
+          # Retry:DeepSeek 生成攻击偶发返回非合法 YAML(promptfoo 默认 GPT-5.5
+          # 更稳,换 DeepSeek 省钱的代价;实测 persistence plugin 触发过
+          # "LLM returned invalid YAML" → exit 1)。bash 重试兜底:每次重新采样
+          # (temperature>0),单次解析失败不阻塞。仍失败则 cat 错误转储后 exit 1
+          # (STRICT:真失败仍红,提示生成阶段需修)。
+          MAX=3
+          for attempt in $(seq 1 "$MAX"); do
+            echo "Generate attempt $attempt/$MAX..."
+            if npx promptfoo redteam generate \
+              -c promptfooconfig.redteam.yaml \
+              --env-path .env.ci \
+              -o redteam.yaml; then
+              echo "Generate succeeded on attempt $attempt"
+              break
+            fi
+            if [ "$attempt" -lt "$MAX" ]; then
+              echo "Generate failed (likely LLM YAML parse),retry in 10s..."
+              sleep 10
+            else
+              echo "Generate failed after $MAX attempts. Parse-error dumps:"
+              cat llm_parse_error_*.txt 2>/dev/null || echo "(no llm_parse_error_*.txt)"
+              exit 1
+            fi
+          done
 
       - name: Run OWASP probes
         working-directory: eval/promptfoo

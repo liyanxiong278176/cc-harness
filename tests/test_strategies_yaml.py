@@ -64,3 +64,17 @@ def test_comment_js_reads_pr_comment_md():
     assert "readFileSync('pr-comment.md'" in js_text, (
         "JS must readFileSync('pr-comment.md') — the body is Python-owned"
     )
+
+
+def test_generate_steps_have_retry():
+    """generate step 用 DeepSeek 生成攻击,偶发 'LLM returned invalid YAML'
+    (persistence plugin 实测触发过 → CI exit 1)。bash retry 循环兜底。此 test
+    防 regression:有人简化 generate step 删掉 retry,会再踩同一个 flaky。
+    redteam.yml + redteam-full.yml 两个 workflow 都要有(generate 都用 DeepSeek)。"""
+    for wf in (".github/workflows/redteam.yml",
+               ".github/workflows/redteam-full.yml"):
+        text = open(wf, encoding="utf-8").read()
+        assert "for attempt in $(seq 1" in text, \
+            f"{wf} generate step 缺 retry 循环(DeepSeek YAML flaky 会再咬)"
+        assert "llm_parse_error_*.txt" in text, \
+            f"{wf} 缺错误转储 cat(失败时无诊断)"

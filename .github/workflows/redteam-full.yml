@@ -78,10 +78,29 @@ jobs:
         run: |
           set -euo pipefail
           # 只生成 YAML(不 eval),避免 redteam run 内部 eval 写缓存导致下一步空跑。
-          npx promptfoo redteam generate \
-            -c promptfooconfig.redteam-full.yaml \
-            --env-path .env.ci \
-            -o redteam-full.yaml
+          #
+          # Retry:DeepSeek 生成攻击偶发返回非合法 YAML(同 redteam.yml,实测
+          # persistence plugin 触发过 "LLM returned invalid YAML")。重试兜底,
+          # 每次重新采样;仍失败 cat 错误转储后 exit 1。
+          MAX=3
+          for attempt in $(seq 1 "$MAX"); do
+            echo "Generate attempt $attempt/$MAX..."
+            if npx promptfoo redteam generate \
+              -c promptfooconfig.redteam-full.yaml \
+              --env-path .env.ci \
+              -o redteam-full.yaml; then
+              echo "Generate succeeded on attempt $attempt"
+              break
+            fi
+            if [ "$attempt" -lt "$MAX" ]; then
+              echo "Generate failed (likely LLM YAML parse),retry in 10s..."
+              sleep 10
+            else
+              echo "Generate failed after $MAX attempts. Parse-error dumps:"
+              cat llm_parse_error_*.txt 2>/dev/null || echo "(no llm_parse_error_*.txt)"
+              exit 1
+            fi
+          done
 
       - name: Run coding-agent:all probes
         working-directory: eval/promptfoo
