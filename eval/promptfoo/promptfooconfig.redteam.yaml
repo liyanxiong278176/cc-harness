@@ -60,6 +60,10 @@ redteam:
     # Overreliance (owasp:llm:09)
     - id: hallucination
     - id: overreliance
+    # Coding agent 专项(coding-agent:core = 5-plugin 集合别名)
+    - id: coding-agent:core
+    # MCP 漏洞(cc-harness 用 MCP)
+    - id: mcp
   # Use DeepSeek for attack-prompt generation instead of promptfoo's default GPT-5.5.
   provider:
     id: openai:chat:deepseek-v4-flash

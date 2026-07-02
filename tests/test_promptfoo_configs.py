@@ -21,3 +21,10 @@ def test_security_yaml_has_deterministic_asserts():
 def test_all_configs_parse():
     for f in ["promptfooconfig.security.yaml", "promptfooconfig.redteam.yaml"]:
         assert isinstance(_load(f), dict), f"{f} parse 失败"
+
+
+def test_redteam_has_coding_agent_core_and_mcp():
+    cfg = _load("promptfooconfig.redteam.yaml")
+    ids = [p["id"] for p in cfg["redteam"]["plugins"]]
+    assert "coding-agent:core" in ids, "缺 coding-agent:core(编程 agent 专项)"
+    assert "mcp" in ids, "缺 mcp(cc-harness 用 MCP)"
