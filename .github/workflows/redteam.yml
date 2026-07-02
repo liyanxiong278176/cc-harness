@@ -43,7 +43,7 @@ jobs:
       - name: Install cc-harness deps
         run: |
           python -m pip install --upgrade pip
-          pip install -e .
+          pip install -e '.[dlp]'      # [dlp]=presidio-analyzer, 让 pii-exfil 计入 L5 ASR
 
       - uses: actions/setup-node@v4
         with:
@@ -56,6 +56,12 @@ jobs:
       - name: Clear promptfoo state
         run: rm -rf ~/.promptfoo
         continue-on-error: true
+
+      - name: Verify PII layer (presidio usable)
+        run: |
+          python -c "from cc_harness.l5 import _maybe_build_pii_layer; from cc_harness.config import L5Config; \
+          assert _maybe_build_pii_layer(L5Config()) is not None, \
+          'presidio init failed — pii-exfil 会假阴性不计 L5 ASR'"
 
       - name: Build runtime env (no PROMPTFOO_API_KEY needed for eval)
         working-directory: eval/promptfoo
@@ -145,7 +151,7 @@ jobs:
       - name: Install cc-harness deps
         run: |
           python -m pip install --upgrade pip
-          pip install -e .
+          pip install -e '.[dlp]'      # [dlp]=presidio-analyzer, 让 pii-exfil 计入 L5 ASR
 
       - uses: actions/setup-node@v4
         with:

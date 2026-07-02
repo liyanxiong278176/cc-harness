@@ -117,12 +117,13 @@ def _build_cn_recognizers() -> list:
     from presidio_analyzer import Pattern, PatternRecognizer
     cn_phone = PatternRecognizer(
         supported_entity="CN_PHONE",
-        patterns=[Pattern(r"\b1[3-9]\d{9}\b", 0.9)],
+        patterns=[Pattern("cn_phone", r"\b1[3-9]\d{9}\b", 0.9)],
     )
     cn_id = PatternRecognizer(
         supported_entity="CN_ID_CARD",
         # 18 位:6 地区码 + 4 年 + 2 月 + 2 日 + 3 序号 + 1 校验(X/x)
         patterns=[Pattern(
+            "cn_id_card",
             r"\b[1-9]\d{5}(?:19|20)\d{2}(?:0[1-9]|1[0-2])(?:0[1-9]|[12]\d|3[01])\d{3}[\dXx]\b",
             0.85,
         )],
