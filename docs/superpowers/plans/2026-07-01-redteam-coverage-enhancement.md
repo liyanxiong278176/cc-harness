@@ -246,7 +246,7 @@ def _safe_layer(result: dict) -> str:
 
 - [ ] **Step 5: 更新现有 `tests/test_report_to_md.py`(verbatim 断言修订)**
 
-现有测试断言"沙箱/权限/提示词注入/其它",改为 layer 语义。**逐个替换**(导入方式不变,仍 importlib 加载 `rtm`):
+现有 `tests/test_report_to_md.py` 有 **6 个函数引用 `classify_issue`**(`test_classify_sandbox`/`test_classify_permission`/`test_classify_injection`/`test_classify_other`/`test_classify_dynamic_categories`/`test_classify_pluginid_wins_over_category`)——**全部删除**,用下列新函数替代。导入方式不变(importlib 加载到 `rtm`)。⚠ `importlib.util.exec_module` **不**注册到 `sys.modules`,故异常类**必须**用 `rtm.UnknownCategoryError`,**绝不** `from report_to_md import`(会 `ModuleNotFoundError`,现有测试全靠 `rtm.xxx` 规避此点):
 
 ```python
 # 旧 test_classify_sandbox / test_classify_permission / test_classify_injection
@@ -282,10 +282,9 @@ def test_classify_harmful_special_case_to_judge():
 
 def test_classify_unknown_fail_closed():
     """matrix 未定义的 category/pluginId -> UnknownCategoryError(不落'其它')。"""
-    from report_to_md import UnknownCategoryError  # 同 importlib 模块名
-    with pytest.raises(UnknownCategoryError):
+    with pytest.raises(rtm.UnknownCategoryError):
         rtm.classify_layer(_owasp("misinformation-disinformation"))
-    with pytest.raises(UnknownCategoryError):
+    with pytest.raises(rtm.UnknownCategoryError):
         rtm.classify_layer({"metadata": {}})
 
 
