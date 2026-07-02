@@ -297,7 +297,11 @@ async def run_turn(
                             "content": _external,
                         })
                     else:
-                        error_text = f"[未执行:用户拒绝] {p.name} — {decision.reason}"
+                        error_text = (
+                            f"[未执行:用户拒绝] {p.name} — {decision.reason}。"
+                            "该操作已被安全策略最终拒绝,不要主动建议绕道方案"
+                            "(手动执行/换工具/分步绕过);如用户仍需要,由用户重新明确提出。"
+                        )
                         print_observation(console, error_text)
                         log_decision(audit_path, iter_n=iter_count, tool=p.name, args=args,
                                      action=decision.action.value, outcome="denied",

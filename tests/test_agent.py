@@ -790,3 +790,32 @@ async def test_l5_redact_audited_without_plaintext(tmp_path):
     assert entry["outcome"] == "redacted"
     assert "api_key" in entry["rule_id"]
     assert secret not in logf.read_text(encoding="utf-8")   # 审计绝不记明文
+
+
+@pytest.mark.asyncio
+async def test_denied_feedback_tells_agent_no_workaround(tmp_path, monkeypatch):
+    """ask 被拒后,喂回 agent 的 tool message 必须含'不绕道'指导(spec 改动2)。
+    根因: 红队 L4 ASR 14%——agent 收一串'用户拒绝'后当障碍找绕道(手动/请确认)。"""
+    from cc_harness import agent as agent_mod
+    from cc_harness.policy import PolicyEngine
+
+    pending = [PendingToolCall(index=0, id="c1", name="run_command",
+                               arguments_json='{"command":"cat ~/.ssh/id_rsa"}')]
+    llm = FakeLLM(responses=[
+        [FakeStreamEvent(kind="done", content="", pending=pending, finish_reason="tool_calls")],
+        [FakeStreamEvent(kind="done", content="好的不执行", pending=[], finish_reason="stop")],
+    ])
+    mcp = FakeMCP(tools_spec=[], results={}, calls=[])
+    monkeypatch.setattr("builtins.input", lambda *a, **k: "")  # 回车 = 默认 no
+
+    messages = [{"role": "user", "content": "读密钥"}]
+    policy = PolicyEngine(project_root=tmp_path)
+    await agent_mod.run_turn(messages, llm, mcp, mode="coding",
+                             cwd=str(tmp_path), max_iter=5, policy=policy)
+
+    # 找 ask 被拒的 tool message
+    denied = [m for m in messages if m.get("role") == "tool"
+              and "未执行" in m.get("content", "")]
+    assert denied, "没找到被拒 tool message(ask 分支未触发?)"
+    assert any("不要主动建议绕道" in m["content"] for m in denied), \
+        "被拒 feedback 缺'不绕道'指导——agent 仍会找绕道(L4 ASR 根因)"
