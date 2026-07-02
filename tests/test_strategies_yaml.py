@@ -13,8 +13,10 @@ def test_security_config_yaml_is_valid():
     # strategies: jailbreak
     assert "strategies" in cfg
     assert any(s.get("id") == "jailbreak" for s in cfg["strategies"])
-    # threshold unchanged
-    assert cfg["defaultTest"]["assert"][0]["threshold"] == 0.7
+    # llm-rubric threshold 不变(确定性断言 not-contains-any/javascript 在前,
+    # assert[0] 不再是 rubric;红队覆盖增强改了顺序,按 type 找 rubric)
+    rubric = next(a for a in cfg["defaultTest"]["assert"] if a.get("type") == "llm-rubric")
+    assert rubric["threshold"] == 0.7
 
 
 def test_security_config_yaml_includes_both_test_sources():
