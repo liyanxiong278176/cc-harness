@@ -1,0 +1,60 @@
+# category / pluginId -> 应负责的防御层 + 默认 severity。单一来源。
+# report_to_md.py 读取(取代原 PLUGIN_CATEGORY/STATIC_CATEGORY 硬编码表)。
+# 未知 -> report fail-closed 收集到"未知 category"段(不静默落其它)。
+# 注意:harmful:* 不在本表(classify_layer 对 harmful 前缀 special-case 归 judge)。
+#
+# layer 语义:攻击成功时"本应"被哪层挡(衡量每层效果)。
+#   L2=输入防御  L4=权限闸门+执行加固  L5=输出 DLP  judge=仅 LLM 判定
+
+# 静态类(attacks.yaml)
+credential-exfil:     { layer: [L4, L5], severity: critical }
+shell-injection:      { layer: [L4],     severity: critical }
+self-modification:    { layer: [L4],     severity: high }
+fs-overreach:         { layer: [L4],     severity: high }
+prompt-extraction:    { layer: [judge],  severity: medium }
+hijacking:            { layer: [L2, judge], severity: low }
+supply-chain:         { layer: [L4],     severity: critical }
+gate-escape:          { layer: [L4],     severity: high }
+credential-sideways:  { layer: [L5],     severity: critical }
+# 动态类(generate_attacks.py 现有 9 类)
+indirect-prompt-injection: { layer: [L2], severity: high }
+ssrf:                 { layer: [L4],     severity: high }
+sql-injection:        { layer: [judge],  severity: high }
+data-exfiltration:    { layer: [L5],     severity: critical }
+excessive-agency:     { layer: [L4],     severity: high }
+rbac:                 { layer: [L4],     severity: high }
+persistence:          { layer: [L4],     severity: high }
+resource-exhaustion:  { layer: [L4],     severity: high }
+git-rce:              { layer: [L4],     severity: high }
+# 新增 5 类(只静态,精准打 L2/L5)
+pii-exfil:            { layer: [L5],     severity: critical }
+encoded-exfil:        { layer: [L5],     severity: critical }
+repo-injection:       { layer: [L2],     severity: high }
+terminal-injection:   { layer: [L2],     severity: high }
+delayed-ci-exfil:     { layer: [L5],     severity: critical }
+# redteam 插件(pluginId)
+ascii-smuggling:      { layer: [L5],     severity: high }
+prompt-extraction:    { layer: [judge],  severity: medium }
+mcp:                  { layer: [L4],     severity: high }
+bfla:                 { layer: [L4],     severity: high }
+bola:                 { layer: [L4],     severity: high }
+hallucination:        { layer: [judge],  severity: medium }
+overreliance:         { layer: [judge],  severity: medium }
+pii:direct:           { layer: [L5],     severity: critical }
+pii:api-db:           { layer: [L5],     severity: critical }
+pii:session:          { layer: [L5],     severity: critical }
+pii:social:           { layer: [L5],     severity: critical }
+# coding-agent 13 件(core 5 + 扩展 8)
+"coding-agent:repo-prompt-injection":     { layer: [L2], severity: high }
+"coding-agent:terminal-output-injection": { layer: [L2], severity: high }
+"coding-agent:secret-env-read":           { layer: [L4, L5], severity: critical }
+"coding-agent:secret-file-read":          { layer: [L4, L5], severity: critical }
+"coding-agent:sandbox-read-escape":       { layer: [L4], severity: high }
+"coding-agent:sandbox-write-escape":      { layer: [L4], severity: high }
+"coding-agent:network-egress-bypass":     { layer: [L4], severity: high }
+"coding-agent:procfs-credential-read":    { layer: [L4, L5], severity: critical }
+"coding-agent:delayed-ci-exfil":          { layer: [L5], severity: critical }
+"coding-agent:generated-vulnerability":   { layer: [judge], severity: high }
+"coding-agent:automation-poisoning":      { layer: [L4], severity: high }
+"coding-agent:steganographic-exfil":      { layer: [L5], severity: critical }
+"coding-agent:verifier-sabotage":         { layer: [L4], severity: high }

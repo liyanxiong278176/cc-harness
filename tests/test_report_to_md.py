@@ -3,6 +3,8 @@
 import importlib.util
 from pathlib import Path
 
+import pytest
+
 TOOL = Path(__file__).resolve().parents[1] / "eval" / "promptfoo" / "tools" / "report_to_md.py"
 _spec = importlib.util.spec_from_file_location("report_to_md", TOOL)
 rtm = importlib.util.module_from_spec(_spec)
@@ -14,46 +16,58 @@ def _owasp(plugin, **kw):
 def _static(cat, **kw):
     return {"metadata": {"category": cat, **kw}}
 
-def test_classify_sandbox():
-    for p in ["shell-injection", "sql-injection", "ssrf", "pii:api-db", "pii:direct",
-              "pii:session", "pii:social"]:
-        assert rtm.classify_issue(_owasp(p)) == "沙箱", p
-    assert rtm.classify_issue(_static("shell-injection")) == "沙箱"
-    assert rtm.classify_issue(_static("credential-exfil")) == "沙箱"
-
-def test_classify_permission():
+# 旧 test_classify_sandbox / test_classify_permission / test_classify_injection
+# 合并为按 layer 断言(classify_issue -> classify_layer):
+def test_classify_layers():
+    # L4
+    for p in ["shell-injection", "ssrf"]:
+        assert rtm.classify_layer(_owasp(p)) == "L4", p
+    for c in ["shell-injection", "credential-exfil", "self-modification", "fs-overreach"]:
+        assert rtm.classify_layer(_static(c)) == "L4", c
     for p in ["bfla", "bola", "rbac", "excessive-agency"]:
-        assert rtm.classify_issue(_owasp(p)) == "权限", p
-    for c in ["self-modification", "fs-overreach"]:
-        assert rtm.classify_issue(_static(c)) == "权限", c
+        assert rtm.classify_layer(_owasp(p)) == "L4", p
+    # L5
+    for p in ["pii:api-db", "pii:direct", "pii:session", "pii:social", "ascii-smuggling"]:
+        assert rtm.classify_layer(_owasp(p)) == "L5", p
+    for c in ["credential-sideways", "data-exfiltration"]:
+        assert rtm.classify_layer(_static(c)) == "L5", c
+    # L2
+    for c in ["indirect-prompt-injection", "hijacking"]:
+        assert rtm.classify_layer(_static(c)) == "L2", c
+    # judge
+    for p in ["prompt-extraction", "overreliance", "hallucination", "sql-injection"]:
+        assert rtm.classify_layer(_owasp(p)) == "judge", p
+    for c in ["prompt-extraction"]:
+        assert rtm.classify_layer(_static(c)) == "judge", c
 
-def test_classify_injection():
-    for p in ["prompt-extraction", "overreliance", "hallucination",
-              "ascii-smuggling", "indirect-prompt-injection"]:
-        assert rtm.classify_issue(_owasp(p)) == "提示词注入", p
-    for c in ["hijacking", "prompt-extraction"]:
-        assert rtm.classify_issue(_static(c)) == "提示词注入", c
 
-def test_classify_other():
-    assert rtm.classify_issue(_owasp("harmful")) == "其它"
-    assert rtm.classify_issue(_owasp("harmful:profanity")) == "其它"
-    assert rtm.classify_issue(_owasp("misinformation-disinformation")) == "其它"
-    assert rtm.classify_issue({"metadata": {}}) == "其它"   # 未命中
+def test_classify_harmful_special_case_to_judge():
+    """harmful:* 不在 matrix,classify_layer special-case 归 judge。"""
+    assert rtm.classify_layer(_owasp("harmful")) == "judge"
+    assert rtm.classify_layer(_owasp("harmful:profanity")) == "judge"
 
-def test_classify_dynamic_categories():
-    """动态 dynamic_attacks.yaml 的类别(与静态错开)应正确分类,不归到'其它'。"""
-    assert rtm.classify_issue(_static("indirect-prompt-injection")) == "提示词注入"
-    assert rtm.classify_issue(_static("ssrf")) == "沙箱"
-    assert rtm.classify_issue(_static("sql-injection")) == "沙箱"
-    assert rtm.classify_issue(_static("data-exfiltration")) == "沙箱"
-    assert rtm.classify_issue(_static("supply-chain")) == "沙箱"
-    assert rtm.classify_issue(_static("rbac")) == "权限"
-    assert rtm.classify_issue(_static("excessive-agency")) == "权限"   # 已有
+
+def test_classify_unknown_fail_closed():
+    """matrix 未定义的 category/pluginId -> UnknownCategoryError(不落'其它')。"""
+    with pytest.raises(rtm.UnknownCategoryError):
+        rtm.classify_layer(_owasp("misinformation-disinformation"))
+    with pytest.raises(rtm.UnknownCategoryError):
+        rtm.classify_layer({"metadata": {}})
 
 
 def test_classify_pluginid_wins_over_category():
     r = {"metadata": {"pluginId": "bfla", "category": "hijacking"}}
-    assert rtm.classify_issue(r) == "权限"
+    assert rtm.classify_layer(r) == "L4"  # bfla plugin 赢 -> L4
+
+
+def test_classify_dynamic_categories():
+    assert rtm.classify_layer(_static("indirect-prompt-injection")) == "L2"
+    assert rtm.classify_layer(_static("ssrf")) == "L4"
+    assert rtm.classify_layer(_static("sql-injection")) == "judge"
+    assert rtm.classify_layer(_static("data-exfiltration")) == "L5"
+    assert rtm.classify_layer(_static("supply-chain")) == "L4"
+    assert rtm.classify_layer(_static("rbac")) == "L4"
+    assert rtm.classify_layer(_static("excessive-agency")) == "L4"
 
 def test_detect_infra_failure_wrapper():
     for err, pat in [("main.py not found at X", "main.py not found"),
@@ -117,7 +131,7 @@ def test_extract_fields_owasp():
     f = rtm.extract_fields(r)
     assert f["success"] is False and f["prompt"] == "attack X"
     assert f["severity"] == "high" and f["source"] == "owasp"
-    assert f["category"] == "权限" and f["is_infra"] is False
+    assert f["category"] == "L4" and f["is_infra"] is False
     assert f["reason"] == "执行了越权命令"
 
 def test_generate_report_orders_failed_by_severity():
@@ -140,5 +154,5 @@ def test_generate_pr_comment_has_summary_and_category():
          "response": {"output": "d"}, "gradingResult": {"componentResults": [{"reason": "越权"}]}}
     p = {"success": True, "vars": {"prompt": "y"}, "metadata": {"severity": "low"}}
     c = rtm.generate_pr_comment([[r, p]])
-    assert "Security Eval" in c and "权限" in c and "artifact" in c
+    assert "Security Eval" in c and "L4" in c and "artifact" in c
     assert "真实突破 1" in c

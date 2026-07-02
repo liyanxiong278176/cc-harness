@@ -8,43 +8,59 @@ import argparse
 import json
 from pathlib import Path
 
-# --- Classification (mirrors spec table; single source of truth) ---
-PLUGIN_CATEGORY = {
-    "shell-injection": "沙箱", "sql-injection": "沙箱", "ssrf": "沙箱",
-    "pii:api-db": "沙箱", "pii:direct": "沙箱", "pii:session": "沙箱", "pii:social": "沙箱",
-    "bfla": "权限", "bola": "权限", "rbac": "权限", "excessive-agency": "权限",
-    "prompt-extraction": "提示词注入", "overreliance": "提示词注入",
-    "hallucination": "提示词注入", "ascii-smuggling": "提示词注入",
-    "indirect-prompt-injection": "提示词注入",
-}
-STATIC_CATEGORY = {
-    # 静态 attacks.yaml 的类别
-    "shell-injection": "沙箱", "credential-exfil": "沙箱",
-    "self-modification": "权限", "excessive-agency": "权限", "fs-overreach": "权限",
-    "hijacking": "提示词注入", "prompt-extraction": "提示词注入", "overreliance": "提示词注入",
-    # 动态 dynamic_attacks.yaml 的类别(与静态错开,扩大覆盖)
-    "indirect-prompt-injection": "提示词注入",
-    "ssrf": "沙箱", "sql-injection": "沙箱",
-    "data-exfiltration": "沙箱", "supply-chain": "沙箱",
-    "rbac": "权限",
-}
+import yaml
+
+# --- Classification (single source of truth: defense_matrix.yaml) ---
+_MATRIX_PATH = Path(__file__).resolve().parent.parent / "defense_matrix.yaml"
+
+
+def _load_defense_matrix() -> dict:
+    if not _MATRIX_PATH.exists():
+        raise FileNotFoundError(f"defense_matrix.yaml not found at {_MATRIX_PATH}")
+    return yaml.safe_load(_MATRIX_PATH.read_text(encoding="utf-8"))
+
+
+_DEFENSE_MATRIX = _load_defense_matrix()
+
+
+class UnknownCategoryError(KeyError):
+    """report 遇到 matrix 未定义的 category/pluginId。fail-closed。"""
 
 
 def _metadata(result: dict) -> dict:
     return (result.get("metadata") or result.get("testCase", {}).get("metadata") or {})
 
 
-def classify_issue(result: dict) -> str:
-    """沙箱 / 权限 / 提示词注入 / 其它. Does NOT consider infra failure
-    (caller checks detect_infra_failure first). pluginId wins over category."""
+def classify_layer(result: dict) -> str:
+    """pluginId 优先于 category;harmful:* 前缀 special-case 归 judge。
+    未知 -> 抛 UnknownCategoryError(由调用方收集,不静默落'其它')。
+    返回 layer 列表首元素(主层)。"""
     md = _metadata(result)
     plugin = md.get("pluginId")
     if plugin:
-        if plugin.startswith("harmful"):
-            return "其它"
-        return PLUGIN_CATEGORY.get(plugin, "其它")
-    cat = md.get("category")
-    return STATIC_CATEGORY.get(cat, "其它") if cat else "其它"
+        if plugin == "harmful" or plugin.startswith("harmful:"):
+            return "judge"  # harmful:* 26 子插件,不进 matrix,统一 judge 层
+        key = plugin
+    else:
+        key = md.get("category")
+    if not key:
+        raise UnknownCategoryError("(no pluginId/category)")
+    if key not in _DEFENSE_MATRIX:
+        raise UnknownCategoryError(key)
+    layers = _DEFENSE_MATRIX[key]["layer"]
+    return layers[0] if layers else "judge"
+
+
+def _safe_layer(result: dict) -> str:
+    try:
+        return classify_layer(result)
+    except UnknownCategoryError:
+        return "未知"
+
+
+def _unknown_key(result: dict):
+    md = _metadata(result)
+    return md.get("pluginId") or md.get("category")
 
 
 INFRA_FAILURE_PATTERNS = [
@@ -109,18 +125,21 @@ def extract_fields(result: dict) -> dict:
     vars_ = result.get("vars") or {}
     resp = result.get("response") or {}
     is_infra, infra_label = detect_infra_failure(result)
+    layer = _safe_layer(result)
+    unknown_key = None if layer != "未知" else _unknown_key(result)
     return {
         "success": bool(result.get("success")),
         "prompt": str(vars_.get("prompt") or "").strip(),
         "severity": md.get("severity") or "medium",
         "source": ("owasp" if md.get("pluginId")
                    else "dynamic" if md.get("source") == "dynamic" else "static"),
-        "category": classify_issue(result),
+        "category": layer,
         "is_infra": is_infra,
         "infra_label": infra_label,
         "reason": extract_reason(result),
         "error": str(resp.get("error") or ""),
         "agent_response": str(resp.get("output") or ""),
+        "unknown_key": unknown_key,
     }
 
 
