@@ -95,7 +95,7 @@ eval/promptfoo/
 | `npm run curate` | 从 `security-results.json` 筛 + append 到 `attacks.yaml` |
 | `python tools/report_to_md.py eval.json owasp.json --gate` | 跑 severity 分层门禁（§9.5） |
 
-**redteam config（OWASP 插件）**：CI 跑 `coding-agent:all`（13-plugin 全集）+ `mcp`（OWASP job 实测 ~46min，360min 门禁余量足，§9.6）。
+**redteam config（OWASP 插件）**：CI 门禁跑 `coding-agent:core`（5-plugin）+ `mcp`（门禁 ~126 probe 串行 ~252min，360min 有余量，§9.6）。全 13 件 `coding-agent:all` 在 `promptfooconfig.redteam-full.yaml`，由 `.github/workflows/redteam-full.yml` 手动触发（`workflow_dispatch`，不卡合并）。
 
 ---
 
@@ -380,12 +380,12 @@ infra 故障不计（`detect_infra_failure` 排除）。空结果列表 → exit
 python eval/promptfoo/tools/report_to_md.py eval-results.json owasp-results.json --gate
 ```
 
-### 9.6 redteam.yaml 插件（CI 跑）
+### 9.6 编程 agent 插件（core 门禁 / all 深度扫描）
 
-`promptfooconfig.redteam.yaml` 的 `plugins:` 列表里现在有两组新插件：
+编程 agent 全 13 件分两层跑。**为何分层**：实测 `coding-agent:all` 进门禁会让 OWASP job probe 126→165、串行 `~330min` 贴 360min job 上限零余量（首 probe cold-start MCP+DeepSeek 就吃 70min），门禁只跑 core 保稳定。
 
-- **`coding-agent:all`** —— 13-plugin 全集（repo-prompt-injection / terminal-output-injection / secret-env-read / sandbox-read-escape / verifier-sabotage / secret-file-read / sandbox-write-escape / network-egress-bypass / procfs-credential-read / delayed-ci-exfil / generated-vulnerability / automation-poisoning / steganographic-exfil），专门打 coding agent 攻击面。CI 跑全集（OWASP job 实测 ~46min，360min 门禁余量足）。
-- **`mcp`** —— MCP 漏洞探测（cc-harness 用 MCP）。
+- **门禁（CI 卡合并）`promptfooconfig.redteam.yaml`** —— 含 `coding-agent:core`（5 件）+ `mcp` + OWASP 全套。`redteam.yml` redteam job 跑，~126 probe 串行 `-j 1` ~252min，360min 有余量。
+- **深度扫描（手动，不卡合并）`promptfooconfig.redteam-full.yaml`** —— `coding-agent:all`（13-plugin 全集：repo-prompt-injection / terminal-output-injection / secret-env-read / sandbox-read-escape / verifier-sabotage / secret-file-read / sandbox-write-escape / network-egress-bypass / procfs-credential-read / delayed-ci-exfil / generated-vulnerability / automation-poisoning / steganographic-exfil）+ `mcp`，~44 probe 串行 ~90min。由 `.github/workflows/redteam-full.yml` 手动触发（`workflow_dispatch`），结果人工看。发版前 / 大改 `prompts.py`|`agent.py` 后跑一次。
 
 ---
 
@@ -507,7 +507,9 @@ python tools/curate_attacks.py --threshold 0.5
 # severity 门禁（本地复现 CI gate）
 python tools/report_to_md.py security-results.json owasp-results.json --gate
 
-# coding-agent 全集已默认在 CI 跑（coding-agent:all，无需临时改）
+# coding-agent 全集（coding-agent:all）手动跑，不卡合并：
+# GitHub Actions → "cc-harness full coding-agent redteam" → Run workflow
+# （门禁只跑 core 5 件；all 13 件作为发版前深度扫描）
 ```
 
 ---
