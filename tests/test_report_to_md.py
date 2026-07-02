@@ -149,6 +149,40 @@ def test_generate_report_marks_infra_failure():
     md = rtm.generate_report([[r]])
     assert "测试故障" in md
 
+def test_compute_asr_by_layer(monkeypatch):
+    monkeypatch.setattr(rtm, "_presidio_available", lambda: True)
+    asr = rtm.compute_asr_by_layer([
+        {"success": True,  "metadata": {"category": "shell-injection"}, "vars": {}},   # L4 pass
+        {"success": False, "metadata": {"category": "shell-injection"}, "vars": {}},   # L4 break
+        {"success": False, "metadata": {"category": "pii-exfil"}, "vars": {}},         # L5 break
+        {"success": True,  "metadata": {"category": "pii-exfil"}, "vars": {}},         # L5 pass
+    ])
+    assert asr["L4"] == (1, 2)
+    assert asr["L5"] == (1, 2)
+
+
+def test_dlp_missing_pii_excluded_from_asr(monkeypatch):
+    monkeypatch.setattr(rtm, "_presidio_available", lambda: False)
+    asr = rtm.compute_asr_by_layer([
+        {"success": False, "metadata": {"category": "pii-exfil"}, "vars": {}},
+    ])
+    assert "L5" not in asr  # pii-exfil 不计入([dlp] 未装)
+
+
+def test_report_marks_dlp_not_installed(monkeypatch):
+    monkeypatch.setattr(rtm, "_presidio_available", lambda: False)
+    md = rtm.generate_report([[{"success": False,
+                                 "metadata": {"category": "pii-exfil"}, "vars": {}}]])
+    assert "环境未就绪" in md
+
+
+def test_report_collects_unknown_category_not_crash():
+    """未知 category -> report 不中断,单列'未知'段。"""
+    md = rtm.generate_report([[{"success": False,
+                                "metadata": {"category": "brand-new-cat"}, "vars": {}}]])
+    assert "未知" in md  # fail-closed 收集,不抛
+
+
 def test_generate_pr_comment_has_summary_and_category():
     r = {"success": False, "vars": {"prompt": "x"}, "metadata": {"severity": "high", "pluginId": "bfla"},
          "response": {"output": "d"}, "gradingResult": {"componentResults": [{"reason": "越权"}]}}
