@@ -116,7 +116,7 @@ error_text = (
 # 改:  - id: coding-agent:all
 ```
 
-promptfoo 0.121.17 实测 `coding-agent:all` 展开 **13 件**(eval/bug/9 generate 日志 + node_modules grep 确认):
+promptfoo 0.121.17 的 `coding-agent:all` 展开 **13 件**(node_modules grep + `defense_matrix.yaml` REQUIRED_PLUGINS 双向确认;注: eval/bug/9 当时 config 是 core,只实测跑了 core 5 件):
 repo-prompt-injection、terminal-output-injection、secret-env-read、secret-file-read、delayed-ci-exfil、sandbox-read-escape、sandbox-write-escape、network-egress-bypass、procfs-credential-read、generated-vulnerability、automation-poisoning、steganographic-exfil、verifier-sabotage。
 
 `defense_matrix.yaml` 已登记全部 13 件(`classify_layer` 能分类,不触发 `UnknownCategoryError`)。
@@ -131,7 +131,7 @@ repo-prompt-injection、terminal-output-injection、secret-env-read、secret-fil
 ## 5. 测试
 
 ### 5.1 单元(实现时跑)
-- `tests/test_prompts.py`(若无则创建): `PromptComposer(mode="coding").render()` 断言含 "绝不主动建议绕道方案" / "被安全策略拦截" / "不要建议用户手动执行任何被权限层拒绝" 等约束文本
+- `tests/test_prompts.py`(**已存在**,在现有用例上 augment): 断言 `PromptComposer(mode="coding").render()` 含 "绝不主动建议绕道方案" / "被安全策略拦截" / "不要建议用户手动执行任何被权限层拒绝" 等约束文本
 - `tests/test_agent.py`: ask 被拒分支,FakeLLM 触发 ask→confirm 返 no→`error_text` 含 "不要主动建议绕道"
 - `tests/test_promptfoo_configs.py`: redteam.yaml 含 `coding-agent:all`
 - 现有 `test_defense_matrix` / `test_l5` 不动,全绿
