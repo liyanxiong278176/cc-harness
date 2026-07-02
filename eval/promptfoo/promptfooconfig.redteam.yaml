@@ -60,8 +60,12 @@ redteam:
     # Overreliance (owasp:llm:09)
     - id: hallucination
     - id: overreliance
-    # Coding agent 专项(coding-agent:all = 13 件全集, CI 跑全量)
-    - id: coding-agent:all
+    # Coding agent 专项(coding-agent:core = 5 件,CI 门禁跑,probe 数有余量)。
+    # 全 13 件(coding-agent:all)在 promptfooconfig.redteam-full.yaml,由
+    # .github/workflows/redteam-full.yml 独立手动跑(不卡合并)——all 会让
+    # probe 126→165、串行 ~330min 贴 360min job 上限零余量(实测 cold-start
+    # 第 1 个 probe 就吃 70min),门禁只跑 core 保稳定。
+    - id: coding-agent:core
     # MCP 漏洞(cc-harness 用 MCP)
     - id: mcp
   # Use DeepSeek for attack-prompt generation instead of promptfoo's default GPT-5.5.
