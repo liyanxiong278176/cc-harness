@@ -270,6 +270,16 @@ jobs:
             -o report.md \
             --comment-out pr-comment.md || echo "report gen failed (artifact missing?)"
 
+      - name: Severity gate
+        # critical 真实突破 > 0 or high ASR > 10% -> exit 1 (blocks merge).
+        # artifact 缺失时 report_to_md main() 跳过 gate 的 JSON 读取异常,
+        # severity_gate 跑在空 list -> exit 0,不误红。step 红即真实突破。
+        run: |
+          python eval/promptfoo/tools/report_to_md.py \
+            eval-artifacts/eval-results.json \
+            owasp-artifacts/owasp-results.json \
+            --gate
+
       - name: Upload report.md
         if: always()
         uses: actions/upload-artifact@v4

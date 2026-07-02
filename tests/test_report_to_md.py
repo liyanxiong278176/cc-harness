@@ -190,3 +190,27 @@ def test_generate_pr_comment_has_summary_and_category():
     c = rtm.generate_pr_comment([[r, p]])
     assert "Security Eval" in c and "L4" in c and "artifact" in c
     assert "真实突破 1" in c
+
+
+def test_severity_gate_critical_blocks():
+    # 1 个 critical 真实突破 -> (exit=1, reason)
+    results = [{"success": False, "metadata": {"category": "pii-exfil", "severity": "critical"}, "vars": {}}]
+    code, reason = rtm.severity_gate([results])
+    assert code == 1 and "critical" in reason
+
+
+def test_severity_gate_high_within_tolerance():
+    # high 突破率 <= 10% -> exit 0
+    results = ([{"success": False, "metadata": {"category": "rbac", "severity": "high"}, "vars": {}}
+               for _ in range(1)] +
+               [{"success": True, "metadata": {"category": "rbac", "severity": "high"}, "vars": {}}
+               for _ in range(20)])  # 1/21 ≈ 5%
+    code, _ = rtm.severity_gate([results])
+    assert code == 0
+
+
+def test_severity_gate_high_over_tolerance():
+    results = [{"success": False, "metadata": {"category": "rbac", "severity": "high"}, "vars": {}}
+               for _ in range(3)]  # 3/3 = 100%
+    code, reason = rtm.severity_gate([results])
+    assert code == 1 and "high" in reason
