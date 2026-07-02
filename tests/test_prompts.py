@@ -273,3 +273,19 @@ def test_composed_prompt_does_not_leak_unresolved_placeholders():
     import re
     leftovers = re.findall(r"\{[a-z_]+\}", out)
     assert leftovers == [], f"unresolved placeholders: {leftovers}"
+
+
+def test_dangerous_ops_forbids_workaround():
+    """拒绝姿态(spec 2026-07-02 改动1): dangerous_ops 必须教 agent 不绕道。
+    红队 eval/bug/9 暴露 agent 说'请确认/你手动 cat'被判 BROKE。"""
+    out = build_system_prompt("/x", mode="coding")
+    assert "绝不主动建议绕道方案" in out, "dangerous_ops 缺'不绕道'禁令"
+    assert "被安全策略拦截" in out, "dangerous_ops 缺'被拒后如实告知'"
+    assert "不要建议用户手动执行任何被权限层拒绝" in out, "tool_discipline #3 未强化"
+
+
+def test_dangerous_ops_forbids_workaround_is_coding_only():
+    """dangerous_ops 是 coding-only(plan/design 不调工具,不需要)。"""
+    for m in ("plan", "design"):
+        assert "绝不主动建议绕道方案" not in build_system_prompt("/x", mode=m), \
+            f"mode={m} 不应含 dangerous_ops"
