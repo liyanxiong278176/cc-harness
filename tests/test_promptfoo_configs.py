@@ -23,8 +23,9 @@ def test_all_configs_parse():
         assert isinstance(_load(f), dict), f"{f} parse 失败"
 
 
-def test_redteam_has_coding_agent_core_and_mcp():
+def test_redteam_has_coding_agent_all_and_mcp():
+    """coding-agent:all = 13 件全集(CI 用全量,OWASP job 46min 余量足)。"""
     cfg = _load("promptfooconfig.redteam.yaml")
     ids = [p["id"] for p in cfg["redteam"]["plugins"]]
-    assert "coding-agent:core" in ids, "缺 coding-agent:core(编程 agent 专项)"
+    assert "coding-agent:all" in ids, "缺 coding-agent:all(编程 agent 全 13 件)"
     assert "mcp" in ids, "缺 mcp(cc-harness 用 MCP)"

@@ -95,7 +95,7 @@ eval/promptfoo/
 | `npm run curate` | 从 `security-results.json` 筛 + append 到 `attacks.yaml` |
 | `python tools/report_to_md.py eval.json owasp.json --gate` | 跑 severity 分层门禁（§9.5） |
 
-**redteam config（OWASP 插件）**：CI 跑 `coding-agent:core`（5-plugin 别名）+ `mcp`；本地想跑全 13 件 coding-agent 插件，把 `redteam.yaml` 里 `coding-agent:core` 临时改成 `coding-agent:all`（§9.6）。
+**redteam config（OWASP 插件）**：CI 跑 `coding-agent:all`（13-plugin 全集）+ `mcp`（OWASP job 实测 ~46min，360min 门禁余量足，§9.6）。
 
 ---
 
@@ -384,10 +384,8 @@ python eval/promptfoo/tools/report_to_md.py eval-results.json owasp-results.json
 
 `promptfooconfig.redteam.yaml` 的 `plugins:` 列表里现在有两组新插件：
 
-- **`coding-agent:core`** —— 5-plugin 集合别名（repo-prompt-injection / terminal-output-injection / secret-env-read / sandbox-read-escape / verifier-sabotage），专门打 coding agent 攻击面。CI 跑这个限量集合。
+- **`coding-agent:all`** —— 13-plugin 全集（repo-prompt-injection / terminal-output-injection / secret-env-read / sandbox-read-escape / verifier-sabotage / secret-file-read / sandbox-write-escape / network-egress-bypass / procfs-credential-read / delayed-ci-exfil / generated-vulnerability / automation-poisoning / steganographic-exfil），专门打 coding agent 攻击面。CI 跑全集（OWASP job 实测 ~46min，360min 门禁余量足）。
 - **`mcp`** —— MCP 漏洞探测（cc-harness 用 MCP）。
-
-**`coding-agent:all`**（13-plugin 全集）本地手动跑：临时把 `redteam.yaml` 的 `coding-agent:core` 改成 `coding-agent:all` 跑一次（CI 不跑全集，烧配额），覆盖 13 件全部 coding-agent 攻击面（core 5 + secret-file-read / sandbox-write-escape / network-egress-bypass / procfs-credential-read / delayed-ci-exfil / generated-vulnerability / automation-poisoning / steganographic-exfil）。
 
 ---
 
@@ -509,8 +507,7 @@ python tools/curate_attacks.py --threshold 0.5
 # severity 门禁（本地复现 CI gate）
 python tools/report_to_md.py security-results.json owasp-results.json --gate
 
-# coding-agent 全集（本地手动，CI 只跑 core）
-# 临时改 redteam.yaml: coding-agent:core -> coding-agent:all 再跑
+# coding-agent 全集已默认在 CI 跑（coding-agent:all，无需临时改）
 ```
 
 ---
