@@ -218,3 +218,18 @@ async def test_run_falls_back_to_native_on_sandbox_unavailable(monkeypatch, tmp_
                         lambda cwd: native)
     result = await tools.run_command({"command": "echo"}, cwd=str(tmp_path))
     assert "fallback" in result.llm_text
+
+
+@pytest.mark.asyncio
+async def test_shutdown_session_executor_kills_and_clears(monkeypatch):
+    """shutdown 调 executor.kill + shutdown_owned,清空单例(fail-soft)。"""
+    from cc_harness import tools
+    from unittest.mock import AsyncMock, MagicMock
+    fake_exec = MagicMock()
+    fake_exec.kill = AsyncMock()
+    monkeypatch.setattr(tools, "_session_executor", fake_exec)
+    from cc_harness import sandbox_server as ss
+    monkeypatch.setattr(ss, "shutdown_owned", AsyncMock())
+    await tools.shutdown_session_executor()
+    fake_exec.kill.assert_awaited()
+    assert tools._session_executor is None

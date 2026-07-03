@@ -1,10 +1,12 @@
 """Dangerous-command detection + user confirmation prompt + built-in tools."""
 from __future__ import annotations
 import re
+import sys
 from pathlib import Path
 from typing import Optional
 
-from cc_harness.executor import Executor, NativeExecutor
+from cc_harness.config import ExecutorConfig
+from cc_harness.executor import Executor, NativeExecutor, build_executor
 from cc_harness.mcp_client import ToolResult
 
 # 体验级安全 — 不是安全边界。真正安全要靠沙箱和权限控制,这里只是防误操作的提示。
@@ -87,13 +89,12 @@ RUN_COMMAND_TIMEOUT_S = 30
 _session_executor: Optional[Executor] = None
 
 
-def init_session_executor(config, project_root) -> None:
+def init_session_executor(config: ExecutorConfig, project_root: str | Path) -> None:
     """repl 启动调:按 config.backend 建会话级 executor(native 或 sandbox)。
 
     project_root 锁执行 cwd;sandbox 在容器内 mount 该根为只读。
     """
     global _session_executor
-    from cc_harness.executor import build_executor
     _session_executor = build_executor(config, Path(project_root))
 
 
@@ -149,6 +150,10 @@ async def run_command(args: dict, *, cwd: str = ".") -> ToolResult:
     """Built-in shell tool。走会话级 executor;sandbox 连败 3 次
     (_with_retry 内)抛 SandboxUnavailableError → 降级 native + 警告。
 
+    注意:会话路径中 cwd 被忽略——工作目录由 init_session_executor 的
+    project_root 决定(沙箱 mount / NativeExecutor 锁项目根)。cwd 仅在
+    降级路径(_native_fallback)构造 NativeExecutor 时使用。
+
     执行加固(cwd 锁项目根 / env-strip 密钥 / 超时)在 NativeExecutor;
     sandbox 时这些由容器隔离承担。权限决策(allow/ask)由 agent 层
     PolicyEngine 在派发前完成,本函数不再 gate。timeout_s 仍 AT CALL TIME
@@ -158,7 +163,7 @@ async def run_command(args: dict, *, cwd: str = ".") -> ToolResult:
     try:
         return await get_session_executor().run(args, cwd=Path(cwd))
     except SandboxUnavailableError:
-        print("[warn] 沙箱不可用,降级 native 执行(非隔离模式)")
+        print("[warn] 沙箱不可用,降级 native 执行(非隔离模式)", file=sys.stderr)
         return await _native_fallback(cwd).run(args, cwd=Path(cwd))
 
 
