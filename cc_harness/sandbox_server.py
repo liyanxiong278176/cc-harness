@@ -96,11 +96,32 @@ def _set_config_port(config_path: Path, port: int) -> None:
     config_path.write_text(txt, encoding="utf-8")
 
 
-async def _fork_server(port: int, host: str, config_path: Path):
+def _set_allowed_host_paths(config_path: Path, paths: list[str]) -> None:
+    r"""server 0.2.1 空 allowed_host_paths 拒绝所有 host mount(与 config 注释矛盾)。
+
+    init-config 生成的 example 注释声称"空=允许所有",但 server 0.2.1 实际按 DENY-ALL
+    处理 → `Sandbox.create(volumes=[Volume(host=Host(path=...))])` 报
+    `[VOLUME::HOST_PATH_NOT_ALLOWED] ... Allowed prefixes: []`。故 _fork_server 生成
+    config 后显式写允许前缀(项目根)。
+
+    toml 基本字符串转义:Windows 路径分隔符 `\`(chr(92))在 toml 基本串里需写成 `\\`,
+    tomllib 解析后还原成单 `\`(round-trip 已测)。直接替换字面 `allowed_host_paths = []`
+    这一行——init-config 生成的 example 中该字面只出现一次(注释行是 [...] 形式,不撞)。
+    """
+    txt = config_path.read_text(encoding="utf-8")
+    toml_paths = ", ".join(f'"{p.replace(chr(92), chr(92) * 2)}"' for p in paths)
+    txt = txt.replace("allowed_host_paths = []", f"allowed_host_paths = [{toml_paths}]")
+    config_path.write_text(txt, encoding="utf-8")
+
+
+async def _fork_server(port: int, host: str, config_path: Path,
+                       allowed_host_paths: list[str] | None = None):
     """fork opensandbox-server(console script)子进程。
 
     config_path 指定 toml(含 port/host);不存在则 init-config --example docker 生成
-    (默认 port 8080、host 127.0.0.1),再 _set_config_port 改成目标 port。
+    (默认 port 8080、host 127.0.0.1),依次 _set_config_port(8080→port)、
+    _set_allowed_host_paths(写 allowed_host_paths;server 0.2.1 空=拒绝所有 host mount,
+    需显式设项目根前缀,否则 create volume 报 HOST_PATH_NOT_ALLOWED)。
     api_key 空 → 需 env OPENSANDBOX_INSECURE_SERVER=YES(server 才会 insecure ack 启动)。
     返回 asyncio.create_subprocess_exec 协程(await 得 Process)。
     """
@@ -114,7 +135,9 @@ async def _fork_server(port: int, host: str, config_path: Path):
             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False,
         )
         if config_path.exists():
-            _set_config_port(config_path, port)   # 8080 → port
+            _set_config_port(config_path, port)              # 8080 → port
+            if allowed_host_paths:                            # server 0.2.1:空=拒绝
+                _set_allowed_host_paths(config_path, allowed_host_paths)
     env = {**os.environ, "OPENSANDBOX_INSECURE_SERVER": "YES"}  # api_key 空 → insecure ack
     return await asyncio.create_subprocess_exec(
         str(_server_cli()), "--config", str(config_path),
@@ -126,18 +149,23 @@ async def _fork_server(port: int, host: str, config_path: Path):
 
 
 async def ensure_server(port: int, host: str = "127.0.0.1",
-                        ready_timeout: float = 30.0) -> ServerState | None:
+                        ready_timeout: float = 30.0,
+                        config_path: Path | None = None,
+                        allowed_host_paths: list[str] | None = None) -> ServerState | None:
     """确保 server 在跑。复用 / 自动起 / Docker 不可用返回 None。
 
     host 默认 127.0.0.1(非 localhost):Windows localhost 解析到 IPv6 ::1,
     而 server 绑 127.0.0.1(IPv4)→ ping 连不上。显式 127.0.0.1 强制 IPv4。
+
+    config_path 默认 ~/.cc-harness-sandbox.toml;allowed_host_paths 非空时透传给
+    _fork_server → _set_allowed_host_paths(server 0.2.1 空=拒绝所有 host mount)。
     """
     if await ping(host, port):
         return ServerState(owned=False)
     if not _docker_available():
         return None
-    config_path = Path.home() / ".cc-harness-sandbox.toml"
-    proc = await _fork_server(port, host, config_path)
+    config_path = config_path or (Path.home() / ".cc-harness-sandbox.toml")
+    proc = await _fork_server(port, host, config_path, allowed_host_paths)
     loop = asyncio.get_running_loop()
     deadline = loop.time() + ready_timeout
     while loop.time() < deadline:

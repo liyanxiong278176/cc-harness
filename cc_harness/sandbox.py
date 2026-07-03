@@ -124,7 +124,14 @@ class SandboxExecutor:
         # 仅 Sandbox.create 通信步进 _with_retry。state None → SandboxUnavailableError 触发既有降级链。
         # 懒 import(patch 目标 = cc_harness.sandbox_server.ensure_server 属性,单测 monkeypatch 该模块属性即可生效)。
         from cc_harness.sandbox_server import ensure_server
-        state = await ensure_server(host=self.cfg.server_host, port=self.cfg.server_port)
+        # allowed_host_paths=[project_root]:server 0.2.1 空 allowed_host_paths = DENY-ALL
+        # (与 config 注释矛盾)→ 下方 Volume(host=Host(path=project_root)) mount 报
+        # HOST_PATH_NOT_ALLOWED。_fork_server 生成 config 时写入项目根前缀解锁。
+        state = await ensure_server(
+            host=self.cfg.server_host,
+            port=self.cfg.server_port,
+            allowed_host_paths=[str(self.project_root)],
+        )
         if state is None:
             # Docker 没装/server 起不来 → 直接走降级(run() 的 except SandboxUnavailableError 接住)。
             raise SandboxUnavailableError(
