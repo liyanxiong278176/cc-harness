@@ -2,6 +2,9 @@
 from __future__ import annotations
 import re
 from pathlib import Path
+from typing import Optional
+
+from cc_harness.executor import Executor, NativeExecutor
 from cc_harness.mcp_client import ToolResult
 
 # 体验级安全 — 不是安全边界。真正安全要靠沙箱和权限控制,这里只是防误操作的提示。
@@ -78,18 +81,85 @@ def confirm_tool(tool_name: str, args: dict) -> str:
 RUN_COMMAND_TIMEOUT_S = 30
 
 
-async def run_command(args: dict, *, cwd: str = ".") -> ToolResult:
-    """Built-in shell tool. Execution hardening (cwd-lock / env-strip / timeout)
-    lives in NativeExecutor.
+# --- Session-level executor singleton (Task 9) ---
+# 会话级复用:sandbox 容器跨命令复用,避免每条命令 cold-start。
+# repl 启动调 init_session_executor,repl 退出调 shutdown_session_executor。
+_session_executor: Optional[Executor] = None
 
-    The permission decision (allow/ask) is made by the agent-layer PolicyEngine
-    BEFORE dispatch; this function no longer gates. timeout_s is read at CALL
-    TIME from this module's RUN_COMMAND_TIMEOUT_S (so tests can monkeypatch it).
+
+def init_session_executor(config, project_root) -> None:
+    """repl 启动调:按 config.backend 建会话级 executor(native 或 sandbox)。
+
+    project_root 锁执行 cwd;sandbox 在容器内 mount 该根为只读。
     """
-    from cc_harness.executor import NativeExecutor
-    return await NativeExecutor(
-        project_root=Path(cwd), timeout_s=RUN_COMMAND_TIMEOUT_S,
-    ).run(args, cwd=Path(cwd))
+    global _session_executor
+    from cc_harness.executor import build_executor
+    _session_executor = build_executor(config, Path(project_root))
+
+
+def get_session_executor() -> Executor:
+    """run_command 取;未 init(repl 外,如测试/脚本)lazy 兜底 NativeExecutor。
+
+    lazy 路径读 RUN_COMMAND_TIMEOUT_S AT CALL TIME(与历史行为一致,允许测试
+    monkeypatch 该常量)。project_root 默认当前目录(repl 外调用语义)。
+    """
+    global _session_executor
+    if _session_executor is None:
+        _session_executor = NativeExecutor(
+            project_root=Path("."), timeout_s=RUN_COMMAND_TIMEOUT_S,
+        )
+    return _session_executor
+
+
+def reset_session_executor() -> None:
+    """测试隔离:清空单例,使下次 get 重新 lazy-init。"""
+    global _session_executor
+    _session_executor = None
+
+
+async def shutdown_session_executor() -> None:
+    """repl 退出调:sandbox 时 kill 容器 + shutdown_owned_server;native 无副作用。
+
+    全部 best-effort:任何异常吞掉(退出路径不能炸)。NativeExecutor 无 kill
+    方法 → getattr 返回 None → 跳过。
+    """
+    global _session_executor
+    if _session_executor is None:
+        return
+    kill = getattr(_session_executor, "kill", None)
+    if kill is not None:
+        try:
+            await kill()
+        except Exception:
+            pass
+    try:
+        from cc_harness.sandbox_server import shutdown_owned
+        await shutdown_owned()
+    except Exception:
+        pass
+    _session_executor = None
+
+
+def _native_fallback(cwd: str) -> NativeExecutor:
+    """sandbox 降级用的 native executor(隔离 cwd = per-call cwd)。"""
+    return NativeExecutor(project_root=Path(cwd), timeout_s=RUN_COMMAND_TIMEOUT_S)
+
+
+async def run_command(args: dict, *, cwd: str = ".") -> ToolResult:
+    """Built-in shell tool。走会话级 executor;sandbox 连败 3 次
+    (_with_retry 内)抛 SandboxUnavailableError → 降级 native + 警告。
+
+    执行加固(cwd 锁项目根 / env-strip 密钥 / 超时)在 NativeExecutor;
+    sandbox 时这些由容器隔离承担。权限决策(allow/ask)由 agent 层
+    PolicyEngine 在派发前完成,本函数不再 gate。timeout_s 仍 AT CALL TIME
+    读 RUN_COMMAND_TIMEOUT_S(测试可 monkeypatch)。
+    """
+    from cc_harness.sandbox import SandboxUnavailableError
+    try:
+        return await get_session_executor().run(args, cwd=Path(cwd))
+    except SandboxUnavailableError:
+        print("[warn] 沙箱不可用,降级 native 执行(非隔离模式)")
+        return await _native_fallback(cwd).run(args, cwd=Path(cwd))
 
 
 # OpenAI function-calling spec for run_command — matches the shape produced
