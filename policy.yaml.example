@@ -8,3 +8,15 @@ l5:
   enabled: true          # L5 输出 DLP:false=关闭(只留 L4+L2)
   keys_on: true          # Layer A 密钥正则(零依赖):false=不扫密钥
   pii_on: true           # Layer B Presidio PII(需 pip install -e '.[dlp]'):false=不扫 PII
+executor:
+  enabled: true            # 总开关:false=强制 native(紧急回退现状)
+  backend: native          # native(现状)| sandbox(OpenSandbox 隔离)
+  sandbox:
+    server_port: 8000
+    image: cc-harness-runtime:local
+    timeout_s: 120
+    cpu: 2
+    memory_mb: 2048
+    egress_allow: [api.deepseek.com, api.siliconflow.cn, pypi.org, github.com]
+    vault: true            # Credential Vault(失败退化 strip_secrets)
+    fallback_on_error: native   # native(降级)| hard(报错,红队严格测)
