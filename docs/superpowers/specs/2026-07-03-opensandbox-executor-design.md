@@ -30,7 +30,23 @@ OpenSandbox(阿里 2026-03 开源,Apache 2.0)是 AI agent 专用沙箱 runtime:P
 
 ### 4.1 Executor 协议不变
 
-`cc_harness/executor.py` 的 `Executor` Protocol(`async run(args, cwd) -> ToolResult`)**一行不改**。新增 `SandboxExecutor(Executor)` 实现,内部调 OpenSandbox Python SDK。`policy.py` 的 ask 闸门完全不动——用户同意后执行后端从 NativeExecutor 换 SandboxExecutor。用哪个由 `policy.yaml: executor.backend` 配。
+`cc_harness/executor.py` 的 `Executor` Protocol(`async run(self, args, *, cwd: Path) -> ToolResult`)**一行不改**。新增 `SandboxExecutor(Executor)` 实现,内部调 OpenSandbox Python SDK。`policy.py` 的 ask 闸门完全不动——用户同意后执行后端从 NativeExecutor 换 SandboxExecutor。用哪个由 `policy.yaml: executor.backend` 配。
+
+### 4.1b 会话级 executor 接线(核心接入点)
+
+**现状(已核实代码)**:`tools.py:run_command`(L81-92)内联 `NativeExecutor(project_root=..., timeout_s=...).run(args, cwd)` **per-call 新建**(无状态);`agent.py`(L269/L289)调 `NATIVE_TOOLS[name]["handler"](args, cwd=str(project_root))`,**不持有 executor**。会话级 sandbox 复用需要一个地方持 SandboxExecutor 实例。
+
+**方案:`tools.py` 模块级 lazy 单例 + repl 生命周期钩子**(改动最小,符合现有"handler 是无状态函数"模式):
+
+- `cc_harness/tools.py`:
+  - 模块级 `_session_executor: Executor | None`
+  - `init_session_executor(config, project_root)`——repl 启动调,按 `config.backend` 经 `build_executor` 建 Native/Sandbox
+  - `get_session_executor()`——`run_command` 取;若未 init(非 repl 调用,如测试)lazy 兜底 NativeExecutor
+  - `async shutdown_session_executor()`——SandboxExecutor 时 kill sandbox + `shutdown_owned_server`
+  - `reset_session_executor()`——测试隔离清单例
+  - `run_command` 改:`await get_session_executor().run(args, cwd=Path(cwd))`(替换内联 `NativeExecutor(...)` 构造)
+- `cc_harness/repl.py`:启动调 `init_session_executor(config, project_root)`;REPL 退出调 `await shutdown_session_executor()`(接 atexit / main loop 结束)。
+- SandboxExecutor 构造时**不立即 create sandbox**——lazy create on 首次 `run`(会话级复用,后续 run 复用同一 sandbox)。
 
 ### 4.2 数据流
 
@@ -38,7 +54,7 @@ OpenSandbox(阿里 2026-03 开源,Apache 2.0)是 AI agent 专用沙箱 runtime:P
 agent.py: 收到 run_command("pytest")
   → policy.evaluate → ASK("执行 shell 命令需确认")
   → confirm_tool() → 用户 yes
-  → executor.run(args)        ← build_executor(config) 选:
+  → executor.run(args, cwd)   ← get_session_executor()(repl 启动 init,按 config 选 backend):
         ├─ native  → NativeExecutor(asyncio subprocess, 宿主机)[现有,降级用]
         └─ sandbox → SandboxExecutor
               │
@@ -68,7 +84,9 @@ agent.py: 收到 run_command("pytest")
 | `cc_harness/executor.py` | Executor 协议不动;加工厂 `build_executor(config)` 按 backend 选 Native/Sandbox | 改(小) |
 | `cc_harness/config.py` | `ExecutorConfig`(backend、镜像、server、超时、egress、vault、降级) | 改 |
 | `cc_harness/repl.py` | 会话结束钩子 → `sandbox.kill()` + `shutdown_owned_server` | 改(小) |
-| `cc_harness/agent.py` | executor 实例化点换 `build_executor(config)`(已接协议,几乎无改) | 改(几乎无) |
+| `cc_harness/tools.py` | **session executor 单例**(`init`/`get`/`shutdown`/`reset`)+ `run_command` 改用 `get_session_executor().run(...)` | 改 |
+| `cc_harness/agent.py` | **不动**(仍调 `NATIVE_TOOLS[name]["handler"](args, cwd)`,handler 内部走 session executor) | 改(无) |
+| `eval/promptfoo/wrappers/cc_harness.py` | 加 `confirm` 策略参数(deny/allow);allow 模式捕获沙箱执行结果喂判定 | 改 |
 | `cc_harness/prompts.py` | `tool_discipline`:教 agent 写文件用 fs 工具别用 shell 重定向(沙箱 RO 拒) | 改(小) |
 | `sandboxes/Dockerfile` | 轻量运行时镜像(`python:3.12-slim` + node + git + CLI) | 新 |
 | `policy.yaml.example` | `executor:` 段示例 + kill-switch | 改 |
@@ -124,6 +142,8 @@ wrapper 加 `confirm` 策略参数;promptfoo config 给执行类攻击配 `allow
 ### 6.4 defense_matrix 加 L8 沙箱层
 
 执行类攻击 ASR 单算到 **L8(沙箱隔离)**。区分 L4(agent 闸门 broke)vs L8(沙箱 hold/broke)——agent broke 但沙箱 hold = L4 漏 L8 兜住。
+
+> 编号说明:cc-harness 现有层是 L2/L4/L5(历史跳号,无 L1/L3/L6/L7 占位)。L8 沿用此风格。`classify_layer` 用字符串,编号本身不影响功能;若后续 M4(L6 监控)等定义导致冲突,实现时可重编号。
 
 ## 7. 错误处理 + 重试 + kill-switch
 
