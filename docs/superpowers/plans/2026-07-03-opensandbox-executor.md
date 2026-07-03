@@ -369,7 +369,7 @@ async def test_run_returns_stdout_as_toolresult(tmp_path):
         ex = SandboxExecutor(SandboxConfig(), project_root=tmp_path)
         result = await ex.run({"command": "echo hello"}, cwd=tmp_path)
     assert "hello" in result.llm_text
-    assert result.error is False
+    assert result.is_error is False    # ToolResult 字段是 is_error(非 error;error 是 classmethod 构造器)
 
 
 @pytest.mark.asyncio
@@ -387,7 +387,7 @@ async def test_run_nonzero_exit_returns_error_toolresult(tmp_path):
         SDK.create = AsyncMock(return_value=fake_sandbox)
         ex = SandboxExecutor(SandboxConfig(), project_root=tmp_path)
         result = await ex.run({"command": "bad-cmd"}, cwd=tmp_path)
-    assert result.error is True
+    assert result.is_error is True     # ToolResult 字段是 is_error
     assert "boom" in result.llm_text
 ```
 
@@ -1037,15 +1037,11 @@ async def test_repl_inits_and_shuts_down_executor(monkeypatch, tmp_path):
     from cc_harness import repl, tools
     monkeypatch.setattr(repl, "_read_user", lambda **kw: "exit")
     init_calls, shutdown_calls = [], []
+    async def fake_shutdown():
+        shutdown_calls.append(1)
     monkeypatch.setattr(tools, "init_session_executor",
                         lambda c, r: init_calls.append((c, r)))
-    monkeypatch.setattr(tools, "shutdown_session_executor",
-                        lambda: shutdown_calls.append(1))
-    # 使 shutdown 可 await:包一层 async
-    async def _aw():
-        pass
-    monkeypatch.setattr(tools, "shutdown_session_executor",
-                        lambda: shutdown_calls.append(1) or _aw())
+    monkeypatch.setattr(tools, "shutdown_session_executor", fake_shutdown)
     await repl.run_repl(...)
     assert init_calls, "repl 启动未调 init_session_executor"
     assert shutdown_calls, "repl 退出未调 shutdown_session_executor"
