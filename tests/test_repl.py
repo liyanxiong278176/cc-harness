@@ -264,10 +264,56 @@ async def test_repl_inits_and_shuts_down_executor(monkeypatch, tmp_path):
     await run_repl(_NoopLLM(), _NoopMCP(), cwd=str(tmp_path))
 
     assert init_calls, "repl 启动未调 init_session_executor"
-    # init 收到 (ExecutorConfig, project_root) 两参
-    assert len(init_calls[0]) == 2
-    assert init_calls[0][1] == str(tmp_path)
+    # init 收到 (ExecutorConfig, project_root) 两参——类型 + 值都钉死,
+    # 防 (None, cwd) 这类 arity 相同但 contract 走样的回归。
+    from cc_harness.config import ExecutorConfig
+    cfg, root = init_calls[0]
+    assert isinstance(cfg, ExecutorConfig), \
+        f"init 第一参应为 ExecutorConfig,实际 {type(cfg).__name__}"
+    assert root == str(tmp_path)
     assert shutdown_calls, "repl 退出未调 shutdown_session_executor"
+
+
+@pytest.mark.asyncio
+async def test_repl_shuts_down_executor_on_turn_exception(monkeypatch, tmp_path):
+    """run_turn 抛异常 → finally 仍调 shutdown(不泄漏 sandbox 容器)。
+
+    repl.py 的 run_turn 在 try/finally 的 try 块里被 await,异常不被 catch,
+    直接传播——但 finally 的 shutdown 必须先跑。pytest.raises 包住断言传播,
+    同时断言 shutdown_calls 非空(load-bearing:不依赖输出捕获)。
+    """
+    from cc_harness import repl as repl_mod
+    from cc_harness.repl import run_repl
+    from cc_harness.l2 import ScanResult
+
+    # _read_user 先给一个非 exit 输入(触发 run_turn);"exit" 兜底(异常传播后用不到)。
+    inputs = iter(["do something", "exit"])
+    monkeypatch.setattr(repl_mod, "_read_user", _fake_read_user(inputs))
+
+    shutdown_calls: list[int] = []
+
+    async def fake_shutdown():
+        shutdown_calls.append(1)
+
+    monkeypatch.setattr(repl_mod, "init_session_executor", lambda c, r: None)
+    monkeypatch.setattr(repl_mod, "shutdown_session_executor", fake_shutdown)
+
+    # scan 放行(避免依赖 env 里的 judge key;reason 非 judge_error 不走审计分支)
+    async def fake_scan(raw, *, l2_cfg, client, model):
+        return ScanResult(allowed=True, reason="heuristic_pass",
+                          wrapped_text=f"<user_input>{raw}</user_input>")
+    monkeypatch.setattr(repl_mod, "scan_user_input", fake_scan)
+
+    # repl 每轮 `from cc_harness.agent import run_turn` 重新绑定,
+    # 所以 patch cc_harness.agent.run_turn 模块属性(同 test_l2_block_* 的手法)。
+    async def boom(*a, **kw):
+        raise RuntimeError("turn blew up")
+    monkeypatch.setattr("cc_harness.agent.run_turn", boom)
+
+    with pytest.raises(RuntimeError, match="turn blew up"):
+        await run_repl(_NoopLLM(), _NoopMCP(), cwd=str(tmp_path))
+
+    assert shutdown_calls, "异常路径 finally 未调 shutdown_session_executor"
 
 
 # --- Disk change summary ---
