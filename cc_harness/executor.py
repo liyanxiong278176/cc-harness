@@ -79,3 +79,17 @@ class NativeExecutor:
                 llm=f"[Tool Error] exit {proc.returncode}\nstdout: {stdout}\nstderr: {stderr}",
             )
         return ToolResult.success(stdout if stdout else "(no output)")
+
+
+def build_executor(cfg, project_root: Path) -> Executor:
+    """按 ExecutorConfig 选 NativeExecutor / SandboxExecutor。
+
+    cfg.enabled=False 强制 native(紧急 kill-switch / 回退)。
+    SandboxExecutor 局部 import:避免模块加载即拉起 opensandbox SDK import 链
+    (无 [sandbox] extra 的环境也能 import executor.py)。
+    """
+    from cc_harness.config import ExecutorBackend
+    if not cfg.enabled or cfg.backend is ExecutorBackend.NATIVE:
+        return NativeExecutor(project_root=project_root)
+    from cc_harness.sandbox import SandboxExecutor
+    return SandboxExecutor(cfg.sandbox, project_root=project_root)

@@ -3,7 +3,8 @@ from pathlib import Path
 
 import pytest
 
-from cc_harness.executor import NativeExecutor, strip_secrets
+from cc_harness.config import ExecutorBackend, ExecutorConfig
+from cc_harness.executor import NativeExecutor, build_executor, strip_secrets
 
 
 def test_strip_secrets_removes_key_token_secret():
@@ -54,3 +55,24 @@ async def test_executor_env_has_no_api_key(tmp_path: Path, monkeypatch):
     env = ex._build_env()
     assert "OPENAI_API_KEY" not in env
     assert "MY_TOKEN" not in env
+
+
+def test_build_executor_native():
+    ex = build_executor(ExecutorConfig(backend=ExecutorBackend.NATIVE),
+                        project_root=Path("/tmp"))
+    assert isinstance(ex, NativeExecutor)
+
+
+def test_build_executor_sandbox():
+    """sandbox 后端构造 SandboxExecutor;构造不要求 opensandbox SDK(lazy create)。"""
+    from cc_harness.sandbox import SandboxExecutor
+    ex = build_executor(ExecutorConfig(backend=ExecutorBackend.SANDBOX),
+                        project_root=Path("/tmp"))
+    assert isinstance(ex, SandboxExecutor)
+
+
+def test_build_executor_disabled_forces_native():
+    """enabled=False → 即使 backend=sandbox 也强制 native(紧急回退 / kill-switch)。"""
+    ex = build_executor(ExecutorConfig(enabled=False, backend=ExecutorBackend.SANDBOX),
+                        project_root=Path("/tmp"))
+    assert isinstance(ex, NativeExecutor)
