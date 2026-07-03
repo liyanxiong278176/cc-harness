@@ -3,7 +3,8 @@ from pathlib import Path
 
 import pytest
 
-from cc_harness.config import AppConfig, MCPServerConfig, ConfigError, load_config
+from cc_harness.config import (AppConfig, MCPServerConfig, ConfigError, load_config,
+                                ExecutorConfig, ExecutorBackend, load_executor_config)
 
 
 def test_stdio_server_config():
@@ -175,3 +176,30 @@ def test_load_l5_config_missing_file_returns_defaults(tmp_path):
     from cc_harness.config import load_l5_config
     c = load_l5_config(tmp_path / "nope.yaml")
     assert c.keys_on is True and c.pii_on is True
+
+
+def test_executor_config_defaults_native():
+    cfg = ExecutorConfig()
+    assert cfg.enabled is True
+    assert cfg.backend is ExecutorBackend.NATIVE   # 缺省 native(降级安全)
+    assert cfg.sandbox.server_port == 8000
+
+
+def test_load_executor_config_reads_yaml(tmp_path):
+    p = tmp_path / "policy.yaml"
+    p.write_text(
+        "executor:\n  enabled: true\n  backend: sandbox\n"
+        "  sandbox:\n    server_port: 8000\n    image: cc-harness-runtime:local\n"
+        "    timeout_s: 120\n    egress_allow: [api.deepseek.com]\n",
+        encoding="utf-8",
+    )
+    cfg = load_executor_config(p)
+    assert cfg.backend is ExecutorBackend.SANDBOX
+    assert cfg.sandbox.server_port == 8000
+    assert cfg.sandbox.image == "cc-harness-runtime:local"
+    assert "api.deepseek.com" in cfg.sandbox.egress_allow
+
+
+def test_load_executor_config_missing_file_returns_default():
+    cfg = load_executor_config(Path("/nonexistent/policy.yaml"))
+    assert cfg.backend is ExecutorBackend.NATIVE   # 无文件 = native(现状)

@@ -1,5 +1,6 @@
 import json
 import os
+from enum import Enum
 from pathlib import Path
 from typing import Literal
 
@@ -119,3 +120,41 @@ def load_l5_config(path: Path) -> L5Config:
     import yaml
     raw = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
     return L5Config(**(raw.get("l5") or {}))
+
+
+class ExecutorBackend(str, Enum):
+    NATIVE = "native"
+    SANDBOX = "sandbox"
+
+
+class SandboxConfig(BaseModel):
+    """沙箱执行器配置(policy.yaml 的 executor.sandbox 段)。"""
+    server_port: int = 8000
+    image: str = "cc-harness-runtime:local"
+    timeout_s: int = 120          # 沙箱命令超时(比 native 30s 长,含容器开销)
+    cpu: int = 2
+    memory_mb: int = 2048
+    egress_allow: list[str] = ["api.deepseek.com", "api.siliconflow.cn",
+                               "pypi.org", "github.com"]
+    vault: bool = True            # Credential Vault(失败退化 strip_secrets)
+    fallback_on_error: str = "native"   # native(降级) | hard(报错)
+
+    model_config = {"extra": "ignore"}
+
+
+class ExecutorConfig(BaseModel):
+    """执行后端配置。缺省 native(现状);sandbox 启用 OpenSandbox。"""
+    enabled: bool = True          # 总开关:false = 强制 native(紧急回退)
+    backend: ExecutorBackend = ExecutorBackend.NATIVE
+    sandbox: SandboxConfig = SandboxConfig()
+
+    model_config = {"extra": "ignore"}
+
+
+def load_executor_config(path: Path) -> ExecutorConfig:
+    """读 policy.yaml 的 `executor:` 段;文件/段缺失→默认(native)。"""
+    if not path.exists():
+        return ExecutorConfig()
+    import yaml
+    raw = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
+    return ExecutorConfig(**(raw.get("executor") or {}))
