@@ -39,11 +39,11 @@ except ImportError:
 
 
 class SandboxUnavailableError(RuntimeError):
-    """沙箱层连败 3 次,调用方(tools.py:get_session_executor)应降级 NativeExecutor。"""
+    """沙箱层连败 3 次;调用方(run_command 包装处)应降级 NativeExecutor。"""
 
 
 async def _with_retry(coro_factory, attempts: int = 3):
-    """指数退避 1s/2s/4s。返回 coro 结果;全败抛 SandboxUnavailableError(包 last)。
+    """指数退避:第 1、2 次重试前睡 1s、2s(第 3 次是最后尝试不睡)。返回 coro 结果;全败抛 SandboxUnavailableError(包 last)。
 
     - coro_factory:零参返回新协程的 callable(每次重试重建协程,避免
       "coroutine was never awaited" / 不能 reuse)。

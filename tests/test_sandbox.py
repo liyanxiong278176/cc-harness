@@ -107,5 +107,30 @@ async def test_run_falls_back_after_3_failures(tmp_path, monkeypatch):
     with patch("cc_harness.sandbox.Sandbox") as SDK:
         SDK.create = AsyncMock(side_effect=ConnectionError("down"))
         ex = SandboxExecutor(SandboxConfig(), project_root=tmp_path)
-        with pytest.raises(SandboxUnavailableError):
+        with pytest.raises(SandboxUnavailableError) as excinfo:
             await ex.run({"command": "echo"}, cwd=tmp_path)
+    assert isinstance(excinfo.value.__cause__, ConnectionError)
+
+
+@pytest.mark.asyncio
+async def test_run_retries_commands_run_then_succeeds(tmp_path, monkeypatch):
+    """commands.run 通信错也重试(第二个 retry 调用点)。"""
+    monkeypatch.setattr("cc_harness.sandbox.asyncio.sleep", AsyncMock())
+    from cc_harness.sandbox import SandboxExecutor
+    from cc_harness.config import SandboxConfig
+    fake_exec = MagicMock(exit_code=0, logs=MagicMock(stdout=[MagicMock(text="ok2")], stderr=[]))
+    fake_sandbox = MagicMock()
+    fake_sandbox.kill = AsyncMock()
+    calls = {"n": 0}
+    async def flaky_run(cmd):
+        calls["n"] += 1
+        if calls["n"] < 3:
+            raise ConnectionError("transient run")
+        return fake_exec
+    fake_sandbox.commands.run = flaky_run
+    with patch("cc_harness.sandbox.Sandbox") as SDK:
+        SDK.create = AsyncMock(return_value=fake_sandbox)
+        ex = SandboxExecutor(SandboxConfig(), project_root=tmp_path)
+        result = await ex.run({"command": "echo ok2"}, cwd=tmp_path)
+    assert calls["n"] == 3
+    assert "ok2" in result.llm_text
