@@ -71,7 +71,9 @@ def _audit_fallback(project_root: Path, reason: str, retries: int = 3) -> None:
     若审计抛 OSError 会 mask 真实的 SandboxUnavailableError)。沿用 audit.py 模式。
     """
     entry = {
-        "ts": time.time(),
+        # ISO 字符串匹配 audit.py(<root>/logs/*.jsonl 消费方格式统一),
+        # 而非 epoch float。
+        "ts": time.strftime("%Y-%m-%dT%H:%M:%S"),
         "action": "fallback_after_retry",
         "reason": reason,
         "retries": retries,

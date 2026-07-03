@@ -191,3 +191,33 @@ async def test_fallback_audited(tmp_path, monkeypatch):
         with pytest.raises(SandboxUnavailableError):
             await ex.run({"command": "x"}, cwd=tmp_path)
     assert logged and logged[0]["retries"] == 3
+
+
+@pytest.mark.asyncio
+async def test_kill_clears_sandbox_even_if_kill_raises(tmp_path):
+    """kill() 抛异常也清空 _sandbox(下次 run 重建)。"""
+    from cc_harness.sandbox import SandboxExecutor
+    from cc_harness.config import SandboxConfig
+    fake_exec = MagicMock(exit_code=0, logs=MagicMock(stdout=[MagicMock(text="")], stderr=[]))
+    fake_sandbox = MagicMock()
+    fake_sandbox.commands.run = AsyncMock(return_value=fake_exec)
+    fake_sandbox.kill = AsyncMock(side_effect=RuntimeError("kill boom"))
+    with patch("cc_harness.sandbox.Sandbox") as SDK:
+        SDK.create = AsyncMock(return_value=fake_sandbox)
+        ex = SandboxExecutor(SandboxConfig(), project_root=tmp_path)
+        await ex.run({"command": "x"}, cwd=tmp_path)
+        await ex.kill()   # 不抛(kill 异常被吞)
+    assert ex._sandbox is None
+
+
+def test_audit_fallback_writes_jsonl(tmp_path):
+    """_audit_fallback 真写入 logs/sandbox.jsonl(不 monkeypatch)。"""
+    import json
+    from cc_harness.sandbox import _audit_fallback
+    _audit_fallback(project_root=tmp_path, reason="conn down", retries=3)
+    log = (tmp_path / "logs" / "sandbox.jsonl").read_text(encoding="utf-8").strip()
+    rec = json.loads(log)
+    assert rec["action"] == "fallback_after_retry"
+    assert rec["reason"] == "conn down"
+    assert rec["retries"] == 3
+    assert "ts" in rec
