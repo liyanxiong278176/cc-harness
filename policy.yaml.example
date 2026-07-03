@@ -20,3 +20,5 @@ executor:
     egress_allow: [api.deepseek.com, api.siliconflow.cn, pypi.org, github.com]
     vault: true            # Credential Vault(失败退化 strip_secrets)
     fallback_on_error: native   # native(降级)| hard(报错,红队严格测)
+            # ⚠️ hard 模式(报错不降级)Plan 2 红队适配时实现;当前仅 native 降级生效
+            # (tools.run_command 无条件 catch SandboxUnavailableError → 降级,不读本字段)。

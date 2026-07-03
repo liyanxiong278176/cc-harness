@@ -2,6 +2,22 @@ import pytest
 from unittest.mock import AsyncMock, MagicMock, patch
 
 
+@pytest.fixture(autouse=True)
+def _mock_ensure_server(monkeypatch):
+    """Gap 1:_ensure_sandbox 现调 ensure_server;默认 mock 成 ServerState(owned=False)
+    让现有测试不依赖真 Docker(_docker_available 在 CI/本机通常 False → ensure_server 返 None → 降级)。
+    个别测试要验 ensure_server 行为时本地 monkeypatch.setattr 覆盖(后 applied 者生效)。"""
+    from cc_harness.sandbox_server import ServerState
+
+    async def _fake_ensure(port, host="localhost", **kw):
+        return ServerState(owned=False)
+
+    # patch 懒 import 的目标:_ensure_sandbox 内 `from cc_harness.sandbox_server import ensure_server`
+    # 在 CALL 时执行,读取的是 sandbox_server 模块的当前 ensure_server 属性 → monkeypatch 模块属性即生效。
+    import cc_harness.sandbox_server as ss
+    monkeypatch.setattr(ss, "ensure_server", _fake_ensure)
+
+
 @pytest.mark.asyncio
 async def test_run_returns_stdout_as_toolresult(tmp_path):
     """commands.run 返回的 stdout → ToolResult.success。"""
@@ -221,3 +237,61 @@ def test_audit_fallback_writes_jsonl(tmp_path):
     assert rec["reason"] == "conn down"
     assert rec["retries"] == 3
     assert "ts" in rec
+
+
+# ---------------------------------------------------------------------------
+# Gap 1 接线测试:_ensure_sandbox 必须先调 ensure_server,再 Sandbox.create。
+# autouse _mock_ensure_server 默认返 ServerState(owned=False);下面两测各自覆盖。
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_ensure_sandbox_calls_ensure_server(tmp_path, monkeypatch):
+    """_ensure_sandbox 先调 ensure_server,且传 SandboxConfig.server_port(默认 8000)。"""
+    from cc_harness import sandbox_server as ss
+    from cc_harness.sandbox_server import ServerState
+
+    called = {"port": None}
+
+    async def spy(port, host="localhost", **kw):
+        called["port"] = port
+        return ServerState(owned=False)
+
+    # 覆盖 autouse fixture 的 _fake_ensure(后 setattr 者生效)。
+    monkeypatch.setattr(ss, "ensure_server", spy)
+
+    from cc_harness.sandbox import SandboxExecutor
+    from cc_harness.config import SandboxConfig
+
+    fake_sandbox = MagicMock(
+        kill=AsyncMock(),
+        commands=MagicMock(run=AsyncMock(return_value=MagicMock(
+            exit_code=0, logs=MagicMock(stdout=[MagicMock(text="ok")], stderr=[])))),
+    )
+    with patch("cc_harness.sandbox.Sandbox") as SDK:
+        SDK.create = AsyncMock(return_value=fake_sandbox)
+        ex = SandboxExecutor(SandboxConfig(), project_root=tmp_path)
+        await ex.run({"command": "echo ok"}, cwd=tmp_path)
+    assert called["port"] == 8000   # SandboxConfig.server_port 默认
+
+
+@pytest.mark.asyncio
+async def test_ensure_server_unavailable_raises(tmp_path, monkeypatch):
+    """ensure_server 返 None(Docker 没装/server 起不来)→ SandboxUnavailableError;
+    且 Sandbox.create 不该被调(ensure_server 先返 None 短路)。"""
+    from cc_harness import sandbox_server as ss
+
+    async def no_server(port, host="localhost", **kw):
+        return None
+
+    monkeypatch.setattr(ss, "ensure_server", no_server)
+
+    from cc_harness.sandbox import SandboxExecutor, SandboxUnavailableError
+    from cc_harness.config import SandboxConfig
+
+    with patch("cc_harness.sandbox.Sandbox") as SDK:
+        SDK.create = AsyncMock()   # 不该被调(ensure_server 先返 None)
+        ex = SandboxExecutor(SandboxConfig(), project_root=tmp_path)
+        with pytest.raises(SandboxUnavailableError):
+            await ex.run({"command": "echo"}, cwd=tmp_path)
+        SDK.create.assert_not_called()   # ensure_server None 时不该 create

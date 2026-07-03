@@ -98,8 +98,22 @@ class SandboxExecutor:
             return self._sandbox
         if Sandbox is None:
             raise RuntimeError("opensandbox SDK 未装(pip install -e '.[sandbox]')")
+        # Gap 1 修复:确保 opensandbox-server 在跑(复用 external / 自动起 owned / 无 Docker 返 None)。
+        # ensure_server 内部已轮询 ready_timeout 等 server 起,故放 _with_retry 外(不重试 server lifecycle);
+        # 仅 Sandbox.create 通信步进 _with_retry。state None → SandboxUnavailableError 触发既有降级链。
+        # 懒 import(patch 目标 = cc_harness.sandbox_server.ensure_server 属性,单测 monkeypatch 该模块属性即可生效)。
+        from cc_harness.sandbox_server import ensure_server
+        state = await ensure_server(port=self.cfg.server_port, host="localhost")
+        if state is None:
+            # Docker 没装/server 起不来 → 直接走降级(run() 的 except SandboxUnavailableError 接住)。
+            raise SandboxUnavailableError(
+                "opensandbox-server 不可用(Docker 未装/未运行,或 server 起不来)")
+        # ⚠️ Gap 2(deferred):下面 Sandbox.create kwargs 是 placeholder,真 SDK 签名是
+        # (image, connection_config=, resource=, network_policy=, credential_proxy=, ...),
+        # 不支持 mounts=/workdir= 且缺必需 connection_config=。真集成需按 Task 12 WebSearch
+        # 发现锁定(加 ConnectionConfig 字段 + 文件共享改 sandbox.files.write_files / server PVC)。
+        # 当前单测 mock Sandbox.create,不触发真 TypeError。mounts/workdir/env/timeout 语义注释保留如下。
         # 项目根 RO mount:fs 工具改动实时反映(读一致);workdir 写隔离(销毁即清)。
-        # 具体 Mount API 在 Task 12 按 SDK 实际签名锁定。
         # _with_retry 内含 1s/2s/4s 重试,全败抛 SandboxUnavailableError(让调用方降级)。
         self._sandbox = await _with_retry(lambda: Sandbox.create(
             self.cfg.image,
