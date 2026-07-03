@@ -124,7 +124,7 @@ class SandboxExecutor:
         # 仅 Sandbox.create 通信步进 _with_retry。state None → SandboxUnavailableError 触发既有降级链。
         # 懒 import(patch 目标 = cc_harness.sandbox_server.ensure_server 属性,单测 monkeypatch 该模块属性即可生效)。
         from cc_harness.sandbox_server import ensure_server
-        state = await ensure_server(port=self.cfg.server_port, host="localhost")
+        state = await ensure_server(host=self.cfg.server_host, port=self.cfg.server_port)
         if state is None:
             # Docker 没装/server 起不来 → 直接走降级(run() 的 except SandboxUnavailableError 接住)。
             raise SandboxUnavailableError(
@@ -137,7 +137,7 @@ class SandboxExecutor:
         # reserved(SandboxConfig 死字段,见下方 TODO,SDK 增强时接)。
         # _with_retry 内含 1s/2s/4s 重试,全败抛 SandboxUnavailableError(让调用方降级)。
         # 项目根 RO mount:fs 工具改动实时反映(读一致)。
-        cc = (ConnectionConfig(domain=f"localhost:{self.cfg.server_port}")
+        cc = (ConnectionConfig(domain=f"{self.cfg.server_host}:{self.cfg.server_port}")
               if ConnectionConfig is not None else None)
         self._sandbox = await _with_retry(lambda: Sandbox.create(
             self.cfg.image,

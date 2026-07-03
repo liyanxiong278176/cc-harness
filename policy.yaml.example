@@ -12,6 +12,7 @@ executor:
   enabled: true            # 总开关:false=强制 native(紧急回退现状)
   backend: native          # native(现状)| sandbox(OpenSandbox 隔离)
   sandbox:
+    server_host: 127.0.0.1   # 用 127.0.0.1 非 localhost(Windows localhost→IPv6 ::1 连不上)
     server_port: 8000
     image: cc-harness-runtime:local
     timeout_s: 120

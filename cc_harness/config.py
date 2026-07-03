@@ -133,9 +133,10 @@ class SandboxConfig(BaseModel):
     RESERVED(deferred — SDK 锁定时消费):cpu / memory_mb / egress_allow / vault 四字段
     解析但暂未传入 Sandbox.create。真 SDK kwargs 是 resource= / network_policy= /
     credential_proxy=(Task 12 WebSearch 发现锁定);当前 _ensure_sandbox 的 create kwargs
-    仍是 placeholder(mounts=/workdir=)。server_port 已在 Gap 1 后生效(经 ensure_server)。
-    timeout_s 是唯一当前消费的字段。
+    仍是 placeholder(mounts=/workdir=)。server_host / server_port 已在 Gap 1 后生效(经
+    ensure_server + ConnectionConfig domain)。timeout_s 同样已消费。
     """
+    server_host: str = "127.0.0.1"   # 用 127.0.0.1 非 localhost(Windows IPv6 ::1 连不上绑 127.0.0.1 的 server)
     server_port: int = 8000
     image: str = "cc-harness-runtime:local"
     timeout_s: int = 120          # 沙箱命令超时(比 native 30s 长,含容器开销)
