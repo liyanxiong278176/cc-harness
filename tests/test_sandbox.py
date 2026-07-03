@@ -134,3 +134,25 @@ async def test_run_retries_commands_run_then_succeeds(tmp_path, monkeypatch):
         result = await ex.run({"command": "echo ok2"}, cwd=tmp_path)
     assert calls["n"] == 3
     assert "ok2" in result.llm_text
+
+
+@pytest.mark.asyncio
+async def test_env_stripped_no_secrets(tmp_path):
+    """沙箱 env 不含 KEY/TOKEN/SECRET(Vault 未接时 strip_secrets 兜底)。"""
+    import os
+    from cc_harness.sandbox import SandboxExecutor
+    from cc_harness.config import SandboxConfig
+    captured = {}
+    async def fake_create(*a, **kw):
+        captured.update(kw)
+        return MagicMock(kill=AsyncMock(),
+                         commands=MagicMock(run=AsyncMock(return_value=MagicMock(
+                             exit_code=0, logs=MagicMock(stdout=[MagicMock(text="")], stderr=[])))))
+    with patch.dict(os.environ, {"OPENAI_API_KEY": "sk-leak", "PATH": "/x"}):
+        with patch("cc_harness.sandbox.Sandbox") as SDK:
+            SDK.create = fake_create
+            ex = SandboxExecutor(SandboxConfig(), project_root=tmp_path)
+            await ex.run({"command": "env"}, cwd=tmp_path)
+    env = captured.get("env", {})
+    assert "OPENAI_API_KEY" not in env, "密钥泄露进沙箱 env"
+    assert "PATH" in env
