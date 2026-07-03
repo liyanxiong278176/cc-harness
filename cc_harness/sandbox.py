@@ -19,6 +19,20 @@ try:
 except ImportError:
     Sandbox = None
 
+# Mount 配置对象(真实 SDK 路径 / fallback)。具体 API 在 Task 12 按 SDK 实际签名锁定。
+try:
+    from opensandbox.models import Mount   # 真实 SDK 路径(Task 12 锁定)
+except ImportError:
+    class Mount:                            # fallback:无 SDK extra 时单元测试 / 模块加载用
+        def __init__(self, source: str, target: str, read_only: bool = False) -> None:
+            self.source, self.target, self.read_only = source, target, read_only
+
+        def __repr__(self) -> str:
+            # source 用原值嵌入(不用 !r):Windows 路径分隔符 \ 被 !r 转义成 \\,
+            # 会让 `str(path) in str(mount)` 这类断言在 Windows 上假阴。
+            return (f"Mount(source={self.source}, target={self.target!r}, "
+                    f"read_only={self.read_only})")
+
 
 class SandboxExecutor:
     def __init__(self, cfg: SandboxConfig, project_root: Path) -> None:
@@ -31,14 +45,21 @@ class SandboxExecutor:
             return self._sandbox
         if Sandbox is None:
             raise RuntimeError("opensandbox SDK 未装(pip install -e '.[sandbox]')")
+        # 项目根 RO mount:fs 工具改动实时反映(读一致);workdir 写隔离(销毁即清)。
+        # 具体 Mount API 在 Task 12 按 SDK 实际签名锁定。
         self._sandbox = await Sandbox.create(
             self.cfg.image,
+            mounts=[
+                Mount(source=str(self.project_root), target="/workspace", read_only=True),
+            ],
+            workdir="/tmp/work",
             env=strip_secrets(dict(os.environ)),
             timeout=timedelta(seconds=self.cfg.timeout_s),
         )
         return self._sandbox
 
     async def run(self, args: dict, *, cwd: Path) -> ToolResult:
+        # cwd 接受仅为协议对齐;实际工作目录由 mount/project_root + workdir 决定(Task 12 完整接线)。
         command = args.get("command", "")
         if not isinstance(command, str) or not command.strip():
             return ToolResult.error(
