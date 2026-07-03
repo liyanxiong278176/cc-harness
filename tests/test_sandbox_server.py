@@ -2,6 +2,13 @@ import pytest
 from unittest.mock import patch, AsyncMock, MagicMock
 
 
+@pytest.fixture(autouse=True)
+def _reset_owned_proc():
+    yield
+    from cc_harness import sandbox_server as ss
+    ss._OWNED_PROC[0] = None
+
+
 @pytest.mark.asyncio
 async def test_ping_returns_true_when_port_open():
     from cc_harness.sandbox_server import ping
@@ -54,3 +61,16 @@ async def test_ensure_server_fallback_when_no_docker(monkeypatch):
     monkeypatch.setattr(ss, "_docker_available", MagicMock(return_value=False))
     state = await ss.ensure_server(port=8000)
     assert state is None
+
+
+@pytest.mark.asyncio
+async def test_ensure_server_times_out_and_kills(monkeypatch):
+    """fork 后轮询超时 → kill proc + 返 None(第四分支)。"""
+    from cc_harness import sandbox_server as ss
+    monkeypatch.setattr(ss, "ping", AsyncMock(side_effect=lambda *a, **kw: False))
+    monkeypatch.setattr(ss, "_docker_available", MagicMock(return_value=True))
+    fake_proc = MagicMock()
+    monkeypatch.setattr(ss, "_fork_server", AsyncMock(return_value=fake_proc))
+    state = await ss.ensure_server(port=8000, ready_timeout=0.01)
+    assert state is None
+    fake_proc.kill.assert_called()   # _kill_proc_tree 走 fallback 调 proc.kill()

@@ -1,12 +1,13 @@
 """opensandbox-server lifecycle:ping / auto-start(setsid 子进程)/ shutdown_owned。
 
 混合策略:先 ping,port 占用就复用(external,退出不 kill);否则检测 Docker,
-可用就 fork `uvx opensandbox-server`,轮询等 ready,标记 owned(退出 kill)。
-Docker 不可用 / 起不来 → 返回 None(调用方降级 NativeExecutor)。
+可用就 fork opensandbox-server 子进程(具体命令 Task 12 集成时按实际包入口锁定),
+轮询等 ready,标记 owned(退出 kill)。Docker 不可用 / 起不来 → 返回 None(调用方降级 NativeExecutor)。
 """
 from __future__ import annotations
 import asyncio
 import os
+import signal
 import subprocess
 import sys
 from dataclasses import dataclass
@@ -46,7 +47,32 @@ def _docker_available() -> bool:
         return False
 
 
-def _fork_server(port: int) -> asyncio.subprocess.Process:
+def _kill_proc_tree(proc) -> None:
+    """整组 kill 子进程(Unix killpg / Windows taskkill /T),任一失败 fallback proc.kill()。
+
+    opensandbox-server 会 spawn Docker 容器,只 kill 直连子进程会孤儿化容器——
+    这正是本模块要防的泄漏。MagicMock 般假 pid / taskkill 非零返回 → fallback proc.kill(),
+    保证可测。start_new_session=True 在 Windows 是 no-op,故 Windows 必须走 taskkill /T 树删。
+    """
+    try:
+        if sys.platform != "win32":
+            os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+        else:
+            r = subprocess.run(
+                ["taskkill", "/T", "/F", "/PID", str(proc.pid)],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+            if r.returncode != 0:
+                raise RuntimeError(f"taskkill exited {r.returncode}")
+    except Exception:
+        try:
+            proc.kill()
+        except Exception:
+            pass
+
+
+async def _fork_server(port: int):
     """fork opensandbox-server 子进程(新会话组,cross-platform start_new_session)。"""
     toml = os.path.expanduser("~/.sandbox.toml")
     if not os.path.exists(toml):
@@ -60,7 +86,7 @@ def _fork_server(port: int) -> asyncio.subprocess.Process:
             )
         except Exception:
             pass
-    return asyncio.create_subprocess_exec(  # type: ignore[return-value]
+    return await asyncio.create_subprocess_exec(
         sys.executable, "-m", "opensandbox_server",
         "--port", str(port),
         stdout=asyncio.subprocess.DEVNULL,
@@ -81,13 +107,12 @@ async def ensure_server(port: int, host: str = "localhost",
     deadline = loop.time() + ready_timeout
     while loop.time() < deadline:
         if await ping(host, port):
+            if _OWNED_PROC[0] is not None:
+                _kill_proc_tree(_OWNED_PROC[0])
             _OWNED_PROC[0] = proc
             return ServerState(owned=True)
         await asyncio.sleep(0.5)
-    try:
-        proc.kill()
-    except Exception:
-        pass
+    _kill_proc_tree(proc)
     return None
 
 
@@ -96,8 +121,8 @@ async def shutdown_owned() -> None:
     proc = _OWNED_PROC[0]
     if proc is None:
         return
+    _kill_proc_tree(proc)
     try:
-        proc.kill()
         await asyncio.wait_for(proc.wait(), timeout=5)
     except Exception:
         pass
