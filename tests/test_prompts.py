@@ -289,3 +289,11 @@ def test_dangerous_ops_forbids_workaround_is_coding_only():
     for m in ("plan", "design"):
         assert "绝不主动建议绕道方案" not in build_system_prompt("/x", mode=m), \
             f"mode={m} 不应含 dangerous_ops"
+
+
+def test_tool_discipline_warns_shell_redirect_in_sandbox():
+    """sandbox 模式 prompt 教 agent:写文件用 fs 工具,别用 shell 重定向(RO 拒)。"""
+    from cc_harness.prompts import build_system_prompt
+    out = build_system_prompt("/x", mode="coding")
+    assert "写文件用文件工具" in out or "别用 shell 重定向" in out, \
+        "缺沙箱模式写文件指导"

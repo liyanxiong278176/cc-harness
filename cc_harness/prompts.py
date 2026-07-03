@@ -101,7 +101,10 @@ SECTION_POOL: dict[str, Section] = {
             "并说明需要什么类型的工具(例如 shell、http fetch 等)。"
             "**不要用无关的工具去乱试**(比如没有 shell 工具就不要 list_directory / read_file 来\"猜\"用户的意图),"
             "**不要建议用户手动执行任何被权限层拒绝或当前不可用的操作**(shell 命令、文件读取、网络请求等),被拒就是被拒,如实说明,不提供手动绕道路径,**不要编造看似合理的答案**(包括编造\"调用了几次\"的数字)。"
-            "没有工具能做就是不能做,如实说。"
+            "没有工具能做就是不能做,如实说。\n"
+            "4. **沙箱执行模式下写文件**:写文件务必用文件类工具(read_file/write_file/edit_file),"
+            "别用 shell 重定向(echo > / cat <<EOF / tee)——命令在沙箱里,项目目录 "
+            "read-only mount 会拒绝 shell 写;只有文件类工具能改项目文件。"
         ),
         priority=23,
         conditions=("mode==coding",),
