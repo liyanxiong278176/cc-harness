@@ -19,25 +19,46 @@ from cc_harness.config import SandboxConfig
 from cc_harness.executor import strip_secrets
 from cc_harness.mcp_client import ToolResult
 
-# OpenSandbox SDK(lazy import:无 [sandbox] extra 时模块加载不崩,调用时报错)
+# OpenSandbox SDK(lazy import:无 [sandbox] extra 时模块加载不崩,调用时报错)。
+# 真 SDK 签名锁定(opensandbox 0.1.13,inspect.signature 核实,非 WebSearch):
+#   - Volume(*, name, host=Host|None, pvc=..., ossfs=..., mountPath, readOnly=False, subPath=None)
+#     kwargs 是 camelCase、keyword-only;属性存成 snake_case(mount_path / read_only)。
+#   - Host(*, path: str)
+#   - ConnectionConfig(*, api_key=None, domain=None, protocol='http', ...)
+# fallback stub 镜像真签名(camelCase kwargs + snake_case 属性),让 CI 无 [sandbox] extra
+# 时模块加载 + 单元测试(仅 mock Sandbox.create,Volume/Host 仍走 stub)不崩。
 try:
     from opensandbox import Sandbox
-except ImportError:
+    from opensandbox.models.sandboxes import Volume, Host
+    from opensandbox.config.connection import ConnectionConfig
+    _HAS_SANDBOX_SDK = True
+except ImportError:  # 无 [sandbox] extra(CI / 基础安装)
     Sandbox = None
+    _HAS_SANDBOX_SDK = False
+    ConnectionConfig = None
 
-# Mount 配置对象(真实 SDK 路径 / fallback)。具体 API 在 Task 12 按 SDK 实际签名锁定。
-try:
-    from opensandbox.models import Mount   # 真实 SDK 路径(Task 12 锁定)
-except ImportError:
-    class Mount:                            # fallback:无 SDK extra 时单元测试 / 模块加载用
-        def __init__(self, source: str, target: str, read_only: bool = False) -> None:
-            self.source, self.target, self.read_only = source, target, read_only
+    class Host:
+        def __init__(self, *, path: str) -> None:
+            self.path = path
 
         def __repr__(self) -> str:
-            # source 用原值嵌入(不用 !r):Windows 路径分隔符 \ 被 !r 转义成 \\,
-            # 会让 `str(path) in str(mount)` 这类断言在 Windows 上假阴。
-            return (f"Mount(source={self.source}, target={self.target!r}, "
-                    f"read_only={self.read_only})")
+            # path 用原值嵌入(不用 !r):Windows 路径分隔符 \ 被 !r 转义成 \\,
+            # 会让 `str(path) in str(host)` 这类断言在 Windows 上假阴。
+            return f"Host(path={self.path})"
+
+    class Volume:
+        # 镜像真 SDK:camelCase kwargs、snake_case 属性(repr 与真类一致,
+        # 真类 repr 也含 host=Host(path=<原值>) → substring 断言两端都成立)。
+        def __init__(self, *, name: str, host: "Host | None" = None,
+                     mountPath: str, readOnly: bool = False) -> None:
+            self.name = name
+            self.host = host
+            self.mount_path = mountPath      # 真类属性也是 snake_case
+            self.read_only = readOnly
+
+        def __repr__(self) -> str:
+            return (f"Volume(name={self.name}, host={self.host}, "
+                    f"mount_path={self.mount_path}, read_only={self.read_only})")
 
 
 class SandboxUnavailableError(RuntimeError):
@@ -108,21 +129,30 @@ class SandboxExecutor:
             # Docker 没装/server 起不来 → 直接走降级(run() 的 except SandboxUnavailableError 接住)。
             raise SandboxUnavailableError(
                 "opensandbox-server 不可用(Docker 未装/未运行,或 server 起不来)")
-        # ⚠️ Gap 2(deferred):下面 Sandbox.create kwargs 是 placeholder,真 SDK 签名是
-        # (image, connection_config=, resource=, network_policy=, credential_proxy=, ...),
-        # 不支持 mounts=/workdir= 且缺必需 connection_config=。真集成需按 Task 12 WebSearch
-        # 发现锁定(加 ConnectionConfig 字段 + 文件共享改 sandbox.files.write_files / server PVC)。
-        # 当前单测 mock Sandbox.create,不触发真 TypeError。mounts/workdir/env/timeout 语义注释保留如下。
-        # 项目根 RO mount:fs 工具改动实时反映(读一致);workdir 写隔离(销毁即清)。
+        # Gap 2:kwargs 已锁真 SDK(opensandbox 0.1.13,inspect.signature 核实):
+        #   volumes=[Volume(name, host=Host(path), mountPath, readOnly)] 替代 mounts=/Mount
+        #   (真 SDK 无 Mount 类、无 mounts= 参数);connection_config=ConnectionConfig(domain=...)
+        #   指向 opensandbox-server;真 SDK 无 workdir= 参数(已删,工作目录由 mount 决定)。
+        # image / env / timeout 与真签名一致,保留。resource / network_policy / credential_proxy
+        # reserved(SandboxConfig 死字段,见下方 TODO,SDK 增强时接)。
         # _with_retry 内含 1s/2s/4s 重试,全败抛 SandboxUnavailableError(让调用方降级)。
+        # 项目根 RO mount:fs 工具改动实时反映(读一致)。
+        cc = (ConnectionConfig(domain=f"localhost:{self.cfg.server_port}")
+              if ConnectionConfig is not None else None)
         self._sandbox = await _with_retry(lambda: Sandbox.create(
             self.cfg.image,
-            mounts=[
-                Mount(source=str(self.project_root), target="/workspace", read_only=True),
+            volumes=[
+                Volume(name="workspace",
+                       host=Host(path=str(self.project_root)),
+                       mountPath="/workspace",
+                       readOnly=True),
             ],
-            workdir="/tmp/work",
             env=strip_secrets(dict(os.environ)),
             timeout=timedelta(seconds=self.cfg.timeout_s),
+            connection_config=cc,
+            # TODO(Gap 2 增强):resource={"cpu": str(self.cfg.cpu), "memory": f"{self.cfg.memory_mb}Mi"},
+            #                    network_policy=<NetworkPolicy from egress_allow>,
+            #                    credential_proxy=<Vault>
         ))
         return self._sandbox
 

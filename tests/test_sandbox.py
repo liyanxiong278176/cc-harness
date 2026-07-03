@@ -60,8 +60,8 @@ async def test_run_nonzero_exit_returns_error_toolresult(tmp_path):
 
 @pytest.mark.asyncio
 async def test_ensure_sandbox_passes_mount(tmp_path, monkeypatch):
-    """Sandbox.create 收到项目根 RO mount + /tmp/work workdir。"""
-    from cc_harness.sandbox import SandboxExecutor
+    """Sandbox.create 收到项目根 RO volume mount(volumes=,真 SDK 签名)。"""
+    from cc_harness.sandbox import SandboxExecutor, _HAS_SANDBOX_SDK
     from cc_harness.config import SandboxConfig
     # Task-4 forward-fix:commands.run 必须是 AsyncMock,否则 await MagicMock
     # 抛 TypeError → 走 _with_retry(3 次 + sleeps)→ 测试变慢且验证错路径。
@@ -82,9 +82,19 @@ async def test_ensure_sandbox_passes_mount(tmp_path, monkeypatch):
         SDK.create = fake_create
         ex = SandboxExecutor(SandboxConfig(), project_root=tmp_path)
         await ex.run({"command": "ls"}, cwd=tmp_path)
-    mounts = captured.get("mounts") or []
-    assert any(str(tmp_path) in str(m) for m in mounts), "缺项目根 mount"
-    assert captured.get("workdir") == "/tmp/work", "workdir 未设为 /tmp/work"
+    # Gap 2:真 SDK 用 volumes=[Volume(host=Host(path=...))](非 mounts=/Mount)。
+    # 注:真 Volume 是 pydantic BaseModel,其 __str__ 会把 Windows 路径分隔符 \ 转义成 \\,
+    # 故 `str(tmp_path) in str(v)` 在 Windows 假阴;改断结构化字段 v.host.path(原值未转义)。
+    # 真 SDK:v.host 是 Host 对象、v.host.path 是原字符串;CI stub 同理(属性同名)。
+    volumes = captured.get("volumes") or []
+    assert volumes, "缺 volumes= 参数"
+    assert any(getattr(v, "host", None) and str(tmp_path) in str(v.host.path)
+               for v in volumes), "缺项目根 volume mount"
+    # workdir 断言已删(真 SDK 无 workdir= 参数)。
+    # connection_config 仅在 SDK 装好时非 None(CI 无 extra 时 ConnectionConfig=None,
+    # 但 mock create 仍接受 None);不写死成必传以避免 CI 假红。
+    if _HAS_SANDBOX_SDK:
+        assert captured.get("connection_config") is not None, "SDK 装好时 connection_config 必传"
 
 
 @pytest.mark.asyncio
