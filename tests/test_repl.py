@@ -239,6 +239,37 @@ async def test_run_repl_invalid_default_mode_raises():
         await run_repl(fake_llm, fake_mcp, cwd="/x", default_mode="bogus")
 
 
+@pytest.mark.asyncio
+async def test_repl_inits_and_shuts_down_executor(monkeypatch, tmp_path):
+    """repl 启动调 init_session_executor,主循环退出(正常 exit)finally 调
+    await shutdown_session_executor。验证会话级 executor 生命周期被正确接入。"""
+    from cc_harness import repl as repl_mod
+    from cc_harness.repl import run_repl
+
+    inputs = iter(["exit"])
+    monkeypatch.setattr(repl_mod, "_read_user", _fake_read_user(inputs))
+
+    init_calls: list[tuple] = []
+    shutdown_calls: list[int] = []
+
+    def fake_init(config, project_root):
+        init_calls.append((config, project_root))
+
+    async def fake_shutdown():
+        shutdown_calls.append(1)
+
+    monkeypatch.setattr(repl_mod, "init_session_executor", fake_init)
+    monkeypatch.setattr(repl_mod, "shutdown_session_executor", fake_shutdown)
+
+    await run_repl(_NoopLLM(), _NoopMCP(), cwd=str(tmp_path))
+
+    assert init_calls, "repl 启动未调 init_session_executor"
+    # init 收到 (ExecutorConfig, project_root) 两参
+    assert len(init_calls[0]) == 2
+    assert init_calls[0][1] == str(tmp_path)
+    assert shutdown_calls, "repl 退出未调 shutdown_session_executor"
+
+
 # --- Disk change summary ---
 
 def test_collect_disk_changes_no_changes(tmp_path):

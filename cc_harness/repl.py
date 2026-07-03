@@ -21,12 +21,13 @@ from pathlib import Path
 from openai import AsyncOpenAI
 from rich.console import Console
 from cc_harness.audit import log_decision
-from cc_harness.config import load_l2_config, load_l5_config, load_policy_config
+from cc_harness.config import load_executor_config, load_l2_config, load_l5_config, load_policy_config
 from cc_harness.l2 import REFUSAL_TEMPLATE, scan_user_input
 from cc_harness.l5 import build_l5_engine
 from cc_harness.policy import PolicyEngine
 from cc_harness.render import print_info, print_result, print_warn, print_token_summary
 from cc_harness.tokens import TokenCounter, SessionTokenStats
+from cc_harness.tools import init_session_executor, shutdown_session_executor
 
 _VALID_MODES = ("coding", "plan", "design")
 
@@ -157,77 +158,87 @@ async def run_repl(
     print_info(console, "  type 'exit' or 'quit' to leave, Ctrl+C / Ctrl+D also works; /help for commands")
     print_info(console, "")
 
-    while True:
-        try:
-            raw = (await _read_user(_prompt_for(state.mode))).strip()
-        except (EOFError, KeyboardInterrupt):
-            print_token_summary(console, "session 总计", state.session_stats)
-            print_info(console, "shutting down")
-            break
+    # 启动钩子:读 policy.yaml executor 段 → ExecutorConfig → init 会话级 executor。
+    # native(默认)无副作用;sandbox 时建会话级容器供 run_command 复用,避免每条
+    # 命令 cold-start。kill-switch 在 config.enabled / config.backend(policy.yaml)。
+    exec_cfg = load_executor_config(Path(cwd) / "policy.yaml")
+    init_session_executor(exec_cfg, cwd)
+    try:
+        while True:
+            try:
+                raw = (await _read_user(_prompt_for(state.mode))).strip()
+            except (EOFError, KeyboardInterrupt):
+                print_token_summary(console, "session 总计", state.session_stats)
+                print_info(console, "shutting down")
+                break
 
-        if not raw:
-            continue
-        if raw.lower() in ("exit", "quit"):
-            print_token_summary(console, "session 总计", state.session_stats)
-            print_info(console, "shutting down")
-            break
-
-        # Slash command dispatch
-        if raw.startswith("/"):
-            if _handle_slash(raw, state, console):
+            if not raw:
                 continue
-            # Unknown slash command — warn but let it through to the LLM
-            print_warn(console, f"未知命令: {raw!r}(当作普通消息处理)")
+            if raw.lower() in ("exit", "quit"):
+                print_token_summary(console, "session 总计", state.session_stats)
+                print_info(console, "shutting down")
+                break
 
-        # L2 输入防御:命中即阻断,不进 run_turn、不入历史
-        if l2_cfg.enabled:
-            scan = await scan_user_input(
-                raw, l2_cfg=l2_cfg, client=l2_client, model=l2_model,
+            # Slash command dispatch
+            if raw.startswith("/"):
+                if _handle_slash(raw, state, console):
+                    continue
+                # Unknown slash command — warn but let it through to the LLM
+                print_warn(console, f"未知命令: {raw!r}(当作普通消息处理)")
+
+            # L2 输入防御:命中即阻断,不进 run_turn、不入历史
+            if l2_cfg.enabled:
+                scan = await scan_user_input(
+                    raw, l2_cfg=l2_cfg, client=l2_client, model=l2_model,
+                )
+                if not scan.allowed:
+                    log_decision(
+                        l2_audit_path,
+                        iter_n=state.session_stats.turns, tool="user_input",
+                        args={"input_hash": hashlib.sha256(raw.encode("utf-8")).hexdigest()[:16]},
+                        action="l2_block", outcome="blocked",
+                        rule_id=scan.reason, reason="", mode=state.mode,
+                    )
+                    print_result(console, REFUSAL_TEMPLATE)  # 走 print_result → 带 结果: 头
+                    continue                                   # 不 append、不 run_turn
+                user_content = scan.wrapped_text
+                if scan.reason.startswith("judge_error"):
+                    log_decision(
+                        l2_audit_path,
+                        iter_n=state.session_stats.turns, tool="user_input",
+                        args={"input_hash": hashlib.sha256(raw.encode("utf-8")).hexdigest()[:16]},
+                        action="l2_allow", outcome="judge_fail_open",
+                        rule_id=scan.reason, reason="", mode=state.mode,
+                    )
+            else:
+                user_content = raw
+
+            state.messages.append({"role": "user", "content": user_content})
+            turn_start = time.time()
+            from cc_harness.agent import run_turn
+            turn_stats = await run_turn(
+                state.messages, llm, mcp,
+                max_iter=max_iter,
+                mode=state.mode,
+                cwd=cwd,
+                design_dir=design_dir,
+                token_counter=state.token_counter,
+                policy=policy,
+                l5=l5,
             )
-            if not scan.allowed:
-                log_decision(
-                    l2_audit_path,
-                    iter_n=state.session_stats.turns, tool="user_input",
-                    args={"input_hash": hashlib.sha256(raw.encode("utf-8")).hexdigest()[:16]},
-                    action="l2_block", outcome="blocked",
-                    rule_id=scan.reason, reason="", mode=state.mode,
-                )
-                print_result(console, REFUSAL_TEMPLATE)  # 走 print_result → 带 结果: 头
-                continue                                   # 不 append、不 run_turn
-            user_content = scan.wrapped_text
-            if scan.reason.startswith("judge_error"):
-                log_decision(
-                    l2_audit_path,
-                    iter_n=state.session_stats.turns, tool="user_input",
-                    args={"input_hash": hashlib.sha256(raw.encode("utf-8")).hexdigest()[:16]},
-                    action="l2_allow", outcome="judge_fail_open",
-                    rule_id=scan.reason, reason="", mode=state.mode,
-                )
-        else:
-            user_content = raw
+            state.session_stats.add(turn_stats)
 
-        state.messages.append({"role": "user", "content": user_content})
-        turn_start = time.time()
-        from cc_harness.agent import run_turn
-        turn_stats = await run_turn(
-            state.messages, llm, mcp,
-            max_iter=max_iter,
-            mode=state.mode,
-            cwd=cwd,
-            design_dir=design_dir,
-            token_counter=state.token_counter,
-            policy=policy,
-            l5=l5,
-        )
-        state.session_stats.add(turn_stats)
+            # 打印 token 明细
+            print_token_summary(console, "本轮", turn_stats)
+            print_token_summary(console, f"累计 {state.session_stats.turns} 轮", state.session_stats)
 
-        # 打印 token 明细
-        print_token_summary(console, "本轮", turn_stats)
-        print_token_summary(console, f"累计 {state.session_stats.turns} 轮", state.session_stats)
-
-        # After the turn, show what actually changed on disk — so the user
-        # can see real file state without F5-ing their file manager.
-        _print_disk_changes(console, cwd, since=turn_start)
+            # After the turn, show what actually changed on disk — so the user
+            # can see real file state without F5-ing their file manager.
+            _print_disk_changes(console, cwd, since=turn_start)
+    finally:
+        # 主循环退出(正常 exit / EOF / Ctrl-C / 异常)→ shutdown 会话级 executor。
+        # async,非 atexit;sandbox 时 kill 容器 + shutdown_owned_server,best-effort。
+        await shutdown_session_executor()
 
 
 # --- Disk change summary (printed after each LLM turn) ---
