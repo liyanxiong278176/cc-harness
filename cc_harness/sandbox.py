@@ -9,7 +9,9 @@ stdout/stderr/exit → ToolResult(格式同 NativeExecutor)。
 from __future__ import annotations
 
 import asyncio
+import json
 import os
+import time
 from datetime import timedelta
 from pathlib import Path
 
@@ -62,6 +64,27 @@ async def _with_retry(coro_factory, attempts: int = 3):
     raise SandboxUnavailableError(str(last)) from last
 
 
+def _audit_fallback(project_root: Path, reason: str, retries: int = 3) -> None:
+    """降级审计:写一行 JSON 到 <project_root>/logs/sandbox.jsonl。
+
+    best-effort:IO 失败只吞(降级路径不能再因审计崩;调用方即将 raise,
+    若审计抛 OSError 会 mask 真实的 SandboxUnavailableError)。沿用 audit.py 模式。
+    """
+    entry = {
+        "ts": time.time(),
+        "action": "fallback_after_retry",
+        "reason": reason,
+        "retries": retries,
+    }
+    log = project_root / "logs" / "sandbox.jsonl"
+    try:
+        log.parent.mkdir(parents=True, exist_ok=True)
+        with log.open("a", encoding="utf-8") as f:
+            f.write(json.dumps(entry, ensure_ascii=False) + "\n")
+    except OSError:
+        pass
+
+
 class SandboxExecutor:
     def __init__(self, cfg: SandboxConfig, project_root: Path) -> None:
         self.cfg = cfg
@@ -98,8 +121,10 @@ class SandboxExecutor:
         try:
             sb = await self._ensure_sandbox()    # 内含 retry,3 次后抛 SandboxUnavailableError
             execution = await _with_retry(lambda: sb.commands.run(command))
-        except SandboxUnavailableError:
-            raise        # 让调用方(build_executor / tools.py 包装处)降级 native
+        except SandboxUnavailableError as e:
+            # 降级前落审计(action/reason/retries → logs/sandbox.jsonl),再上抛让调用方降级 native。
+            _audit_fallback(project_root=self.project_root, reason=str(e), retries=3)
+            raise
         except Exception as e:
             return ToolResult.error(
                 display=f"sandbox run failed: {e}",

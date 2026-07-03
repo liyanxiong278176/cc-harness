@@ -156,3 +156,38 @@ async def test_env_stripped_no_secrets(tmp_path):
     env = captured.get("env", {})
     assert "OPENAI_API_KEY" not in env, "密钥泄露进沙箱 env"
     assert "PATH" in env
+
+
+@pytest.mark.asyncio
+async def test_kill_destroys_sandbox(tmp_path):
+    from cc_harness.sandbox import SandboxExecutor
+    from cc_harness.config import SandboxConfig
+    fake_exec = MagicMock(exit_code=0,
+                          logs=MagicMock(stdout=[MagicMock(text="x")], stderr=[]))
+    fake_sandbox = MagicMock(kill=AsyncMock())
+    fake_sandbox.commands.run = AsyncMock(return_value=fake_exec)
+    with patch("cc_harness.sandbox.Sandbox") as SDK:
+        SDK.create = AsyncMock(return_value=fake_sandbox)
+        ex = SandboxExecutor(SandboxConfig(), project_root=tmp_path)
+        await ex.run({"command": "x"}, cwd=tmp_path)
+        await ex.kill()
+    fake_sandbox.kill.assert_awaited()
+    assert ex._sandbox is None
+
+
+@pytest.mark.asyncio
+async def test_fallback_audited(tmp_path, monkeypatch):
+    """降级事件落 logs/sandbox.jsonl。"""
+    from cc_harness.sandbox import SandboxExecutor, SandboxUnavailableError
+    from cc_harness.config import SandboxConfig
+    logged = []
+    monkeypatch.setattr("cc_harness.sandbox._audit_fallback",
+                        lambda **kw: logged.append(kw))
+    # create 连败 3 次 → _with_retry 真 sleep 1s+2s 会让测试变慢/Flaky。
+    monkeypatch.setattr("cc_harness.sandbox.asyncio.sleep", AsyncMock())
+    with patch("cc_harness.sandbox.Sandbox") as SDK:
+        SDK.create = AsyncMock(side_effect=ConnectionError("down"))
+        ex = SandboxExecutor(SandboxConfig(), project_root=tmp_path)
+        with pytest.raises(SandboxUnavailableError):
+            await ex.run({"command": "x"}, cwd=tmp_path)
+    assert logged and logged[0]["retries"] == 3
