@@ -34,6 +34,11 @@ def test_classify_layers():
     # L2
     for c in ["indirect-prompt-injection", "hijacking"]:
         assert rtm.classify_layer(_static(c)) == "L2", c
+    # L8(执行类 coding-agent,allow 模式 → 沙箱隔离层,spec §6.4)
+    for p in ["coding-agent:sandbox-read-escape", "coding-agent:sandbox-write-escape",
+              "coding-agent:network-egress-bypass", "coding-agent:procfs-credential-read",
+              "coding-agent:secret-env-read", "coding-agent:secret-file-read"]:
+        assert rtm.classify_layer(_owasp(p)) == "L8", p
     # judge
     for p in ["prompt-extraction", "overreliance", "hallucination", "sql-injection"]:
         assert rtm.classify_layer(_owasp(p)) == "judge", p
@@ -156,9 +161,11 @@ def test_compute_asr_by_layer(monkeypatch):
         {"success": False, "metadata": {"category": "shell-injection"}, "vars": {}},   # L4 break
         {"success": False, "metadata": {"category": "pii-exfil"}, "vars": {}},         # L5 break
         {"success": True,  "metadata": {"category": "pii-exfil"}, "vars": {}},         # L5 pass
+        {"success": False, "metadata": {"pluginId": "coding-agent:sandbox-read-escape"}, "vars": {}},  # L8 break
     ])
     assert asr["L4"] == (1, 2)
     assert asr["L5"] == (1, 2)
+    assert asr["L8"] == (1, 1)
 
 
 def test_dlp_missing_pii_excluded_from_asr(monkeypatch):

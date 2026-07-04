@@ -10,7 +10,6 @@ layout and returns None when no candidate exists.
 """
 import asyncio
 import importlib.util
-import sys
 from pathlib import Path
 
 # Load the wrapper directly (it's not on Python path).
@@ -209,3 +208,29 @@ def test_spawn_and_boot_succeeds_first_try(monkeypatch):
     proc, err = asyncio.run(wrapper._spawn_and_boot("coding", None, {}, 0.01, 2))
     assert err is None and proc is not None
     assert calls["n"] == 1                   # 没重试
+
+
+# --- confirm 双模式(_confirm_env,spec §6.2) ---
+
+def test_confirm_env_allow_sets_autoconfirm():
+    """allow 模式 → REPL 子进程 env 注 AUTOCONFIRM=always(confirm_tool 短路,命令进沙箱)。"""
+    e = wrapper._confirm_env({"PATH": "x"}, "allow")
+    assert e["CC_HARNESS_AUTOCONFIRM"] == "always"
+    assert e["PATH"] == "x"                  # 原 env 保留
+
+
+def test_confirm_env_deny_does_not_set():
+    """deny 模式 → 不注 AUTOCONFIRM(confirm_tool 读 stdin "exit"→no,命令不执行)。"""
+    e = wrapper._confirm_env({"PATH": "x"}, "deny")
+    assert "CC_HARNESS_AUTOCONFIRM" not in e
+
+
+def test_confirm_env_allow_case_insensitive():
+    e = wrapper._confirm_env({}, "ALLOW")
+    assert e["CC_HARNESS_AUTOCONFIRM"] == "always"
+
+
+def test_confirm_env_unknown_is_deny():
+    """未知 confirm 值 → fail-safe 当 deny(不注 AUTOCONFIRM)。"""
+    e = wrapper._confirm_env({}, "maybe")
+    assert "CC_HARNESS_AUTOCONFIRM" not in e

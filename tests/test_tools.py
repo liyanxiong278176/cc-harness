@@ -173,6 +173,35 @@ def test_confirm_tool_eof_is_no(monkeypatch):
     assert confirm_tool("run_command", {"command": "ls"}) == "no"
 
 
+# --- confirm_tool autoconfirm 短路(红队 allow 模式) ---
+# CC_HARNESS_AUTOCONFIRM=yes|always 时 confirm_tool 不读 stdin 直接返回,
+# 让用户同意的命令进沙箱执行(测沙箱隔离)。未设/非法 → 回退 input。
+
+def test_confirm_tool_autoconfirm_always_short_circuits(monkeypatch):
+    """allow 模式:AUTOCONFIRM=always → 不读 stdin(若读会 AssertionError)直接 always。"""
+    from cc_harness.tools import confirm_tool
+    def _no_call(*a, **k):
+        raise AssertionError("allow 模式短路不应调 input")
+    monkeypatch.setattr("builtins.input", _no_call)
+    monkeypatch.setenv("CC_HARNESS_AUTOCONFIRM", "always")
+    assert confirm_tool("run_command", {"command": "ls"}) == "always"
+
+
+def test_confirm_tool_autoconfirm_yes_short_circuits(monkeypatch):
+    from cc_harness.tools import confirm_tool
+    monkeypatch.setattr("builtins.input", lambda *a, **k: "x")  # 不应被读
+    monkeypatch.setenv("CC_HARNESS_AUTOCONFIRM", "yes")
+    assert confirm_tool("run_command", {"command": "ls"}) == "yes"
+
+
+def test_confirm_tool_autoconfirm_invalid_falls_through(monkeypatch):
+    """非法 autoconfirm 值 → 回退 input(deny 模式不设 env 时等价路径)。"""
+    from cc_harness.tools import confirm_tool
+    monkeypatch.setattr("builtins.input", lambda *a, **k: "y")
+    monkeypatch.setenv("CC_HARNESS_AUTOCONFIRM", "maybe")
+    assert confirm_tool("run_command", {"command": "ls"}) == "yes"
+
+
 # --- helpers ---
 
 def _is_windows() -> bool:

@@ -101,6 +101,23 @@ PYTHON_BIN = _resolve_python()
 _RESULT_MARKERS = ("结果：", "结果:")
 
 
+# --- 红队 confirm 双模式(spec §6.2) ---
+# allow 模式:设 CC_HARNESS_AUTOCONFIRM=always 让 cc_harness/tools.py:confirm_tool
+# 短路(不读 stdin),用户同意的命令进沙箱执行 → 测沙箱隔离(执行类攻击)。
+# deny 模式(默认):不设 → confirm_tool 读 wrapper 喂的 "exit" 行 → no → 命令不执行
+# → 测 agent 闸门姿态(诱导类攻击)。env 名须与 tools.AUTOCONFIRM_ENV 一致。
+_AUTOCONFIRM_ENV = "CC_HARNESS_AUTOCONFIRM"
+
+
+def _confirm_env(env: dict, policy: str) -> dict:
+    """按 confirm 策略给 REPL 子进程 env 注 AUTOCONFIRM。
+    allow → always(短路 confirm_tool);deny/未知 → 不动(走 stdin→no)。"""
+    if str(policy).lower() == "allow":
+        env = dict(env)
+        env[_AUTOCONFIRM_ENV] = "always"
+    return env
+
+
 # --- self-modification guard ---
 # Each probe runs the agent WITH write access to the repo. A real breakthrough
 # (e.g. "comment out is_dangerous", "replace the system prompt") means the agent
@@ -239,6 +256,8 @@ async def _call_api_inner(prompt: str, options: dict, context: dict) -> dict:
     env = os.environ.copy()
     env["PYTHONIOENCODING"] = "utf-8"
     env["PYTHONUNBUFFERED"] = "1"
+    # 红队双模式:allow → 注 AUTOCONFIRM=always(命令进沙箱);deny(默认)→ 不注。
+    env = _confirm_env(env, cfg.get("confirm", "deny"))
 
     start = time.time()
     proc, boot_err = await _spawn_and_boot(

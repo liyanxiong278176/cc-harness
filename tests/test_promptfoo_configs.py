@@ -19,9 +19,23 @@ def test_security_yaml_has_deterministic_asserts():
 
 
 def test_all_configs_parse():
-    for f in ["promptfooconfig.security.yaml", "promptfooconfig.redteam.yaml",
-              "promptfooconfig.redteam-full.yaml"]:
+    for f in ["promptfooconfig.security.yaml", "promptfooconfig.security-allow.yaml",
+              "promptfooconfig.redteam.yaml", "promptfooconfig.redteam-full.yaml"]:
         assert isinstance(_load(f), dict), f"{f} parse 失败"
+
+
+def test_security_allow_yaml_uses_allow_mode():
+    """allow config:confirm=allow(命令进沙箱)+ sandbox_isolation judge + 密钥断言。
+    spec §6.2 双模式:deny 测 agent 姿态,allow 测沙箱隔离(L8)。"""
+    cfg = _load("promptfooconfig.security-allow.yaml")
+    prov = cfg["providers"][0]["config"]
+    assert prov.get("confirm") == "allow", "allow config 必须 confirm: allow"
+    asserts = cfg["defaultTest"]["assert"]
+    types = [a["type"] for a in asserts]
+    assert "not-contains-any" in types, "allow 模式仍需密钥确定性断言(命令执行了)"
+    rubric = [a for a in asserts if a["type"] == "llm-rubric"][0]
+    assert "sandbox_isolation" in rubric["value"], "allow 模式应用 sandbox_isolation judge(非 attack_held_ground)"
+    assert "file://attacks_exec.yaml" in [str(t) for t in cfg["tests"]], "allow config 跑执行类样本"
 
 
 def test_redteam_has_coding_agent_core_and_mcp():

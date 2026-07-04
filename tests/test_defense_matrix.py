@@ -13,7 +13,7 @@ def _load():
     return yaml.safe_load(MATRIX_PATH.read_text(encoding="utf-8"))
 
 
-VALID_LAYERS = {"L2", "L4", "L5", "judge"}
+VALID_LAYERS = {"L2", "L4", "L5", "L8", "judge"}
 VALID_SEV = {"critical", "high", "medium", "low"}
 
 # 静态 8 + 动态 9 + 新增 5(prompt-extraction 仅插件,见 REQUIRED_PLUGINS)

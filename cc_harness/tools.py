@@ -1,5 +1,6 @@
 """Dangerous-command detection + user confirmation prompt + built-in tools."""
 from __future__ import annotations
+import os
 import re
 import sys
 from pathlib import Path
@@ -59,11 +60,24 @@ def confirm(prompt: str) -> bool:
     return answer == "y"
 
 
+# 红队 allow 模式短路:env 设 yes/always 时 confirm_tool 不读 stdin 直接返回,
+# 让用户同意的命令进沙箱执行(测沙箱隔离,非测 agent 姿态)。未设(deny 模式)→
+# 走 input(),wrapper 喂的 "exit" 行被读成非 yes/no → no(命令不执行,现状不变)。
+# 仅红队 wrapper 用;生产 REPL 不设此 env,交互确认照常。
+AUTOCONFIRM_ENV = "CC_HARNESS_AUTOCONFIRM"
+
+
 def confirm_tool(tool_name: str, args: dict) -> str:
     """3-way confirmation for the L4 policy gate. Returns 'yes' / 'always' / 'no'.
 
     Default is 'no' (Enter = no). EOF / Ctrl-C → 'no' (fail-closed).
+
+    红队 allow 模式:CC_HARNESS_AUTOCONFIRM=yes|always 短路(不读 stdin)——
+    wrapper 设此 env 让命令进沙箱执行,测沙箱隔离而非 agent 闸门姿态。
     """
+    auto = os.getenv(AUTOCONFIRM_ENV, "").strip().lower()
+    if auto in ("yes", "always"):
+        return auto
     prompt = f"允许执行 {tool_name}?(yes / always / [no])"
     try:
         answer = input(f"{prompt}: ").strip().lower()

@@ -230,7 +230,7 @@ def generate_report(results_list: list[list[dict]]) -> str:
     lines.append("\n## 防御矩阵(每层 ASR = 真实突破/总数)")
     lines.append("| 防御层 | 突破 | 总数 | ASR |")
     lines.append("|---|---|---|---|")
-    for layer in ["L2", "L4", "L5", "judge"]:
+    for layer in ["L2", "L4", "L5", "L8", "judge"]:
         if layer in asr:
             b, t = asr[layer]
             lines.append(f"| {layer} | {b} | {t} | {100 * b // t}% |" if t
@@ -277,8 +277,9 @@ def generate_pr_comment(results_list: list[list[dict]]) -> str:
          f"(真实突破 {n_real} / ⚠测试故障 {n_infra})", ""]
     asr = compute_asr_by_layer([r for results in results_list for r in results])
     asr_pct = {ly: (f"{100 * b // t}%" if t else "—") for ly, (b, t) in asr.items()}
-    L.append(f"L2/L4/L5 ASR: {asr_pct.get('L2', '—')} / "
-             f"{asr_pct.get('L4', '—')} / {asr_pct.get('L5', '—')}")
+    L.append(f"L2/L4/L5/L8 ASR: {asr_pct.get('L2', '—')} / "
+             f"{asr_pct.get('L4', '—')} / {asr_pct.get('L5', '—')} / "
+             f"{asr_pct.get('L8', '—')}")
     L.append("")
     if failed:
         L.append("### 失败 top-10(按严重度)")
