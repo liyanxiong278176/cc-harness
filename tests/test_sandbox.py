@@ -163,8 +163,10 @@ async def test_run_retries_commands_run_then_succeeds(tmp_path, monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_env_stripped_no_secrets(tmp_path):
-    """沙箱 env 不含 KEY/TOKEN/SECRET(Vault 未接时 strip_secrets 兜底)。"""
+async def test_no_host_env_injected(tmp_path):
+    """host(Windows)env 不注入沙箱:PATH/SYSTEMROOT 进 Linux 容器会破坏它。
+    沙箱用容器默认 env;凭证后续走 Credential Vault(Task 12),非 host env。
+    故 Sandbox.create 调用不应带 env= kwarg(host env 天然不进,无密钥泄露路径)。"""
     import os
     from cc_harness.sandbox import SandboxExecutor
     from cc_harness.config import SandboxConfig
@@ -179,9 +181,7 @@ async def test_env_stripped_no_secrets(tmp_path):
             SDK.create = fake_create
             ex = SandboxExecutor(SandboxConfig(), project_root=tmp_path)
             await ex.run({"command": "env"}, cwd=tmp_path)
-    env = captured.get("env", {})
-    assert "OPENAI_API_KEY" not in env, "密钥泄露进沙箱 env"
-    assert "PATH" in env
+    assert "env" not in captured, "host env 不应注入沙箱(Windows env 破坏 Linux 容器)"
 
 
 @pytest.mark.asyncio

@@ -10,13 +10,11 @@ from __future__ import annotations
 
 import asyncio
 import json
-import os
 import time
 from datetime import timedelta
 from pathlib import Path
 
 from cc_harness.config import SandboxConfig
-from cc_harness.executor import strip_secrets
 from cc_harness.mcp_client import ToolResult
 
 # OpenSandbox SDK(lazy import:无 [sandbox] extra 时模块加载不崩,调用时报错)。
@@ -154,8 +152,11 @@ class SandboxExecutor:
                        mountPath="/workspace",
                        readOnly=True),
             ],
-            env=strip_secrets(dict(os.environ)),
-            timeout=timedelta(seconds=self.cfg.timeout_s),
+            # 不传 env=:host(Windows)env(PATH/SYSTEMROOT)注入 Linux 沙箱会破坏容器。
+            # 沙箱用容器默认 env;凭证后续走 Credential Vault(Task 12 增强),非 host env。
+            # 不传 timeout=(sandbox lifetime,默认 600s):cfg.timeout_s(120s)过短,
+            # Windows volume mount 慢 → sandbox 在 health check 期间过期。
+            ready_timeout=timedelta(seconds=self.cfg.timeout_s),  # 等 ready:Windows mount 慢,默认 30s 不够
             connection_config=cc,
             # TODO(Gap 2 增强):resource={"cpu": str(self.cfg.cpu), "memory": f"{self.cfg.memory_mb}Mi"},
             #                    network_policy=<NetworkPolicy from egress_allow>,
