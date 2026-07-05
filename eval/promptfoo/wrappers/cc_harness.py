@@ -111,17 +111,22 @@ _AUTOCONFIRM_ENV = "CC_HARNESS_AUTOCONFIRM"
 # override sandbox.fallback_on_error。防 L8 失真(沙箱没参与测宿主=假数据)+ 防降级
 # 路径泄露(沙箱挂时命令在 CI runner 真跑 → secret 外传)。
 _SANDBOX_FALLBACK_ENV = "CC_HARNESS_SANDBOX_FALLBACK"
+# allow 模式强制 sandbox backend:CI 无 policy.yaml 时默认 native → 命令进
+# NativeExecutor 在宿主跑(L8 假数据 + 真泄露)。allow 必 sandbox 才测沙箱隔离。
+_EXECUTOR_BACKEND_ENV = "CC_HARNESS_EXECUTOR_BACKEND"
 
 
 def _confirm_env(env: dict, policy: str) -> dict:
-    """按 confirm 策略给 REPL 子进程 env 注 AUTOCONFIRM + SANDBOX_FALLBACK。
+    """按 confirm 策略给 REPL 子进程 env 注 AUTOCONFIRM + SANDBOX_FALLBACK + EXECUTOR_BACKEND。
     allow → AUTOCONFIRM=always(短路 confirm_tool,命令进沙箱)
-           + SANDBOX_FALLBACK=hard(沙箱挂不降级,绑死);
-    deny/未知 → 不动(走 stdin→no,现状)。"""
+           + SANDBOX_FALLBACK=hard(沙箱挂不降级,绑死)
+           + EXECUTOR_BACKEND=sandbox(强制沙箱 backend,防 CI 默认 native 宿主跑);
+    deny/未知 → 不动(走 stdin→no,native backend 现状)。"""
     if str(policy).lower() == "allow":
         env = dict(env)
         env[_AUTOCONFIRM_ENV] = "always"
         env[_SANDBOX_FALLBACK_ENV] = "hard"
+        env[_EXECUTOR_BACKEND_ENV] = "sandbox"
     return env
 
 

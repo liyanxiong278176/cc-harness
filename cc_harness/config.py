@@ -177,4 +177,9 @@ def load_executor_config(path: Path) -> ExecutorConfig:
     fallback_env = os.getenv("CC_HARNESS_SANDBOX_FALLBACK", "").strip().lower()
     if fallback_env in ("hard", "native"):
         cfg.sandbox.fallback_on_error = fallback_env
+    # env override backend(allow 红队强制 sandbox:CI 无 policy.yaml 时默认 native,
+    # allow 模式不强制 sandbox → 命令进 NativeExecutor 在宿主跑 → L8 假数据 + 真泄露)。
+    backend_env = os.getenv("CC_HARNESS_EXECUTOR_BACKEND", "").strip().lower()
+    if backend_env in ("sandbox", "native"):
+        cfg.backend = ExecutorBackend(backend_env)
     return cfg

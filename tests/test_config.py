@@ -222,3 +222,19 @@ def test_load_executor_config_env_override_ignores_garbage(monkeypatch):
     monkeypatch.setenv("CC_HARNESS_SANDBOX_FALLBACK", "maybe")
     cfg = load_executor_config(Path("/nonexistent/policy.yaml"))
     assert cfg.sandbox.fallback_on_error == "native"
+
+
+def test_load_executor_config_env_override_backend(monkeypatch):
+    """env CC_HARNESS_EXECUTOR_BACKEND=sandbox|native 覆盖 backend
+    (allow 红队强制 sandbox:CI 无 policy.yaml 默认 native → 命令宿主跑,L8 假数据)。"""
+    monkeypatch.setenv("CC_HARNESS_EXECUTOR_BACKEND", "sandbox")
+    cfg = load_executor_config(Path("/nonexistent/policy.yaml"))
+    assert cfg.backend is ExecutorBackend.SANDBOX
+
+    monkeypatch.setenv("CC_HARNESS_EXECUTOR_BACKEND", "native")
+    cfg2 = load_executor_config(Path("/nonexistent/policy.yaml"))
+    assert cfg2.backend is ExecutorBackend.NATIVE
+
+    monkeypatch.setenv("CC_HARNESS_EXECUTOR_BACKEND", "maybe")
+    cfg3 = load_executor_config(Path("/nonexistent/policy.yaml"))
+    assert cfg3.backend is ExecutorBackend.NATIVE   # 非法 → 默认 fail-safe

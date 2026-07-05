@@ -213,18 +213,20 @@ def test_spawn_and_boot_succeeds_first_try(monkeypatch):
 # --- confirm 双模式(_confirm_env,spec §6.2) ---
 
 def test_confirm_env_allow_sets_autoconfirm():
-    """allow 模式 → AUTOCONFIRM=always(命令进沙箱)+ SANDBOX_FALLBACK=hard(沙箱挂不降级,绑死)。"""
+    """allow → AUTOCONFIRM=always + SANDBOX_FALLBACK=hard + EXECUTOR_BACKEND=sandbox(强制沙箱)。"""
     e = wrapper._confirm_env({"PATH": "x"}, "allow")
     assert e["CC_HARNESS_AUTOCONFIRM"] == "always"
     assert e["CC_HARNESS_SANDBOX_FALLBACK"] == "hard"
+    assert e["CC_HARNESS_EXECUTOR_BACKEND"] == "sandbox"
     assert e["PATH"] == "x"                  # 原 env 保留
 
 
 def test_confirm_env_deny_does_not_set():
-    """deny 模式 → 不注 AUTOCONFIRM / SANDBOX_FALLBACK(confirm 读 stdin "exit"→no,降级照常)。"""
+    """deny → 不注 AUTOCONFIRM / SANDBOX_FALLBACK / EXECUTOR_BACKEND(native 现状)。"""
     e = wrapper._confirm_env({"PATH": "x"}, "deny")
     assert "CC_HARNESS_AUTOCONFIRM" not in e
     assert "CC_HARNESS_SANDBOX_FALLBACK" not in e
+    assert "CC_HARNESS_EXECUTOR_BACKEND" not in e
 
 
 def test_confirm_env_allow_case_insensitive():
