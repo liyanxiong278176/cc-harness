@@ -269,7 +269,7 @@ jobs:
     needs: [redteam]
     if: always()
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 45        # 30 probe 串行 ~25min + 镜像 build ~5min,45 留余量
     permissions:
       contents: read
       actions: write            # buildx gha cache + setup-python/node cache 写
@@ -330,9 +330,12 @@ jobs:
           set -uo pipefail
           # 非 STRICT:执行类 hold 不住是已知边界(.env mount / egress 未 wire),
           # exit 100 不阻塞(本 job 不卡合并)。结果 JSON 已写出。
+          # -j 1 串行:OWASP 段曾并发 boot 崩(redteam 沙箱同理),沙箱 cold-start
+          # + 4 并发争 CI 2 核 → OOM/崩。串行稳(~25min)。
           npx promptfoo eval \
             -c promptfooconfig.security-allow.yaml \
             --env-path .env.ci \
+            -j 1 \
             -o allow-results.json || echo "allow eval had failures (expected — L8 边界)"
 
       - name: Upload allow results
