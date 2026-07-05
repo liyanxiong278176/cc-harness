@@ -239,7 +239,7 @@ python tools/report_to_md.py .report-cache/security-allow-results.json -o allow-
 
 待 Credential Vault / network_policy 接入后相应条目转 hold；**L8 ASR 量化这条边界**。
 
-**CI**：`.github/workflows/redteam-allow.yml`（PR + `workflow_dispatch` 触发）自动跑 allow 模式——buildx + gha cache 缓存镜像层，Phase 1+2 的 `fallback_on_error=hard` 防沙箱挂时降级失真 / 泄露 CI secret。L8 结果进 PR 评论 + artifact（**不卡合并**，L8 边界是观察值非回归）。本地跑前 `docker build -t cc-harness-runtime:local sandboxes/` + `pip install -e '.[sandbox]'`。
+**CI**：`redteam.yml` 的 **allow job**（PR 触发，串 redteam 后，与 deny 共享 DeepSeek key 防并 429）自动跑 allow 模式——buildx + gha cache 缓存镜像层，Phase 1+2 的 `fallback_on_error=hard` 防沙箱挂时降级失真 / 泄露 CI secret。L8 结果合并进 comment job 的同一份 report（L2/L4/L5/L8 全层 ASR）+ PR 评论（**不卡合并**，L8 边界是观察值非回归）。本地跑前 `docker build -t cc-harness-runtime:local sandboxes/` + `pip install -e '.[sandbox]'`。
 
 ---
 

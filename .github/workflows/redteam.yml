@@ -260,12 +260,94 @@ jobs:
           path: eval/promptfoo/owasp-results.json
           if-no-files-found: warn
 
-  # Job 3: Post PR comment. Depends on BOTH eval and redteam (so artifacts
-  # are available). Runs even if either upstream failed (if: always()) so
-  # the PR still gets a comment explaining what went wrong.
+  # Job 2.5: allow 模式沙箱红队(L8,spec §6.2)。串 redteam 后(共享 DeepSeek key
+  # 防并 429)。不进 required checks(L8 边界 deferred:secret-file/.env mount、
+  # network-egress 未 wire,hold 不住是观察值非回归,不卡合并)。
+  # allow 模式:wrapper 注 AUTOCONFIRM=always(命令进沙箱)+ SANDBOX_FALLBACK=hard(挂不降级)。
+  allow:
+    name: Sandbox isolation (allow, L8)
+    needs: [redteam]
+    if: always()
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      actions: write            # buildx gha cache + setup-python/node cache 写
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+          cache: pip
+          cache-dependency-path: pyproject.toml
+
+      - name: Install cc-harness + sandbox SDK + dlp
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e '.[sandbox,dlp]'
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Build sandbox image (layer cache)
+        uses: docker/build-push-action@v5
+        with:
+          context: sandboxes
+          load: true
+          tags: cc-harness-runtime:local
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: npm
+          cache-dependency-path: eval/promptfoo/package-lock.json
+
+      - name: Install promptfoo
+        working-directory: eval/promptfoo
+        run: npm ci
+
+      - name: Verify image + sandbox SDK
+        run: |
+          docker images cc-harness-runtime:local
+          python -c "from cc_harness.sandbox import _HAS_SANDBOX_SDK; assert _HAS_SANDBOX_SDK"
+
+      - name: Build runtime env (DeepSeek key only — 执行类不需 OWASP/embedding)
+        working-directory: eval/promptfoo
+        run: |
+          {
+            echo "OPENAI_API_KEY=${{ secrets.OPENAI_API_KEY }}"
+            echo "OPENAI_BASE_URL=https://api.deepseek.com/v1"
+            echo "OPENAI_MODEL=deepseek-v4-flash"
+            echo "JUDGE_MODEL=deepseek-v4-flash"
+            echo "PROMPTFOO_CACHE_TYPE=memory"
+          } > .env.ci
+
+      - name: Run allow-mode sandbox redteam (L8)
+        working-directory: eval/promptfoo
+        run: |
+          set -uo pipefail
+          # 非 STRICT:执行类 hold 不住是已知边界(.env mount / egress 未 wire),
+          # exit 100 不阻塞(本 job 不卡合并)。结果 JSON 已写出。
+          npx promptfoo eval \
+            -c promptfooconfig.security-allow.yaml \
+            --env-path .env.ci \
+            -o allow-results.json || echo "allow eval had failures (expected — L8 边界)"
+
+      - name: Upload allow results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: allow-results
+          path: eval/promptfoo/allow-results.json
+          if-no-files-found: warn
+
+  # Job 3: Post PR comment. Depends on eval + redteam + allow (so all artifacts
+  # available). Runs even if upstream failed (if: always()) so PR still gets a comment.
   comment:
     name: Post PR comment
-    needs: [eval, redteam]
+    needs: [eval, redteam, allow]
     if: always() && github.event_name == 'pull_request'
     runs-on: ubuntu-latest
     timeout-minutes: 5
@@ -290,6 +372,13 @@ jobs:
           path: owasp-artifacts/
         continue-on-error: true
 
+      - name: Download allow results
+        uses: actions/download-artifact@v4
+        with:
+          name: allow-results
+          path: allow-artifacts/
+        continue-on-error: true
+
       - uses: actions/setup-python@v5
         with:
           python-version: '3.13'
@@ -305,6 +394,7 @@ jobs:
           python eval/promptfoo/tools/report_to_md.py \
             eval-artifacts/eval-results.json \
             owasp-artifacts/owasp-results.json \
+            allow-artifacts/allow-results.json \
             -o report.md \
             --comment-out pr-comment.md || echo "report gen failed (artifact missing?)"
 
@@ -316,6 +406,7 @@ jobs:
           python eval/promptfoo/tools/report_to_md.py \
             eval-artifacts/eval-results.json \
             owasp-artifacts/owasp-results.json \
+            allow-artifacts/allow-results.json \
             --gate
 
       - name: Upload report.md
