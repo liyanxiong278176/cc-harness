@@ -33,6 +33,7 @@ jobs:
     timeout-minutes: 360
     permissions:
       contents: read
+      actions: write          # setup-python/setup-node cache 写(actions cache API)
     steps:
       - uses: actions/checkout@v4
 
@@ -145,6 +146,7 @@ jobs:
     timeout-minutes: 360     # GitHub max — OWASP plugin probes can be slow
     permissions:
       contents: read
+      actions: write          # setup-python/setup-node cache 写(actions cache API)
     steps:
       - uses: actions/checkout@v4
 
@@ -270,6 +272,7 @@ jobs:
     permissions:
       pull-requests: write
       contents: read
+      actions: write          # setup-python cache:pip 写
     steps:
       - uses: actions/checkout@v4
 

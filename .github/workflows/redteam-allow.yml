@@ -32,6 +32,7 @@ jobs:
     permissions:
       contents: read
       pull-requests: write      # L8 摘要评论
+      actions: write            # buildx gha cache + setup-python/node cache 写
     steps:
       - uses: actions/checkout@v4
 
