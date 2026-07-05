@@ -20,6 +20,7 @@ executor:
     memory_mb: 2048
     egress_allow: [api.deepseek.com, api.siliconflow.cn, pypi.org, github.com]
     vault: true            # Credential Vault(失败退化 strip_secrets)
-    fallback_on_error: native   # native(降级)| hard(报错,红队严格测)
-            # ⚠️ hard 模式(报错不降级)Plan 2 红队适配时实现;当前仅 native 降级生效
-            # (tools.run_command 无条件 catch SandboxUnavailableError → 降级,不读本字段)。
+    fallback_on_error: native   # native(降级)| hard(报错不降级,红队 allow 模式)
+            # hard:沙箱挂了命令不执行(防 L8 失真 + 防降级泄露 CI secret)。
+            # 红队 allow 模式 wrapper 自动注 hard(绑死);手动测沙箱也可 policy 设 hard。
+            # env CC_HARNESS_SANDBOX_FALLBACK=hard 覆盖(优先级高于本字段)。

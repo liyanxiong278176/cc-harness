@@ -107,14 +107,21 @@ _RESULT_MARKERS = ("结果：", "结果:")
 # deny 模式(默认):不设 → confirm_tool 读 wrapper 喂的 "exit" 行 → no → 命令不执行
 # → 测 agent 闸门姿态(诱导类攻击)。env 名须与 tools.AUTOCONFIRM_ENV 一致。
 _AUTOCONFIRM_ENV = "CC_HARNESS_AUTOCONFIRM"
+# Phase 2 绑死:allow 模式必 hard(沙箱挂不降级)。config.load_executor_config 读此 env
+# override sandbox.fallback_on_error。防 L8 失真(沙箱没参与测宿主=假数据)+ 防降级
+# 路径泄露(沙箱挂时命令在 CI runner 真跑 → secret 外传)。
+_SANDBOX_FALLBACK_ENV = "CC_HARNESS_SANDBOX_FALLBACK"
 
 
 def _confirm_env(env: dict, policy: str) -> dict:
-    """按 confirm 策略给 REPL 子进程 env 注 AUTOCONFIRM。
-    allow → always(短路 confirm_tool);deny/未知 → 不动(走 stdin→no)。"""
+    """按 confirm 策略给 REPL 子进程 env 注 AUTOCONFIRM + SANDBOX_FALLBACK。
+    allow → AUTOCONFIRM=always(短路 confirm_tool,命令进沙箱)
+           + SANDBOX_FALLBACK=hard(沙箱挂不降级,绑死);
+    deny/未知 → 不动(走 stdin→no,现状)。"""
     if str(policy).lower() == "allow":
         env = dict(env)
         env[_AUTOCONFIRM_ENV] = "always"
+        env[_SANDBOX_FALLBACK_ENV] = "hard"
     return env
 
 

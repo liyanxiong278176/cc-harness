@@ -203,3 +203,22 @@ def test_load_executor_config_reads_yaml(tmp_path):
 def test_load_executor_config_missing_file_returns_default():
     cfg = load_executor_config(Path("/nonexistent/policy.yaml"))
     assert cfg.backend is ExecutorBackend.NATIVE   # 无文件 = native(现状)
+
+
+def test_load_executor_config_env_override_fallback(monkeypatch):
+    """env CC_HARNESS_SANDBOX_FALLBACK=hard|native 覆盖 sandbox.fallback_on_error
+    (红队 allow 模式 wrapper 注 → 绑死沙箱挂不降级)。"""
+    monkeypatch.setenv("CC_HARNESS_SANDBOX_FALLBACK", "hard")
+    cfg = load_executor_config(Path("/nonexistent/policy.yaml"))
+    assert cfg.sandbox.fallback_on_error == "hard"
+
+    monkeypatch.setenv("CC_HARNESS_SANDBOX_FALLBACK", "native")
+    cfg2 = load_executor_config(Path("/nonexistent/policy.yaml"))
+    assert cfg2.sandbox.fallback_on_error == "native"
+
+
+def test_load_executor_config_env_override_ignores_garbage(monkeypatch):
+    """非法 env 值 → 不 override(保留默认 native,fail-safe)。"""
+    monkeypatch.setenv("CC_HARNESS_SANDBOX_FALLBACK", "maybe")
+    cfg = load_executor_config(Path("/nonexistent/policy.yaml"))
+    assert cfg.sandbox.fallback_on_error == "native"

@@ -250,6 +250,36 @@ async def test_run_falls_back_to_native_on_sandbox_unavailable(monkeypatch, tmp_
 
 
 @pytest.mark.asyncio
+async def test_run_command_hard_mode_no_fallback(monkeypatch, tmp_path):
+    """fallback_on_error=hard + sandbox backend:沙箱挂 → 返 ToolResult.error,不降级 native。
+    防 L8 失真(沙箱没参与时测宿主=假突破数据)+ 防降级泄露(沙箱挂时命令在 CI runner 真跑)。"""
+    from cc_harness import tools
+    from cc_harness.config import ExecutorConfig, ExecutorBackend, SandboxConfig
+    from cc_harness.sandbox import SandboxUnavailableError
+
+    hard_cfg = ExecutorConfig(
+        backend=ExecutorBackend.SANDBOX,
+        sandbox=SandboxConfig(fallback_on_error="hard"),
+    )
+    monkeypatch.setattr(tools, "_session_executor_config", hard_cfg)
+
+    sb = MagicMock()
+    sb.run = AsyncMock(side_effect=SandboxUnavailableError("down"))
+    monkeypatch.setattr(tools, "get_session_executor", lambda: sb)
+
+    native_called = []
+    native = MagicMock()
+    native.run = AsyncMock(return_value=MagicMock(llm_text="SHOULD-NOT-HAPPEN", error=False))
+    monkeypatch.setattr(tools, "_native_fallback",
+                        lambda cwd: native_called.append(cwd) or native)
+
+    result = await tools.run_command({"command": "echo"}, cwd=str(tmp_path))
+    assert result.is_error
+    assert "hard" in result.llm_text or "未执行" in result.llm_text
+    assert not native_called, "hard 模式不应降级 native"
+
+
+@pytest.mark.asyncio
 async def test_shutdown_session_executor_kills_and_clears(monkeypatch):
     """shutdown 调 executor.kill + shutdown_owned,清空单例(fail-soft)。"""
     from cc_harness import tools

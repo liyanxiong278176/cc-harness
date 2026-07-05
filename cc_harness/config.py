@@ -162,9 +162,19 @@ class ExecutorConfig(BaseModel):
 
 
 def load_executor_config(path: Path) -> ExecutorConfig:
-    """读 policy.yaml 的 `executor:` 段;文件/段缺失→默认(native)。"""
+    """读 policy.yaml 的 `executor:` 段;文件/段缺失→默认(native)。
+
+    env CC_HARNESS_SANDBOX_FALLBACK=hard|native 覆盖 sandbox.fallback_on_error
+    (红队 allow 模式 wrapper 注,绑死:测沙箱时沙箱挂了不降级 → 防 L8 失真 +
+    防 CI secret 经降级路径泄露)。hard 优先级高于 policy.yaml。
+    """
     if not path.exists():
-        return ExecutorConfig()
-    import yaml
-    raw = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
-    return ExecutorConfig(**(raw.get("executor") or {}))
+        cfg = ExecutorConfig()
+    else:
+        import yaml
+        raw = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
+        cfg = ExecutorConfig(**(raw.get("executor") or {}))
+    fallback_env = os.getenv("CC_HARNESS_SANDBOX_FALLBACK", "").strip().lower()
+    if fallback_env in ("hard", "native"):
+        cfg.sandbox.fallback_on_error = fallback_env
+    return cfg

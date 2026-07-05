@@ -6,7 +6,7 @@ import sys
 from pathlib import Path
 from typing import Optional
 
-from cc_harness.config import ExecutorConfig
+from cc_harness.config import ExecutorConfig, ExecutorBackend
 from cc_harness.executor import Executor, NativeExecutor, build_executor
 from cc_harness.mcp_client import ToolResult
 
@@ -101,15 +101,20 @@ RUN_COMMAND_TIMEOUT_S = 30
 # 会话级复用:sandbox 容器跨命令复用,避免每条命令 cold-start。
 # repl 启动调 init_session_executor,repl 退出调 shutdown_session_executor。
 _session_executor: Optional[Executor] = None
+# 会话级 config(Phase 1 hard 模式):run_command 降级分支读 cfg.sandbox.fallback_on_error
+# 决定降级 / 报错。None = repl 外 lazy 路径(无 config → 现状降级)。
+_session_executor_config: Optional[ExecutorConfig] = None
 
 
 def init_session_executor(config: ExecutorConfig, project_root: str | Path) -> None:
     """repl 启动调:按 config.backend 建会话级 executor(native 或 sandbox)。
 
     project_root 锁执行 cwd;sandbox 在容器内 mount 该根为只读。
+    存 config 供 run_command 降级分支读 fallback_on_error(hard 模式)。
     """
-    global _session_executor
+    global _session_executor, _session_executor_config
     _session_executor = build_executor(config, Path(project_root))
+    _session_executor_config = config
 
 
 def get_session_executor() -> Executor:
@@ -128,8 +133,9 @@ def get_session_executor() -> Executor:
 
 def reset_session_executor() -> None:
     """测试隔离:清空单例,使下次 get 重新 lazy-init。"""
-    global _session_executor
+    global _session_executor, _session_executor_config
     _session_executor = None
+    _session_executor_config = None
 
 
 async def shutdown_session_executor() -> None:
@@ -177,6 +183,21 @@ async def run_command(args: dict, *, cwd: str = ".") -> ToolResult:
     try:
         return await get_session_executor().run(args, cwd=Path(cwd))
     except SandboxUnavailableError:
+        # hard 模式:沙箱挂了不降级 → 返错(命令未执行)。
+        # 双重作用:① 防 L8 失真(沙箱没参与时测宿主=假突破数据);
+        # ② 防降级路径泄露(沙箱挂时命令在宿主/CI runner 真跑 → secret 外传)。
+        # 触发:config sandbox.fallback_on_error=hard(policy.yaml 或 env
+        # CC_HARNESS_SANDBOX_FALLBACK=hard,后者 config 层 load 时已 override)。
+        cfg = _session_executor_config
+        hard = (cfg is not None
+                and cfg.backend == ExecutorBackend.SANDBOX
+                and cfg.sandbox.fallback_on_error == "hard")
+        if hard:
+            return ToolResult.error(
+                display="sandbox unavailable (hard mode — no native fallback)",
+                llm="[Tool Error] 沙箱不可用且 fallback_on_error=hard,命令未执行"
+                    "(防降级失真 + 防 secret 经降级路径外传)",
+            )
         print("[warn] 沙箱不可用,降级 native 执行(非隔离模式)", file=sys.stderr)
         return await _native_fallback(cwd).run(args, cwd=Path(cwd))
 
