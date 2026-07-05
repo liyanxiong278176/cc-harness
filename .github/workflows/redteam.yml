@@ -39,6 +39,8 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: '3.13'
+          cache: pip
+          cache-dependency-path: pyproject.toml
 
       - name: Install cc-harness deps
         run: |
@@ -48,6 +50,8 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: '20'
+          cache: npm
+          cache-dependency-path: eval/promptfoo/package-lock.json
 
       - name: Install promptfoo
         working-directory: eval/promptfoo
@@ -147,6 +151,8 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: '3.13'
+          cache: pip
+          cache-dependency-path: pyproject.toml
 
       - name: Install cc-harness deps
         run: |
@@ -156,6 +162,8 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: '20'
+          cache: npm
+          cache-dependency-path: eval/promptfoo/package-lock.json
 
       - name: Install promptfoo
         working-directory: eval/promptfoo
@@ -282,6 +290,8 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: '3.13'
+          cache: pip
+          cache-dependency-path: pyproject.toml
 
       - name: Generate report.md + pr-comment.md
         # Classification lives ONLY in eval/promptfoo/tools/report_to_md.py
