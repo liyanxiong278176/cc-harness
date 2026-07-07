@@ -80,6 +80,7 @@ runner.py:langfuse.flush() 同步上 cloud
 | `eval/locomo/trace.py` | langfuse SDK 封装:trace/span/generation/score | 新建 |
 | `eval/locomo/report.py` | HTML 报告生成 | 新建 |
 | `eval/locomo/tests/test_*.py` | 3 个单测 | 新建 |
+| `eval/locomo/download_dataset.py` | 从 snap-research/locomo 拉 `data/locomo10.json` 到 `eval/locomo/data/` | 新建 |
 | `eval/locomo/data/locomo10.json` | 数据集副本(从 snap-research/locomo 拉) | 新建 + .gitignore |
 | `eval/locomo/.checkpoint.json` | 断点续跑 | 新建 + .gitignore |
 | `cc_harness/tools.py` | **加 2 个 native tool**:`memory_store`、`memory_query` | 改 |
@@ -156,7 +157,20 @@ python eval/locomo/runner.py --resume
 
 # 只评分不存(deepeval 拿分用)
 python eval/locomo/runner.py --eval-only
+
+# 启动时探活 langfuse 连通(默认开,不通就 [yellow] 报但不阻断)
+python eval/locomo/runner.py --no-check-trace  # 跳过探活
 ```
+
+完整 flag:
+
+| flag | 默认 | 含义 |
+|---|---|---|
+| `--limit N` | 10(全量) | 只跑前 N 个 sample |
+| `--no-trace` | false | 不连 langfuse(本地 trace 仍写) |
+| `--no-check-trace` | false | 启动时跳过 langfuse 探活 |
+| `--resume` | false | 从 .checkpoint.json 续跑 |
+| `--eval-only` | false | 只评分(已有 result JSON),不重跑 agent |
 
 ### 3.2 evaluator.py 接口
 
@@ -174,6 +188,7 @@ def evaluate_qa(prompt: str, predicted: str, gold: str) -> dict:
         "f1": token_f1(predicted, gold),
         "quality": quality_score(prompt, predicted, gold),
         "pass": (token_f1 > 0.5) or (quality > 0.7),
+        "final": {"f1": ..., "quality": ..., "pass": ...},  # 给 langfuse trace.update(output=) 用
     }
 ```
 
@@ -206,15 +221,28 @@ for turn_idx, turn in enumerate(turns):
     span.end()
 trace.score(name="f1", value=f1_score)
 trace.score(name="quality", value=quality_score)
-trace.update(output={"qa_score": final})
+trace.update(output=eval_result["final"])  # eval_result = evaluate_qa(...) return dict
 ```
 
 ### 3.5 HTML 报告字段(每条 QA 一行)
 
-| sample_id | turn_idx | q_type | f1 | quality | pass | prompt_tokens | completion_tokens | cost_usd | tool_calls |
-|---|---|---|---|---|---|---|---|---|---|
+| sample_id | turn_idx | q_type | status | f1 | quality | pass | prompt_tokens | completion_tokens | cost_usd | tool_calls |
+|---|---|---|---|---|---|---|---|---|---|---|
 
-顶层 summary cards:`总样本 / 通过样本 / F1 中位数 / 质量分中位数 / 总成本(USD) / 总 tool 调用数`。
+`status` 列定义(每条 QA 一行,失败也要写):
+
+| status 值 | f1 | quality | pass | 渲染 |
+|---|---|---|---|---|
+| `ok` | 数字 | 数字 | bool | 正常行,绿/红 pass |
+| `quality_null` | 数字 | `null` | `f1 > 0.5` | 黄底"judge 失败,只用 F1" |
+| `agent_crash` | `null` | `null` | false | 灰底"agent 崩溃,该 sample 剩余 QA 同标" |
+| `infra_fail` | `null` | `null` | false | 灰底"LLM 3 次 retry 失败" |
+| `timeout` | `null` | `null` | false | 灰底"sample 超时" |
+| `skipped` | `null` | `null` | false | 灰底"无 QA 列表" |
+
+**agent 崩溃粒度**:`agent_crash` 影响**该 sample 剩余所有 QA**(全标 `agent_crash`),不是只当前 turn。原因:ReAct 跑过中后段 agent 挂了,前面 turn 累计的 memory 状态不可信,继续出 QA 没意义。
+
+顶层 summary cards:`总样本 / 通过样本 / F1 中位数 / 质量分中位数 / 总成本(USD) / 总 tool 调用数`,每张卡可点进展开失败样本清单。
 
 ---
 
@@ -314,7 +342,10 @@ LANGFUSE_HOST=https://cloud.langfuse.com  # 或 self-host URL
 
 ## 7. 关键设计决策(记录为什么)
 
-- **选方案 C(eval runner 包 run_turn)而非 A/B**:agent.py 不动,locomo 100% 控速控测,产品/eval 干净分离
+- **选方案 C(eval runner 包 run_turn)而非 A/B**:
+  - A:deepeval + langfuse 直接 import 进 `agent.py:run_turn` 内部埋点(改 1 个文件,污染产品代码)
+  - B:sidecar 事件总线(`agent.py` 暴露 `emit()` 钩子,eval 启子进程订阅,产品/eval 完全解耦但多进程)
+  - C(选):`eval/locomo/runner.py` 直接 import `cc_harness/agent.py:run_turn_sync` 同步外壳(agent.py 不改,locomo 100% 控速控测,产品/eval 干净分离)
 - **memory 接成 native tool 而非自动注入**:agent 主动决定"什么时候存、什么时候查",更真实;L4 闸门天然能拦滥用
 - **F1 + GEval 双指标**:F1 确定性 + GEval 主观性互补,单 F1 评不出表达类问题
 - **langfuse cloud 而非自托管**:多容器资源重 + 跟现有 dify 容器可能冲 port;cloud 零运维
