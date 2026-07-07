@@ -8,7 +8,7 @@ import sys
 import time
 from pathlib import Path
 from rich.console import Console
-from cc_harness.config import load_config, ConfigError
+from cc_harness.config import load_config, ConfigError, load_executor_config
 from cc_harness.llm import LLMClient
 from cc_harness.mcp_client import MCPClient
 from cc_harness.repl import run_repl
@@ -69,6 +69,35 @@ def main() -> None:
             console.print(
                 f"[dim]startup: {time.monotonic() - boot_start:.2f}s[/dim]"
             )
+
+            # Pre-warm sandbox server when backend=sandbox.
+            # Why: ensure_server() currently only fires on the first command,
+            # which (a) hides config errors until something breaks, and
+            # (b) adds ~3s cold-start to the first sandboxed run. Pre-warming
+            # at boot surfaces failures immediately and removes the cold-start
+            # cliff. No-op when backend=native (default).
+            exec_cfg = load_executor_config(PROJECT_ROOT / "policy.yaml")
+            if str(exec_cfg.backend.value) == "sandbox":
+                from cc_harness.sandbox_server import ensure_server
+                sb = exec_cfg.sandbox
+                console.print(
+                    f"[dim]sandbox pre-warm: {sb.server_host}:{sb.server_port}[/dim]"
+                )
+                state = await ensure_server(
+                    sb.server_port, sb.server_host,
+                    ready_timeout=sb.timeout_s,
+                    allowed_host_paths=[str(PROJECT_ROOT)],
+                )
+                if state is None:
+                    console.print(
+                        "[red]sandbox server 起不来 → sandbox 模式不可用"
+                        "(Docker 未起 / port 冲突 / 镜像缺失)[/red]"
+                    )
+                else:
+                    console.print(
+                        f"[dim]sandbox server up (owned={state.owned})[/dim]"
+                    )
+
             await run_repl(
                 llm, mcp,
                 cwd=str(PROJECT_ROOT),

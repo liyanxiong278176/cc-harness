@@ -4,7 +4,8 @@
   "version": "0.2.0",
   "description": "promptfoo-based security CI for cc-harness (50 hand-written attacks)",
   "scripts": {
-    "security": "python tools/generate_attacks.py && promptfoo eval -c promptfooconfig.security.yaml",
+    "redteam-all": "python tools/run_eval.py unified",
+    "redteam-unified": "python tools/run_eval.py unified --keep-json",
     "gen-attacks": "python tools/generate_attacks.py",
     "curate": "python tools/curate_attacks.py",
     "view": "promptfoo view"
