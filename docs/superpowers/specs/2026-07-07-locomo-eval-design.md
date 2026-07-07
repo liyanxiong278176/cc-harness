@@ -55,7 +55,7 @@ runner.py 主循环(10 样本)
   ↓
 dataset.py 解析:turns = [speaker, dia_id, text, ...], qa = [(q, a, category, evidence)]
   ↓
-对每 turn:run_turn_sync(turn.text)  ← 调 cc_harness/agent.py
+对每 turn:run_turn_sync(messages, options)  ← 传累积的 messages 列表并读回更新后的列表(让 memory tool 有东西可查)
   ↓
 agent.py 调 llm.py(deepseek) ─────→ trace.generation(name="llm-call", usage={...})
   ↓
@@ -227,8 +227,8 @@ for turn_idx, turn in enumerate(turns):
             input=msgs, output=response,
             usage={"input": prompt_tokens, "output": completion_tokens},
         )
-    if tool_called == "memory_store":
-        span.event(name="tool-memory_store", input=args, output=result)
+    if tool_called in ("memory_store", "memory_query"):
+        span.event(name=f"tool-{tool_called}", input=args, output=result)
     # 命名约定:event name = "tool-{tool_name}"(跟 §2.1 "tool-xxx" 对齐)
     span.end()
 trace.score(name="f1", value=f1_score)
