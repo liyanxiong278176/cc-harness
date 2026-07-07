@@ -88,7 +88,7 @@ runner.py:langfuse.flush() 同步上 cloud
 | `pyproject.toml` | **加依赖**:`deepeval`、`langfuse` | 改 |
 | `policy.yaml` | **加段**:`locomo_eval:`(kill-switch) | 改 |
 | `cc_harness/policy.py` | **加 2 条 tool 规则**:`memory_store` ask、`memory_query` allow (拦 'password'/'token' 关键词) | 改 |
-| `tests/test_evaluator.py` 等 | pytest 单测走 cc_harness 测试目录 | 放 `eval/locomo/tests/` |
+| `eval/locomo/tests/test_evaluator.py` 等 | locomo 子系统自带单测目录,跑 `pytest eval/locomo/tests/ -v` | 新建(放 `eval/locomo/tests/`,**不混** cc-harness 仓根 `tests/`) |
 
 ### 2.3 新 native tool 接口(`cc_harness/tools.py` 加)
 
@@ -264,7 +264,7 @@ trace.update(output=eval_result["trace_payload"])  # eval_result = evaluate_qa(.
 
 | 失败 | 检测 | 处理 | 是否 abort |
 |---|---|---|---|
-| locomo JSON 加载失败(文件缺/格式坏) | 启动时立即报 | 终端 `[red]` 报,exit 2 | **是** |
+| locomo JSON 加载失败(文件缺/格式坏) | 启动时立即报 | 终端 `[red]` 报,exit 2 + 提示 `python eval/locomo/download_dataset.py` | **是** |
 | LLM API 失败(网络/限流) | 单 turn 内 | retry 3 次(指数退避 1/2/4s),3 次还挂 → 该 sample 标 `infra_fail` 跳过 | 否 |
 | memory 写失败(SQLite 锁/磁盘满) | tool 内部 | tool 返回 `{ok: False, error: ...}`,agent 收到后继续 | 否 |
 | memory 查失败(embedding API 挂) | tool 内部 | tool 返回 `{ok: False, fallback: "noop"}`,agent 继续 | 否 |
