@@ -184,11 +184,22 @@ def quality_score(prompt: str, predicted: str, gold: str) -> float:
     ...
 
 def evaluate_qa(prompt: str, predicted: str, gold: str) -> dict:
+    """返回字段:
+    - f1: token F1(locomo 官方推荐)
+    - quality: deepeval GEval 质量分
+    - pass: f1 > 0.5 OR quality > 0.7
+    - trace_payload: 直接给 langfuse trace.update(output=) 用的子 dict
+      (避免 trace 调用方再拼一遍字段)
+    """
+    f1 = token_f1(predicted, gold)
+    quality = quality_score(prompt, predicted, gold)
     return {
-        "f1": token_f1(predicted, gold),
-        "quality": quality_score(prompt, predicted, gold),
-        "pass": (token_f1 > 0.5) or (quality > 0.7),
-        "final": {"f1": ..., "quality": ..., "pass": ...},  # 给 langfuse trace.update(output=) 用
+        "f1": f1,
+        "quality": quality,
+        "pass": (f1 > 0.5) or (quality > 0.7),
+        "trace_payload": {
+            "f1": f1, "quality": quality, "pass": (f1 > 0.5) or (quality > 0.7),
+        },
     }
 ```
 
@@ -218,10 +229,11 @@ for turn_idx, turn in enumerate(turns):
         )
     if tool_called == "memory_store":
         span.event(name="tool-memory_store", input=args, output=result)
+    # 命名约定:event name = "tool-{tool_name}"(跟 §2.1 "tool-xxx" 对齐)
     span.end()
 trace.score(name="f1", value=f1_score)
 trace.score(name="quality", value=quality_score)
-trace.update(output=eval_result["final"])  # eval_result = evaluate_qa(...) return dict
+trace.update(output=eval_result["trace_payload"])  # eval_result = evaluate_qa(...) return dict
 ```
 
 ### 3.5 HTML 报告字段(每条 QA 一行)
@@ -295,7 +307,7 @@ locomo_eval:
 
 | 风险 | 等级 | 缓解 |
 |---|---|---|
-| 3000 turn × 2s = 100 min 全量 | 高 | 默认 sample_timeout=30 min;支持 `--limit N` 抽样;报告里标 "本跑 N/M 样本" |
+| 3000 turn × 2s = 100 min 全量 | 高 | **Phase 1 头 1 个 sample 实测 wall-clock** 校准 sample_timeout;支持 `--limit N` 抽样;报告里标 "本跑 N/M 样本" |
 | langfuse cloud API key 漏到 git | 高 | 走 `.env`(已有),CI 用 secret |
 | memory 写污染下次跑 | 中 | runner 启动时清 `locomo/%` tag,隔离 |
 | deepeval GEval 跟人类判断不符 | 中 | F1 兜底,GEval 参考;报告两分都列 |
