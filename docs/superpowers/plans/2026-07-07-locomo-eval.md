@@ -397,26 +397,35 @@ Expected: `OK` 或 ImportError(失败信息给后续 task 用)
   git checkout 040e518~f3141b6 -- cc_harness/memory/
   ```
 
-- [ ] **Step 4: 验 MemoryService 有 delete_by_tag 方法**
+- [ ] **Step 4: 验 MemoryService 有 delete_by_tag 方法 + 看 MemoryStore schema**
 
 Run: `PYTHONIOENCODING=utf-8 .venv/Scripts/python.exe -c "from cc_harness.memory.service import MemoryService; import inspect; print('delete_by_tag' in dir(MemoryService))" 2>&1 | tail -3`
 Expected: `True` 或 `False`
 
-如果 `False` → 在 `cc_harness/memory/service.py` 加最小实现:
+**先 inspect schema**:
+```bash
+grep -n "CREATE TABLE\|tags" cc_harness/memory/store.py 2>&1 | head -10
+```
+
+看 tags 是 JSON column / junction table / 别的。然后再写 delete_by_tag:
+
+如果 `False` → 在 `cc_harness/memory/service.py` 加最小实现(根据实际 schema):
 ```python
 def delete_by_tag(self, tag_pattern: str) -> int:
     """Delete all memories whose tags match the LIKE pattern. Returns row count."""
-    # pattern 示例:'locomo/%' → SQL LIKE 'locomo/%' 通配
+    # 实现要 match store.py 实际 schema(tags 是 JSON column 还是 junction table)
+    # 若是 JSON:WHERE json_extract(tags, '$') LIKE ? 或 tags LIKE ?
+    # 若是 junction:DELETE FROM memory_tags WHERE tag LIKE ? 然后级联删 memories
     with sqlite3.connect(self.store.db_path) as conn:
         cur = conn.execute(
-            "DELETE FROM memories WHERE tags LIKE ?",
+            "DELETE FROM memories WHERE tags LIKE ?",  # 或对应 schema 的 SQL
             (tag_pattern,),
         )
         conn.commit()
         return cur.rowcount
 ```
 
-(具体数据表 schema 看 `cc_harness/memory/store.py` 的 `MemoryStore` 方法,实现要 match 实际 schema)
+(具体 schema 看 inspect 输出,实现要 match 实际数据表结构)
 
 - [ ] **Step 5: commit**
 
@@ -694,24 +703,34 @@ extra_native_specs: list[dict] | None = None,
 
 b) 在 ReAct loop 里 dispatch tool_call 时(原来调用 `NATIVE_TOOLS[p.name]["handler"](args, cwd=str(cwd))` 那里),加 `extra_native_specs` 路径:
 
-```python
-# 原:
-result = await NATIVE_TOOLS[p.name]["handler"](args, cwd=str(cwd))
+**两处必改**:
+1. **tool_specs 累积**(让 LLM 看到 extra specs),在 `for native in NATIVE_TOOLS.values():` 之后:
+   ```python
+   for native in NATIVE_TOOLS.values():
+       tool_specs.append(native["spec"])
+   for entry in (extra_native_specs or []):
+       tool_specs.append(entry["spec"])  # NEW
+   ```
 
-# 改:
-result = None
-if p.name in NATIVE_TOOLS:
-    result = await NATIVE_TOOLS[p.name]["handler"](args, cwd=str(cwd))
-else:
-    for entry in (extra_native_specs or []):
-        if entry["spec"]["function"]["name"] == p.name:
-            h_kwargs = {"cwd": str(cwd), **entry.get("deps", {})}
-            result = await entry["handler"](args, **h_kwargs)
-            break
-    if result is None:
-        # 未知工具,记错误并继续
-        ...
-```
+2. **dispatch tool_call**(让 handler 被调),原来调用 `NATIVE_TOOLS[p.name]["handler"](args, cwd=str(cwd))` 那里:
+   ```python
+   # 原:
+   result = await NATIVE_TOOLS[p.name]["handler"](args, cwd=str(cwd))
+
+   # 改:
+   result = None
+   if p.name in NATIVE_TOOLS:
+       result = await NATIVE_TOOLS[p.name]["handler"](args, cwd=str(cwd))
+   else:
+       for entry in (extra_native_specs or []):
+           if entry["spec"]["function"]["name"] == p.name:
+               h_kwargs = {"cwd": str(cwd), **entry.get("deps", {})}
+               result = await entry["handler"](args, **h_kwargs)
+               break
+       if result is None:
+           # 未知工具,记错误并继续
+           ...
+   ```
 
 (具体改法看 agent.py 实际 ReAct loop 结构;核心:加 extra 分支,保持 NATIVE_TOOLS 路径不变以保 REPL 行为 1:1)
 
@@ -951,6 +970,7 @@ class LocomoTrace:
             pass
 
     def update(self, output: dict):
+        """给 trace 追加 output payload(spec §3.3 没列,但 runner.py 需要,加性扩展)。"""
         trace = self._trace_or_skip()
         if trace is None:
             return
@@ -1254,7 +1274,7 @@ from pathlib import Path
 REPO = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(REPO))
 
-from dotenv import dotenv_values
+from dotenv import dotenv_values  # 已在 pyproject.toml(整个 cc-harness 都用,本 spec 不改)
 from eval.locomo import dataset as ds
 from eval.locomo.evaluator import evaluate_qa
 from eval.locomo.report import write_html_report
@@ -1291,8 +1311,11 @@ async def _build_memory_extras(policy: dict):
     if not policy.get("inject_memory_tools", True):
         return [], None
     try:
-        from cc_harness.memory.service import MemoryService
+        from cc_harness.memory.store import MemoryStore
+        from cc_harness.memory.embedding import EmbeddingClient
+        from cc_harness.memory.decider import LLMDecider
         from cc_harness.memory.retriever import MemoryRetriever
+        from cc_harness.memory.service import MemoryService
         from cc_harness.memory.tools import (
             MEMORY_RECALL_SPEC, MEMORY_SAVE_SPEC,
             memory_recall_handler, memory_save_handler,
@@ -1301,11 +1324,14 @@ async def _build_memory_extras(policy: dict):
         print(f"[runner] memory import failed: {e}; running without memory tools")
         return [], None
 
-    # Service + retriever 实例(具体构造参数看 MemoryService/MemoryRetriever API)
-    # 占位:从 .env 读 EMBEDDING_* 配置
+    # 构造依赖(看 f3141b6 各自类的 __init__ 签名,以下为典型构造)
     try:
-        service = MemoryService.from_env()  # 若没此方法,改 MemoryService()
-        retriever = MemoryRetriever.from_env()
+        # 从 .env 取 EMBEDDING_* 配置;若缺,降级到 no-op
+        store = MemoryStore.from_env() if hasattr(MemoryStore, "from_env") else MemoryStore()
+        embedder = EmbeddingClient.from_env() if hasattr(EmbeddingClient, "from_env") else EmbeddingClient()
+        decider = LLMDecider.from_env() if hasattr(LLMDecider, "from_env") else LLMDecider()
+        service = MemoryService(store=store, embedder=embedder, decider=decider)
+        retriever = MemoryRetriever(store=store, embedder=embedder)
     except Exception as e:
         print(f"[runner] memory service init failed: {e}; running without memory tools")
         return [], None
@@ -1355,15 +1381,16 @@ async def _run_sample(sample: dict, policy: dict, extras: list[dict], trace: Loc
     await mcp.start()
 
     try:
-        messages: list[dict] = []
-        for turn in turns:
+        messages: list[dict] = []  # 累积全对话;run_turn mutate in place
+        for turn_idx, turn in enumerate(turns):
             if time.time() - started > sample_timeout_s:
                 return [{"sample_id": parsed.sample_id, "turn_idx": -1, "q_type": "n/a",
                          "status": "timeout", "f1": None, "quality": None, "pass": False,
                          "prompt_tokens": 0, "completion_tokens": 0, "cost_usd": 0.0,
                          "tool_calls": []}]
-            span = trace.start_turn(len(messages), turn.text)
-            messages = _make_initial_messages(turn.text, turn.speaker)
+            span = trace.start_turn(turn_idx, turn.text)
+            # 追加新 turn 到累积 messages(不覆盖)
+            messages.append({"role": "user", "content": f"[{turn.speaker}] {turn.text}"})
             try:
                 stats = await run_turn(
                     messages, llm, mcp,
@@ -1384,7 +1411,7 @@ async def _run_sample(sample: dict, policy: dict, extras: list[dict], trace: Loc
                              messages, stats, {"prompt_tokens": stats.api_prompt_tokens,
                                                "completion_tokens": stats.api_completion_tokens})
 
-        # Ask each QA
+        # Ask each QA(基于累积的 messages,带全对话上下文)
         results = []
         for qa in ds.iter_qa(parsed):
             qa_messages = list(messages) + [{"role": "user", "content": qa.question}]
