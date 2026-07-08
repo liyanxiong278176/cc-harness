@@ -1,10 +1,16 @@
-# Locomo 长对话记忆 QA 评测子系统设计
+# Locomo 长对话记忆 QA 评测子系统设计 — v2(基于真实代码)
 
 - 日期:2026-07-07
-- 状态:已批准
+- 状态:v2 草稿(基于实际 cc-harness 代码 + f3141b6 旧 memory 实现重写)
 - 子项目编号:**M5(eval 多工具化,子项目 1)**
-- 作者:Claude(claude-fable-5)+ liyanxiong
-- 系列:`eval/{promptfoo,deepeval,langfuse}` 多工具评测体系的第 1 个落地
+- v1 → v2 关键改动:
+  - run_turn 用**真实签名**`(messages, llm, mcp, *, max_iter=20, mode, cwd, ...)`(v1 编的 `(messages, options)` 删)
+  - 返回类型用**真实** `TurnTokenStats` dataclass(v1 编的 dict 删)
+  - memory tools 跟 **f3141b6 旧实现**对齐:`memory_recall` / `memory_save`(v1 编的 `memory_store` / `memory_query` 删)
+  - memory tools 走 **closure-based 注入**进 `native_handlers`,**不进 NATIVE_TOOLS dict**(v1 编的 NATIVE_TOOLS 注册删)
+  - L4 用 **`_classify(name) -> str`** 模式,v1 编的 `Rule` / `TOOL_RULES` 删;secret 过滤进 tool handler 内部
+  - **policy.yaml 不存在**,要用 `cc_harness/config.py` 的 `ExecutorConfig` 模式或新建 policy.yaml
+  - 真实情况:`cc_harness/memory/` 包**只存在于 git 历史**(f3141b6 + 8 个前置 commit),工作树只剩 `.db` + `__pycache__`,要从 git checkout 恢复
 
 ---
 
@@ -12,132 +18,186 @@
 
 ### 1.1 现状
 
-`eval/promptfoo/` 已有红队评测(L2/L4/L5/L8 防御层 + OWASP + coding-agent 全集),测的是"agent 会不会被诱导/攻破"。**但这只能回答"安不安全",回答不了"质量怎么样 + 成本多少 + 干了什么"**。
-
-`cc_harness/memory/`(SQLite + BAAI/bge-m3 embedding)代码在仓里,但**未 wire 进 ReAct loop**(CLAUDE.md 明示)。这次顺手接上,作为 memory 第一次实跑验证。
+- `eval/promptfoo/` 已有红队评测,L2/L4/L5/L8 防御层验证过
+- `cc_harness/memory/` **8 个 commit 完整实现过**(f3141b6: memory_recall/save + tools.py / 2402222: MemoryRetriever / e968ed4: MemoryPipeline / ad79ceb: MemoryService / d751e7c: LLMDecider / 7e397d3: MemoryStore / bda1701: EmbeddingClient / 040e518: MemoryConfig),但**工作树只剩 .db + __pycache__,代码全部 lost**
+- 任务:把 memory 包 checkout 回来 → 接到 run_turn → 用 locomo 数据集验证
 
 ### 1.2 目标(GOAL)
 
-**搭建 `eval/locomo/` 子系统,跑 snap-research/locomo 数据集,测 cc-harness agent 在长对话下的记忆能力 + 成本 + 任务轨迹,并把结果上 langfuse cloud。**
+**搭建 `eval/locomo/` 子系统,跑 snap-research/locomo 10 样本,测 cc-harness agent 长对话记忆 + 成本 + 任务轨迹,结果上 langfuse cloud。**
 
 完成定义:
-1. `python eval/locomo/runner.py` 一行命令跑完 10 个 locomo 样本(支持 `--limit N` 抽样)
-2. 产出 `eval/result/locomo-report-YYYY-MM-DD.html`,每条 QA 一行:f1 / deepeval 质量分 / token 成本 / tool-call 列表 / pass 标志
-3. 同步把 trace 上 langfuse cloud(项目名 `cc-harness-locomo`)
-4. 3 个 pytest 单元测试通过
+1. `python eval/locomo/runner.py` 一行跑通,支持 `--limit N`
+2. 产出 `eval/result/locomo-report-YYYY-MM-DD.html`,每条 QA 一行:f1 / deepeval 质量分 / token 成本 / tool-call 列表 / 状态
+3. 同步 trace 上 langfuse cloud(项目 `cc-harness-locomo`)
+4. 3 个 pytest 通过
 
 ### 1.3 不在范围(OUT)
 
-- ❌ 改 cc-harness ReAct loop 主体(只在 `tools.py` 加 2 个 native tool,`run_turn()` 小幅 refactor)
-- ❌ 改 `cc_harness/memory/` 包的实现(SQL/embedding 算法不动)
-- ❌ 跑其它数据集(MTEB、LongBench、NeedleBench 后续单独立项)
-- ❌ 起 langfuse 自托管服务器(用 cloud)
-- ❌ 红队整合(子项目 4 的事,后续做)
-- ❌ 多 agent 协作(单人 1 agent)
+- ❌ 改 cc-harness ReAct loop 主体(`run_turn` 内部 ReAct 逻辑)
+- ❌ 改 `cc_harness/policy.py` 的 L4 引擎主体(只 `_classify` 加 case)
+- ❌ 改 `cc_harness/tokens.py` TokenCounter / TurnTokenStats 字段
+- ❌ 改 `cc_harness/memory/` 已有算法(SQL/embedding 不动,只恢复文件 + 接 tools)
+- ❌ 跑其它数据集
+- ❌ 起 langfuse 自托管
+- ❌ 红队整合
 
 ### 1.4 验收标准(AC)
 
-- **AC1**:`runner.py --limit 1` 跑通 1 个样本,产出 HTML + 上 langfuse,人能读懂
-- **AC2**:10 个样本全跑完,产出报告 + langfuse 有 10 个 trace
-- **AC3**:`memory_store` / `memory_query` 通过 L4 闸门(危险调用被拦,日志在 `policy.jsonl`)
-- **AC4**:3 个 pytest 单元测试通过(`pytest eval/locomo/tests/ -v`)
+- **AC1**:`runner.py --limit 1` 跑通 1 样本,产 HTML + 上 langfuse
+- **AC2**:10 样本全跑完,产报告 + langfuse 有 10 个 trace
+- **AC3**:`memory_save` 走 L4 ask 闸门,`memory_recall` 走 allow 闸门(写 `policy.jsonl` 有日志)
+- **AC4**:`pytest eval/locomo/tests/ -v` 3 个测试通过
 
 ---
 
-## 2. 架构
+## 2. 架构(基于真实代码)
 
 ### 2.1 数据流(单条 QA)
 
 ```
-locomo10.json
+locomo10.json (下载到 eval/locomo/data/)
   ↓
-runner.py 主循环(10 样本)
+runner.py 主循环 (10 样本)
   ↓
-dataset.py 解析:turns = [speaker, dia_id, text, ...], qa = [(q, a, category, evidence)]
+对每 sample:
+  1. dataset.iter_turns(sample) → list[Turn]
+  2. 清旧 memory (按 tag "locomo/%")
+  3. messages = []
+  4. for turn in turns[:max_turns]:
+       messages.append({role:user, content:[speaker] text})
+       out = run_turn_sync(messages, llm_client, mcp_client, ...)
+         # 内部 ReAct: LLM 决定调 memory_save 或 memory_recall
+       messages = out.messages  # mutated in place
+  5. for qa in sample.qa:
+       qa_messages = messages + [{role:user, content:qa.question}]
+       out = run_turn_sync(qa_messages, ...)
+       predicted = out.messages[-1].content
+       eval_result = evaluate_qa(prompt, predicted, gold_answer)
+       trace.score(f1), trace.score(quality)
   ↓
-对每 turn:run_turn_sync(messages, options)  ← 传累积的 messages 列表并读回更新后的列表(让 memory tool 有东西可查)
-  ↓
-agent.py 调 llm.py(deepseek) ─────→ trace.generation(name="llm-call", usage={...})
-  ↓
-agent.py 调 tools.py(memory_store / memory_query) ─→ trace.event(name="tool-xxx")
-  ↓
-最后一条 user turn 是 QA 提问,agent 返回答案
-  ↓
-evaluator.py:token_f1 + deepeval GEval ─────────→ trace.score(name="f1" / "quality")
-  ↓
-report.py:行追加到 locomo-report-YYYY-MM-DD.html
-  ↓
-runner.py:langfuse.flush() 同步上 cloud
+runner 聚合 results → report.py HTML → langfuse.flush()
 ```
 
 ### 2.2 模块清单
 
-| 路径 | 角色 | 新建/改 |
+| 路径 | 角色 | 来源 |
 |---|---|---|
-| `eval/locomo/runner.py` | 入口:循环 10 样本,每样本 replay + QA + 评分 + 报告 | 新建 |
-| `eval/locomo/dataset.py` | locomo JSON 加载、turn 解析、QA 切分 | 新建 |
-| `eval/locomo/evaluator.py` | F1、deepeval GEval、cost 抓取 | 新建 |
-| `eval/locomo/trace.py` | langfuse SDK 封装:trace/span/generation/score | 新建 |
-| `eval/locomo/report.py` | HTML 报告生成 | 新建 |
-| `eval/locomo/tests/test_*.py` | 3 个单测 | 新建 |
-| `eval/locomo/download_dataset.py` | 从 snap-research/locomo 拉 `data/locomo10.json` 到 `eval/locomo/data/` | 新建 |
-| `eval/locomo/data/locomo10.json` | 数据集副本(从 snap-research/locomo 拉) | 新建 + .gitignore |
-| `eval/locomo/.checkpoint.json` | 断点续跑 | 新建 + .gitignore |
-| `cc_harness/tools.py` | **加 2 个 native tool**:`memory_store`、`memory_query` | 改 |
-| `cc_harness/agent.py` | **小幅 refactor**:抽 `run_turn_sync` 供外部直接调 | 改 |
-| `pyproject.toml` | **加依赖**:`deepeval`、`langfuse` | 改 |
-| `policy.yaml` | **加段**:`locomo_eval:`(kill-switch) | 改 |
-| `cc_harness/policy.py` | **加 2 条 tool 规则**:`memory_store` ask、`memory_query` allow (拦 'password'/'token' 关键词) | 改 |
-| `eval/locomo/tests/test_evaluator.py` 等 | locomo 子系统自带单测目录,跑 `pytest eval/locomo/tests/ -v` | 新建(放 `eval/locomo/tests/`,**不混** cc-harness 仓根 `tests/`) |
+| `eval/locomo/runner.py` | 入口,10 样本循环 | 新建 |
+| `eval/locomo/dataset.py` | locomo JSON 解析、turn/QA 切分 | 新建 |
+| `eval/locomo/evaluator.py` | token_f1 + deepeval GEval | 新建 |
+| `eval/locomo/trace.py` | langfuse SDK 封装(fail-soft) | 新建 |
+| `eval/locomo/report.py` | HTML 报告 | 新建 |
+| `eval/locomo/download_dataset.py` | 拉 locomo10.json | 新建 |
+| `eval/locomo/tests/test_*.py` | 3 单测 | 新建 |
+| `eval/locomo/data/.gitkeep` | 数据目录占位 | 新建 |
+| `cc_harness/memory/` | **从 git checkout** `040e518`~`f3141b6`(8 个 commit) | 恢复 |
+| `cc_harness/agent.py` | **小幅改**:`run_turn` 加可选参数 `extra_native_specs: list[dict]` + `native_handlers: dict[str, Callable]`(注入 memory tools) | 改 |
+| `cc_harness/policy.py` | **`_classify` 加 2 case**:`memory_save` → "fs_write" / `memory_recall` → "fs_read" | 改 |
+| `pyproject.toml` | 加 `deepeval`、`langfuse` 依赖 | 改 |
 
-### 2.3 新 native tool 接口(`cc_harness/tools.py` 加)
+**注意**:`cc_harness/memory/` 8 个文件**不是新写** — 用 `git checkout 040e518~f3141b6 -- cc_harness/memory/` 恢复。这保留原设计(8 个 commit 已经过审)。
 
+### 2.3 run_turn 注入接口(改 agent.py)
+
+**当前签名**:
 ```python
-@register_tool(
-    name="memory_store",
-    schema={
-        "text": "<string, 要存的摘要文本>",
-        "tags": "<list[string], 可选, 如 ['locomo', 'turn-23']>",
-    },
-    description="把一条对话摘要存进本地 SQLite+embedding 记忆库。",
-)
-def memory_store(args: dict, ctx: dict) -> dict:
-    """L4 闸门:执行/写 → ask。text 含 'password'/'token' 拦。"""
-    ...
-
-@register_tool(
-    name="memory_query",
-    schema={
-        "question": "<string>",
-        "top_k": "<int, default 5>",
-    },
-    description="按语义相似度从记忆库检索 top-k 条摘要。",
-)
-def memory_query(args: dict, ctx: dict) -> dict:
-    """L4 闸门:工作区内读 → allow。question 含 'password'/'token' 拦。"""
-    ...
+async def run_turn(
+    messages: list[dict],
+    llm,                  # any object with async chat(messages, tools) -> AsyncIterator[StreamEvent]
+    mcp,                  # any object with list_tools() and async call_tool(name, args) -> ToolResult
+    *, max_iter: int = 20, mode: str = "coding", cwd: str | None = None,
+    design_dir: Path | None = None, token_counter: TokenCounter | None = None,
+    policy: PolicyEngine | None = None, l5: L5Engine | None = None,
+) -> TurnTokenStats
 ```
 
-具体接入方式:跟现有 `run_command` 同模式,`policy.py` 注册新规则。
-
-### 2.4 run_turn 同步化(`cc_harness/agent.py`)
-
-`run_turn` 现在是 async + REPL 耦合。改造方式:
-
+**改后签名**(加 2 可选参数,默认 None 表示保持现状):
 ```python
-# 原:async def run_turn(messages, options) -> dict
-# 改:抽出 _run_turn_inner(同步核),run_turn(异步外壳,REPL 调它) 和 run_turn_sync(同步外壳,runner 调它) 都包它
-def _run_turn_inner(messages, options) -> dict:
-    """ReAct 循环核心,同步。"""
-    ...
-async def run_turn(messages, options) -> dict:
-    return _run_turn_inner(messages, options)
-def run_turn_sync(messages, options) -> dict:
-    """locomo runner / 测试 用的同步入口。"""
-    return _run_turn_inner(messages, options)
+async def run_turn(
+    messages, llm, mcp, *,
+    max_iter=20, mode="coding", cwd=None, design_dir=None,
+    token_counter=None, policy=None, l5=None,
+    extra_native_specs: list[dict] | None = None,
+    # extra_native_specs[i] = {"name": ..., "spec": <OpenAI function spec>, "handler": async fn(args, ctx)}
+) -> TurnTokenStats
 ```
 
-**保证**:REPL 行为不变,只新增一个同步外壳。
+**内部改动**(line 100 附近,`for native in NATIVE_TOOLS.values()` 后面):
+```python
+# 原:
+for native in NATIVE_TOOLS.values():
+    tool_specs.append(native["spec"])
+# 原 dispatch 走 NATIVE_TOOLS[p.name]["handler"]
+
+# 改后:
+for native in NATIVE_TOOLS.values():
+    tool_specs.append(native["spec"])
+for spec in (extra_native_specs or []):
+    tool_specs.append(spec["spec"])
+# dispatch 加: if p.name in extra_handlers: extra_handlers[p.name](p.arguments, ctx)
+```
+
+**保证**:不传 `extra_native_specs` 时,REPL 行为 1:1 不变(契约测试守护)。
+
+### 2.4 memory 工具(f3141b6 设计已审)
+
+```python
+# cc_harness/memory/tools.py (恢复,103 行)
+MEMORY_RECALL_SPEC = {
+    "type": "function",
+    "function": {
+        "name": "memory_recall",
+        "description": "按语义查询长期记忆,返回 top-k 相似记忆。",
+        "parameters": {"type": "object", "properties": {"query": {"type": "string"}}, "required": ["query"]},
+    },
+}
+
+MEMORY_SAVE_SPEC = {
+    "type": "function",
+    "function": {
+        "name": "memory_save",
+        "description": "保存一条长期记忆。系统自动检索相似记忆并执行 ADD/UPDATE/DELETE/NOOP。",
+        "parameters": {"type": "object", "properties": {"text": {"type": "string"}}, "required": ["text"]},
+    },
+}
+
+def make_recall_handler(retriever):  # closure injection
+    async def _handler(args, ctx):
+        return retriever.recall(args["query"], top_k=5)
+    return _handler
+
+def make_save_handler(service):  # closure injection
+    async def _handler(args, ctx):
+        return service.save(args["text"])
+    return _handler
+```
+
+**Secret 过滤**(在 handler 内部,不在 policy):
+```python
+_SECRET_RE = re.compile(r"(?i)(password|secret|token|credential|api[_-]?key)")
+def _scrub_secrets(text: str) -> str:
+    return "[REDACTED]" if _SECRET_RE.search(text) else text
+```
+
+### 2.5 L4 闸门(policy.py 改 1 处)
+
+**现状**:`_classify(name) -> str` 返回字符串 class,后续 switch 转 Decision。
+
+**改 1 处**:`_classify` 加 2 case:
+```python
+def _classify(name: str) -> str:
+    n = name.lower()
+    if n == "run_command": return "shell"
+    if n == "memory_save": return "fs_write"   # NEW
+    if n == "memory_recall": return "fs_read"  # NEW
+    # ... 其它原有 case 不动
+```
+
+`_classify("memory_save")` → "fs_write" → L4 转 ASK(写操作)。
+`_classify("memory_recall")` → "fs_read" → L4 转 ALLOW(工作区内读)。
+
+Secret 关键词不进 policy(违反 "无 deny" 不变式),在 tool handler `_scrub_secrets` 处理。
 
 ---
 
@@ -146,61 +206,35 @@ def run_turn_sync(messages, options) -> dict:
 ### 3.1 runner.py CLI
 
 ```bash
-# 默认:跑 10 样本,上 langfuse,产出 HTML
-python eval/locomo/runner.py
-
-# 烟测:1 个样本,不连 langfuse(防凭据漏)
-python eval/locomo/runner.py --limit 1 --no-trace
-
-# 跑完继续(从 .checkpoint.json 续)
-python eval/locomo/runner.py --resume
-
-# 只评分不存(deepeval 拿分用)
-python eval/locomo/runner.py --eval-only
-
-# 启动时探活 langfuse 连通(默认开,不通就 [yellow] 报但不阻断)
-python eval/locomo/runner.py --no-check-trace  # 跳过探活
+python eval/locomo/runner.py                       # 全量 10 样本
+python eval/locomo/runner.py --limit 1 --no-trace  # smoke
+python eval/locomo/runner.py --resume              # 断点续跑
+python eval/locomo/runner.py --no-memory-tools     # 测纯 baseline (不注入 memory)
 ```
 
 完整 flag:
 
 | flag | 默认 | 含义 |
 |---|---|---|
-| `--limit N` | 10(全量) | 只跑前 N 个 sample |
-| `--no-trace` | false | 不连 langfuse(本地 trace 仍写) |
-| `--no-check-trace` | false | 启动时跳过 langfuse 探活 |
-| `--resume` | false | 从 .checkpoint.json 续跑 |
-| `--eval-only` | false | 只评分(已有 result JSON),不重跑 agent |
+| `--limit N` | 10 | 只跑前 N 个 sample |
+| `--no-trace` | false | 不连 langfuse |
+| `--no-check-trace` | false | 启动跳过 langfuse 探活 |
+| `--resume` | false | 从 .checkpoint.json 续 |
+| `--no-memory-tools` | false | 不注入 memory tools(测 baseline) |
+| `--output-dir` | `eval/result` | 报告输出 |
 
-### 3.2 evaluator.py 接口
+### 3.2 evaluator 接口
 
 ```python
-def token_f1(predicted: str, gold: str) -> float:
-    """locomo 官方推荐:token 级 F1。"""
-    ...
-
-def quality_score(prompt: str, predicted: str, gold: str) -> float:
-    """deepeval GEval('答案质量'),返回 0-1。"""
-    ...
-
+def token_f1(predicted: str, gold: str) -> float: ...
+def quality_score(prompt: str, predicted: str, gold: str) -> float | None: ...  # deepeval 不可用时返 None
 def evaluate_qa(prompt: str, predicted: str, gold: str) -> dict:
-    """返回字段:
-    - f1: token F1(locomo 官方推荐)
-    - quality: deepeval GEval 质量分
+    """Returns:
+    - f1: token F1
+    - quality: deepeval GEval or None
     - pass: f1 > 0.5 OR quality > 0.7
-    - trace_payload: 直接给 langfuse trace.update(output=) 用的子 dict
-      (避免 trace 调用方再拼一遍字段)
+    - trace_payload: {f1, quality, pass} 给 langfuse trace.update(output=)
     """
-    f1 = token_f1(predicted, gold)
-    quality = quality_score(prompt, predicted, gold)
-    return {
-        "f1": f1,
-        "quality": quality,
-        "pass": (f1 > 0.5) or (quality > 0.7),
-        "trace_payload": {
-            "f1": f1, "quality": quality, "pass": (f1 > 0.5) or (quality > 0.7),
-        },
-    }
 ```
 
 ### 3.3 trace.py 接口
@@ -208,88 +242,113 @@ def evaluate_qa(prompt: str, predicted: str, gold: str) -> dict:
 ```python
 class LocomoTrace:
     def __init__(self, sample_id: str, enabled: bool = True): ...
-    def start_turn(self, turn_idx: int, text: str) -> Span: ...
-    def record_llm(self, span, model, input_msgs, output, usage) -> None: ...
-    def record_tool(self, span, name, args, result) -> None: ...
-    def score(self, name: str, value: float) -> None: ...
-    def flush(self) -> None: ...
+    def start_turn(self, turn_idx: int, text: str) -> Span | None: ...
+    def record_llm(self, span, model, input, output, usage): ...  # 注意:见 §3.5 LLM trace 限制
+    def record_tool(self, span, name, args, result): ...
+    def score(self, name: str, value: float): ...
+    def flush(self): ...
 ```
 
-### 3.4 langfuse trace 结构
+### 3.4 runner 调 agent 的方式
 
 ```python
-trace = langfuse.trace(name=f"locomo-{sample_id}", user_id="cc-harness-locomo-runner")
-for turn_idx, turn in enumerate(turns):
-    span = trace.span(name=f"turn-{turn_idx}", input=turn.text)
-    if llm_called:
-        generation = span.generation(
-            name="llm-call", model=cfg.openai_model,
-            input=msgs, output=response,
-            usage={"input": prompt_tokens, "output": completion_tokens},
-        )
-    if tool_called in ("memory_store", "memory_query"):
-        span.event(name=f"tool-{tool_called}", input=args, output=result)
-    # 命名约定:event name = "tool-{tool_name}"(跟 §2.1 "tool-xxx" 对齐)
-    span.end()
-trace.score(name="f1", value=f1_score)
-trace.score(name="quality", value=quality_score)
-trace.update(output=eval_result["trace_payload"])  # eval_result = evaluate_qa(...) return dict
+import asyncio
+from cc_harness.agent import run_turn
+from cc_harness.llm import LLMClient
+from cc_harness.mcp_client import MCPClient
+from cc_harness.memory.tools import MEMORY_SAVE_SPEC, MEMORY_RECALL_SPEC, make_save_handler, make_recall_handler
+from cc_harness.memory import MemoryService, MemoryRetriever
+
+# 1. 构造真实 LLM + MCP
+llm = LLMClient(api_key=..., model=..., base_url=...)
+mcp = MCPClient([...])
+await mcp.start()
+
+# 2. 构造 memory(retriever + service,从已恢复的 cc_harness/memory/)
+service = MemoryService(...)
+retriever = MemoryRetriever(...)
+
+# 3. 构造 extra_native_specs(注入,不是注册到 NATIVE_TOOLS)
+extra_specs = [
+    {"name": "memory_save", "spec": MEMORY_SAVE_SPEC, "handler": make_save_handler(service)},
+    {"name": "memory_recall", "spec": MEMORY_RECALL_SPEC, "handler": make_recall_handler(retriever)},
+]
+
+# 4. 调 run_turn
+async def main():
+    stats = await run_turn(
+        messages=[{"role": "user", "content": "..."}],
+        llm=llm, mcp=mcp,
+        extra_native_specs=extra_specs,
+        max_iter=10, mode="coding", cwd=...,
+    )
+    # stats.messages 已 mutated,取最后一条 assistant
+    predicted = stats.messages[-1].get("content", "")
+
+asyncio.run(main())
 ```
 
-### 3.5 HTML 报告字段(每条 QA 一行)
+### 3.5 LLM call trace(限制)
+
+**问题**:`run_turn` 内部 `async for ev in llm.chat(...)` 不会回调给 caller。spec 2.1 说要 trace 每个 LLM call,但当前接口不支持。
+
+**v2 决定**:**只 trace turn-level span**(每个 turn 一个 span),不 trace 单次 LLM call。trace 里:
+- `span.generation(name="llm-aggregate", model=cfg.openai_model, usage={"prompt_tokens": stats.api_prompt_tokens, "completion_tokens": stats.api_completion_tokens})`
+- `span.event(name=f"tool-{name}", input=args, output=result)`
+
+将来若要细粒度 LLM call trace,需在 agent.py 加 `on_llm_call: Callable | None = None` 回调(留作后续,本 spec 不做)。
+
+### 3.6 HTML 报告 schema(每条 QA 一行)
 
 | sample_id | turn_idx | q_type | status | f1 | quality | pass | prompt_tokens | completion_tokens | cost_usd | tool_calls |
 |---|---|---|---|---|---|---|---|---|---|---|
 
-`status` 列定义(每条 QA 一行,失败也要写):
+`status` 6 状态:ok / quality_null / agent_crash / infra_fail / timeout / skipped(同 v1)
 
-| status 值 | f1 | quality | pass | 渲染 |
-|---|---|---|---|---|
-| `ok` | 数字 | 数字 | bool | 正常行,绿/红 pass |
-| `quality_null` | 数字 | `null` | `f1 > 0.5` | 黄底"judge 失败,只用 F1" |
-| `agent_crash` | `null` | `null` | false | 灰底"agent 崩溃,该 sample 剩余 QA 同标" |
-| `infra_fail` | `null` | `null` | false | 灰底"LLM 3 次 retry 失败" |
-| `timeout` | `null` | `null` | false | 灰底"sample 超时" |
-| `skipped` | `null` | `null` | false | 灰底"无 QA 列表" |
+`agent_crash` 影响该 sample 剩余所有 QA。
 
-**agent 崩溃粒度**:`agent_crash` 影响**该 sample 剩余所有 QA**(全标 `agent_crash`),不是只当前 turn。原因:ReAct 跑过中后段 agent 挂了,前面 turn 累计的 memory 状态不可信,继续出 QA 没意义。
-
-顶层 summary cards:`总样本 / 通过样本 / F1 中位数 / 质量分中位数 / 总成本(USD) / 总 tool 调用数`,每张卡可点进展开失败样本清单。
+顶层 summary cards:总样本 / 通过 / F1 中位数 / 质量中位数 / 总成本(USD) / 总 tool 调用数。
 
 ---
 
-## 4. 失败处理、错误恢复、kill-switch
+## 4. 失败处理、kill-switch、恢复
 
 ### 4.1 失败模式 → 处理
 
-| 失败 | 检测 | 处理 | 是否 abort |
-|---|---|---|---|
-| locomo JSON 加载失败(文件缺/格式坏) | 启动时立即报 | 终端 `[red]` 报,exit 2 + 提示 `python eval/locomo/download_dataset.py` | **是** |
-| LLM API 失败(网络/限流) | 单 turn 内 | retry 3 次(指数退避 1/2/4s),3 次还挂 → 该 sample 标 `infra_fail` 跳过 | 否 |
-| memory 写失败(SQLite 锁/磁盘满) | tool 内部 | tool 返回 `{ok: False, error: ...}`,agent 收到后继续 | 否 |
-| memory 查失败(embedding API 挂) | tool 内部 | tool 返回 `{ok: False, fallback: "noop"}`,agent 继续 | 否 |
-| deepeval GEval 失败(judge LLM 挂) | evaluator 内部 | 该条 QA 标 `quality=null` 但保留 F1 | 否 |
-| langfuse cloud 连不上(API key 错/网络) | runner 启动时 `--check-trace` flag 默认开 | 终端 `[yellow]` 报,**不阻断**(本地 trace 仍写) | 否 |
-| 跑超时(单 sample > 30 min) | runner 计时 | 该 sample 标 `timeout`,继续下个 | 否 |
-| agent 跑出 OOM/REPL 死 | run_turn 抛异常 | 捕获,该 turn 标 `agent_crash` 跳过,继续 | 否 |
-| dataset 有 N/A 或空 QA 列表 | dataset.py 解析时 | skip 该 sample,日志 `skipped: 0 qa pairs` | 否 |
+| 失败 | 处理 | 是否 abort |
+|---|---|---|
+| locomo JSON 加载失败 | `[red]` 报 + 提示 `python eval/locomo/download_dataset.py`,exit 2 | 是 |
+| LLM API 失败(网络/限流) | runner 内 retry 3 次(指数退避 1/2/4s),仍挂 → 该 sample 标 `infra_fail` | 否 |
+| `memory_save` / `memory_recall` 抛异常 | tool handler 返回 `{ok: False, error}`,agent 继续 | 否 |
+| deepeval GEval 失败 | quality=None,保留 F1,status=`quality_null` | 否 |
+| langfuse cloud 连不上 | 启动 `[yellow]` 报,不阻断(本地 trace 不写) | 否 |
+| 单 sample 超时(sample_timeout_s) | sample 标 `timeout`,继续下个 | 否 |
+| agent crash | 该 sample 剩余 QA 全标 `agent_crash` | 否 |
+| QA 列表为空 | sample 标 `skipped` | 否 |
 
-### 4.2 Kill-switch(`policy.yaml` 加段)
+### 4.2 kill-switch
+
+不走 `policy.yaml`(不存在)。改用 `eval/locomo/policy_local.yaml`(新建 locomo 子系统自己的,跟 cc-harness 解耦):
 
 ```yaml
+# eval/locomo/policy_local.yaml
 locomo_eval:
-  enabled: true             # kill: false 全跳过 locomo runner
-  trace_to_langfuse: true   # kill: false 跑但不报 langfuse
-  max_turns_per_sample: 500 # 防止 locomo 某个超长对话拖垮
-  sample_timeout_s: 1800    # 30 min/sample
+  enabled: true
+  trace_to_langfuse: true
+  max_turns_per_sample: 500
+  sample_timeout_s: 1800
+  inject_memory_tools: true
+  clear_memory_tags: ["locomo/"]   # runner 启动时清的 tag
 ```
+
+(本 spec **不**改 cc_harness/policy.yaml;Locomo 是独立子系统,配置文件也独立)
 
 ### 4.3 幂等 / 可恢复
 
-- `runner.py` 默认从 `eval/locomo/.checkpoint.json` 读上次跑到的 sample_id,**断点续跑**
-- 每个 sample 跑完立刻追加一次报告(不全跑完才出 HTML)
-- `eval/locomo/data/locomo10.json` 单独 gitignore(数据大),仓里只放 `data/.gitkeep`
-- runner 启动时清 `locomo/%` tag 的旧 memory(隔离,防污染下次跑)
+- `runner.py` 默认从 `eval/locomo/.checkpoint.json` 读已 done 的 sample_id,断点续
+- 每个 sample 跑完立刻追加 report(不全跑完才出 HTML)
+- `eval/locomo/data/locomo10.json` gitignore,仓里只放 `.gitkeep`
+- runner 启动时清 `tag LIKE 'locomo/%'` 的 memory(隔离,防污染下次跑)— 见 §2.4 `MemoryService.delete_by_tag`
 
 ---
 
@@ -299,76 +358,82 @@ locomo_eval:
 
 | 文件 | 测什么 | 怎么测 |
 |---|---|---|
-| `eval/locomo/tests/test_evaluator.py` | `token_f1` + `evaluate_qa` 纯函数 | 给定 (pred, gold) → 期望 F1 范围,5 个 fixture case |
-| `eval/locomo/tests/test_dataset.py` | locomo JSON 解析、turn 切分、QA 切分、edge case | 用 mock data 覆盖 4 种 case(空 QA / 单 QA / 多 session / N/A) |
-| `eval/locomo/tests/test_runner_smoke.py` | 端到端:`--limit 1 --no-trace` 不连 langfuse,只验"能跑通不挂" | subprocess 真起 runner,验 exit code 0 + .checkpoint.json 写对 |
+| `eval/locomo/tests/test_evaluator.py` | `token_f1` + `evaluate_qa` | 5 fixture:exact/partial/no-match/empty pred/empty gold/CJK |
+| `eval/locomo/tests/test_dataset.py` | locomo 解析 | 4 case:basic/empty session/malformed entry/no QA |
+| `eval/locomo/tests/test_runner_smoke.py` | 端到端 | `subprocess.run(['python','eval/locomo/runner.py','--limit','1','--no-trace','--no-memory-tools'])` 验 exit 0 + HTML 产出 |
+
+`--no-memory-tools` 让 smoke 不依赖 f3141b6 恢复(若恢复失败,smoke 仍能跑 baseline)。
 
 ### 5.2 风险 & 缓解
 
 | 风险 | 等级 | 缓解 |
 |---|---|---|
-| 3000 turn × 2s = 100 min 全量 | 高 | **Phase 1 头 1 个 sample 实测 wall-clock** 校准 sample_timeout;支持 `--limit N` 抽样;报告里标 "本跑 N/M 样本" |
-| langfuse cloud API key 漏到 git | 高 | 走 `.env`(已有),CI 用 secret |
-| memory 写污染下次跑 | 中 | runner 启动时清 `locomo/%` tag,隔离 |
-| deepeval GEval 跟人类判断不符 | 中 | F1 兜底,GEval 参考;报告两分都列 |
-| locomo JSON 许可不明(snap-research 无明确 license) | 中 | 仅本地评测用,不入仓数据,报告里标 attribution |
-| agent 在长 context 下 token 爆 | 中 | `max_turns_per_sample: 500`;每 50 turn 检查 tokens,超 80K 截断早段 |
-| run_turn 同步化破坏 REPL | 中 | 抽 `_run_turn_inner` 共享给 sync wrapper,REPL 仍调原 `run_turn` async 不变 |
+| f3141b6 旧代码跟当前 cc_harness 主干不兼容(import 失败) | 高 | Phase 1 头一步先 `git checkout` 试 import;失败 → fallback 到重建最小包(`MemoryStore` + `EmbeddingClient` + `MemoryConfig` 不动算法,只保证接口齐) |
+| memory_save / memory_recall 在 `mode=plan/design` 下被传工具,触发 schema 校验 | 中 | runner 强制 `mode="coding"` |
+| `_classify` 加 case 改了 L4 默认行为 | 中 | 契约测试:`_classify("memory_save") == "fs_write"` + `_classify("memory_recall") == "fs_read"` + 跑 cc-harness 自带 `tests/test_policy.py`(若有) |
+| 3000 turn × 2s = 100 min 全量(悲观) | 中 | Phase 1 头 1 sample 实测 wall-clock 校准 `sample_timeout_s`;支持 `--limit N` 抽样 |
+| runner 跟 REPL 竞争 LLM API quota | 低 | runner 用独立 API key(env `OPENAI_API_KEY_RUNNER`,默认沿用主 key) |
+| langfuse cloud API key 漏到 git | 低 | 走 `.env`,CI secret |
 
 ### 5.3 时间表
 
-| 阶段 | 内容 | 估时 |
+| Phase | 内容 | 估时 |
 |---|---|---|
-| Phase 1 | 数据下载脚本 + dataset.py + evaluator.py + 1 个 pytest | 0.5 天 |
-| Phase 2 | 改 `cc_harness/tools.py` 加 2 tool + `agent.py` run_turn_sync + `policy.py` 加规则 | 0.5 天 |
-| Phase 3 | runner.py 主循环 + trace.py langfuse SDK + report.py HTML | 1 天 |
-| Phase 4 | policy.yaml kill-switch + 3 个 pytest + smoke 跑通 1 样本 | 0.5 天 |
-| Phase 5 | 全量 10 样本跑 + 修 bug + 报告 review | 1 天 |
+| Phase 1 | git checkout memory 包 + 验 import + dataset.py + evaluator.py + 1 pytest | 0.5 天 |
+| Phase 2 | agent.py 加 `extra_native_specs` + policy.py 加 2 case + 契约测试 | 0.5 天 |
+| Phase 3 | runner.py 主循环 + trace.py + report.py | 1 天 |
+| Phase 4 | policy_local.yaml + 3 pytest + smoke `--no-memory-tools` 跑通 | 0.5 天 |
+| Phase 5 | 全量 10 样本(带 memory tools)跑 + 修 bug | 1 天 |
 | **合计** | | **3.5 天** |
 
 ### 5.4 依赖新增
 
 ```toml
-# pyproject.toml [project.dependencies] 加
-"deepeval>=0.21",   # LLM judge (Answer Relevancy/GEval)
-"langfuse>=2.0",    # cloud trace SDK
+# pyproject.toml
+"deepeval>=0.21",
+"langfuse>=2.0",
 ```
 
-`.env.example` 加 2 项:
-
+`.env.example` 加:
 ```
 LANGFUSE_PUBLIC_KEY=pk-lf-...
 LANGFUSE_SECRET_KEY=sk-lf-...
-LANGFUSE_HOST=https://cloud.langfuse.com  # 或 self-host URL
+LANGFUSE_HOST=https://cloud.langfuse.com
 ```
 
 ---
 
-## 6. 后续(子项目 2-4,不在本 spec 范围)
+## 6. 跟 v1 的差异(给 reviewer)
 
-- **子项目 2**:token 成本 + ReAct 轨迹追踪(本 spec 已部分覆盖,后续扩到所有 agent 跑)
-- **子项目 3**:任务完成度 + 工具调用评估(用 coding 任务数据集,非对话)
-- **子项目 4**:跟红队整合(redteam 跑完直接 push 同一 langfuse project 出看板)
+| 段 | v1 | v2 | 为什么改 |
+|---|---|---|---|
+| §1.3 OUT | ❌ 改 cc_harness/memory/ 包不动 | ❌ 改 memory 算法(SQL/embedding 不动),**从 git checkout 恢复文件** | v1 没注意 memory 包没在工作树 |
+| §2.2 模块 | NATIVE_TOOLS 加 2 entry + TOOL_DISPATCH | **`extra_native_specs` 注入**(closure) | 实际 agent.py 用 NATIVE_TOOLS dict,模块级无 per-call deps |
+| §2.3 agent.py | 重构 run_turn_sync 返回 dict | **加 2 可选参数** `extra_native_specs` + `native_handlers` | 实际 `run_turn` 签名是 `(messages, llm, mcp, ...)`,返回 `TurnTokenStats` |
+| §2.4 memory tools | `memory_store` / `memory_query` + 内部 SQLite | **`memory_save` / `memory_recall`** + 走 git 恢复的 f3141b6 + 7 前置 | f3141b6 已经审过,改名/重写浪费 |
+| §2.5 L4 | Rule / TOOL_RULES 列表 | **`_classify` 加 2 case**(`memory_save→fs_write`, `memory_recall→fs_read`) | 实际 L4 用 `_classify(name) -> str` 模式,无 Rule 系统 |
+| §2.5 secret 过滤 | `args_deny_patterns` | **tool handler 内部 `_scrub_secrets`** | L4 引擎明确"无 deny",secret 过滤必须进 handler |
+| §3.3 trace | 记录每次 LLM call | **turn-level aggregate**(记 stats 总数,不记每次) | run_turn 不暴露 LLM call 回调;粒度降到 turn |
+| §4.2 kill-switch | policy.yaml(仓根,不存在) | **`eval/locomo/policy_local.yaml`**(独立) | 仓根没 policy.yaml,locomo 子系统独立配置 |
 
 ---
 
 ## 7. 关键设计决策(记录为什么)
 
-- **选方案 C(eval runner 包 run_turn)而非 A/B**:
-  - A:deepeval + langfuse 直接 import 进 `agent.py:run_turn` 内部埋点(改 1 个文件,污染产品代码)
-  - B:sidecar 事件总线(`agent.py` 暴露 `emit()` 钩子,eval 启子进程订阅,产品/eval 完全解耦但多进程)
-  - C(选):`eval/locomo/runner.py` 直接 import `cc_harness/agent.py:run_turn_sync` 同步外壳(agent.py 不改,locomo 100% 控速控测,产品/eval 干净分离)
-- **memory 接成 native tool 而非自动注入**:agent 主动决定"什么时候存、什么时候查",更真实;L4 闸门天然能拦滥用
-- **F1 + GEval 双指标**:F1 确定性 + GEval 主观性互补,单 F1 评不出表达类问题
-- **langfuse cloud 而非自托管**:多容器资源重 + 跟现有 dify 容器可能冲 port;cloud 零运维
-- **数据 gitignore**:locomo JSON 不入仓,只放 download 脚本 + attribution
+- **方案 C 不变**:`eval/locomo/runner.py` 直接 import `cc_harness.agent.run_turn`,agent.py 主体不动,locomo 100% 控速
+- **走 f3141b6 不重写**:8 个 commit 已经过审,恢复 8 个文件 + 改 2 处接口就够了;重写浪费一周
+- **`extra_native_specs` 不进 NATIVE_TOOLS**:模块级 dict 没有 per-call deps;closure 注入是 f3141b6 既定方案
+- **secret 进 handler 不进 policy**:L4 引擎明确"无 deny",不变式不能破
+- **trace 降级到 turn-level**:run_turn 不暴露 LLM call 回调;细粒度留后续,先能跑
+- **policy_local.yaml 独立**:仓根没 policy.yaml,locomo 是独立子系统,配置文件也独立不污染 cc-harness
+- **`--no-memory-tools` smoke fallback**:即使 memory 包恢复失败,smoke 仍能跑 baseline
 
 ---
 
 ## 8. 文档交叉引用
 
-- `CLAUDE.md` § "L4 权限闸门" — 工具注册模式参考
-- `CLAUDE.md` § "L2 输入防御" — 防御层不影响本 spec,但 locomo runner 跑的数据走 L2
-- `docs/superpowers/specs/2026-07-03-opensandbox-executor-design.md` — 沙箱设计(本 spec 暂未用沙箱,后续要 sandbox 测再参考)
+- `CLAUDE.md` § "L4 权限闸门" — `_classify` 模式参考
+- `CLAUDE.md` § "Out of scope" — memory 未 wire 进 ReAct(本 spec 是 wire 起点)
+- git commit `f3141b6` — memory tools 设计源头
 - `eval/promptfoo/tools/report_to_html.py` — HTML 报告样式参考
-- 后续:本 spec 落地后会写 `docs/superpowers/plans/2026-07-07-locomo-eval-plan.md`(由 writing-plans skill 生成)
+- 后续:本 spec 落地后写 `docs/superpowers/plans/2026-07-07-locomo-eval.md`
