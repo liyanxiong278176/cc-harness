@@ -14,6 +14,7 @@ dependencies = [
   "numpy>=1.24",
   "PyYAML>=6.0",
   "jsonschema>=4.21",
+  "deepeval>=0.21",
 ]
 
 [project.optional-dependencies]
