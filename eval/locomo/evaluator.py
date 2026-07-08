@@ -50,7 +50,7 @@ def quality_score(prompt: str, predicted: str, gold: str) -> Optional[float]:
         )
         case = LLMTestCase(input=prompt, actual_output=predicted, expected_output=gold)
         metric.measure(case)
-        return float(metric.score) / 100.0
+        return float(metric.score)
     except Exception:
         return None
 
