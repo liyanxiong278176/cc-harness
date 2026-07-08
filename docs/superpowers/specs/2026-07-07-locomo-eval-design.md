@@ -92,7 +92,7 @@ runner 聚合 results → report.py HTML → langfuse.flush()
 | `eval/locomo/tests/test_*.py` | 3 单测 | 新建 |
 | `eval/locomo/data/.gitkeep` | 数据目录占位 | 新建 |
 | `cc_harness/memory/` | **从 git checkout** `040e518`~`f3141b6`(8 个 commit) | 恢复 |
-| `cc_harness/agent.py` | **小幅改**:`run_turn` 加 1 可选参数 `extra_native_specs: list[dict]`(每条 `{spec, handler}`,handler 签名 `async (args, cwd) -> str`,agent 内部每 turn 调 `handler(args, cwd=str(cwd))`) | 改 |
+| `cc_harness/agent.py` | **小幅改**:`run_turn` 加 1 可选参数 `extra_native_specs: list[dict]`(每条 `{spec, handler, deps}`,handler 签名 `async (args, *, cwd, **deps) -> ToolResult`,agent 内部每 turn 调 `handler(args, cwd=str(cwd), **entry["deps"])`) | 改 |
 | `cc_harness/policy.py` | **`_classify` 加 2 case**:`memory_save` → "fs_write" / `memory_recall` → "fs_read" | 改 |
 | `pyproject.toml` | 加 `deepeval`、`langfuse` 依赖 | 改 |
 | `.gitignore`(仓根) | 加 `eval/locomo/data/locomo10.json`、`eval/locomo/.checkpoint.json` | 改 |
@@ -172,45 +172,28 @@ MEMORY_SAVE_SPEC = {
 # agent.py 内部调:await handler(args, cwd=cwd_str, retriever=..., service=...)
 # (cwd + deps 都由 agent.py 提供,不靠 closure)
 
-async def memory_recall_handler(args: dict, *, cwd: str, retriever) -> str:
+async def memory_recall_handler(args: dict, *, cwd: str, retriever) -> ToolResult:
     """retriever = MemoryRetriever; 调 retriever.search(query, top_k=5)"""
-    results = retriever.search(args["query"], top_k=5)
-    return _format_recall_results(results)
+    results = await retriever.search(args["query"], top_k=5)  # async,必须 await
+    return ToolResult.success(_format_recall_results(results))
 
-async def memory_save_handler(args: dict, *, cwd: str, service) -> str:
+async def memory_save_handler(args: dict, *, cwd: str, service) -> ToolResult:
     """service = MemoryService; 调 service.save(text, source='llm')"""
-    result = service.save(args["text"], source="llm")
-    return _format_save_result(result)
+    result = await service.save(args["text"], source="llm")  # async,必须 await
+    return ToolResult.success(_format_save_result(result))
 ```
 
-**agent.py dispatch 改造**(对应 §2.3):
+**agent.py dispatch 改造**(对应 §2.3,把 retriever/service 塞进 entry["deps"]):
 ```python
 # dispatch 循环加 extra_native_specs 路径
-if entry in (extra_native_specs or []):
+for entry in (extra_native_specs or []):
     if entry["spec"]["function"]["name"] == p.name:
-        # 绑 per-call deps(retriever / service 由 caller 在构造 runner 时传入并存在 ctx)
-        result_str = await entry["handler"](
-            p.arguments,
-            cwd=str(cwd),
-            retriever=extra_deps["retriever"],  # 跟 extra_native_specs 一起传
-            service=extra_deps["service"],
-        )
+        # 拆 kwargs:cwd 由 agent 每 turn 提供,deps(retriever/service)由 caller 注入
+        h_kwargs = {"cwd": str(cwd), **entry.get("deps", {})}
+        result = await entry["handler"](p.arguments, **h_kwargs)
+        # result 是 ToolResult,取 .llm_text 给 LLM
+        result_str = result.llm_text if hasattr(result, "llm_text") else str(result)
 ```
-
-**实际实现走法**(避免再加参数):把 retriever/service 塞进 `extra_native_specs[i]` entry 本身:
-```python
-# caller 端(eval/locomo/runner.py):
-extra_specs = [
-    {"spec": MEMORY_RECALL_SPEC,
-     "handler": memory_recall_handler,
-     "deps": {"retriever": retriever}},
-    {"spec": MEMORY_SAVE_SPEC,
-     "handler": memory_save_handler,
-     "deps": {"service": service}},
-]
-```
-
-agent.py dispatch 拆 kwargs:`h_kwargs = {"cwd": str(cwd), **entry.get("deps", {})}`。
 
 **Secret 过滤**(本 spec **不**引入,留给后续):
 
@@ -421,6 +404,7 @@ locomo_eval:
 | 风险 | 等级 | 缓解 |
 |---|---|---|
 | f3141b6 旧代码跟当前 cc_harness 主干不兼容(import 失败) | 高 | Phase 1 头一步先 `git checkout` 试 import;失败 → fallback 到重建最小包(`MemoryStore` + `EmbeddingClient` + `MemoryConfig` 不动算法,只保证接口齐) |
+| `MemoryService` 无 `delete_by_tag(tag_pattern)` 方法 | 中 | Phase 1 任务清单加一项:验 f3141b6 service.py 是否有 delete_by_tag,若无 → Phase 1 内补一个最小实现(单 SQL `DELETE WHERE tag LIKE ?`,不影响 service 主流程) |
 | memory_save / memory_recall 在 `mode=plan/design` 下被传工具,触发 schema 校验 | 中 | runner 强制 `mode="coding"` |
 | `_classify` 加 case 改了 L4 默认行为 | 中 | 契约测试:`_classify("memory_save") == "fs_write"` + `_classify("memory_recall") == "fs_read"` + 跑 cc-harness 自带 `tests/test_policy.py`(若有) |
 | 3000 turn × 2s = 100 min 全量(悲观) | 中 | Phase 1 头 1 sample 实测 wall-clock 校准 `sample_timeout_s`;支持 `--limit N` 抽样 |
