@@ -30,10 +30,13 @@ class LocomoTrace:
         if not self.enabled:
             return None
         if self._trace is None:
-            self._trace = self._client.trace(
-                name=f"locomo-{self.sample_id}",
-                user_id="cc-harness-locomo-runner",
-            )
+            try:
+                self._trace = self._client.trace(
+                    name=f"locomo-{self.sample_id}",
+                    user_id="cc-harness-locomo-runner",
+                )
+            except Exception:
+                return None
         return self._trace
 
     def start_turn(self, turn_idx: int, text: str):

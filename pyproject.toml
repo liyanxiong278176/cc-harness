@@ -15,7 +15,7 @@ dependencies = [
   "PyYAML>=6.0",
   "jsonschema>=4.21",
   "deepeval>=0.21",
-  "langfuse>=2.0",
+  "langfuse>=2.0,<3",
 ]
 
 [project.optional-dependencies]
