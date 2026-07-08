@@ -16,3 +16,7 @@ build/
 # L4 policy gate audit log (M1) — agent writes decisions here each run.
 # Scope to this file only; logs/ also holds the tracked logs/mcp_server.log.
 /logs/policy.jsonl
+
+# locomo dataset (大,不入仓)
+eval/locomo/data/locomo10.json
+eval/locomo/.checkpoint.json

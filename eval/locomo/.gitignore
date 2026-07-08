@@ -1,0 +1,4 @@
+data/locomo10.json
+.checkpoint.json
+__pycache__/
+*.pyc
