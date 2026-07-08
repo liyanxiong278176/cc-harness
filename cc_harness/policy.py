@@ -40,6 +40,10 @@ def _classify(name: str) -> str:
     n = name.lower()
     if n == "run_command":
         return "shell"
+    if n == "memory_save":
+        return "fs_write"
+    if n == "memory_recall":
+        return "fs_read"
     if "context7" in n:
         return "docs"
     if "git" in n:
