@@ -44,3 +44,20 @@ def test_load_report_results_round_trip(tmp_path):
     src = tmp_path / "results.json"
     src.write_text('[]', encoding="utf-8")
     assert load_report_results(src) == []
+
+
+def test_status_badge_renders_as_html_not_escaped_text(tmp_path):
+    """Status badge must be raw HTML, not html-escaped text."""
+    results = [
+        {"sample_id": "s1", "turn_idx": 0, "q_type": "x", "status": "ok",
+         "f1": 0.5, "quality": 0.6, "pass": True,
+         "prompt_tokens": 10, "completion_tokens": 5, "cost_usd": 0.0001,
+         "tool_calls": []},
+    ]
+    out = tmp_path / "report.html"
+    write_html_report(results, out)
+    text = out.read_text(encoding="utf-8")
+    # The <span> tag should be present as raw HTML, not as &lt;span&gt;
+    assert '<span style="color:#3fb950' in text
+    # And the escaped form should NOT be present
+    assert "&lt;span style=" not in text

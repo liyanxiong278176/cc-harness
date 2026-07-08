@@ -42,20 +42,22 @@ def _summary_cards(results: list[dict]) -> str:
 def _row(r: dict) -> str:
     status = r.get("status", "ok")
     fg, bg = STATUS_COLORS.get(status, ("#fff", "#222"))
+    # Status badge is raw HTML — escape the status value, not the span
+    status_cell = f'<span style="color:{fg};background:{bg};padding:2px 6px;border-radius:3px">{html.escape(status)}</span>'
     cells = [
-        str(r.get("sample_id", "")),
-        str(r.get("turn_idx", "")),
-        str(r.get("q_type", "")),
-        f'<span style="color:{fg};background:{bg};padding:2px 6px;border-radius:3px">{status}</span>',
+        html.escape(str(r.get("sample_id", ""))),
+        html.escape(str(r.get("turn_idx", ""))),
+        html.escape(str(r.get("q_type", ""))),
+        status_cell,  # raw HTML
         f"{r.get('f1', ''):.3f}" if r.get("f1") is not None else "-",
         f"{r.get('quality', ''):.3f}" if r.get("quality") is not None else "-",
         "✓" if r.get("pass") else "✗",
-        str(r.get("prompt_tokens", "")),
-        str(r.get("completion_tokens", "")),
+        html.escape(str(r.get("prompt_tokens", ""))),
+        html.escape(str(r.get("completion_tokens", ""))),
         f"${r.get('cost_usd', 0):.4f}",
-        ", ".join(r.get("tool_calls") or []),
+        html.escape(", ".join(r.get("tool_calls") or [])),
     ]
-    return "<tr>" + "".join(f"<td>{html.escape(c)}</td>" for c in cells) + "</tr>"
+    return "<tr>" + "".join(f"<td>{c}</td>" for c in cells) + "</tr>"
 
 
 def write_html_report(results: list[dict], out_path: Path,
@@ -63,8 +65,9 @@ def write_html_report(results: list[dict], out_path: Path,
     """Write self-contained HTML report. Returns out_path."""
     rows = "\n".join(_row(r) for r in results)
     cards = _summary_cards(results)
+    safe_title = html.escape(title)
     page = f"""<!DOCTYPE html>
-<html lang="zh"><head><meta charset="utf-8"><title>{title}</title>
+<html lang="zh"><head><meta charset="utf-8"><title>{safe_title}</title>
 <style>
 body {{ font-family: -apple-system, "PingFang SC", "Microsoft YaHei", sans-serif;
        background: #0f1419; color: #e6edf3; margin: 0; padding: 24px; line-height: 1.5; }}
@@ -79,7 +82,7 @@ th, td {{ padding: 8px 12px; text-align: left; border-bottom: 1px solid #30363d;
 th {{ background: #161b22; color: #7d8590; font-weight: 600; }}
 tr:hover {{ background: #1c1c1c; }}
 </style></head><body>
-<h1>{title}</h1>
+<h1>{safe_title}</h1>
 {cards}
 <table>
 <thead><tr>
