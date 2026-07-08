@@ -92,9 +92,10 @@ runner 聚合 results → report.py HTML → langfuse.flush()
 | `eval/locomo/tests/test_*.py` | 3 单测 | 新建 |
 | `eval/locomo/data/.gitkeep` | 数据目录占位 | 新建 |
 | `cc_harness/memory/` | **从 git checkout** `040e518`~`f3141b6`(8 个 commit) | 恢复 |
-| `cc_harness/agent.py` | **小幅改**:`run_turn` 加可选参数 `extra_native_specs: list[dict]` + `native_handlers: dict[str, Callable]`(注入 memory tools) | 改 |
+| `cc_harness/agent.py` | **小幅改**:`run_turn` 加 1 可选参数 `extra_native_specs: list[dict]`(每条 `{spec, handler}`,handler 签名 `async (args, cwd) -> str`,agent 内部每 turn 调 `handler(args, cwd=str(cwd))`) | 改 |
 | `cc_harness/policy.py` | **`_classify` 加 2 case**:`memory_save` → "fs_write" / `memory_recall` → "fs_read" | 改 |
 | `pyproject.toml` | 加 `deepeval`、`langfuse` 依赖 | 改 |
+| `.gitignore`(仓根) | 加 `eval/locomo/data/locomo10.json`、`eval/locomo/.checkpoint.json` | 改 |
 
 **注意**:`cc_harness/memory/` 8 个文件**不是新写** — 用 `git checkout 040e518~f3141b6 -- cc_harness/memory/` 恢复。这保留原设计(8 个 commit 已经过审)。
 
@@ -112,14 +113,17 @@ async def run_turn(
 ) -> TurnTokenStats
 ```
 
-**改后签名**(加 2 可选参数,默认 None 表示保持现状):
+**改后签名**(加 1 可选参数,默认 None 表示保持现状):
 ```python
 async def run_turn(
     messages, llm, mcp, *,
     max_iter=20, mode="coding", cwd=None, design_dir=None,
     token_counter=None, policy=None, l5=None,
     extra_native_specs: list[dict] | None = None,
-    # extra_native_specs[i] = {"name": ..., "spec": <OpenAI function spec>, "handler": async fn(args, ctx)}
+    # extra_native_specs[i] = {
+    #   "spec": <OpenAI function spec>,
+    #   "handler": async fn(args, cwd) -> str  # cwd 由 agent 每 turn 注入
+    # }
 ) -> TurnTokenStats
 ```
 
@@ -128,22 +132,24 @@ async def run_turn(
 # 原:
 for native in NATIVE_TOOLS.values():
     tool_specs.append(native["spec"])
-# 原 dispatch 走 NATIVE_TOOLS[p.name]["handler"]
+# 原 dispatch 走 NATIVE_TOOLS[p.name]["handler"](args, cwd=str(cwd))
 
 # 改后:
-for native in NATIVE_TOOLS.values():
-    tool_specs.append(native["spec"])
-for spec in (extra_native_specs or []):
-    tool_specs.append(spec["spec"])
-# dispatch 加: if p.name in extra_handlers: extra_handlers[p.name](p.arguments, ctx)
+for entry in (extra_native_specs or []):
+    tool_specs.append(entry["spec"])
+# dispatch 加: for e in (extra_native_specs or []):
+#                  if p.name matches(e["spec"]["function"]["name"]):
+#                      result_str = await e["handler"](p.arguments, cwd)
 ```
 
-**保证**:不传 `extra_native_specs` 时,REPL 行为 1:1 不变(契约测试守护)。
+**保证**:不传 `extra_native_specs` 时,REPL 行为 1:1 不变(契约测试守护:`run_turn(messages, llm, mcp)` 输出等于原版)。
 
-### 2.4 memory 工具(f3141b6 设计已审)
+### 2.4 memory 工具(f3141b6 设计,真实 API)
+
+**注意**:`f3141b6` 的真实 API 是 **plain function**(per-call 依赖注入),不是 closure factory。
 
 ```python
-# cc_harness/memory/tools.py (恢复,103 行)
+# cc_harness/memory/tools.py (从 f3141b6 恢复,103 行)
 MEMORY_RECALL_SPEC = {
     "type": "function",
     "function": {
@@ -162,23 +168,53 @@ MEMORY_SAVE_SPEC = {
     },
 }
 
-def make_recall_handler(retriever):  # closure injection
-    async def _handler(args, ctx):
-        return retriever.recall(args["query"], top_k=5)
-    return _handler
+# 真实签名(f3141b6):handler 接收 per-call deps 作为 keyword args
+# agent.py 内部调:await handler(args, cwd=cwd_str, retriever=..., service=...)
+# (cwd + deps 都由 agent.py 提供,不靠 closure)
 
-def make_save_handler(service):  # closure injection
-    async def _handler(args, ctx):
-        return service.save(args["text"])
-    return _handler
+async def memory_recall_handler(args: dict, *, cwd: str, retriever) -> str:
+    """retriever = MemoryRetriever; 调 retriever.search(query, top_k=5)"""
+    results = retriever.search(args["query"], top_k=5)
+    return _format_recall_results(results)
+
+async def memory_save_handler(args: dict, *, cwd: str, service) -> str:
+    """service = MemoryService; 调 service.save(text, source='llm')"""
+    result = service.save(args["text"], source="llm")
+    return _format_save_result(result)
 ```
 
-**Secret 过滤**(在 handler 内部,不在 policy):
+**agent.py dispatch 改造**(对应 §2.3):
 ```python
-_SECRET_RE = re.compile(r"(?i)(password|secret|token|credential|api[_-]?key)")
-def _scrub_secrets(text: str) -> str:
-    return "[REDACTED]" if _SECRET_RE.search(text) else text
+# dispatch 循环加 extra_native_specs 路径
+if entry in (extra_native_specs or []):
+    if entry["spec"]["function"]["name"] == p.name:
+        # 绑 per-call deps(retriever / service 由 caller 在构造 runner 时传入并存在 ctx)
+        result_str = await entry["handler"](
+            p.arguments,
+            cwd=str(cwd),
+            retriever=extra_deps["retriever"],  # 跟 extra_native_specs 一起传
+            service=extra_deps["service"],
+        )
 ```
+
+**实际实现走法**(避免再加参数):把 retriever/service 塞进 `extra_native_specs[i]` entry 本身:
+```python
+# caller 端(eval/locomo/runner.py):
+extra_specs = [
+    {"spec": MEMORY_RECALL_SPEC,
+     "handler": memory_recall_handler,
+     "deps": {"retriever": retriever}},
+    {"spec": MEMORY_SAVE_SPEC,
+     "handler": memory_save_handler,
+     "deps": {"service": service}},
+]
+```
+
+agent.py dispatch 拆 kwargs:`h_kwargs = {"cwd": str(cwd), **entry.get("deps", {})}`。
+
+**Secret 过滤**(本 spec **不**引入,留给后续):
+
+`_scrub_secrets` 是 v1 提的,实际不在 f3141b6。决策:**本 spec 不加 secret scrub**,理由:memory 包是 cc-harness 已有代码,我们恢复不加新行为;secret scrub 应该是 `MemoryService.save` 内的责任(若要做,后续单独 spec 改 memory 包)。Runner 这层不挡。
 
 ### 2.5 L4 闸门(policy.py 改 1 处)
 
@@ -256,8 +292,13 @@ import asyncio
 from cc_harness.agent import run_turn
 from cc_harness.llm import LLMClient
 from cc_harness.mcp_client import MCPClient
-from cc_harness.memory.tools import MEMORY_SAVE_SPEC, MEMORY_RECALL_SPEC, make_save_handler, make_recall_handler
-from cc_harness.memory import MemoryService, MemoryRetriever
+# 注意:`cc_harness/memory/__init__.py` 只有 docstring,不能 from cc_harness.memory import
+from cc_harness.memory.service import MemoryService
+from cc_harness.memory.retriever import MemoryRetriever
+from cc_harness.memory.tools import (
+    MEMORY_RECALL_SPEC, MEMORY_SAVE_SPEC,
+    memory_recall_handler, memory_save_handler,
+)
 
 # 1. 构造真实 LLM + MCP
 llm = LLMClient(api_key=..., model=..., base_url=...)
@@ -268,25 +309,36 @@ await mcp.start()
 service = MemoryService(...)
 retriever = MemoryRetriever(...)
 
-# 3. 构造 extra_native_specs(注入,不是注册到 NATIVE_TOOLS)
+# 3. 构造 extra_native_specs(handler 签名 (args, *, cwd, retriever|service))
 extra_specs = [
-    {"name": "memory_save", "spec": MEMORY_SAVE_SPEC, "handler": make_save_handler(service)},
-    {"name": "memory_recall", "spec": MEMORY_RECALL_SPEC, "handler": make_recall_handler(retriever)},
+    {"spec": MEMORY_RECALL_SPEC, "handler": memory_recall_handler,
+     "deps": {"retriever": retriever}},
+    {"spec": MEMORY_SAVE_SPEC, "handler": memory_save_handler,
+     "deps": {"service": service}},
 ]
 
-# 4. 调 run_turn
+# 4. 调 run_turn(messages 是 caller-owned list,run_turn mutate in place)
+messages = [{"role": "user", "content": "[A] hello"}]
 async def main():
     stats = await run_turn(
-        messages=[{"role": "user", "content": "..."}],
+        messages=messages,
         llm=llm, mcp=mcp,
         extra_native_specs=extra_specs,
         max_iter=10, mode="coding", cwd=...,
     )
-    # stats.messages 已 mutated,取最后一条 assistant
-    predicted = stats.messages[-1].get("content", "")
+    # stats = TurnTokenStats(没有 .messages 字段)
+    # predicted 从 caller 自己的 messages 列表末尾拿(run_turn 已 mutate in place)
+    predicted = messages[-1].get("content", "")
 
 asyncio.run(main())
 ```
+
+**关键修正**:
+- `stats.messages[-1]` ❌ — `TurnTokenStats` 无 `.messages`,**用 caller 的 `messages` list**(`run_turn` 内部已 mutate in place)
+- `make_save_handler` / `make_recall_handler` ❌ — f3141b6 用 plain function 不用 closure factory
+- `from cc_harness.memory import MemoryService, MemoryRetriever` ❌ — `__init__.py` 只有 docstring,改用 `from cc_harness.memory.service import MemoryService`
+- `MemoryRetriever.recall()` ❌ — 真实是 `.search()`(per ad79ceb)
+- `service.save(text)` ❌ — 真实签名 `service.save(text, source="llm")`
 
 ### 3.5 LLM call trace(限制)
 
@@ -347,8 +399,8 @@ locomo_eval:
 
 - `runner.py` 默认从 `eval/locomo/.checkpoint.json` 读已 done 的 sample_id,断点续
 - 每个 sample 跑完立刻追加 report(不全跑完才出 HTML)
-- `eval/locomo/data/locomo10.json` gitignore,仓里只放 `.gitkeep`
-- runner 启动时清 `tag LIKE 'locomo/%'` 的 memory(隔离,防污染下次跑)— 见 §2.4 `MemoryService.delete_by_tag`
+- `eval/locomo/data/locomo10.json` gitignore(`.gitignore` 加 `eval/locomo/data/locomo10.json` + `eval/locomo/.checkpoint.json`),仓里只放 `.gitkeep`
+- runner 启动时清 `tag LIKE 'locomo/%'` 的 memory(隔离,防污染下次跑)— f3141b6 `MemoryService` 提供 `delete_by_tag(tag_pattern)`(若不在,plan 阶段给 service 加这个方法)
 
 ---
 
