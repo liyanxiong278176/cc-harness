@@ -216,3 +216,59 @@ def build_system_prompt(cwd: str, mode: str = "coding") -> str:
     """Public entry point. Renders the system prompt for the given mode
     with `cwd` substituted. mode is one of 'coding', 'plan', 'design'."""
     return PromptComposer(mode=mode, ctx={"cwd": cwd}).render()
+
+
+# --- Memory decide prompts (Task 3, f3141b6 baseline restored) ---
+
+MEMORY_DECIDE_SYSTEM_PROMPT = """你是 cc-harness 记忆管理决策器。
+
+给定[新记忆]和[现有相似记忆列表],判断应该执行哪种操作:
+
+- **ADD**: 新记忆与现有记忆无重叠,直接添加
+- **UPDATE**: 新记忆与某条现有记忆**部分重叠**,需要合并(返回 merged_text)
+- **DELETE**: 新记忆与某条现有记忆**冲突**(新记忆否定旧记忆),删除旧记忆(系统会随后 ADD 新记忆)
+- **NOOP**: 新记忆与某条现有记忆**完全等价**,不做任何操作
+
+# 决策规则
+1. 新信息完全包含旧信息(如旧:"用户住北京",新:"用户住北京, 朝阳区工作")→ UPDATE,merged_text 用合并后版本
+2. 旧包含新(如旧:"用户住北京, 朝阳区, 养猫",新:"用户住北京")→ NOOP(新信息无新增价值)
+3. 新信息否定旧信息(如旧:"项目用 PostgreSQL",新:"项目改用 MySQL 了")→ DELETE
+4. 新旧完全等价 → NOOP
+5. 跨主题(如"用 ruff" vs "住北京")→ ADD
+
+# 严格输出 JSON(只输出 JSON,不要其他文字):
+{
+  "action": "ADD" | "UPDATE" | "DELETE" | "NOOP",
+  "target_id": "<被操作的现有记忆 id,仅 UPDATE/DELETE 需要>",
+  "merged_text": "<合并后的文本,仅 UPDATE 需要>",
+  "reasoning": "<一句话理由,可选>"
+}
+"""
+
+
+def memory_decide_user_prompt(new_text: str, similar_json: str) -> str:
+    return f"[新记忆]\n{new_text}\n\n[现有相似记忆]\n{similar_json}\n\n请输出 JSON 决策。"
+
+
+# --- Memory extract prompts (f3141b6 baseline) ---
+
+MEMORY_EXTRACT_SYSTEM_PROMPT = """你是 cc-harness 记忆提取器。
+从对话中提取 1-3 条**长期有价值**的事实记忆。
+
+值得提取的:
+- 用户偏好 (语言、风格、工具、约束)
+- 项目事实 (架构、技术栈、约定)
+- 重要决策 (选了 X 不选 Y)
+- 反复出现的约定 (提交前跑测试、用某种命名)
+
+不值得提取的(由 Tier 3 摘要管):
+- 临时性对话("你好"、"谢谢")
+- 任务过程("已实现 X 函数")
+
+严格输出 JSON,不要其他文字:
+{"memories": ["text1", "text2", ...]}
+没有就 {"memories": []}"""
+
+
+def memory_extract_user_prompt(delta_text: str) -> str:
+    return f"[对话]\n{delta_text}\n\n请输出 JSON。"
