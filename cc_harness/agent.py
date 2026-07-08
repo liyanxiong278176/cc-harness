@@ -55,6 +55,7 @@ async def run_turn(
     token_counter: TokenCounter | None = None,
     policy: PolicyEngine | None = None,
     l5: L5Engine | None = None,
+    extra_native_specs: list[dict] | None = None,
 ) -> TurnTokenStats:
     """Run one user turn in the given mode.
 
@@ -62,6 +63,13 @@ async def run_turn(
     In `plan` mode: one-shot LLM call (no tools passed, tool_calls dropped if any).
     In `design` mode: same as plan, plus the final assistant content is
         persisted to `design_dir` (default: ~/.cc-harness/designs/).
+
+    `extra_native_specs` lets callers inject native-style tools alongside the
+    built-in NATIVE_TOOLS (e.g. the locomo runner's memory_recall / memory_save).
+    Each entry: ``{"spec": <OpenAI tool spec>, "handler": async fn,
+    "deps": <dict splatted as kwargs at dispatch>}``. The LLM sees the merged
+    spec list; tool_calls to an extra name dispatch to that entry's handler
+    with ``(args, cwd=str(project_root), **deps)``.
 
     If `cwd` is provided, the system prompt at `messages[0]` is refreshed
     to match the current mode before the first LLM call. If `cwd` is None,
@@ -112,15 +120,37 @@ async def run_turn(
 
     # In plan/design mode, the LLM should not see any tool definitions, so
     # it physically cannot emit tool_calls. In coding mode, expose both the
-    # MCP tool set and the native tool registry.
+    # MCP tool set and the native tool registry (built-in + caller-injected).
     if mode == "coding":
         tool_specs = list(mcp.list_tools())
         for native in NATIVE_TOOLS.values():
             tool_specs.append(native["spec"])
+        for entry in (extra_native_specs or []):
+            tool_specs.append(entry["spec"])
     else:
         tool_specs = None
 
     iter_usages: list[UsageRecord] = []   # per-iter API-reported usage
+
+    async def _dispatch(p, args: dict, project_root: Path):
+        """Route a tool call to its handler.
+
+        Precedence: NATIVE_TOOLS (built-in) > extra_native_specs (caller-
+        injected) > mcp.call_tool (existing fallback). Handlers return a
+        mcp_client.ToolResult; the caller reads `.llm_text` for the message
+        appended to `messages`.
+        """
+        if p.name in NATIVE_TOOLS:
+            return await NATIVE_TOOLS[p.name]["handler"](args, cwd=str(project_root))
+        extra_entry = next(
+            (e for e in (extra_native_specs or [])
+             if e["spec"]["function"]["name"] == p.name),
+            None,
+        )
+        if extra_entry is not None:
+            h_kwargs = {"cwd": str(project_root), **extra_entry.get("deps", {})}
+            return await extra_entry["handler"](args, **h_kwargs)
+        return await mcp.call_tool(p.name, args)
 
     def _stats() -> TurnTokenStats:
         """Build TurnTokenStats from current messages + tool_specs + iter_usages."""
@@ -266,9 +296,7 @@ async def run_turn(
                     log_decision(audit_path, iter_n=iter_count, tool=p.name, args=args,
                                  action=decision.action.value, outcome="executed",
                                  rule_id=decision.rule_id, reason=decision.reason, mode=mode)
-                    result = (await NATIVE_TOOLS[p.name]["handler"](args, cwd=str(project_root))
-                              if p.name in NATIVE_TOOLS
-                              else await mcp.call_tool(p.name, args))
+                    result = await _dispatch(p, args, project_root)
                     print_observation(console, result.llm_text)
                     _external = f"<untrusted>{result.llm_text}</untrusted>"
                     messages.append({
@@ -286,9 +314,7 @@ async def run_turn(
                         log_decision(audit_path, iter_n=iter_count, tool=p.name, args=args,
                                      action=decision.action.value, outcome="executed",
                                      rule_id=decision.rule_id, reason=decision.reason, mode=mode)
-                        result = (await NATIVE_TOOLS[p.name]["handler"](args, cwd=str(project_root))
-                                  if p.name in NATIVE_TOOLS
-                                  else await mcp.call_tool(p.name, args))
+                        result = await _dispatch(p, args, project_root)
                         print_observation(console, result.llm_text)
                         _external = f"<untrusted>{result.llm_text}</untrusted>"
                         messages.append({
