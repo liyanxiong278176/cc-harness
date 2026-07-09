@@ -1,0 +1,8 @@
+# Locomo 子系统独立 kill-switch(跟 cc-harness L4 解耦,仓根没 policy.yaml)
+locomo_eval:
+  enabled: true
+  trace_to_langfuse: true
+  max_turns_per_sample: 500
+  sample_timeout_s: 1800
+  inject_memory_tools: true
+  clear_memory_tags: ["locomo/"]
