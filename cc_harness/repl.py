@@ -54,6 +54,7 @@ class ReplState:
     messages: list[dict] = field(default_factory=list)
     session_stats: SessionTokenStats = field(default_factory=SessionTokenStats)
     token_counter: TokenCounter = field(default_factory=TokenCounter)
+    memory_extras: list = field(default_factory=list)  # Plan2: memory 工具 extras(session 级)
 
 
 async def _read_user(prompt: str) -> str:
@@ -163,6 +164,25 @@ async def run_repl(
     # 命令 cold-start。kill-switch 在 config.enabled / config.backend(policy.yaml)。
     exec_cfg = load_executor_config(Path(cwd) / "policy.yaml")
     init_session_executor(exec_cfg, cwd)
+
+    # Plan2: 构造 memory 工具(session 级单例)。失败优雅降级(无 EMBEDDING_* 或
+    # sqlite-vec 缺 → helper 返 ([], None);此处兜底构造异常)。生产 db=logs/memory.db
+    # (与 eval logs/locomo_memory.db 隔离)。
+    from dotenv import dotenv_values
+    _mem_env = {**os.environ, **{k: v for k, v in dotenv_values(Path(cwd) / ".env").items() if v}}
+    try:
+        from cc_harness.memory.extras import build_memory_extras
+        state.memory_extras, _mem_deps = await build_memory_extras(
+            _mem_env, Path(cwd) / "logs" / "memory.db"
+        )
+        if state.memory_extras:
+            print_info(console, f"  memory tools: {len(state.memory_extras)} 个(memory_recall/save)")
+        else:
+            print_info(console, "  memory tools: 未启用(EMBEDDING_* 缺失或初始化失败)")
+    except Exception as e:
+        print_warn(console, f"memory 初始化异常: {e}; 不接入记忆工具")
+        state.memory_extras = []
+
     try:
         while True:
             try:
@@ -225,6 +245,7 @@ async def run_repl(
                 token_counter=state.token_counter,
                 policy=policy,
                 l5=l5,
+                extra_native_specs=state.memory_extras or None,  # Plan2: 记忆工具(chat/coding)
             )
             state.session_stats.add(turn_stats)
 

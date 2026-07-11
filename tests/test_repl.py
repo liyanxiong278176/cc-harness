@@ -52,6 +52,12 @@ def test_repl_state_is_mutable():
     assert len(s.messages) == 1
 
 
+def test_repl_state_has_memory_extras():
+    """ReplState 有 memory_extras 字段,默认空 list(Plan2 记忆接入)。"""
+    s = ReplState()
+    assert s.memory_extras == []
+
+
 # --- _handle_slash ---
 
 def _console():
