@@ -29,6 +29,7 @@ from cc_harness.audit import log_decision
 from cc_harness.l5 import L5Engine
 from cc_harness.tools import confirm_tool, run_command, RUN_COMMAND_SPEC
 from cc_harness.tokens import TokenCounter, TurnTokenStats, UsageRecord
+from cc_harness.config import ContextConfig
 
 _VALID_MODES = ("coding", "plan", "design", "chat")
 
@@ -57,6 +58,7 @@ async def run_turn(
     policy: PolicyEngine | None = None,
     l5: L5Engine | None = None,
     extra_native_specs: list[dict] | None = None,
+    context_config: ContextConfig | None = None,
 ) -> TurnTokenStats:
     """Run one user turn in the given mode.
 
@@ -87,6 +89,7 @@ async def run_turn(
     iter_count = 0
     _empty_retried = False  # one-shot retry guard for empty-content turns
     tool_call_log: list = []  # Plan1 Task4: [{name, args, ok, result}] per tool dispatch
+    last_compaction = None  # Plan3: CompactionStats from maybe_compact (or None)
 
     if cwd is not None:
         _refresh_system_prompt(messages, cwd, mode)
@@ -166,6 +169,7 @@ async def run_turn(
             tool_calls=cats["tool_calls"],
             llm_output=cats["llm_output"],
             system_prompt=cats["system_prompt"],
+            summary=cats["summary"],
             tool_definitions=cats["tool_definitions"],
             api_prompt_tokens=sum(u.prompt_tokens for u in iter_usages),
             api_completion_tokens=sum(u.completion_tokens for u in iter_usages),
@@ -173,6 +177,7 @@ async def run_turn(
             iter_count=len(iter_usages),
             api_reported=bool(iter_usages),
             tool_call_log=tool_call_log,
+            compaction=last_compaction,
         )
 
     async def _stream_one_turn() -> tuple[str, list, str | None, UsageRecord | None]:
@@ -203,6 +208,15 @@ async def run_turn(
     while iter_count < max_iter:
         iter_count += 1
         iter_usage: UsageRecord | None = None   # usage for this iter (set on done)
+
+        # Plan3: maybe compact context before LLM call (all modes). Catches own
+        # errors (returns stats.error) so compaction never kills the ReAct loop.
+        if context_config and context_config.enabled:
+            from cc_harness.context import maybe_compact
+            _counter = token_counter or TokenCounter()
+            last_compaction = await maybe_compact(
+                messages, tool_specs, _counter, context_config, llm
+            )
 
         # 1. Stream one LLM turn (buffered — see _stream_one_turn).
         try:

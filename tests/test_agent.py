@@ -947,3 +947,41 @@ async def test_agent_tool_call_log_ask_confirmed_marked_ok(tmp_path, monkeypatch
     assert entry["name"] == "run_command"
     assert entry["ok"] is True
     assert "CMD OUTPUT" in entry["result"]
+
+
+# --- context_config (Plan3 Task6) ---
+
+
+def test_run_turn_accepts_context_config():
+    """run_turn 签名接受 context_config 参数。"""
+    import inspect
+    from cc_harness.agent import run_turn
+    assert "context_config" in inspect.signature(run_turn).parameters
+
+
+@pytest.mark.asyncio
+async def test_run_turn_default_no_context_config_no_crash(tmp_path):
+    """不传 context_config(默认 None)→ 不压缩,不崩,compaction None。"""
+    from cc_harness import agent as agent_mod
+    events = [FakeStreamEvent(kind="done", content="ok", pending=[], finish_reason="stop")]
+    llm = FakeLLM(responses=[events])
+    mcp = FakeMCP(tools_spec=[], results={}, calls=[])
+    messages = [{"role": "user", "content": "hi"}]
+    stats = await agent_mod.run_turn(messages, llm, mcp, mode="coding",
+                                     cwd=str(tmp_path), max_iter=1)
+    assert stats.compaction is None
+
+
+@pytest.mark.asyncio
+async def test_run_turn_compaction_disabled(tmp_path):
+    """context_config.enabled=False → 不调 maybe_compact,compaction None。"""
+    from cc_harness import agent as agent_mod
+    from cc_harness.config import ContextConfig
+    events = [FakeStreamEvent(kind="done", content="ok", pending=[], finish_reason="stop")]
+    llm = FakeLLM(responses=[events])
+    mcp = FakeMCP(tools_spec=[], results={}, calls=[])
+    messages = [{"role": "user", "content": "hi"}]
+    stats = await agent_mod.run_turn(messages, llm, mcp, mode="coding",
+                                     cwd=str(tmp_path), max_iter=1,
+                                     context_config=ContextConfig(enabled=False))
+    assert stats.compaction is None
