@@ -300,6 +300,35 @@ def test_apply_tier2_prune_skip_summary_message():
     assert msgs[0]["content"] == content
 
 
+def test_apply_tier2_prune_user_codeblock_force():
+    """Tier2 对 user ```代码块 force 截:head=1/tail=0,绕过 threshold。
+
+    spec 强制 Tier2 对 user 代码块用 force=True head=1/tail=0(只保留首行 +
+    省略标记)。即使内容短(2 行)也会被截 —— force 路径 threshold = head+tail = 1,
+    比 Tier1 的 head+tail+1 低 1,所以 2 行块在 Tier2 被截而 Tier1 不截。
+    """
+    _, _, _, _, apply_tier2_prune, *_ = _import_context()
+    cfg = _cfg()
+    code = "```python\nline1\nline2\nline3\nline4\n```"
+    msgs = [{"role": "user", "content": code}]
+    apply_tier2_prune(msgs, protect_until=1, config=cfg)
+    # force head=1/tail=0:fence 保留 + 首行保留 + 省略标记,line2-4 被截
+    result = msgs[0]["content"]
+    assert "```python" in result           # fence 结构保留
+    assert "line1" in result               # 首行(head=1)保留
+    assert "line2" not in result           # 被截
+    assert "line4" not in result           # tail=0 → 尾行也不留
+    assert "3 lines omitted" in result     # OMITTED_TEMPLATE 省略标记
+
+    # force 绕过 threshold:仅 2 行的代码块在 Tier1(head+tail+1=2 → 不截)
+    # 但 Tier2 force(threshold = head+tail = 1 → 截)
+    short_msgs = [{"role": "user", "content": "```js\nonly1\nonly2\n```"}]
+    apply_tier2_prune(short_msgs, protect_until=1, config=cfg)
+    assert "only1" in short_msgs[0]["content"]
+    assert "only2" not in short_msgs[0]["content"]
+    assert "1 lines omitted" in short_msgs[0]["content"]
+
+
 # ============================================================
 # maybe_compact — non-Tier3 (5 tests)
 # ============================================================
@@ -380,3 +409,4 @@ async def test_maybe_compact_exception_isolation():
     assert stats.tier == CompactionTier.NONE
     assert stats.error is not None
     assert "boom" in stats.error
+    assert stats.before_snapshot is not None  # 异常路径留快照供 debug(spec 要求)
