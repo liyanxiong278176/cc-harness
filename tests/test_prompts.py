@@ -86,7 +86,7 @@ def test_composer_unknown_mode_raises():
 
 
 def test_composer_known_modes_accepted():
-    for m in ("coding", "plan", "design"):
+    for m in ("coding", "plan", "design", "chat"):
         PromptComposer(mode=m, ctx=_CTX)  # should not raise
 
 
@@ -120,7 +120,7 @@ def test_has_tools_condition_filters_by_context():
 
 def test_always_condition_includes_regardless():
     s = Section(name="a", body="ALWAYS-MARKER", conditions=("always",))
-    for m in ("coding", "plan", "design"):
+    for m in ("coding", "plan", "design", "chat"):
         assert "ALWAYS-MARKER" in PromptComposer(mode=m, ctx=_CTX, extra=[s]).render()
 
 
@@ -248,9 +248,9 @@ def test_composed_prompt_preserves_all_12_legacy_rules():
 
 
 def test_instruction_hierarchy_renders_in_all_modes():
-    """G1: 始终生效。coding/plan/design 都应含指令层级段。"""
+    """G1: 始终生效。coding/plan/design/chat 都应含指令层级段。"""
     from cc_harness.prompts import build_system_prompt
-    for mode in ("coding", "plan", "design"):
+    for mode in ("coding", "plan", "design", "chat"):
         p = build_system_prompt("/x", mode=mode)
         assert "指令层级与不可信数据" in p, f"mode={mode} 缺指令层级"
         assert "<untrusted>" in p

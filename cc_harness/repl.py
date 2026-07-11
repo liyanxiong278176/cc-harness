@@ -64,8 +64,8 @@ async def _read_user(prompt: str) -> str:
 def _prompt_for(mode: str) -> str:
     """Return the REPL prompt prefix for the current mode.
 
-    All three modes are tagged ("> [coding] " / "> [plan] " / "> [design] ")
-    so the active mode is always visible at a glance.
+    All four modes are tagged ("> [coding] " / "> [plan] " / "> [design] " /
+    "> [chat] ") so the active mode is always visible at a glance.
     """
     return f"> [{mode}] "
 

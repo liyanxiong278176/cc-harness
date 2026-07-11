@@ -28,9 +28,9 @@ def test_prompt_for_design_has_tag():
 
 
 def test_prompt_for_all_modes_are_tagged():
-    """All three modes are tagged, never the bare '> ' — so the active mode
+    """All modes are tagged, never the bare '> ' — so the active mode
     is always visible at a glance."""
-    for mode in ("coding", "plan", "design"):
+    for mode in ("coding", "plan", "design", "chat"):
         prompt = _prompt_for(mode)
         assert "[" in prompt, f"mode {mode!r} has no tag: {prompt!r}"
         assert f"[{mode}]" in prompt
