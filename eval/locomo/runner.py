@@ -193,7 +193,7 @@ async def _run_sample(sample: dict, policy: dict, extras: list[dict], trace: Loc
                 stats = await run_turn(
                     messages, llm, mcp,
                     extra_native_specs=extras,
-                    max_iter=8, mode="coding", cwd=str(REPO),
+                    max_iter=4, mode="chat", cwd=str(REPO),
                 )
             except Exception as e:
                 trace.record_tool(span, "agent_crash", {"err": str(e)[:200]}, {"ok": False})
@@ -218,7 +218,7 @@ async def _run_sample(sample: dict, policy: dict, extras: list[dict], trace: Loc
                 stats = await run_turn(
                     qa_messages, llm, mcp,
                     extra_native_specs=extras,
-                    max_iter=6, mode="coding", cwd=str(REPO),
+                    max_iter=6, mode="chat", cwd=str(REPO),
                 )
                 predicted = qa_messages[-1].get("content", "") or ""
                 trace.record_llm(span, env.get("OPENAI_MODEL", "?"),
@@ -246,7 +246,8 @@ async def _run_sample(sample: dict, policy: dict, extras: list[dict], trace: Loc
                 "prompt_tokens": stats.api_prompt_tokens,
                 "completion_tokens": stats.api_completion_tokens,
                 "cost_usd": cost_usd,
-                "tool_calls": [],  # TODO: hook tool_calls from run_turn return
+                "tool_calls": stats.tool_call_log,  # Plan1: 从 tool_call_log 取(替代 [] TODO)
+                "compaction": None,                  # Plan1 占位,Plan3 压缩落地后填值
             })
             trace.score("f1", eval_result["f1"])
             if eval_result["quality"] is not None:
@@ -274,6 +275,10 @@ def main():
     ap.add_argument("--no-memory-tools", action="store_true")
     ap.add_argument("--output-dir", type=Path, default=REPO / "eval" / "result")
     args = ap.parse_args()
+
+    # Plan1: 让 memory_save 等 ASK 工具在 batch 模式放行
+    # (in-process run_turn → confirm_tool 读 os.getenv → ASK 自动 yes)
+    os.environ.setdefault("CC_HARNESS_AUTOCONFIRM", "always")
 
     policy = _load_policy()
     if not policy.get("enabled", True):
