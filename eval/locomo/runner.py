@@ -230,6 +230,22 @@ def _estimate_cost(prompt_tokens: int, completion_tokens: int) -> float:
     return prompt_tokens * in_rate + completion_tokens * out_rate
 
 
+def _load_resume_state(checkpoint_path: Path, json_path: Path) -> tuple[list, list]:
+    """--resume 时读 checkpoint done 列表 + 已累积的 results json。
+
+    返 (done, all_results)。checkpoint/json 不存在 → 对应返 []。
+    修复历史 bug:旧 --resume 不读旧 json + done 从 [] 起 → 续跑丢已跑 results,
+    且 checkpoint done 被覆盖重写(下次 resume 重跑已 done 样本)。
+    """
+    done: list = []
+    if checkpoint_path.exists():
+        done = json.loads(checkpoint_path.read_text(encoding="utf-8")).get("done", [])
+    all_results: list = []
+    if json_path.exists():
+        all_results = json.loads(json_path.read_text(encoding="utf-8"))
+    return done, all_results
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--limit", type=int, default=10)
@@ -266,9 +282,12 @@ def main():
     html_path = args.output_dir / f"locomo-report-{ts}.html"
     json_path = args.output_dir / f"locomo-results-{ts}.json"
 
-    all_results = []
-    done = []
-    if json_path.exists() and not args.resume:
+    done: list = []
+    all_results: list = []
+    if args.resume and CHECKPOINT.exists():
+        done, all_results = _load_resume_state(CHECKPOINT, json_path)
+        print(f"[runner] resume: {len(done)} done, {len(samples)} remaining, {len(all_results)} results loaded")
+    elif json_path.exists():
         all_results = json.loads(json_path.read_text(encoding="utf-8"))
 
     # Pre-warm: clear old memory tags (isolation)
