@@ -1,0 +1,444 @@
+"""4-tier context compaction for cc-harness (Plan3).
+
+``maybe_compact`` is invoked before each LLM call in the ReAct loop. It walks a
+token-budget cascade:
+
+- Tier 1 Snip  (ratio >= tier1): truncate long tool outputs / user code blocks (head/tail).
+- Tier 2 Prune (ratio >= tier2): tool content -> placeholder; assistant text -> first sentence.
+- Tier 3 Summarize (ratio >= tier3): LLM incremental summary (Task 5 — stubbed here).
+
+A **protect zone** (the most recent ~``protect_zone_tokens`` plus the last user
+message) is never touched. All tiers mutate ``messages`` in place. Failures are
+isolated: ``maybe_compact`` never raises — it returns ``CompactionStats(error=...)``.
+
+Design spec: ``docs/superpowers/specs/2026-06-12-context-compaction-design.md``.
+"""
+from __future__ import annotations
+
+import json
+import re
+from dataclasses import dataclass
+from enum import IntEnum
+from typing import Any
+
+from cc_harness.config import ContextConfig
+from cc_harness.tokens import SUMMARY_MARKER_KEY, TokenCounter
+
+# Public constants -----------------------------------------------------------
+
+TIER2_TOOL_PLACEHOLDER = "[Old tool result content cleared]"
+TRUNCATED_MARKER = " [truncated]"
+OMITTED_TEMPLATE = "... ({n} lines omitted) ..."
+
+# Tier 2 assistant fallback when no sentence boundary is present.
+_FALLBACK_CHARS = 200
+
+# 3-group fence regex for user ```` ``` ```` code blocks (no nested-fence support).
+_CODE_FENCE_RE = re.compile(r"```([^\n]*)\n(.*?)\n```", re.DOTALL)
+
+# Sentence boundary: lookbehind after CJK/Latin punctuation or newline.
+_SENTENCE_SPLIT_RE = re.compile(r"(?<=[.。!?！？\n])\s*")
+
+
+# Data model -----------------------------------------------------------------
+
+class CompactionTier(IntEnum):
+    """Compaction tier reached by ``maybe_compact`` (higher = more aggressive)."""
+
+    NONE = 0
+    SNIP = 1
+    PRUNE = 2
+    SUMMARIZE = 3
+
+
+@dataclass
+class CompactionStats:
+    """Outcome of one ``maybe_compact`` invocation.
+
+    ``before_snapshot`` is populated only on the exception path (deep copy is
+    otherwise avoided to keep the hot path zero-cost).
+    """
+
+    tier: CompactionTier
+    before_tokens: int
+    after_tokens: int
+    ratio_before: float
+    ratio_after: float
+    messages_snip: int = 0                    # tool outputs snipped (Tier 1)
+    messages_prune: int = 0                   # tool outputs pruned (Tier 2)
+    messages_assistant_truncated: int = 0     # assistant texts truncated (Tier 2)
+    summarized: bool = False                  # Tier 3 produced a new summary
+    summary_index: int | None = None          # insert index of the new summary
+    error: str | None = None                  # exception message (if any)
+    before_snapshot: list[dict] | None = None  # debug snapshot (exception path only)
+
+
+# Helpers --------------------------------------------------------------------
+
+
+def _count_msg_tokens(message: dict, counter: TokenCounter) -> int:
+    """Approximate token count of a single message (content + tool_calls json)."""
+    content = message.get("content")
+    total = counter.count_text(content if isinstance(content, str) else "")
+    for tc in (message.get("tool_calls") or []):
+        total += counter.count_text(json.dumps(tc, ensure_ascii=False))
+    return total
+
+
+def _last_user_idx(messages: list[dict]) -> int | None:
+    """Index of the last ``role == user`` message, or None if absent."""
+    for i in range(len(messages) - 1, -1, -1):
+        if messages[i].get("role") == "user":
+            return i
+    return None
+
+
+def _compile_protected_patterns(config: ContextConfig) -> list[re.Pattern]:
+    """Compile ``protected_tool_patterns`` regex strings (empty list is OK)."""
+    compiled: list[re.Pattern] = []
+    for pat in config.protected_tool_patterns:
+        try:
+            compiled.append(re.compile(pat))
+        except re.error:
+            # Skip un-compilable patterns rather than crashing compaction.
+            continue
+    return compiled
+
+
+def _is_protected_tool(message: dict, compiled: list[re.Pattern]) -> bool:
+    """True if the message is a ``role == tool`` whose name matches any pattern."""
+    if message.get("role") != "tool":
+        return False
+    name = message.get("name") or ""
+    return any(p.search(name) for p in compiled)
+
+
+def _snip_lines(text: str, head: int, tail: int) -> str | None:
+    """Snip multi-line ``text`` to ``head`` first + omission marker + ``tail`` last.
+
+    Returns ``None`` when the content is too short to snip (``len(lines) <=
+    head + tail + 1``), so the caller can treat it as a no-op. A leading newline
+    is stripped first (tool outputs sometimes begin with one).
+    """
+    stripped = text.lstrip("\n")
+    lines = stripped.splitlines()
+    if len(lines) <= head + tail + 1:
+        return None
+    skipped = len(lines) - head - tail
+    out = lines[:head] + [OMITTED_TEMPLATE.format(n=skipped)]
+    if tail > 0:
+        out += lines[-tail:]
+    return "\n".join(out)
+
+
+def _snip_code_body(body: str, head: int, tail: int, *, force: bool = False) -> str:
+    """Snip the body of a ```` ``` ```` code block.
+
+    When ``force`` is False (Tier 1), content shorter than ``head + tail + 1``
+    lines is returned unchanged. When ``force`` is True (Tier 2), the threshold
+    check is skipped — any block with more lines than ``head + tail`` is cut.
+    Returns the (possibly snipped) body string.
+    """
+    lines = body.splitlines()
+    threshold = (head + tail) if force else (head + tail + 1)
+    if len(lines) <= threshold:
+        return body
+    skipped = len(lines) - head - tail
+    out = lines[:head] + [OMITTED_TEMPLATE.format(n=skipped)]
+    if tail > 0:
+        out += lines[-tail:]
+    return "\n".join(out)
+
+
+# Protect boundary -----------------------------------------------------------
+
+
+def find_protect_boundary(
+    messages: list[dict], counter: TokenCounter, budget_tokens: int
+) -> int:
+    """Return the slice index ``b`` such that ``messages[b:]`` is the protect zone.
+
+    Walks from the tail accumulating tokens; once the running total reaches
+    ``budget_tokens``, returns ``position + 1``. Clamp: the boundary never
+    crosses the last ``role == user`` message (so the most recent user input is
+    always protected). Returns 0 when the whole list fits the budget (all
+    protected).
+    """
+    if not messages:
+        return 0
+    cumulative = 0
+    boundary = 0
+    for i in range(len(messages) - 1, -1, -1):
+        if cumulative >= budget_tokens:
+            boundary = i + 1
+            break
+        cumulative += _count_msg_tokens(messages[i], counter)
+    # Clamp: never move the boundary past the last user message index.
+    last_user = _last_user_idx(messages)
+    if last_user is not None and boundary > last_user:
+        boundary = last_user
+    return boundary
+
+
+# Tier 1: Snip ---------------------------------------------------------------
+
+
+def apply_tier1_snip(
+    messages: list[dict], protect_until: int, config: ContextConfig
+) -> int:
+    """Truncate long tool outputs and user code blocks (string-level, zero LLM cost).
+
+    Mutates ``messages[:protect_until]`` in place. Skips: the protect zone,
+    ``role == assistant`` content, protected-tool-pattern matches, and content
+    shorter than ``head + tail + 1`` lines. Returns the count of modified
+    messages (tool outputs + user code blocks).
+    """
+    compiled = _compile_protected_patterns(config)
+    head, tail = config.snip_head_lines, config.snip_tail_lines
+    snipped = 0
+
+    for i in range(min(protect_until, len(messages))):
+        m = messages[i]
+        role = m.get("role")
+
+        if role == "tool":
+            if _is_protected_tool(m, compiled):
+                continue
+            content = m.get("content")
+            if not isinstance(content, str):
+                continue
+            new = _snip_lines(content, head, tail)
+            if new is not None:
+                m["content"] = new
+                snipped += 1
+
+        elif role == "user":
+            content = m.get("content")
+            if not isinstance(content, str):
+                continue
+            new_content = _CODE_FENCE_RE.sub(
+                lambda match: _rebuild_fence(match, head, tail, force=False),
+                content,
+            )
+            if new_content != content:
+                m["content"] = new_content
+                snipped += 1
+    return snipped
+
+
+def _rebuild_fence(match: re.Match, head: int, tail: int, *, force: bool) -> str:
+    """Rebuild a ```` ``` ```` fence with a (possibly) snipped body."""
+    lang = match.group(1)
+    body = match.group(2)
+    new_body = _snip_code_body(body, head, tail, force=force)
+    if new_body == body:
+        return match.group(0)
+    return f"```{lang}\n{new_body}\n```"
+
+
+# Tier 2: Prune --------------------------------------------------------------
+
+
+def apply_tier2_prune(
+    messages: list[dict], protect_until: int, config: ContextConfig
+) -> tuple[int, int]:
+    """Replace tool outputs with a placeholder and truncate assistant text.
+
+    Mutates ``messages[:protect_until]`` in place. Tool messages keep their
+    slot (only ``content`` changes) to preserve the ``tool_use``/``tool_result``
+    pairing. Assistant messages keep ``tool_calls`` and are never deleted.
+    Summary-marked assistants, protected tools, and the protect zone are
+    skipped. Returns ``(tool_pruned, assistant_truncated)`` counts.
+    """
+    compiled = _compile_protected_patterns(config)
+    head, tail = 1, 0  # Tier 2 user-code-block aggressiveness (spec 「Tier 2」).
+    pruned_tool = 0
+    truncated_asst = 0
+
+    for i in range(min(protect_until, len(messages))):
+        m = messages[i]
+        role = m.get("role")
+
+        if role == "tool":
+            if _is_protected_tool(m, compiled):
+                continue
+            content = m.get("content")
+            if isinstance(content, str):
+                m["content"] = TIER2_TOOL_PLACEHOLDER
+                pruned_tool += 1
+
+        elif role == "assistant":
+            # Never touch a Tier-3 summary message (self-destruction guard).
+            if m.get(SUMMARY_MARKER_KEY):
+                continue
+            content = m.get("content")
+            if not isinstance(content, str) or not content:
+                continue
+            new = _truncate_assistant(content)
+            if new is not None:
+                m["content"] = new
+                truncated_asst += 1
+
+        elif role == "user":
+            content = m.get("content")
+            if not isinstance(content, str):
+                continue
+            new_content = _CODE_FENCE_RE.sub(
+                lambda match: _rebuild_fence(match, head, tail, force=True),
+                content,
+            )
+            if new_content != content:
+                m["content"] = new_content
+
+    return pruned_tool, truncated_asst
+
+
+def _truncate_assistant(content: str) -> str | None:
+    """Reduce an assistant text to its first sentence (+ truncation marker).
+
+    Returns ``None`` when nothing was actually shortened (no boundary and the
+    content is already under the fallback length). Falls back to the first
+    ``_FALLBACK_CHARS`` characters when no sentence punctuation is found.
+    """
+    parts = _SENTENCE_SPLIT_RE.split(content, maxsplit=1)
+    if len(parts) > 1:
+        return parts[0] + TRUNCATED_MARKER
+    if len(content) > _FALLBACK_CHARS:
+        return content[:_FALLBACK_CHARS] + TRUNCATED_MARKER
+    return None
+
+
+# Tier 3: Summarize (stub — Task 5) -----------------------------------------
+
+
+async def apply_tier3_summarize(
+    messages: list[dict],
+    protect_until: int,
+    config: ContextConfig,
+    llm: Any,
+) -> CompactionStats:
+    """Tier 3 incremental summarization. **Placeholder** — Task 5 implements this.
+
+    Returns a NONE-tier stats with an ``error`` note so the cascade degrades
+    gracefully (no false claim of summarization) until Task 5 lands.
+    """
+    return CompactionStats(
+        tier=CompactionTier.NONE,
+        before_tokens=0,
+        after_tokens=0,
+        ratio_before=0.0,
+        ratio_after=0.0,
+        error="tier3 summarize not implemented (Task 5)",
+    )
+
+
+# Orchestrator ---------------------------------------------------------------
+
+
+def _noop_stats(
+    messages: list[dict],
+    counter: TokenCounter,
+    tool_specs: list[dict] | None,
+    config: ContextConfig,
+) -> CompactionStats:
+    total = sum(counter.categorize(messages, tool_specs).values())
+    ratio = total / config.context_window if config.context_window else 0.0
+    return CompactionStats(
+        tier=CompactionTier.NONE,
+        before_tokens=total,
+        after_tokens=total,
+        ratio_before=ratio,
+        ratio_after=ratio,
+    )
+
+
+async def maybe_compact(
+    messages: list[dict],
+    tool_specs: list[dict] | None,
+    counter: TokenCounter,
+    config: ContextConfig,
+    llm: Any = None,
+) -> CompactionStats:
+    """Run the tier cascade in place on ``messages`` before each LLM call.
+
+    Short-circuits as soon as the post-tier ratio drops below the next
+    threshold. Any exception is caught and surfaced via ``CompactionStats.error``
+    — this function never raises (compaction must not kill the ReAct loop).
+    """
+    if not config.enabled:
+        return _noop_stats(messages, counter, tool_specs, config)
+
+    before = after = 0
+    ratio = 0.0
+    snapshot: list[dict] | None = None
+    try:
+        before = sum(counter.categorize(messages, tool_specs).values())
+        ratio = before / config.context_window
+
+        if ratio < config.tier1_threshold:
+            return CompactionStats(
+                tier=CompactionTier.NONE,
+                before_tokens=before,
+                after_tokens=before,
+                ratio_before=ratio,
+                ratio_after=ratio,
+            )
+
+        protect_until = find_protect_boundary(
+            messages, counter, config.protect_zone_tokens
+        )
+        if protect_until == 0 or protect_until >= len(messages):
+            return CompactionStats(
+                tier=CompactionTier.NONE,
+                before_tokens=before,
+                after_tokens=before,
+                ratio_before=ratio,
+                ratio_after=ratio,
+            )
+
+        # Tier 1: Snip
+        snipped = apply_tier1_snip(messages, protect_until, config)
+        after = sum(counter.categorize(messages, tool_specs).values())
+        if after / config.context_window < config.tier2_threshold:
+            return CompactionStats(
+                tier=CompactionTier.SNIP,
+                before_tokens=before,
+                after_tokens=after,
+                ratio_before=ratio,
+                ratio_after=after / config.context_window,
+                messages_snip=snipped,
+            )
+
+        # Tier 2: Prune
+        pruned_tool, truncated_asst = apply_tier2_prune(messages, protect_until, config)
+        after = sum(counter.categorize(messages, tool_specs).values())
+        if after / config.context_window < config.tier3_threshold:
+            return CompactionStats(
+                tier=CompactionTier.PRUNE,
+                before_tokens=before,
+                after_tokens=after,
+                ratio_before=ratio,
+                ratio_after=after / config.context_window,
+                messages_snip=snipped,
+                messages_prune=pruned_tool,
+                messages_assistant_truncated=truncated_asst,
+            )
+
+        # Tier 3: Summarize (Task 5 placeholder — returns NONE-stats w/ error)
+        stats = await apply_tier3_summarize(messages, protect_until, config, llm)
+        stats.before_tokens = before
+        stats.ratio_before = ratio
+        return stats
+
+    except Exception as e:  # noqa: BLE001 — spec mandates fail-soft
+        if snapshot is None:
+            snapshot = [dict(m) for m in messages]
+        return CompactionStats(
+            tier=CompactionTier.NONE,
+            before_tokens=before,
+            after_tokens=after,
+            ratio_before=ratio,
+            ratio_after=ratio,
+            error=str(e),
+            before_snapshot=snapshot,
+        )
