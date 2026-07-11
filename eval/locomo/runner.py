@@ -52,69 +52,16 @@ def _make_initial_messages(turn_text: str, speaker: str) -> list[dict]:
 
 
 async def _build_memory_extras(policy: dict):
-    """Build extra_native_specs with memory tools if enabled. Returns ([...extras], deps_or_None).
+    """locomo runner 的 memory extras 构造。复用共享 helper(build_memory_extras)。
 
-    All construction is explicit (NOT from_env()) because MemoryStore/EmbeddingClient/LLMDecider
-    don't define from_env. On any failure (missing EMBEDDING_* env, sqlite-vec missing,
-    schema init failure) we degrade gracefully: print warning, return ([], None).
+    inject_memory_tools gate 留在此处(locomo kill-switch);
+    db=logs/locomo_memory.db(eval 隔离,与生产 logs/memory.db 分开)。
+    失败优雅降级由 helper 负责(返 ([], None))。
     """
     if not policy.get("inject_memory_tools", True):
         return [], None
-    try:
-        from cc_harness.memory.store import MemoryStore
-        from cc_harness.memory.embedding import EmbeddingClient
-        from cc_harness.memory.decider import LLMDecider
-        from cc_harness.memory.retriever import MemoryRetriever
-        from cc_harness.memory.service import MemoryService
-        from cc_harness.memory.tools import (
-            MEMORY_RECALL_SPEC, MEMORY_SAVE_SPEC,
-            memory_recall_handler, memory_save_handler,
-        )
-    except ImportError as e:
-        print(f"[runner] memory import failed: {e}; running without memory tools")
-        return [], None
-
-    # Construct dependencies. All explicit — actual __init__ signatures:
-    #   MemoryStore(db_path: Path, embedding_dim: int)
-    #   EmbeddingClient(base_url: str, api_key: str, model: str, dim: int, timeout_s: float = 10.0)
-    #   LLMDecider(llm)  # llm has async chat(messages, tools)
-    #   MemoryService(store, embedder, decider)
-    #   MemoryRetriever(store, embedder, top_k=5, token_budget=800)
-    # Need to call store.init_schema() before any search/add.
-    try:
-        env = _env()
-        emb_base = env.get("EMBEDDING_BASE_URL") or env["OPENAI_BASE_URL"]
-        emb_key = env.get("EMBEDDING_API_KEY") or env["OPENAI_API_KEY"]
-        emb_model = env.get("EMBEDDING_MODEL", "BAAI/bge-m3")
-        emb_dim = int(env.get("EMBEDDING_DIM", "1024"))
-
-        store = MemoryStore(db_path=REPO / "logs" / "locomo_memory.db", embedding_dim=emb_dim)
-        await store.init_schema()
-        embedder = EmbeddingClient(
-            base_url=emb_base, api_key=emb_key, model=emb_model, dim=emb_dim, timeout_s=10.0,
-        )
-
-        # LLMDecider needs an LLMClient (it calls llm.chat). Reuse the runner's main llm
-        # would create a circular reference; build a dedicated one (cheap — same config).
-        from cc_harness.llm import LLMClient
-        decider_llm = LLMClient(
-            api_key=env["OPENAI_API_KEY"],
-            model=env["OPENAI_MODEL"],
-            base_url=env["OPENAI_BASE_URL"],
-        )
-        decider = LLMDecider(llm=decider_llm)
-
-        service = MemoryService(store=store, embedder=embedder, decider=decider)
-        retriever = MemoryRetriever(store=store, embedder=embedder)
-    except Exception as e:
-        print(f"[runner] memory service init failed: {e}; running without memory tools")
-        return [], None
-
-    extras = [
-        {"spec": MEMORY_RECALL_SPEC, "handler": memory_recall_handler, "deps": {"retriever": retriever}},
-        {"spec": MEMORY_SAVE_SPEC, "handler": memory_save_handler, "deps": {"service": service}},
-    ]
-    return extras, {"service": service, "retriever": retriever}
+    from cc_harness.memory.extras import build_memory_extras
+    return await build_memory_extras(_env(), REPO / "logs" / "locomo_memory.db")
 
 
 async def _clear_memory_tags(tags: list[str]):
