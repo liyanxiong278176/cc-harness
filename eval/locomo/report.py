@@ -146,6 +146,28 @@ def _token_series_block(token_series: dict) -> str:
     )
 
 
+def _compaction_block(compaction) -> str:
+    """渲染上下文压缩:triggered 次数 + by_tier 分布 + 平均保留率。未触发 → '未触发'。"""
+    if not isinstance(compaction, dict):
+        return ""
+    triggered = compaction.get("triggered", 0)
+    by_tier = compaction.get("by_tier") or {}
+    avg_retain = compaction.get("avg_retain")
+    retain_label = f"{avg_retain*100:.1f}%" if isinstance(avg_retain, (int, float)) else "-"
+    if not triggered:
+        return '<h2>上下文压缩</h2><div class="card-lbl">未触发(上下文未超阈值)</div>'
+    tier_rows = "".join(
+        f"<tr><td>tier {html.escape(str(t))}</td><td>{c}</td></tr>"
+        for t, c in sorted(by_tier.items())
+    )
+    return (
+        '<h2>上下文压缩</h2>'
+        f'<div class="card-lbl">触发 {triggered} 次 · 平均保留率 {retain_label}</div>'
+        '<table><thead><tr><th>tier</th><th>次数</th></tr></thead>'
+        f"<tbody>{tier_rows}</tbody></table>"
+    )
+
+
 def write_html_report(results: list[dict], out_path: Path,
                       metrics: dict | None = None,
                       title: str = "cc-harness locomo 评测报告") -> Path:
@@ -159,9 +181,11 @@ def write_html_report(results: list[dict], out_path: Path,
     # metrics 派生区块
     q_type_html = ""
     token_series_html = ""
+    compaction_html = ""
     if metrics:
         q_type_html = _q_type_table(metrics.get("by_q_type") or {})
         token_series_html = _token_series_block(metrics.get("token_series") or {})
+        compaction_html = _compaction_block(metrics.get("compaction"))
     safe_title = html.escape(title)
     page = f"""<!DOCTYPE html>
 <html lang="zh"><head><meta charset="utf-8"><title>{safe_title}</title>
@@ -191,6 +215,7 @@ tr:hover {{ background: #1c1c1c; }}
 </table>
 {q_type_html}
 {token_series_html}
+{compaction_html}
 </body></html>"""
     out_path = Path(out_path)
     out_path.write_text(page, encoding="utf-8")

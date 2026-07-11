@@ -95,3 +95,17 @@ def test_write_html_report_uncomputed_judge(tmp_path):
                "memory": "uncomputed", "tool_accuracy": "uncomputed"}
     p = write_html_report([], tmp_path / "r.html", metrics=metrics)
     assert "未计算" in p.read_text(encoding="utf-8")
+
+
+def test_write_html_report_renders_compaction(tmp_path):
+    """metrics 含 compaction(triggered>0)→ HTML 渲染压缩块。"""
+    from eval.locomo.report import write_html_report
+    metrics = {"by_q_type": {}, "compaction": {"triggered": 2, "by_tier": {2: 1, 3: 1}, "avg_retain": 0.83},
+               "utilization": {"avg": 0.05, "peak": 0.07},
+               "token_series": {"prompt": [], "completion": [], "cumulative_cost": 0},
+               "memory": "uncomputed", "tool_accuracy": "uncomputed"}
+    p = write_html_report([], tmp_path / "r.html", metrics=metrics)
+    text = p.read_text(encoding="utf-8")
+    assert "上下文压缩" in text
+    assert "触发 2 次" in text
+    assert "tier 2" in text

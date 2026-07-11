@@ -98,3 +98,17 @@ def test_run_judge_no_key_degrades(tmp_path):
     out = run_judge(FIXTURE, [], None, tmp_path / "j.json")  # 直接调(sync)
     assert out["tool_accuracy"] == "uncomputed"
     assert out["by_q_type"]  # 纯聚合仍有
+
+
+async def test_compute_memory_precision_clamped():
+    """precision 钳制 ≤1.0:1 recall_call + 多 relevant evidence 不超 1。"""
+    from eval.locomo.metrics import compute_memory
+    async def fake_judge(prompt, **kw):
+        return '{"relevant": true}'  # 所有 evidence 判相关
+    results = [{"tool_calls": [
+        {"name": "memory_recall", "args": {}, "ok": True, "result": "找到 3 条:..."}]}]
+    # 3 evidence 全 relevant → p_num=3, p_den=1 → 钳制前 3.0,钳制后 1.0
+    qas = [{"question": "q", "evidence": ["e1", "e2", "e3"]}]
+    out = await compute_memory(results, qas, judge_llm=fake_judge)
+    assert out["precision"] <= 1.0
+    assert out["recall"] == pytest.approx(1.0)  # 3/3 evidence 覆盖

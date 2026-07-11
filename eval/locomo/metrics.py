@@ -111,7 +111,7 @@ async def compute_memory(results, qas, judge_llm) -> dict:
             r_den += 1
         p_den += n_mems
     return {
-        "precision": (p_num / p_den) if p_den else None,
+        "precision": min(1.0, p_num / p_den) if p_den else None,
         "recall": (r_num / r_den) if r_den else None,
     }
 
