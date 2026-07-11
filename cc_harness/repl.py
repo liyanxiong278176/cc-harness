@@ -21,11 +21,11 @@ from pathlib import Path
 from openai import AsyncOpenAI
 from rich.console import Console
 from cc_harness.audit import log_decision
-from cc_harness.config import load_executor_config, load_l2_config, load_l5_config, load_policy_config
+from cc_harness.config import ContextConfig, load_executor_config, load_l2_config, load_l5_config, load_policy_config
 from cc_harness.l2 import REFUSAL_TEMPLATE, scan_user_input
 from cc_harness.l5 import build_l5_engine
 from cc_harness.policy import PolicyEngine
-from cc_harness.render import print_info, print_result, print_warn, print_token_summary
+from cc_harness.render import print_compaction_summary, print_info, print_result, print_warn, print_token_summary
 from cc_harness.tokens import TokenCounter, SessionTokenStats
 from cc_harness.tools import init_session_executor, shutdown_session_executor
 
@@ -55,6 +55,7 @@ class ReplState:
     session_stats: SessionTokenStats = field(default_factory=SessionTokenStats)
     token_counter: TokenCounter = field(default_factory=TokenCounter)
     memory_extras: list = field(default_factory=list)  # Plan2: memory 工具 extras(session 级)
+    context_config: ContextConfig = field(default_factory=ContextConfig)  # Plan3: 压缩配置
 
 
 async def _read_user(prompt: str) -> str:
@@ -113,6 +114,7 @@ async def run_repl(
     cwd: str,
     default_mode: str = "coding",
     design_dir: Path | None = None,
+    context_config: ContextConfig | None = None,
 ) -> None:
     """Run the interactive REPL.
 
@@ -120,6 +122,9 @@ async def run_repl(
     refreshed per mode. `default_mode` is the initial sticky mode (also
     available via /plan /design /coding at runtime). `design_dir` is
     where design-mode outputs get persisted (default: ~/.cc-harness/designs/).
+    `context_config` (Plan3) is the 4-tier compaction config; when None a
+    default ContextConfig is used (main.py loads env overrides via
+    load_context_config()).
     """
     if default_mode not in _VALID_MODES:
         raise ValueError(
@@ -127,7 +132,10 @@ async def run_repl(
         )
 
     console = Console()
-    state = ReplState(mode=default_mode)
+    state = ReplState(
+        mode=default_mode,
+        context_config=context_config or ContextConfig(),
+    )
 
     # Construct ONE PolicyEngine for the whole session. policy.yaml is optional
     # (missing → default enabled=True). project_root is the REPL's cwd so path
@@ -246,12 +254,17 @@ async def run_repl(
                 policy=policy,
                 l5=l5,
                 extra_native_specs=state.memory_extras or None,  # Plan2: 记忆工具(chat/coding)
+                context_config=state.context_config,             # Plan3: 压缩配置
             )
             state.session_stats.add(turn_stats)
 
             # 打印 token 明细
             print_token_summary(console, "本轮", turn_stats)
             print_token_summary(console, f"累计 {state.session_stats.turns} 轮", state.session_stats)
+
+            # Plan3: 本轮发生过压缩(tier > NONE)→ 打印压缩摘要
+            if turn_stats.compaction and int(turn_stats.compaction.tier) > 0:
+                print_compaction_summary(console, "本轮", turn_stats.compaction)
 
             # After the turn, show what actually changed on disk — so the user
             # can see real file state without F5-ing their file manager.

@@ -794,3 +794,83 @@ async def test_repl_passes_l5_engine_to_run_turn(monkeypatch):
 
 def test_chat_mode_valid():
     assert "chat" in _VALID_MODES
+
+
+# --- context_config (Plan3 Task7) ---
+
+def test_repl_state_has_context_config():
+    """ReplState 有 context_config 字段,默认 ContextConfig 实例(不破坏 memory_extras)。"""
+    from cc_harness.config import ContextConfig
+    s = ReplState()
+    assert isinstance(s.context_config, ContextConfig)
+    # memory_extras 字段仍共存(Plan2)
+    assert s.memory_extras == []
+
+
+@pytest.mark.asyncio
+async def test_run_repl_passes_context_config_to_run_turn(monkeypatch):
+    """run_repl 的 context_config 参数透传给 run_turn。"""
+    from cc_harness import repl as repl_mod
+    from cc_harness.repl import run_repl
+    from cc_harness.config import ContextConfig
+
+    inputs = iter(["hi", "exit"])
+    monkeypatch.setattr(repl_mod, "_read_user", _fake_read_user(inputs))
+
+    captured: dict = {}
+    async def _spy(*a, **kw):
+        captured["context_config"] = kw.get("context_config")
+        return TurnTokenStats()
+    monkeypatch.setattr("cc_harness.agent.run_turn", _spy)
+
+    custom_cfg = ContextConfig(context_window=500_000, tier1_threshold=0.5)
+    await run_repl(_StoppingLLM(), _NoopMCP(), cwd="/x", context_config=custom_cfg)
+
+    assert captured.get("context_config") is custom_cfg
+
+
+@pytest.mark.asyncio
+async def test_run_repl_default_context_config_when_none(monkeypatch):
+    """context_config=None → ReplState 默认构造 ContextConfig(非 None 传给 run_turn)。"""
+    from cc_harness import repl as repl_mod
+    from cc_harness.repl import run_repl
+    from cc_harness.config import ContextConfig
+
+    inputs = iter(["hi", "exit"])
+    monkeypatch.setattr(repl_mod, "_read_user", _fake_read_user(inputs))
+
+    captured: dict = {}
+    async def _spy(*a, **kw):
+        captured["context_config"] = kw.get("context_config")
+        return TurnTokenStats()
+    monkeypatch.setattr("cc_harness.agent.run_turn", _spy)
+
+    await run_repl(_StoppingLLM(), _NoopMCP(), cwd="/x")
+
+    cfg = captured.get("context_config")
+    assert cfg is not None
+    assert isinstance(cfg, ContextConfig)
+
+
+@pytest.mark.asyncio
+async def test_run_repl_prints_compaction_summary_when_tier_active(monkeypatch, capfd):
+    """turn_stats.compaction.tier > NONE → print_compaction_summary 被调(输出含 '上下文压缩')。"""
+    from cc_harness import repl as repl_mod
+    from cc_harness.repl import run_repl
+    from cc_harness.context import CompactionTier, CompactionStats
+
+    inputs = iter(["hi", "exit"])
+    monkeypatch.setattr(repl_mod, "_read_user", _fake_read_user(inputs))
+
+    async def _spy(*a, **kw):
+        ts = TurnTokenStats()
+        ts.compaction = CompactionStats(
+            tier=CompactionTier.SNIP, before_tokens=1000, after_tokens=800,
+            ratio_before=0.9, ratio_after=0.7, messages_snip=3,
+        )
+        return ts
+    monkeypatch.setattr("cc_harness.agent.run_turn", _spy)
+
+    await run_repl(_StoppingLLM(), _NoopMCP(), cwd="/x")
+    out = capfd.readouterr().out
+    assert "上下文压缩" in out

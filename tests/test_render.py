@@ -15,6 +15,7 @@ from rich.console import Console as C
 from cc_harness.render import (
     print_thought, print_action, print_observation, print_result,
     print_warn, print_error, print_info,
+    print_token_summary, print_compaction_summary,
 )
 
 
@@ -222,3 +223,101 @@ def test_print_info_plain():
     text = buf.getvalue()
     assert "ready" in text
     assert "\x1b[" not in text
+
+
+# --- print_compaction_summary (Plan3 Task7) ---
+
+def test_print_compaction_summary_none_stats_no_output():
+    """stats=None → 完全不打印(无压缩发生)。"""
+    c, buf = _make_console()
+    print_compaction_summary(c, "本轮", None)
+    assert buf.getvalue() == ""
+
+
+def test_print_compaction_summary_none_tier_no_output():
+    """tier==NONE → 不打印(未触发压缩)。"""
+    from cc_harness.context import CompactionTier, CompactionStats
+    c, buf = _make_console()
+    stats = CompactionStats(
+        tier=CompactionTier.NONE, before_tokens=100, after_tokens=100,
+        ratio_before=0.1, ratio_after=0.1,
+    )
+    print_compaction_summary(c, "本轮", stats)
+    assert buf.getvalue() == ""
+
+
+def test_print_compaction_summary_snip_prints_line():
+    """tier=SNIP → 单行含 label + tier + ratio + snip 计数。"""
+    from cc_harness.context import CompactionTier, CompactionStats
+    c, buf = _make_console()
+    stats = CompactionStats(
+        tier=CompactionTier.SNIP, before_tokens=1000, after_tokens=800,
+        ratio_before=0.9, ratio_after=0.7, messages_snip=3,
+    )
+    print_compaction_summary(c, "本轮", stats)
+    text = buf.getvalue()
+    assert "上下文压缩" in text
+    assert "本轮" in text
+    assert "90%" in text               # ratio_before as pct
+    assert "70%" in text               # ratio_after as pct
+    assert "snip" in text.lower()
+    assert "3" in text                  # messages_snip count
+
+
+def test_print_compaction_summary_summarize_shows_summary_index():
+    """tier=SUMMARIZE + summarized → 含 [summary 插入 #idx]。"""
+    from cc_harness.context import CompactionTier, CompactionStats
+    c, buf = _make_console()
+    stats = CompactionStats(
+        tier=CompactionTier.SUMMARIZE, before_tokens=10000, after_tokens=5000,
+        ratio_before=0.99, ratio_after=0.5, summarized=True, summary_index=1,
+    )
+    print_compaction_summary(c, "本轮", stats)
+    text = buf.getvalue()
+    assert "summary" in text.lower()
+    assert "#1" in text                  # summary_index
+
+
+def test_print_compaction_summary_error_appends_warning():
+    """error 非空 → 追加 ⚠ 行。"""
+    from cc_harness.context import CompactionTier, CompactionStats
+    c, buf = _make_console()
+    stats = CompactionStats(
+        tier=CompactionTier.SUMMARIZE, before_tokens=1000, after_tokens=1000,
+        ratio_before=0.95, ratio_after=0.95, error="LLM timeout",
+    )
+    print_compaction_summary(c, "本轮", stats)
+    text = buf.getvalue()
+    assert "⚠" in text
+    assert "LLM timeout" in text
+
+
+# --- print_token_summary summary bucket (Plan3 Task7) ---
+
+def test_print_token_summary_summary_bucket_shown_when_positive():
+    """summary>0 → '摘要 N' 出现在 LLM 输出 之后。"""
+    from cc_harness.tokens import TurnTokenStats
+    c, buf = _make_console()
+    stats = TurnTokenStats(
+        user_input=10, tool_calls=20, llm_output=30, system_prompt=40,
+        summary=50, tool_definitions=5, api_total_tokens=0,
+    )
+    print_token_summary(c, "本轮", stats)
+    text = buf.getvalue()
+    assert "摘要" in text
+    assert "50" in text
+    # summary bucket appears after LLM 输出
+    assert text.index("LLM 输出") < text.index("摘要")
+
+
+def test_print_token_summary_no_summary_bucket_when_zero():
+    """summary==0 → 不出现 '摘要'(backward-compat:旧 5 桶格式不变)。"""
+    from cc_harness.tokens import TurnTokenStats
+    c, buf = _make_console()
+    stats = TurnTokenStats(
+        user_input=10, tool_calls=20, llm_output=30, system_prompt=40,
+        summary=0, tool_definitions=5, api_total_tokens=0,
+    )
+    print_token_summary(c, "本轮", stats)
+    text = buf.getvalue()
+    assert "摘要" not in text

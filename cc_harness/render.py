@@ -122,6 +122,10 @@ def print_token_summary(console: Console, label: str, stats) -> None:
     `stats` is either a TurnTokenStats or SessionTokenStats (both have the
     5-category fields: user_input / tool_calls / llm_output / system_prompt /
     tool_definitions, plus api_total_tokens).
+
+    The ``summary`` bucket (Plan3) is rendered only when > 0, preserving
+    backward-compatibility with the original 5-bucket layout for turns that
+    have no compaction summary.
     """
     _blank(console)
     sub = stats.breakdown_subtotal
@@ -130,6 +134,12 @@ def print_token_summary(console: Console, label: str, stats) -> None:
         f"用户输入 {stats.user_input}  "
         f"工具调用 {stats.tool_calls}  "
         f"LLM 输出 {stats.llm_output}  "
+    )
+    # Plan3: summary bucket only when > 0 (backward-compat with 5-bucket format)
+    summary = getattr(stats, "summary", 0)
+    if summary:
+        line += f"摘要 {summary}  "
+    line += (
         f"系统 {stats.system_prompt}  "
         f"工具定义 {stats.tool_definitions}  "
         f"= {sub}"
@@ -150,4 +160,44 @@ def print_token_summary(console: Console, label: str, stats) -> None:
             "⚠ 本轮后端未报告 token(可能未实现 stream_options.include_usage)",
             highlight=False,
         )
+    _flush(console)
+
+
+def print_compaction_summary(console: Console, label: str, stats) -> None:
+    """Print a one-line compaction summary for a turn.
+
+    ``label`` is the turn prefix (e.g. '本轮'). ``stats`` is a
+    :class:`~cc_harness.context.CompactionStats` or ``None``.
+
+    Nothing is printed when ``stats`` is ``None`` or ``stats.tier ==
+    CompactionTier.NONE`` (no compaction fired). Otherwise a single line
+    summarising the tier / ratio / snip / prune / summary-insert is emitted,
+    followed by a ``⚠`` line when ``stats.error`` is set.
+    """
+    if stats is None:
+        return
+    # Lazy import to avoid a render → context circular dependency at module
+    # load time (context imports prompts which imports tokens; render is a
+    # leaf — keeping it clean).
+    from cc_harness.context import CompactionTier
+
+    tier = getattr(stats, "tier", CompactionTier.NONE)
+    if tier is None or int(tier) == 0:
+        return
+
+    pct_before = f"{stats.ratio_before * 100:.0f}%"
+    pct_after = f"{stats.ratio_after * 100:.0f}%"
+    parts = [
+        f"上下文压缩 [{label}]:",
+        f"tier {int(tier)}",
+        f"{pct_before} → {pct_after}",
+        f"snip {stats.messages_snip} 条",
+        f"prune {stats.messages_prune} 条",
+    ]
+    if stats.summarized and stats.summary_index is not None:
+        parts.append(f"[summary 插入 #{stats.summary_index}]")
+    console.print("  ".join(parts), markup=False, highlight=False)
+
+    if stats.error:
+        console.print(f"⚠ 压缩异常: {stats.error}", highlight=False)
     _flush(console)

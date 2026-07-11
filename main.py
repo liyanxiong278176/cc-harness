@@ -8,7 +8,7 @@ import sys
 import time
 from pathlib import Path
 from rich.console import Console
-from cc_harness.config import load_config, ConfigError, load_executor_config
+from cc_harness.config import load_config, ConfigError, load_executor_config, load_context_config
 from cc_harness.llm import LLMClient
 from cc_harness.mcp_client import MCPClient
 from cc_harness.repl import run_repl
@@ -103,6 +103,7 @@ def main() -> None:
                 cwd=str(PROJECT_ROOT),
                 default_mode=args.mode,
                 design_dir=args.design_dir,
+                context_config=load_context_config(),
             )
         finally:
             await mcp.shutdown()
