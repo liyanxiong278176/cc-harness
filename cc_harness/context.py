@@ -313,6 +313,51 @@ def _truncate_assistant(content: str) -> str | None:
     return None
 
 
+# Delta size cap (spec 2026-06-12 「Delta 大小上限」 L236-237) ----------------
+
+# Marker prefixed when a Tier-3 delta is truncated to fit the summary budget.
+_DELTA_TRUNCATED_TEMPLATE = "... (delta truncated, {n} earlier messages omitted) ..."
+
+
+def _cap_delta_size(
+    rendered_delta: str,
+    delta_messages: list[dict],
+    config: ContextConfig,
+    counter: TokenCounter | None,
+) -> str:
+    """Enforce the Tier-3 delta size cap (spec L236-237).
+
+    If the serialized delta exceeds ``summarize_max_output_tokens * 4`` tokens
+    (default ≈ 8K), truncate to 70% of the budget — keeping the most recent
+    messages and dropping earlier ones — and prefix a truncation marker naming
+    how many earlier messages were omitted. Prevents the Tier-3 summary LLM call
+    from itself overflowing the context window or being silently truncated by
+    the provider. When under the cap, ``rendered_delta`` is returned unchanged.
+    """
+    token_counter = counter if counter is not None else TokenCounter()
+    budget = config.summarize_max_output_tokens
+    cap = budget * 4
+    if token_counter.count_text(rendered_delta) <= cap:
+        return rendered_delta
+
+    # Over the cap: keep the most recent messages that fit in 70% of the budget.
+    keep_budget = int(budget * 0.7)
+    kept: list[dict] = []
+    running = 0
+    for m in reversed(delta_messages):
+        t = token_counter.count_text(_render_messages_for_summary([m]))
+        # Always keep at least the most recent message, even if it alone exceeds
+        # the budget (an empty delta would starve the summarizer).
+        if kept and running + t > keep_budget:
+            break
+        kept.append(m)
+        running += t
+    kept.reverse()
+    omitted = len(delta_messages) - len(kept)
+    body = _render_messages_for_summary(kept)
+    return f"{_DELTA_TRUNCATED_TEMPLATE.format(n=omitted)}\n\n{body}"
+
+
 # Tier 3: Summarize ----------------------------------------------------------
 
 
@@ -336,6 +381,7 @@ async def apply_tier3_summarize(
     protect_until: int,
     config: ContextConfig,
     llm: Any,
+    counter: TokenCounter | None = None,
 ) -> CompactionStats:
     """Tier 3: LLM-powered incremental summarization.
 
@@ -344,6 +390,11 @@ async def apply_tier3_summarize(
     new summary, then inserts it at index 1 (after system) or 0. The old
     summary (if found) is replaced. ``tools=None`` is passed to ``llm.chat``
     (spec: summary LLM must not call tools).
+
+    The serialized delta is capped at ``summarize_max_output_tokens * 4`` tokens
+    (spec L236-237): over the cap it is truncated to 70% of the budget with a
+    truncation marker, so the summary LLM call cannot itself overflow the
+    context window or be silently truncated by the provider.
 
     Errors are caught and surfaced via ``CompactionStats.error`` — this
     function never raises (Tier 3 failure must not kill the cascade).
@@ -361,8 +412,11 @@ async def apply_tier3_summarize(
         # 2. Slice delta (messages between prev/system and protect zone)
         delta_messages = messages[delta_start:max(protect_until, delta_start)]
 
-        # 3. Build summary prompt
+        # 3. Build summary prompt (cap delta size — spec L236-237)
         rendered_delta = _render_messages_for_summary(delta_messages)
+        rendered_delta = _cap_delta_size(
+            rendered_delta, delta_messages, config, counter
+        )
         user_prompt = summary_user_prompt(prev_content, rendered_delta)
         summary_messages = [
             {"role": "system", "content": SUMMARY_SYSTEM_PROMPT},
@@ -511,7 +565,9 @@ async def maybe_compact(
             )
 
         # Tier 3: Summarize
-        stats = await apply_tier3_summarize(messages, protect_until, config, llm)
+        stats = await apply_tier3_summarize(
+            messages, protect_until, config, llm, counter=counter
+        )
         after = sum(counter.categorize(messages, tool_specs).values())
         stats.before_tokens = before
         stats.after_tokens = after

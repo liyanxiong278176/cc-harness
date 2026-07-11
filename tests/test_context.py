@@ -595,6 +595,32 @@ async def test_apply_tier3_summarize_preserves_user_code_blocks():
     assert "```python" in user_prompt
 
 
+@pytest.mark.asyncio
+async def test_apply_tier3_summarize_truncates_large_delta():
+    """delta 超 summarize_max_output_tokens*4 → 截断到 70% + 前缀标记(spec 236-237)。
+
+    用小 config(summarize_max_output_tokens=10 → cap=40)省构造:
+    50 条 user 消息各 200 字符 → FakeCounter(1char=1token)渲染后远超 cap=40。
+    断言 LLM 收到的 user prompt 含截断前缀,且 N = 被省略的早期消息数(49)。
+    """
+    _, _, _, _, _, apply_tier3_summarize, _, _, _ = _import_context()
+    # summarize_max_output_tokens=10 → cap=40, keep_budget=7
+    cfg = _cfg(summarize_max_output_tokens=10)
+    llm = FakeLLM(content="summary")
+    big_delta = [{"role": "user", "content": "x" * 200}] * 50  # 50 msgs × 200 tokens
+    msgs = [{"role": "system", "content": "sys"}] + big_delta + [
+        {"role": "user", "content": "recent"},
+    ]
+    await apply_tier3_summarize(
+        msgs, protect_until=len(msgs) - 1, config=cfg, llm=llm, counter=FakeCounter()
+    )
+    user_prompt = llm.last_messages[1]["content"]
+    assert "delta truncated" in user_prompt
+    assert "earlier messages omitted" in user_prompt
+    # keep_budget=7 → only the most recent delta message fits → 49 omitted
+    assert "49 earlier messages omitted" in user_prompt
+
+
 # ============================================================
 # maybe_compact — Tier3 cascade (2 tests) — Plan3 Task5
 # ============================================================
