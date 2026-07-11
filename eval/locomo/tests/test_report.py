@@ -8,7 +8,7 @@ def test_write_html_report_creates_file(tmp_path):
         {"sample_id": "s1", "turn_idx": 0, "q_type": "single-hop", "status": "ok",
          "f1": 0.8, "quality": 0.9, "pass": True,
          "prompt_tokens": 100, "completion_tokens": 50, "cost_usd": 0.001,
-         "tool_calls": ["memory_recall"]},
+         "tool_calls": [{"name": "memory_recall", "args": {"query": "q"}, "ok": True, "result": "r"}]},
         {"sample_id": "s1", "turn_idx": 1, "q_type": "multi-hop", "status": "timeout",
          "f1": None, "quality": None, "pass": False,
          "prompt_tokens": 0, "completion_tokens": 0, "cost_usd": 0.0,
@@ -29,7 +29,7 @@ def test_summary_cards_appear(tmp_path):
         {"sample_id": "s1", "turn_idx": 0, "q_type": "x", "status": "ok",
          "f1": 0.5, "quality": 0.6, "pass": True,
          "prompt_tokens": 10, "completion_tokens": 5, "cost_usd": 0.0001,
-         "tool_calls": ["memory_recall"]},
+         "tool_calls": [{"name": "memory_recall", "args": {"query": "q"}, "ok": True, "result": "r"}]},
     ]
     out = tmp_path / "report.html"
     write_html_report(results, out)
@@ -61,3 +61,37 @@ def test_status_badge_renders_as_html_not_escaped_text(tmp_path):
     assert '<span style="color:#3fb950' in text
     # And the escaped form should NOT be present
     assert "&lt;span style=" not in text
+
+
+def test_write_html_report_renders_q_type_table(tmp_path):
+    """HTML 含 q_type 分桶表 + ~10 卡。"""
+    from eval.locomo.report import write_html_report
+    results = [
+        {"sample_id": "s1", "turn_idx": -1, "q_type": "single-hop", "status": "ok",
+         "f1": 0.8, "quality": 0.9, "pass": True,
+         "prompt_tokens": 70000, "completion_tokens": 100, "cost_usd": 0.01,
+         "tool_calls": [{"name": "memory_recall", "args": {}, "ok": True, "result": "r"}],
+         "compaction": None},
+    ]
+    metrics = {"by_q_type": {"single-hop": {"n": 2, "f1_med": 0.7, "quality_med": 0.8, "pass": 1}},
+               "compaction": {"triggered": 0, "by_tier": {}, "avg_retain": None},
+               "utilization": {"avg": 0.05, "peak": 0.07},
+               "token_series": {"prompt": [70000], "completion": [100], "cumulative_cost": 0.01},
+               "memory": {"precision": 0.6, "recall": 0.5},
+               "tool_accuracy": {"mean": 0.8, "n": 1}}
+    p = write_html_report(results, tmp_path / "r.html", metrics=metrics)
+    html_text = p.read_text(encoding="utf-8")
+    assert "single-hop" in html_text
+    assert "q_type" in html_text.lower() or "分桶" in html_text
+    assert "0.8" in html_text  # 工具准确率
+
+
+def test_write_html_report_uncomputed_judge(tmp_path):
+    """judge='uncomputed' → 标'未计算'不崩。"""
+    from eval.locomo.report import write_html_report
+    metrics = {"by_q_type": {}, "compaction": {"triggered": 0, "by_tier": {}, "avg_retain": None},
+               "utilization": {"avg": 0.0, "peak": 0.0},
+               "token_series": {"prompt": [], "completion": [], "cumulative_cost": 0},
+               "memory": "uncomputed", "tool_accuracy": "uncomputed"}
+    p = write_html_report([], tmp_path / "r.html", metrics=metrics)
+    assert "未计算" in p.read_text(encoding="utf-8")

@@ -1,4 +1,8 @@
-"""HTML report for locomo eval results. 6-status schema + summary cards."""
+"""HTML report for locomo eval results. 6-status schema + summary cards.
+
+Plan4 Task4: 多卡(~10)+ q_type 分桶表 + token 时序 + 压缩/利用率/记忆 P·R/工具准确率。
+metrics=None 向后兼容(metrics dict 来自 metrics.run_judge)。
+"""
 from __future__ import annotations
 import html
 import json
@@ -14,7 +18,23 @@ STATUS_COLORS = {
 }
 
 
-def _summary_cards(results: list[dict]) -> str:
+def _card_val(obj, key: str, fmt: str = "{:.3f}") -> str:
+    """Safe read from a metrics sub-dict that may be the literal str "uncomputed".
+
+    Returns formatted value, or "未计算" if obj is str / key missing / value None.
+    """
+    if isinstance(obj, str):
+        return "未计算"
+    val = obj.get(key) if isinstance(obj, dict) else None
+    if val is None:
+        return "未计算"
+    try:
+        return fmt.format(val)
+    except (TypeError, ValueError):
+        return "未计算"
+
+
+def _summary_cards(results: list[dict], metrics: dict | None = None) -> str:
     n = len(results)
     n_pass = sum(1 for r in results if r.get("pass"))
     f1_vals = sorted(r["f1"] for r in results if r.get("f1") is not None)
@@ -23,6 +43,13 @@ def _summary_cards(results: list[dict]) -> str:
     total_tool_calls = sum(len(r.get("tool_calls") or []) for r in results)
     f1_med = f1_vals[len(f1_vals) // 2] if f1_vals else 0.0
     q_med = quality_vals[len(quality_vals) // 2] if quality_vals else 0.0
+    # memory_recall 调用次数(跨所有 results 的 tool_calls 中 name == "memory_recall")
+    n_recall = sum(
+        1
+        for r in results
+        for tc in (r.get("tool_calls") or [])
+        if isinstance(tc, dict) and tc.get("name") == "memory_recall"
+    )
 
     pass_label = f"{n_pass}/{n} ({n_pass/n*100:.0f}%)" if n else "0"
     cards = [
@@ -31,7 +58,19 @@ def _summary_cards(results: list[dict]) -> str:
         ("quality-median", f"{q_med:.3f}"),
         ("cost-usd", f"${total_cost:.4f}"),
         ("tool-calls", f"{total_tool_calls}"),
+        ("memory-recall", f"{n_recall}"),
     ]
+    # metrics 提供时追加 4 张:峰值利用率 / P@k / R / 工具准确率
+    if metrics:
+        util = metrics.get("utilization") or {}
+        peak = util.get("peak") if isinstance(util, dict) else None
+        peak_label = f"{peak*100:.1f}%" if isinstance(peak, (int, float)) else "未计算"
+        cards.append(("util-peak", peak_label))
+        mem = metrics.get("memory")
+        cards.append(("precision", _card_val(mem, "precision")))
+        cards.append(("recall", _card_val(mem, "recall")))
+        ta = metrics.get("tool_accuracy")
+        cards.append(("tool-accuracy", _card_val(ta, "mean")))
     out = ['<div class="cards">']
     for cls, val in cards:
         out.append(f'<div class="card {cls}"><div class="card-num">{val}</div><div class="card-lbl">{cls}</div></div>')
@@ -55,16 +94,74 @@ def _row(r: dict) -> str:
         html.escape(str(r.get("prompt_tokens", ""))),
         html.escape(str(r.get("completion_tokens", ""))),
         f"${r.get('cost_usd', 0):.4f}",
-        html.escape(", ".join(r.get("tool_calls") or [])),
+        html.escape(", ".join(tc.get("name", "?") for tc in (r.get("tool_calls") or []) if isinstance(tc, dict))),
     ]
     return "<tr>" + "".join(f"<td>{c}</td>" for c in cells) + "</tr>"
 
 
+def _q_type_table(by_q_type: dict) -> str:
+    """Render q_type 分桶表:行=各 q_type,列=n/f1-med/quality-med/pass。空 dict → 空串。"""
+    if not by_q_type:
+        return ""
+    rows = []
+    for q_type, st in by_q_type.items():
+        f1m = st.get("f1_med") if isinstance(st, dict) else None
+        qm = st.get("quality_med") if isinstance(st, dict) else None
+        n = st.get("n", "?") if isinstance(st, dict) else "?"
+        p = st.get("pass", "?") if isinstance(st, dict) else "?"
+        rows.append(
+            "<tr>"
+            f"<td>{html.escape(str(q_type))}</td>"
+            f"<td>{n}</td>"
+            f"<td>{'-' if f1m is None else f'{f1m:.3f}'}</td>"
+            f"<td>{'-' if qm is None else f'{qm:.3f}'}</td>"
+            f"<td>{p}</td>"
+            "</tr>"
+        )
+    return (
+        '<h2>q_type 分桶</h2><table><thead><tr>'
+        "<th>q_type</th><th>n</th><th>f1-med</th><th>quality-med</th><th>pass</th>"
+        "</tr></thead><tbody>" + "".join(rows) + "</tbody></table>"
+    )
+
+
+def _token_series_block(token_series: dict) -> str:
+    """Render prompt token 时序(前 20)+ cumulative_cost 一行。空 list → 仅 cost 行。"""
+    if not isinstance(token_series, dict):
+        return ""
+    prompts = token_series.get("prompt") or []
+    completions = token_series.get("completion") or []
+    cost = token_series.get("cumulative_cost", 0.0)
+    head_n = 20
+    rows = []
+    for i, pt in enumerate(prompts[:head_n]):
+        ct = completions[i] if i < len(completions) else ""
+        rows.append(f"<tr><td>#{i}</td><td>{pt}</td><td>{ct}</td></tr>")
+    body = "".join(rows) if rows else '<tr><td colspan="3">(空)</td></tr>'
+    return (
+        '<h2>token 时序(前 20)</h2>'
+        f'<div class="card-lbl">cumulative_cost: ${cost:.4f}</div>'
+        '<table><thead><tr><th>#</th><th>prompt</th><th>completion</th></tr></thead>'
+        f"<tbody>{body}</tbody></table>"
+    )
+
+
 def write_html_report(results: list[dict], out_path: Path,
+                      metrics: dict | None = None,
                       title: str = "cc-harness locomo 评测报告") -> Path:
-    """Write self-contained HTML report. Returns out_path."""
+    """Write self-contained HTML report. Returns out_path.
+
+    metrics=None 时行为不变(只渲染现有 5+1 卡 + 主表)。
+    metrics 提供时追加:峰值利用率/P/R/工具准确率卡 + q_type 分桶表 + token 时序。
+    """
     rows = "\n".join(_row(r) for r in results)
-    cards = _summary_cards(results)
+    cards = _summary_cards(results, metrics)
+    # metrics 派生区块
+    q_type_html = ""
+    token_series_html = ""
+    if metrics:
+        q_type_html = _q_type_table(metrics.get("by_q_type") or {})
+        token_series_html = _token_series_block(metrics.get("token_series") or {})
     safe_title = html.escape(title)
     page = f"""<!DOCTYPE html>
 <html lang="zh"><head><meta charset="utf-8"><title>{safe_title}</title>
@@ -92,6 +189,8 @@ tr:hover {{ background: #1c1c1c; }}
 </tr></thead>
 <tbody>{rows}</tbody>
 </table>
+{q_type_html}
+{token_series_html}
 </body></html>"""
     out_path = Path(out_path)
     out_path.write_text(page, encoding="utf-8")
