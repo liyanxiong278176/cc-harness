@@ -130,3 +130,34 @@ async def compute_tool_accuracy(results, contexts, judge_llm) -> dict:
             except Exception:
                 continue  # fail-soft
     return {"mean": st.mean(scores) if scores else None, "n": len(scores)}
+
+
+def run_judge(results, qas, judge_llm, cache_path) -> dict:
+    """编排:纯聚合(总跑)+ 离线 judge(有 llm 才跑,缓存)。
+    无 judge_llm → judge 维度 'uncomputed'。返回汇总 dict。"""
+    import asyncio
+
+    out = {
+        "by_q_type": compute_by_q_type(results),
+        "compaction": compute_compaction(results),
+        "utilization": compute_context_utilization(results),
+        "token_series": compute_token_series(results),
+    }
+    if judge_llm is None:
+        out["memory"] = out["tool_accuracy"] = "uncomputed"
+        return out
+    if cache_path and cache_path.exists():
+        return {**out, **json.loads(cache_path.read_text(encoding="utf-8"))}
+
+    async def _run():
+        return {
+            "memory": await compute_memory(results, qas, judge_llm),
+            "tool_accuracy": await compute_tool_accuracy(
+                results, [r.get("q_type", "") for r in results], judge_llm
+            ),
+        }
+
+    judged = asyncio.run(_run())
+    if cache_path:
+        cache_path.write_text(json.dumps(judged, ensure_ascii=False, indent=1), encoding="utf-8")
+    return {**out, **judged}

@@ -76,3 +76,25 @@ def test_compute_tool_accuracy():
     out = asyncio.run(compute_tool_accuracy(results, contexts=["x"], judge_llm=fake_judge))
     assert out["mean"] == pytest.approx(0.8)
     assert out["n"] == 1
+
+
+def test_run_judge_caches(tmp_path):
+    """judge 结果缓存到 json,二次读不重跑 judge。run_judge 是 sync(内部管 event loop,直接调)。"""
+    from eval.locomo.metrics import run_judge
+    call_count = [0]
+    async def counting_judge(s, **kw):
+        call_count[0] += 1
+        return '{"score": 0.5}'
+    cache = tmp_path / "judge.json"
+    r1 = run_judge(FIXTURE, [], counting_judge, cache)   # 直接调(sync)
+    r2 = run_judge(FIXTURE, [], counting_judge, cache)    # 命中缓存,不重跑
+    assert call_count[0] == 1  # FIXTURE 只 1 个 tool_call(record0)→ tool_accuracy 跑 1 次;memory qas=[]→0
+    assert r1 == r2
+
+
+def test_run_judge_no_key_degrades(tmp_path):
+    """无 judge_llm(None)→ judge 维度 'uncomputed',纯聚合仍返。"""
+    from eval.locomo.metrics import run_judge
+    out = run_judge(FIXTURE, [], None, tmp_path / "j.json")  # 直接调(sync)
+    assert out["tool_accuracy"] == "uncomputed"
+    assert out["by_q_type"]  # 纯聚合仍有
