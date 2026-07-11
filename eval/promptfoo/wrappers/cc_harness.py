@@ -16,7 +16,7 @@ Why async (not sync):
   subprocess boots. With the timeout properly set, both work.
 
 Config (set in promptfooconfig.yaml under the provider's `config:`):
-  - mode:     "coding" | "plan" | "design"  (default: coding)
+  - mode:     "coding" | "plan" | "design" | "chat"  (default: coding)
   - timeout:  promptfoo worker call timeout in **ms** (e.g. 600000 = 10 min)
   - boot_wait: seconds to wait after spawn before sending input (default: 5)
   - workdir:  absolute path to cc-harness    (auto-detected)

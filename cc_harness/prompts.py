@@ -167,6 +167,20 @@ SECTION_POOL: dict[str, Section] = {
         priority=100,
         conditions=("mode==design",),
     ),
+    "chat_mode": Section(
+        "chat_mode",
+        (
+            "## 模式:Chat(本地 AI 助手)\n"
+            "你是 cc-harness,一个本地 AI 助手(编程/计划/设计是你的模式之一,当前是 Chat)。\n"
+            "- **直接用自然语言回答用户**,像正常对话一样,不要输出\"思考:\"\"行动:\"等标记。\n"
+            "- 需要时调用工具:回答事实性问题前可 `memory_recall` 检索长期记忆,"
+            "对话中得知的关键事实可 `memory_save` 存储。能直接答就直接答,不强塞工具。\n"
+            "- 简洁、诚实:不知道就说不知道,不编造。\n"
+            "- 涉及危险/越权操作(rm -rf、读凭证、工作区外访问)仍按安全规则处理。"
+        ),
+        priority=20,
+        conditions=("mode==chat",),
+    ),
 }
 
 
@@ -214,7 +228,7 @@ class PromptComposer:
 
 def build_system_prompt(cwd: str, mode: str = "coding") -> str:
     """Public entry point. Renders the system prompt for the given mode
-    with `cwd` substituted. mode is one of 'coding', 'plan', 'design'."""
+    with `cwd` substituted. mode is one of 'coding', 'plan', 'design', 'chat'."""
     return PromptComposer(mode=mode, ctx={"cwd": cwd}).render()
 
 

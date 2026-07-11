@@ -297,3 +297,28 @@ def test_tool_discipline_warns_shell_redirect_in_sandbox():
     out = build_system_prompt("/x", mode="coding")
     assert "写文件用文件工具" in out or "别用 shell 重定向" in out, \
         "缺沙箱模式写文件指导"
+
+
+# --- chat mode (Plan1 Task3) ---
+
+def test_chat_mode_prompt_has_assistant_guidance():
+    """chat system prompt 含助手引导 + 自然对话语义。"""
+    from cc_harness.prompts import build_system_prompt
+    prompt = build_system_prompt("/tmp", mode="chat")
+    assert "助手" in prompt        # 本地 AI 助手
+    assert "自然" in prompt        # 自然语言回答
+
+
+def test_chat_mode_excludes_coding_sections():
+    """chat 不含 todo_block / tool_discipline(编程纪律)。"""
+    from cc_harness.prompts import build_system_prompt
+    prompt = build_system_prompt("/tmp", mode="chat")
+    assert "TODO 块" not in prompt
+    assert "工具使用纪律" not in prompt
+
+
+def test_coding_mode_unaffected():
+    """coding prompt 不受 chat section 影响。"""
+    from cc_harness.prompts import build_system_prompt
+    prompt = build_system_prompt("/tmp", mode="coding")
+    assert "TODO 块" in prompt  # coding 仍有

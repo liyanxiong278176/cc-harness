@@ -31,7 +31,7 @@ def _parse_args() -> argparse.Namespace:
     p.add_argument(
         "--mode", choices=("coding", "plan", "design", "chat"),
         default="coding",
-        help="Initial sticky mode (switchable at runtime via /plan /design /coding)",
+        help="Initial sticky mode (switchable at runtime via /plan /design /coding /chat)",
     )
     p.add_argument(
         "--design-dir", type=Path, default=None,
