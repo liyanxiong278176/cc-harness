@@ -1,7 +1,17 @@
 """QA evaluation: token F1 (locomo official) + deepeval GEval (subjective quality)."""
 from __future__ import annotations
+import os
 import re
 from typing import Optional
+
+try:
+    from deepeval.metrics import GEval
+    from deepeval.test_case import LLMTestCase
+    from deepeval.test_case.llm_test_case import SingleTurnParams
+except ImportError:  # fail-soft: deepeval not installed
+    GEval = None  # type: ignore[assignment,misc]
+    LLMTestCase = None  # type: ignore[assignment,misc]
+    SingleTurnParams = None  # type: ignore[assignment,misc]
 
 
 def _tokenize(text: str) -> list[str]:
@@ -38,15 +48,18 @@ def quality_score(prompt: str, predicted: str, gold: str) -> Optional[float]:
         float 0-1 on success
         None if deepeval not installed or judge LLM failed
     """
-    try:
-        from deepeval.metrics import GEval
-        from deepeval.test_case import LLMTestCase
-    except ImportError:
+    if GEval is None:  # deepeval not installed
         return None
     try:
         metric = GEval(
             name="answer-quality",
             criteria="Is the predicted answer factually correct and relevant to the prompt, given the gold reference?",
+            evaluation_params=[
+                SingleTurnParams.INPUT,
+                SingleTurnParams.ACTUAL_OUTPUT,
+                SingleTurnParams.EXPECTED_OUTPUT,
+            ],
+            model=os.environ.get("OPENAI_MODEL", "gpt-4o"),
         )
         case = LLMTestCase(input=prompt, actual_output=predicted, expected_output=gold)
         metric.measure(case)
