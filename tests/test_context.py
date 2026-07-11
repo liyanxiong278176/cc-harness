@@ -1,6 +1,6 @@
-"""Tests for cc_harness/context.py — protect boundary + Tier1 Snip + Tier2 Prune + maybe_compact.
+"""Tests for cc_harness/context.py — protect boundary + Tier1-3 + maybe_compact.
 
-Plan3 Task4: 27 tests (Tier3 Summarize is Task5, not here).
+Plan3 Task4+5: 38+ tests (Tier3 Summarize + full cascade).
 Per spec 2026-06-12 「test_context.py 38 test 分布」.
 """
 import json
@@ -8,6 +8,7 @@ import json
 import pytest
 
 from cc_harness.config import ContextConfig
+from cc_harness.llm import StreamEvent
 from cc_harness.tokens import SUMMARY_MARKER_KEY
 
 
@@ -19,11 +20,14 @@ def _import_context():
         find_protect_boundary,
         apply_tier1_snip,
         apply_tier2_prune,
+        apply_tier3_summarize,
+        _find_previous_summary,
         maybe_compact,
         TIER2_TOOL_PLACEHOLDER,
     )
     return (CompactionTier, CompactionStats, find_protect_boundary,
-            apply_tier1_snip, apply_tier2_prune, maybe_compact, TIER2_TOOL_PLACEHOLDER)
+            apply_tier1_snip, apply_tier2_prune, apply_tier3_summarize,
+            _find_previous_summary, maybe_compact, TIER2_TOOL_PLACEHOLDER)
 
 
 class FakeCounter:
@@ -58,6 +62,29 @@ class FakeCounter:
             for tool in tools:
                 cats["tool_definitions"] += self.count_text(json.dumps(tool, ensure_ascii=False))
         return cats
+
+
+class FakeLLM:
+    """Mock LLM for Tier 3 tests — yields a single done event with preset content.
+
+    Mirrors ``LLMClient.chat``: async generator yielding ``StreamEvent``.
+    Records ``last_messages`` / ``last_tools`` / ``call_count`` for assertions.
+    """
+
+    def __init__(self, content="mock summary", error=None):
+        self.content = content
+        self.error = error
+        self.last_messages = None
+        self.last_tools = "UNSET"  # sentinel to detect tools= kwarg usage
+        self.call_count = 0
+
+    async def chat(self, messages, tools=None):
+        self.last_messages = messages
+        self.last_tools = tools
+        self.call_count += 1
+        if self.error:
+            raise self.error
+        yield StreamEvent(kind="done", content=self.content)
 
 
 def _cfg(**kw):
@@ -225,7 +252,7 @@ def test_apply_tier1_snip_does_not_delete_messages():
 # ============================================================
 
 def test_apply_tier2_prune_tool_to_placeholder():
-    _, _, _, _, apply_tier2_prune, _, TIER2_TOOL_PLACEHOLDER = _import_context()
+    _, _, _, _, apply_tier2_prune, _, _, _, TIER2_TOOL_PLACEHOLDER = _import_context()
     cfg = _cfg()
     msgs = [{"role": "tool", "content": "some long tool output\n" * 5}]
     apply_tier2_prune(msgs, 1, cfg)
@@ -250,7 +277,7 @@ def test_apply_tier2_prune_no_punctuation_fallback():
 
 
 def test_apply_tier2_prune_does_not_delete_tool():
-    _, _, _, _, apply_tier2_prune, _, TIER2_TOOL_PLACEHOLDER = _import_context()
+    _, _, _, _, apply_tier2_prune, _, _, _, TIER2_TOOL_PLACEHOLDER = _import_context()
     cfg = _cfg()
     msgs = [{"role": "tool", "content": "output"}, {"role": "user", "content": "go"}]
     n = len(msgs)
@@ -271,7 +298,7 @@ def test_apply_tier2_prune_preserves_tool_calls_field():
 
 
 def test_apply_tier2_prune_skip_protect_zone():
-    _, _, _, _, apply_tier2_prune, _, TIER2_TOOL_PLACEHOLDER = _import_context()
+    _, _, _, _, apply_tier2_prune, _, _, _, TIER2_TOOL_PLACEHOLDER = _import_context()
     cfg = _cfg()
     msgs = [
         {"role": "tool", "content": "in-range"},     # idx 0 — touched
@@ -335,7 +362,7 @@ def test_apply_tier2_prune_user_codeblock_force():
 
 @pytest.mark.asyncio
 async def test_maybe_compact_disabled():
-    _, _, _, _, _, maybe_compact, _ = _import_context()
+    _, _, _, _, _, _, _, maybe_compact, _ = _import_context()
     cfg = _cfg(enabled=False)
     original = "x" * 200
     msgs = [{"role": "user", "content": original}]
@@ -346,7 +373,7 @@ async def test_maybe_compact_disabled():
 
 @pytest.mark.asyncio
 async def test_maybe_compact_ratio_below_tier1():
-    _, _, _, _, _, maybe_compact, _ = _import_context()
+    _, _, _, _, _, _, _, maybe_compact, _ = _import_context()
     cfg = _cfg(context_window=1000, tier1_threshold=0.6)
     msgs = [{"role": "user", "content": "small"}]  # 5 tokens / 1000 = 0.005
     stats = await maybe_compact(msgs, None, FakeCounter(), cfg)
@@ -359,7 +386,7 @@ async def test_maybe_compact_ratio_below_tier1():
 @pytest.mark.asyncio
 async def test_maybe_compact_tier1_only():
     """Ratio >= tier1 but after Snip drops below tier2 → SNIP."""
-    _, _, _, _, _, maybe_compact, _ = _import_context()
+    _, _, _, _, _, _, _, maybe_compact, _ = _import_context()
     cfg = _cfg(context_window=100, tier1_threshold=0.6, tier2_threshold=0.8,
                protect_zone_tokens=5, snip_head_lines=2, snip_tail_lines=1)
     lines = [f"line{i}" for i in range(30)]
@@ -378,7 +405,7 @@ async def test_maybe_compact_tier1_only():
 @pytest.mark.asyncio
 async def test_maybe_compact_tier1_then_tier2():
     """Tier1 can't reduce (single-line tool) → Tier2 placeholder kicks in → PRUNE."""
-    _, _, _, _, _, maybe_compact, _ = _import_context()
+    _, _, _, _, _, _, _, maybe_compact, _ = _import_context()
     cfg = _cfg(context_window=100, tier1_threshold=0.6, tier2_threshold=0.8,
                tier3_threshold=0.95, protect_zone_tokens=5)
     msgs = [
@@ -401,7 +428,7 @@ async def test_maybe_compact_exception_isolation():
         def categorize(self, messages, tools=None):
             raise RuntimeError("boom")
 
-    _, _, _, _, _, maybe_compact, _ = _import_context()
+    _, _, _, _, _, _, _, maybe_compact, _ = _import_context()
     cfg = _cfg(context_window=100)
     msgs = [{"role": "user", "content": "x" * 200}]
     stats = await maybe_compact(msgs, None, ExplodingCounter(), cfg)
@@ -410,3 +437,235 @@ async def test_maybe_compact_exception_isolation():
     assert stats.error is not None
     assert "boom" in stats.error
     assert stats.before_snapshot is not None  # 异常路径留快照供 debug(spec 要求)
+
+
+# ============================================================
+# apply_tier3_summarize (8 tests) — Plan3 Task5
+# ============================================================
+
+@pytest.mark.asyncio
+async def test_apply_tier3_summarize_no_previous_summary():
+    """No prev summary -> delta starts after system, new summary inserted at idx 1."""
+    _, _, _, _, _, apply_tier3_summarize, _, _, _ = _import_context()
+    cfg = _cfg()
+    llm = FakeLLM(content="new summary text")
+    msgs = [
+        {"role": "system", "content": "system prompt"},
+        {"role": "user", "content": "hello world"},
+        {"role": "assistant", "content": "hi there"},
+        {"role": "user", "content": "recent"},
+    ]
+    stats = await apply_tier3_summarize(msgs, 3, cfg, llm)
+    assert stats.summarized is True
+    assert msgs[1].get("role") == "assistant"
+    assert msgs[1].get(SUMMARY_MARKER_KEY) is True
+    assert msgs[1]["content"] == "new summary text"
+
+
+@pytest.mark.asyncio
+async def test_apply_tier3_summarize_found_previous():
+    """Prev summary found -> delta after prev, old summary replaced by new."""
+    _, _, _, _, _, apply_tier3_summarize, _, _, _ = _import_context()
+    cfg = _cfg()
+    llm = FakeLLM(content="updated summary")
+    msgs = [
+        {"role": "system", "content": "sys"},
+        {"role": "assistant", "content": "old summary", SUMMARY_MARKER_KEY: True},
+        {"role": "user", "content": "new message"},
+        {"role": "user", "content": "recent"},
+    ]
+    stats = await apply_tier3_summarize(msgs, 3, cfg, llm)
+    assert stats.summarized is True
+    assert msgs[1]["content"] == "updated summary"
+    assert msgs[1].get(SUMMARY_MARKER_KEY) is True
+    # Only one summary message should exist (old replaced)
+    summary_count = sum(1 for m in msgs if m.get(SUMMARY_MARKER_KEY))
+    assert summary_count == 1
+
+
+@pytest.mark.asyncio
+async def test_apply_tier3_summarize_inserts_after_system():
+    """Summary is inserted at idx 1 (right after system at idx 0)."""
+    _, _, _, _, _, apply_tier3_summarize, _, _, _ = _import_context()
+    cfg = _cfg()
+    llm = FakeLLM(content="summary")
+    msgs = [
+        {"role": "system", "content": "sys"},
+        {"role": "user", "content": "msg1"},
+        {"role": "user", "content": "recent"},
+    ]
+    await apply_tier3_summarize(msgs, 2, cfg, llm)
+    assert msgs[0]["role"] == "system"
+    assert msgs[1].get(SUMMARY_MARKER_KEY) is True
+    assert msgs[1]["content"] == "summary"
+
+
+@pytest.mark.asyncio
+async def test_apply_tier3_summarize_incremental_across_two_calls():
+    """spec 实施期约束 2: second _find_previous_summary idx == first summary_index."""
+    _, _, _, _, _, apply_tier3_summarize, _find_previous_summary, _, _ = _import_context()
+    cfg = _cfg()
+    llm = FakeLLM(content="incremental summary")
+    msgs = [
+        {"role": "system", "content": "sys"},
+        {"role": "user", "content": "msg1"},
+        {"role": "assistant", "content": "reply1"},
+        {"role": "user", "content": "recent"},
+    ]
+    # First call
+    stats1 = await apply_tier3_summarize(msgs, 3, cfg, llm)
+    assert stats1.summarized is True
+    assert stats1.summary_index is not None
+
+    # spec 实施期约束 2: _find_previous_summary returns idx == first summary_index
+    prev = _find_previous_summary(msgs)
+    assert prev is not None
+    assert prev[0] == stats1.summary_index
+
+    # Second call — should find prev and produce incremental summary
+    stats2 = await apply_tier3_summarize(msgs, 3, cfg, llm)
+    assert stats2.summarized is True
+    assert stats2.summary_index == stats1.summary_index
+
+
+@pytest.mark.asyncio
+async def test_apply_tier3_summarize_tools_none_passed_to_llm():
+    """llm.chat must be called with tools=None (spec: 严禁调用任何工具)."""
+    _, _, _, _, _, apply_tier3_summarize, _, _, _ = _import_context()
+    cfg = _cfg()
+    llm = FakeLLM(content="summary")
+    msgs = [
+        {"role": "system", "content": "sys"},
+        {"role": "user", "content": "msg"},
+        {"role": "user", "content": "recent"},
+    ]
+    await apply_tier3_summarize(msgs, 2, cfg, llm)
+    assert llm.last_tools is None
+
+
+@pytest.mark.asyncio
+async def test_apply_tier3_summarize_llm_error_returns_error():
+    """LLM raises -> stats.error set, summarized=False, no raise."""
+    _, _, _, _, _, apply_tier3_summarize, _, _, _ = _import_context()
+    cfg = _cfg()
+    llm = FakeLLM(error=RuntimeError("LLM unavailable"))
+    msgs = [
+        {"role": "system", "content": "sys"},
+        {"role": "user", "content": "msg"},
+        {"role": "user", "content": "recent"},
+    ]
+    stats = await apply_tier3_summarize(msgs, 2, cfg, llm)
+    assert stats.summarized is False
+    assert stats.error is not None
+    assert "LLM unavailable" in stats.error
+
+
+@pytest.mark.asyncio
+async def test_apply_tier3_summarize_records_summary_index():
+    """stats.summary_index matches actual insert position in messages."""
+    _, _, _, _, _, apply_tier3_summarize, _, _, _ = _import_context()
+    cfg = _cfg()
+    llm = FakeLLM(content="summary")
+    msgs = [
+        {"role": "system", "content": "sys"},
+        {"role": "user", "content": "msg"},
+        {"role": "user", "content": "recent"},
+    ]
+    stats = await apply_tier3_summarize(msgs, 2, cfg, llm)
+    assert stats.summary_index == 1
+    assert msgs[stats.summary_index].get(SUMMARY_MARKER_KEY) is True
+
+
+@pytest.mark.asyncio
+async def test_apply_tier3_summarize_preserves_user_code_blocks():
+    """User ```code blocks``` in delta are preserved verbatim in the LLM prompt."""
+    _, _, _, _, _, apply_tier3_summarize, _, _, _ = _import_context()
+    cfg = _cfg()
+    llm = FakeLLM(content="summary")
+    code = "```python\ndef foo():\n    return 42\n```"
+    msgs = [
+        {"role": "system", "content": "sys"},
+        {"role": "user", "content": f"Here:\n{code}\nDone."},
+        {"role": "user", "content": "recent"},
+    ]
+    await apply_tier3_summarize(msgs, 2, cfg, llm)
+    # The user prompt sent to LLM should contain the code block verbatim
+    user_prompt = llm.last_messages[1]["content"]
+    assert "def foo()" in user_prompt
+    assert "```python" in user_prompt
+
+
+# ============================================================
+# maybe_compact — Tier3 cascade (2 tests) — Plan3 Task5
+# ============================================================
+
+@pytest.mark.asyncio
+async def test_maybe_compact_full_cascade_tier3():
+    """Tier1+Tier2 insufficient -> Tier3 triggers -> SUMMARIZE with LLM summary."""
+    _, _, _, _, _, _, _, maybe_compact, _ = _import_context()
+    cfg = _cfg(context_window=100, tier1_threshold=0.1, tier2_threshold=0.2,
+               tier3_threshold=0.3, protect_zone_tokens=5)
+    llm = FakeLLM(content="cascade summary")
+    msgs = [
+        {"role": "system", "content": "sys"},
+        {"role": "tool", "content": "x" * 200},
+        {"role": "assistant", "content": "done"},
+        {"role": "user", "content": "go"},
+    ]
+    stats = await maybe_compact(msgs, None, FakeCounter(), cfg, llm)
+    from cc_harness.context import CompactionTier
+    assert stats.tier == CompactionTier.SUMMARIZE
+    assert stats.summarized is True
+    assert any(m.get(SUMMARY_MARKER_KEY) for m in msgs)
+
+
+@pytest.mark.asyncio
+async def test_maybe_compact_tier3_llm_error_degrades_gracefully():
+    """Full cascade -> Tier3 -> LLM error -> no raise, error captured in stats."""
+    _, _, _, _, _, _, _, maybe_compact, _ = _import_context()
+    cfg = _cfg(context_window=100, tier1_threshold=0.1, tier2_threshold=0.2,
+               tier3_threshold=0.3, protect_zone_tokens=5)
+    llm = FakeLLM(error=RuntimeError("LLM down"))
+    msgs = [
+        {"role": "system", "content": "sys"},
+        {"role": "tool", "content": "x" * 200},
+        {"role": "assistant", "content": "done"},
+        {"role": "user", "content": "go"},
+    ]
+    stats = await maybe_compact(msgs, None, FakeCounter(), cfg, llm)
+    assert stats.error is not None
+    assert "LLM down" in stats.error
+
+
+# ============================================================
+# Integration (1 test) — Plan3 Task5
+# ============================================================
+
+@pytest.mark.asyncio
+async def test_compaction_cascade_real_scenario():
+    """Integration: mixed messages through full cascade -> summary + protect zone intact."""
+    _, _, _, _, _, _, _, maybe_compact, _ = _import_context()
+    cfg = _cfg(context_window=100, tier1_threshold=0.1, tier2_threshold=0.2,
+               tier3_threshold=0.3, protect_zone_tokens=10)
+    llm = FakeLLM(content="integrated summary of conversation")
+    msgs = [
+        {"role": "system", "content": "system prompt"},
+        {"role": "user", "content": "do task X"},
+        {"role": "assistant", "content": "sure, working on it", "tool_calls": [
+            {"id": "tc1", "type": "function",
+             "function": {"name": "run_cmd", "arguments": "{}"}}
+        ]},
+        {"role": "tool", "content": "x" * 200},
+        {"role": "assistant", "content": "done with X. result is good."},
+        {"role": "user", "content": "now do Y"},
+    ]
+    original_protect_content = msgs[-1]["content"]
+    stats = await maybe_compact(msgs, None, FakeCounter(), cfg, llm)
+    from cc_harness.context import CompactionTier
+    assert stats.tier == CompactionTier.SUMMARIZE
+    assert stats.summarized is True
+    # Summary exists
+    assert any(m.get(SUMMARY_MARKER_KEY) for m in msgs)
+    # Protect zone (last user) untouched
+    assert msgs[-1]["content"] == original_protect_content
+    assert msgs[-1]["role"] == "user"

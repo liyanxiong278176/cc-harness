@@ -5,7 +5,7 @@ token-budget cascade:
 
 - Tier 1 Snip  (ratio >= tier1): truncate long tool outputs / user code blocks (head/tail).
 - Tier 2 Prune (ratio >= tier2): tool content -> placeholder; assistant text -> first sentence.
-- Tier 3 Summarize (ratio >= tier3): LLM incremental summary (Task 5 — stubbed here).
+- Tier 3 Summarize (ratio >= tier3): LLM incremental summary (prev + delta -> new summary).
 
 A **protect zone** (the most recent ~``protect_zone_tokens`` plus the last user
 message) is never touched. All tiers mutate ``messages`` in place. Failures are
@@ -22,6 +22,11 @@ from enum import IntEnum
 from typing import Any
 
 from cc_harness.config import ContextConfig
+from cc_harness.prompts import (
+    SUMMARY_SYSTEM_PROMPT,
+    _render_messages_for_summary,
+    summary_user_prompt,
+)
 from cc_harness.tokens import SUMMARY_MARKER_KEY, TokenCounter
 
 # Public constants -----------------------------------------------------------
@@ -308,7 +313,22 @@ def _truncate_assistant(content: str) -> str | None:
     return None
 
 
-# Tier 3: Summarize (stub — Task 5) -----------------------------------------
+# Tier 3: Summarize ----------------------------------------------------------
+
+
+def _find_previous_summary(messages: list[dict]) -> tuple[int, str] | None:
+    """Reverse-scan for the most recent compaction summary message.
+
+    Returns ``(index, content)`` for the last ``role == assistant`` message
+    carrying the ``_compaction_summary`` marker, or ``None`` if none exists.
+    """
+    for i in range(len(messages) - 1, -1, -1):
+        m = messages[i]
+        if m.get("role") == "assistant" and m.get(SUMMARY_MARKER_KEY):
+            content = m.get("content")
+            if isinstance(content, str):
+                return (i, content)
+    return None
 
 
 async def apply_tier3_summarize(
@@ -317,19 +337,85 @@ async def apply_tier3_summarize(
     config: ContextConfig,
     llm: Any,
 ) -> CompactionStats:
-    """Tier 3 incremental summarization. **Placeholder** — Task 5 implements this.
+    """Tier 3: LLM-powered incremental summarization.
 
-    Returns a NONE-tier stats with an ``error`` note so the cascade degrades
-    gracefully (no false claim of summarization) until Task 5 lands.
+    Finds the previous summary (if any), computes the delta (messages between
+    prev summary and protect zone), asks the LLM to merge prev + delta into a
+    new summary, then inserts it at index 1 (after system) or 0. The old
+    summary (if found) is replaced. ``tools=None`` is passed to ``llm.chat``
+    (spec: summary LLM must not call tools).
+
+    Errors are caught and surfaced via ``CompactionStats.error`` — this
+    function never raises (Tier 3 failure must not kill the cascade).
     """
-    return CompactionStats(
-        tier=CompactionTier.NONE,
-        before_tokens=0,
-        after_tokens=0,
-        ratio_before=0.0,
-        ratio_after=0.0,
-        error="tier3 summarize not implemented (Task 5)",
-    )
+    try:
+        # 1. Find previous summary
+        prev = _find_previous_summary(messages)
+        if prev is not None:
+            prev_idx, prev_content = prev
+            delta_start = prev_idx + 1
+        else:
+            prev_content = None
+            delta_start = 1 if (messages and messages[0].get("role") == "system") else 0
+
+        # 2. Slice delta (messages between prev/system and protect zone)
+        delta_messages = messages[delta_start:max(protect_until, delta_start)]
+
+        # 3. Build summary prompt
+        rendered_delta = _render_messages_for_summary(delta_messages)
+        user_prompt = summary_user_prompt(prev_content, rendered_delta)
+        summary_messages = [
+            {"role": "system", "content": SUMMARY_SYSTEM_PROMPT},
+            {"role": "user", "content": user_prompt},
+        ]
+
+        # 4. Call LLM (tools=None — spec mandates no tools)
+        content = ""
+        async for ev in llm.chat(summary_messages, tools=None):
+            if ev.kind == "done":
+                content = ev.content or ""
+                break
+
+        if not content:
+            return CompactionStats(
+                tier=CompactionTier.SUMMARIZE,
+                before_tokens=0,
+                after_tokens=0,
+                ratio_before=0.0,
+                ratio_after=0.0,
+                error="LLM returned empty summary content",
+            )
+
+        # 5. Remove old summary (if exists) before inserting the new one
+        if prev is not None:
+            messages.pop(prev_idx)
+
+        # 6. Insert new summary at canonical position
+        insert_idx = 1 if (messages and messages[0].get("role") == "system") else 0
+        messages.insert(insert_idx, {
+            "role": "assistant",
+            "content": content,
+            SUMMARY_MARKER_KEY: True,
+        })
+
+        return CompactionStats(
+            tier=CompactionTier.SUMMARIZE,
+            before_tokens=0,    # filled by maybe_compact
+            after_tokens=0,
+            ratio_before=0.0,   # filled by maybe_compact
+            ratio_after=0.0,
+            summarized=True,
+            summary_index=insert_idx,
+        )
+    except Exception as e:  # noqa: BLE001 — Tier 3 fail-soft
+        return CompactionStats(
+            tier=CompactionTier.SUMMARIZE,
+            before_tokens=0,
+            after_tokens=0,
+            ratio_before=0.0,
+            ratio_after=0.0,
+            error=str(e),
+        )
 
 
 # Orchestrator ---------------------------------------------------------------
@@ -424,10 +510,13 @@ async def maybe_compact(
                 messages_assistant_truncated=truncated_asst,
             )
 
-        # Tier 3: Summarize (Task 5 placeholder — returns NONE-stats w/ error)
+        # Tier 3: Summarize
         stats = await apply_tier3_summarize(messages, protect_until, config, llm)
+        after = sum(counter.categorize(messages, tool_specs).values())
         stats.before_tokens = before
+        stats.after_tokens = after
         stats.ratio_before = ratio
+        stats.ratio_after = after / config.context_window
         return stats
 
     except Exception as e:  # noqa: BLE001 — spec mandates fail-soft
