@@ -17,8 +17,14 @@ except ImportError:  # fail-soft: deepeval not installed
     SingleTurnParams = None  # type: ignore[assignment,misc]
 
 
-def _tokenize(text: str) -> list[str]:
-    """Whitespace + simple word splitting. Handles CJK by per-character split."""
+def _tokenize(text) -> list[str]:
+    """Whitespace + simple word splitting. Handles CJK by per-character split.
+
+    Coerces non-str to str: locomo answers can be int (year/count/quantity),
+    and re.findall below would otherwise raise on int input.
+    """
+    if not isinstance(text, str):
+        text = str(text)
     if not text:
         return []
     cjk = re.findall(r"[一-鿿]", text)

@@ -45,3 +45,11 @@ def test_quality_score_fail_soft_no_deepeval(monkeypatch):
     import eval.locomo.evaluator as mod
     monkeypatch.setattr(mod, "GEval", None)
     assert mod.quality_score("q", "a", "g") is None
+
+
+def test_tokenize_handles_int_answer():
+    """locomo answer 可能是 int(年份 2022/次数 2);_tokenize/token_f1 不崩。"""
+    from eval.locomo.evaluator import _tokenize, token_f1
+    assert _tokenize(2022) == ["2022"]
+    assert token_f1("2022", 2022) == 1.0   # int gold 不崩
+    assert token_f1(2022, "2022") == 1.0   # int predicted 不崩
