@@ -238,3 +238,29 @@ def test_load_executor_config_env_override_backend(monkeypatch):
     monkeypatch.setenv("CC_HARNESS_EXECUTOR_BACKEND", "maybe")
     cfg3 = load_executor_config(Path("/nonexistent/policy.yaml"))
     assert cfg3.backend is ExecutorBackend.NATIVE   # 非法 → 默认 fail-safe
+
+
+# --- ContextConfig (Plan3 Task2) ---
+
+
+def test_context_config_defaults():
+    from cc_harness.config import ContextConfig
+    c = ContextConfig()
+    assert c.enabled is True
+    assert c.context_window == 1_000_000  # 1M(deepseek-v4-flash 真实)
+    assert c.tier1_threshold < c.tier2_threshold < c.tier3_threshold
+
+
+def test_context_config_threshold_validation():
+    """threshold 必须 0<t1<t2<t3<1。"""
+    from cc_harness.config import ContextConfig
+    with pytest.raises(Exception):
+        ContextConfig(tier1_threshold=0.9, tier2_threshold=0.5)  # t1 > t2 非法
+
+
+def test_context_config_env_override(monkeypatch):
+    """CONTEXT_WINDOW env 覆盖默认。"""
+    monkeypatch.setenv("CONTEXT_WINDOW", "128000")
+    from cc_harness.config import load_context_config
+    c = load_context_config()
+    assert c.context_window == 128000

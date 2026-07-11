@@ -5,7 +5,7 @@ from pathlib import Path
 from typing import Literal
 
 from dotenv import load_dotenv
-from pydantic import BaseModel
+from pydantic import BaseModel, model_validator
 
 
 class MCPServerConfig(BaseModel):
@@ -183,3 +183,55 @@ def load_executor_config(path: Path) -> ExecutorConfig:
     if backend_env in ("sandbox", "native"):
         cfg.backend = ExecutorBackend(backend_env)
     return cfg
+
+
+class ContextConfig(BaseModel):
+    """4-tier 上下文压缩配置(Plan3)。context_window=1M(deepseek-v4-flash 真实窗口)。
+
+    threshold = 占窗口比例,触发各 tier:tier1(0.6)Snip / tier2(0.8)Prune /
+    tier3(0.95)Summarize。protect_zone_tokens = 最近 N token 不压缩。
+    """
+    enabled: bool = True
+    context_window: int = 1_000_000            # deepseek-v4-flash 真实窗口
+    tier1_threshold: float = 0.6
+    tier2_threshold: float = 0.8
+    tier3_threshold: float = 0.95
+    protect_zone_tokens: int = 8_192
+    protected_tool_patterns: list[str] = []
+    snip_head_lines: int = 5
+    snip_tail_lines: int = 1
+    summarize_max_output_tokens: int = 2_000
+
+    model_config = {"extra": "ignore"}
+
+    @model_validator(mode="after")
+    def _validate(self) -> "ContextConfig":
+        for t in (self.tier1_threshold, self.tier2_threshold, self.tier3_threshold):
+            assert 0 < t < 1, f"threshold {t} not in (0,1)"
+        assert self.tier1_threshold < self.tier2_threshold < self.tier3_threshold, \
+            "thresholds must be strictly increasing"
+        assert self.protect_zone_tokens >= 0 and self.context_window > 0
+        return self
+
+
+def load_context_config(path: Path | None = None) -> ContextConfig:
+    """从 CONTEXT_* env 构造;缺省默认(1M 窗口)。
+
+    path 暂不读(policy.yaml 无 context 段);env 覆盖:CONTEXT_WINDOW /
+    CONTEXT_TIER1/2/3 / CONTEXT_PROTECT_TOKENS。
+    """
+    cw = os.getenv("CONTEXT_WINDOW")
+    t1, t2, t3 = os.getenv("CONTEXT_TIER1"), os.getenv("CONTEXT_TIER2"), os.getenv("CONTEXT_TIER3")
+    pt = os.getenv("CONTEXT_PROTECT_TOKENS")
+    kw: dict = {}
+    if cw:
+        kw["context_window"] = int(cw)
+    if t1:
+        kw["tier1_threshold"] = float(t1)
+    if t2:
+        kw["tier2_threshold"] = float(t2)
+    if t3:
+        kw["tier3_threshold"] = float(t3)
+    if pt:
+        kw["protect_zone_tokens"] = int(pt)
+    return ContextConfig(**kw)
