@@ -1,8 +1,11 @@
 """QA evaluation: token F1 (locomo official) + deepeval GEval (subjective quality)."""
 from __future__ import annotations
+import logging
 import os
 import re
 from typing import Optional
+
+logger = logging.getLogger(__name__)
 
 try:
     from deepeval.metrics import GEval
@@ -64,7 +67,8 @@ def quality_score(prompt: str, predicted: str, gold: str) -> Optional[float]:
         case = LLMTestCase(input=prompt, actual_output=predicted, expected_output=gold)
         metric.measure(case)
         return float(metric.score)
-    except Exception:
+    except Exception as e:
+        logger.warning("quality_score judge failed: %s", e)
         return None
 
 

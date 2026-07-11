@@ -26,6 +26,8 @@ def test_quality_score_passes_required_params(monkeypatch):
     kwargs = MockGEval.call_args.kwargs
     assert "evaluation_params" in kwargs
     assert all(isinstance(p, SingleTurnParams) for p in kwargs["evaluation_params"])
+    expected = {SingleTurnParams.INPUT, SingleTurnParams.ACTUAL_OUTPUT, SingleTurnParams.EXPECTED_OUTPUT}
+    assert set(kwargs["evaluation_params"]) == expected
     assert kwargs["model"] == "deepseek-v4-flash"
 
 
@@ -36,3 +38,10 @@ def test_quality_score_fail_soft_returns_none(monkeypatch):
     with patch("eval.locomo.evaluator.GEval", side_effect=RuntimeError("boom")):
         result = quality_score("q?", "ans", "gold")
     assert result is None
+
+
+def test_quality_score_fail_soft_no_deepeval(monkeypatch):
+    """deepeval 未装(GEval=None)→ return None。"""
+    import eval.locomo.evaluator as mod
+    monkeypatch.setattr(mod, "GEval", None)
+    assert mod.quality_score("q", "a", "g") is None
