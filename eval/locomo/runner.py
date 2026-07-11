@@ -189,6 +189,7 @@ async def _run_sample(sample: dict, policy: dict, extras: list[dict], trace: Loc
                 "sample_id": parsed.sample_id,
                 "turn_idx": -1,
                 "q_type": qa.category,
+                "question": qa.question,  # Plan4: 对齐 evidence(compute_memory 按 (sample_id, question) 查)
                 "status": "ok" if eval_result["quality"] is not None else "quality_null",
                 "f1": eval_result["f1"],
                 "quality": eval_result["quality"],
@@ -306,7 +307,40 @@ def main():
             print(f"[runner]   {sample['sample_id']}: {len(results)} qa, {n_pass} pass", flush=True)
 
     asyncio.run(amain())
-    write_html_report(all_results, html_path)
+
+    # Plan4: 算 metrics(纯聚合 + 离线 judge),再写 HTML(metrics=)
+    from eval.locomo.metrics import run_judge
+    from cc_harness.llm import LLMClient
+
+    _e = _env()
+    judge_llm = None
+    if _e.get("OPENAI_API_KEY") and not args.no_trace:
+        try:
+            judge_llm = LLMClient(
+                api_key=_e["OPENAI_API_KEY"], model=_e["OPENAI_MODEL"],
+                base_url=_e["OPENAI_BASE_URL"],
+            )
+        except Exception as e:
+            print(f"[runner] judge LLM 构造失败,judge 维度将 uncomputed: {e}")
+            judge_llm = None
+
+    # evidence 索引(按 (sample_id, question),避免跨 sample / timeout 结果错位)
+    samples_all = verify_dataset(DEFAULT_FILE)
+    evidence_idx: dict[tuple, list] = {}
+    for s in samples_all:
+        for qa in s.get("qa", []):
+            evidence_idx[(s["sample_id"], qa.get("question", ""))] = qa.get("evidence", []) or []
+
+    # qas 按 all_results 顺序构造(每 result 配其 evidence;无 question 的 → [])
+    qas = [
+        {"question": r.get("question", ""),
+         "evidence": evidence_idx.get((r.get("sample_id"), r.get("question", "")), [])}
+        for r in all_results
+    ]
+
+    judge_cache = args.output_dir / f"locomo-judge-{ts}.json"
+    metrics = run_judge(all_results, qas, judge_llm, judge_cache)
+    write_html_report(all_results, html_path, metrics=metrics)
     print(f"[runner] DONE. results: {json_path}  html: {html_path}")
     return 0
 

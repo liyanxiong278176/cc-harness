@@ -17,7 +17,7 @@ def test_runner_smoke_no_memory_no_trace(tmp_path):
         [PY, str(REPO / "eval/locomo/runner.py"),
          "--limit", "1", "--no-trace", "--no-memory-tools",
          "--output-dir", str(tmp_path)],
-        cwd=REPO, env=env, capture_output=True, text=True, timeout=900,
+        cwd=REPO, env=env, capture_output=True, encoding="utf-8", errors="replace", timeout=1800,
     )
     assert proc.returncode == 0, f"runner failed:\nSTDOUT={proc.stdout[-500:]}\nSTDERR={proc.stderr[-500:]}"
     html_files = list(tmp_path.glob("locomo-report-*.html"))
