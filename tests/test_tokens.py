@@ -196,3 +196,30 @@ def test_session_token_stats_add_turns_without_usage():
     s.add(t)
     assert s.turns == 1
     assert s.turns_with_usage == 0
+
+
+# --- tool_call_log (Plan1 Task4) ---
+
+def test_turn_token_stats_has_tool_call_log():
+    """TurnTokenStats 有 tool_call_log 字段,默认空 list。"""
+    from cc_harness.tokens import TurnTokenStats
+    s = TurnTokenStats()
+    assert s.tool_call_log == []
+    # 注意:现有 tool_calls(int token 桶)不受影响
+    assert s.tool_calls == 0
+
+
+def test_turn_token_stats_tool_call_log_mutable():
+    """tool_call_log 可 append(非 frozen)。"""
+    from cc_harness.tokens import TurnTokenStats
+    s = TurnTokenStats()
+    s.tool_call_log.append({"name": "memory_recall", "args": {"q": "x"}, "ok": True})
+    assert len(s.tool_call_log) == 1
+
+
+def test_turn_token_stats_breakdown_excludes_tool_call_log():
+    """breakdown_subtotal 只含 5 个 token 桶,不含 tool_call_log(它不是 token)。"""
+    from cc_harness.tokens import TurnTokenStats
+    s = TurnTokenStats(user_input=10)
+    s.tool_call_log.append({"name": "x", "args": {}, "ok": True})
+    assert s.breakdown_subtotal == 10  # tool_call_log 不影响

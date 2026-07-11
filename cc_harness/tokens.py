@@ -8,7 +8,7 @@ Provides:
 """
 from __future__ import annotations
 import json
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any
 
 
@@ -120,6 +120,7 @@ class TurnTokenStats:
     # Metadata
     iter_count: int = 0
     api_reported: bool = False
+    tool_call_log: list = field(default_factory=list)  # [{name, args, ok, result}], Plan1 收集
 
     @property
     def breakdown_subtotal(self) -> int:

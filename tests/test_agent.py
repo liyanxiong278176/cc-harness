@@ -853,3 +853,65 @@ async def test_chat_mode_receives_tools():
     llm.chat = spy
     await agent_mod.run_turn(messages, llm, mcp, mode="chat", max_iter=1, cwd=".")
     assert captured["tool_specs"] is not None  # chat 给工具(非 None)
+
+
+# --- tool_call_log collection (Plan1 Task4) ---
+
+@pytest.mark.asyncio
+async def test_agent_collects_tool_call_log(tmp_path):
+    """run_turn 执行工具后,返回的 stats.tool_call_log 记录每次调用 {name,args,ok,result}。"""
+    from cc_harness import agent as agent_mod
+    from cc_harness.mcp_client import ToolResult
+    from cc_harness.policy import PolicyEngine
+
+    fs_tool = {"type": "function", "function": {
+        "name": "mcp__fs__read", "description": "r",
+        "parameters": {"type": "object", "properties": {"path": {"type": "string"}}},
+    }}
+    inside = tmp_path / "a.py"
+    inside.write_text("x", encoding="utf-8")
+    pending = [PendingToolCall(index=0, id="c1", name="mcp__fs__read",
+                               arguments_json=json.dumps({"path": str(inside)}))]
+    llm = FakeLLM(responses=[
+        [FakeStreamEvent(kind="done", content="", pending=pending, finish_reason="tool_calls")],
+        [FakeStreamEvent(kind="done", content="done", pending=[], finish_reason="stop")],
+    ])
+    mcp = FakeMCP(tools_spec=[fs_tool],
+                  results={"mcp__fs__read": ToolResult.success("FILE CONTENTS")}, calls=[])
+
+    messages = [{"role": "user", "content": "read a.py"}]
+    stats = await agent_mod.run_turn(messages, llm, mcp, mode="coding",
+                                     cwd=str(tmp_path), max_iter=5,
+                                     policy=PolicyEngine(project_root=tmp_path))
+    assert isinstance(stats.tool_call_log, list)
+    assert len(stats.tool_call_log) >= 1
+    entry = stats.tool_call_log[0]
+    assert entry["name"] == "mcp__fs__read"
+    assert entry["ok"] is True
+    assert "path" in entry["args"]
+    assert "FILE CONTENTS" in entry["result"]
+
+
+@pytest.mark.asyncio
+async def test_agent_tool_call_log_denied_marked_not_ok(tmp_path, monkeypatch):
+    """ask 被拒的工具调用,tool_call_log 记 ok=False。"""
+    from cc_harness import agent as agent_mod
+    from cc_harness.policy import PolicyEngine
+
+    pending = [PendingToolCall(index=0, id="c1", name="run_command",
+                               arguments_json='{"command":"cat ~/.ssh/id_rsa"}')]
+    llm = FakeLLM(responses=[
+        [FakeStreamEvent(kind="done", content="", pending=pending, finish_reason="tool_calls")],
+        [FakeStreamEvent(kind="done", content="ok", pending=[], finish_reason="stop")],
+    ])
+    mcp = FakeMCP(tools_spec=[], results={}, calls=[])
+    monkeypatch.setattr("builtins.input", lambda *a, **k: "")  # 回车 = no
+
+    messages = [{"role": "user", "content": "读密钥"}]
+    stats = await agent_mod.run_turn(messages, llm, mcp, mode="coding",
+                                     cwd=str(tmp_path), max_iter=5,
+                                     policy=PolicyEngine(project_root=tmp_path))
+    assert len(stats.tool_call_log) >= 1
+    entry = stats.tool_call_log[0]
+    assert entry["name"] == "run_command"
+    assert entry["ok"] is False

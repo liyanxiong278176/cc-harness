@@ -86,6 +86,7 @@ async def run_turn(
     console = Console()
     iter_count = 0
     _empty_retried = False  # one-shot retry guard for empty-content turns
+    tool_call_log: list = []  # Plan1 Task4: [{name, args, ok, result}] per tool dispatch
 
     if cwd is not None:
         _refresh_system_prompt(messages, cwd, mode)
@@ -171,6 +172,7 @@ async def run_turn(
             api_total_tokens=sum(u.total_tokens for u in iter_usages),
             iter_count=len(iter_usages),
             api_reported=bool(iter_usages),
+            tool_call_log=tool_call_log,
         )
 
     async def _stream_one_turn() -> tuple[str, list, str | None, UsageRecord | None]:
@@ -298,7 +300,14 @@ async def run_turn(
                     log_decision(audit_path, iter_n=iter_count, tool=p.name, args=args,
                                  action=decision.action.value, outcome="executed",
                                  rule_id=decision.rule_id, reason=decision.reason, mode=mode)
-                    result = await _dispatch(p, args, project_root)
+                    try:
+                        result = await _dispatch(p, args, project_root)
+                    except Exception as _e:
+                        tool_call_log.append({"name": p.name, "args": args, "ok": False,
+                                              "result": str(_e)[:500]})
+                        raise
+                    tool_call_log.append({"name": p.name, "args": args, "ok": True,
+                                          "result": str(result.llm_text)[:500]})
                     print_observation(console, result.llm_text)
                     _external = f"<untrusted>{result.llm_text}</untrusted>"
                     messages.append({
@@ -316,7 +325,14 @@ async def run_turn(
                         log_decision(audit_path, iter_n=iter_count, tool=p.name, args=args,
                                      action=decision.action.value, outcome="executed",
                                      rule_id=decision.rule_id, reason=decision.reason, mode=mode)
-                        result = await _dispatch(p, args, project_root)
+                        try:
+                            result = await _dispatch(p, args, project_root)
+                        except Exception as _e:
+                            tool_call_log.append({"name": p.name, "args": args, "ok": False,
+                                                  "result": str(_e)[:500]})
+                            raise
+                        tool_call_log.append({"name": p.name, "args": args, "ok": True,
+                                              "result": str(result.llm_text)[:500]})
                         print_observation(console, result.llm_text)
                         _external = f"<untrusted>{result.llm_text}</untrusted>"
                         messages.append({
@@ -334,6 +350,8 @@ async def run_turn(
                         log_decision(audit_path, iter_n=iter_count, tool=p.name, args=args,
                                      action=decision.action.value, outcome="denied",
                                      rule_id=decision.rule_id, reason=decision.reason, mode=mode)
+                        tool_call_log.append({"name": p.name, "args": args, "ok": False,
+                                              "result": error_text[:500]})
                         messages.append({
                             "role": "tool",
                             "tool_call_id": p.id or f"unknown_{i}",
