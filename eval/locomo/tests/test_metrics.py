@@ -46,3 +46,33 @@ def test_compute_token_series():
     out = compute_token_series(FIXTURE)
     assert out["prompt"] == [50000, 60000, 70000]
     assert out["cumulative_cost"] == pytest.approx(0.04)
+
+
+async def test_compute_memory_precision_recall():
+    """记忆 P@k + R:judge 评 recall 返回记忆 ↔ evidence 相关性。"""
+    from eval.locomo.metrics import compute_memory
+    # mock judge:返回相关性判断
+    async def fake_judge(prompt, **kw):
+        return '{"relevant": true}'  # 简化:所有都相关
+    results_with_qa = [{
+        "q_type": "single-hop", "tool_calls": [
+            {"name": "memory_recall", "args": {"query": "q"}, "ok": True,
+             "result": "找到 2 条:1. Alice 住北京 2. Bob 是工程师"}],
+    }]
+    qas = [{"question": "q", "answer": "a", "evidence": ["Alice 住北京"]}]
+    out = await compute_memory(results_with_qa, qas, judge_llm=fake_judge)
+    assert "precision" in out and "recall" in out
+    assert 0.0 <= out["precision"] <= 1.0
+
+
+def test_compute_tool_accuracy():
+    """工具准确率:judge 评每次 tool_call 选择+参数合理性,均值。"""
+    from eval.locomo.metrics import compute_tool_accuracy
+    async def fake_judge(prompt, **kw):
+        return '{"score": 0.8}'
+    results = [{"tool_calls": [
+        {"name": "memory_recall", "args": {"query": "x"}, "ok": True, "result": "r"}]}]
+    import asyncio
+    out = asyncio.run(compute_tool_accuracy(results, contexts=["x"], judge_llm=fake_judge))
+    assert out["mean"] == pytest.approx(0.8)
+    assert out["n"] == 1
