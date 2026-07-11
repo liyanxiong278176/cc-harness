@@ -99,12 +99,12 @@ def test_categorize_empty_list():
     counter = TokenCounter()
     assert counter.categorize([]) == {
         "user_input": 0, "tool_calls": 0, "llm_output": 0, "system_prompt": 0,
-        "tool_definitions": 0,
+        "summary": 0, "tool_definitions": 0,
     }
 
 
 def test_categorize_tool_definitions_counted_when_provided():
-    """5 类拆解:tools 参数的 JSON schema 也要算到 tool_definitions 桶。"""
+    """6 类拆解:tools 参数的 JSON schema 也要算到 tool_definitions 桶。"""
     counter = TokenCounter()
     tools = [
         {"type": "function", "function": {
@@ -115,11 +115,12 @@ def test_categorize_tool_definitions_counted_when_provided():
     ]
     cats = counter.categorize([], tools=tools)
     assert cats["tool_definitions"] > 0
-    # 其余 4 类都还应该是 0
+    # 其余 5 类都还应该是 0
     assert cats["user_input"] == 0
     assert cats["tool_calls"] == 0
     assert cats["llm_output"] == 0
     assert cats["system_prompt"] == 0
+    assert cats["summary"] == 0
 
 
 def test_categorize_tool_definitions_zero_when_none():
@@ -218,8 +219,39 @@ def test_turn_token_stats_tool_call_log_mutable():
 
 
 def test_turn_token_stats_breakdown_excludes_tool_call_log():
-    """breakdown_subtotal 只含 5 个 token 桶,不含 tool_call_log(它不是 token)。"""
+    """breakdown_subtotal 只含 6 个 token 桶,不含 tool_call_log(它不是 token)。"""
     from cc_harness.tokens import TurnTokenStats
     s = TurnTokenStats(user_input=10)
     s.tool_call_log.append({"name": "x", "args": {}, "ok": True})
     assert s.breakdown_subtotal == 10  # tool_call_log 不影响
+
+
+# --- summary bucket + compaction (Plan3 Task1) ---
+
+
+def test_categorize_has_summary_bucket():
+    """categorize 返回 6-key dict(含 summary)。"""
+    from cc_harness.tokens import TokenCounter
+    tc = TokenCounter()
+    cats = tc.categorize([])
+    assert set(cats.keys()) == {"user_input", "tool_calls", "llm_output",
+                                "system_prompt", "tool_definitions", "summary"}
+
+
+def test_summary_message_bucketed_as_summary():
+    """带 _compaction_summary 标记的 assistant 消息 → summary 桶(非 llm_output)。"""
+    from cc_harness.tokens import TokenCounter, SUMMARY_MARKER_KEY
+    tc = TokenCounter()
+    cats = tc.categorize([
+        {"role": "assistant", "content": "历史摘要...", SUMMARY_MARKER_KEY: True},
+        {"role": "assistant", "content": "正常输出"},
+    ])
+    assert cats["summary"] > 0
+    assert cats["llm_output"] > 0  # 只有"正常输出"进 llm_output
+
+
+def test_turn_stats_has_summary_and_compaction_fields():
+    from cc_harness.tokens import TurnTokenStats
+    s = TurnTokenStats()
+    assert s.summary == 0
+    assert s.compaction is None
