@@ -915,3 +915,35 @@ async def test_agent_tool_call_log_denied_marked_not_ok(tmp_path, monkeypatch):
     entry = stats.tool_call_log[0]
     assert entry["name"] == "run_command"
     assert entry["ok"] is False
+
+
+@pytest.mark.asyncio
+async def test_agent_tool_call_log_ask_confirmed_marked_ok(tmp_path, monkeypatch):
+    """ask 路径用户确认 yes → 工具执行 → tool_call_log 记 ok=True。"""
+    from cc_harness import agent as agent_mod
+    from cc_harness.mcp_client import ToolResult
+    from cc_harness.policy import PolicyEngine
+
+    async def fake_run_command(args, *, cwd="."):
+        return ToolResult.success("CMD OUTPUT")
+
+    monkeypatch.setitem(agent_mod.NATIVE_TOOLS["run_command"], "handler", fake_run_command)
+
+    pending = [PendingToolCall(index=0, id="c1", name="run_command",
+                               arguments_json='{"command":"echo hi"}')]
+    llm = FakeLLM(responses=[
+        [FakeStreamEvent(kind="done", content="", pending=pending, finish_reason="tool_calls")],
+        [FakeStreamEvent(kind="done", content="done", pending=[], finish_reason="stop")],
+    ])
+    mcp = FakeMCP(tools_spec=[], results={}, calls=[])
+    monkeypatch.setattr("builtins.input", lambda *a, **k: "yes")
+
+    messages = [{"role": "user", "content": "跑 echo"}]
+    stats = await agent_mod.run_turn(messages, llm, mcp, mode="coding",
+                                     cwd=str(tmp_path), max_iter=5,
+                                     policy=PolicyEngine(project_root=tmp_path))
+    assert len(stats.tool_call_log) >= 1
+    entry = stats.tool_call_log[0]
+    assert entry["name"] == "run_command"
+    assert entry["ok"] is True
+    assert "CMD OUTPUT" in entry["result"]

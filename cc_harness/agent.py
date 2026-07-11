@@ -300,12 +300,9 @@ async def run_turn(
                     log_decision(audit_path, iter_n=iter_count, tool=p.name, args=args,
                                  action=decision.action.value, outcome="executed",
                                  rule_id=decision.rule_id, reason=decision.reason, mode=mode)
-                    try:
-                        result = await _dispatch(p, args, project_root)
-                    except Exception as _e:
-                        tool_call_log.append({"name": p.name, "args": args, "ok": False,
-                                              "result": str(_e)[:500]})
-                        raise
+                    # NOTE: dispatch 异常传播出 run_turn(不 catch);tool_call_log 局部变量随栈帧
+                    # 销毁,故异常路径不记日志。异常 → runner 落 agent_crash result,整轮作废。
+                    result = await _dispatch(p, args, project_root)
                     tool_call_log.append({"name": p.name, "args": args, "ok": True,
                                           "result": str(result.llm_text)[:500]})
                     print_observation(console, result.llm_text)
@@ -325,12 +322,7 @@ async def run_turn(
                         log_decision(audit_path, iter_n=iter_count, tool=p.name, args=args,
                                      action=decision.action.value, outcome="executed",
                                      rule_id=decision.rule_id, reason=decision.reason, mode=mode)
-                        try:
-                            result = await _dispatch(p, args, project_root)
-                        except Exception as _e:
-                            tool_call_log.append({"name": p.name, "args": args, "ok": False,
-                                                  "result": str(_e)[:500]})
-                            raise
+                        result = await _dispatch(p, args, project_root)
                         tool_call_log.append({"name": p.name, "args": args, "ok": True,
                                               "result": str(result.llm_text)[:500]})
                         print_observation(console, result.llm_text)
