@@ -286,3 +286,112 @@ MEMORY_EXTRACT_SYSTEM_PROMPT = """你是 cc-harness 记忆提取器。
 
 def memory_extract_user_prompt(delta_text: str) -> str:
     return f"[对话]\n{delta_text}\n\n请输出 JSON。"
+
+
+# --- Tier 3 Summarize prompts (Plan3 Task3, spec 2026-06-12 「Tier 3」) ---
+
+SUMMARY_SYSTEM_PROMPT = """# 角色
+你是 cc-harness 的上下文压缩摘要器,专职把历史对话压缩成简洁摘要。
+
+# 目标
+给定[历史摘要]和[新增消息],输出一份**合并后的新摘要**,供后续 LLM 调用作上下文:
+- 保留对后续任务**有用**的事实:用户意图、关键决策、已执行操作、文件改动、错误及修复方案
+- 丢弃冗余:工具原始输出、重复思考过程、已完成的中间步骤细节
+- 保持时序:新事件追加在摘要末尾
+
+# 格式
+- 纯文本,用简短条目(`- ...`)或紧凑段落组织
+- 用户代码块(``` ```)**原样保留,不修改、不重新格式化**
+- 控制在合理长度(目标 ≤2000 tokens)
+
+# 约束
+- **严禁调用任何工具**:只输出摘要文本本身,不输出 JSON、不输出 tool_calls、不执行 function
+- 不编造输入中未出现的事实
+- 不回答用户问题或执行任务——你只做摘要
+- 输出语言与输入保持一致(中文输入→中文摘要)
+"""
+
+
+def summary_user_prompt(prev: str | None, delta_messages) -> str:
+    """Build the user prompt for Tier 3 incremental summarization.
+
+    `delta_messages` may be a pre-rendered string or a list[str] of rendered
+    message lines (joined with newline). Returns the standard
+    `[历史摘要]\\n{prev}\\n\\n[新增消息]\\n{delta}\\n\\n请输出新摘要。` shape.
+    """
+    prev_text = prev or "(无)"
+    if isinstance(delta_messages, (list, tuple)):
+        delta_text = "\n".join(str(m) for m in delta_messages)
+    else:
+        delta_text = str(delta_messages)
+    return (
+        f"[历史摘要]\n{prev_text}\n\n"
+        f"[新增消息]\n{delta_text}\n\n"
+        f"请输出新摘要。"
+    )
+
+
+def _render_messages_for_summary(messages) -> str:
+    """Serialize `messages` (OpenAI chat format) into flat text for the
+    Tier 3 summarizer LLM.
+
+    Rendering rules (spec 2026-06-12 「Tier 3」):
+    - user ```` ``` ```` code blocks: preserved verbatim (no rewrite)
+    - role==tool string content  -> `[tool result] <content>`
+    - role==tool list content    -> `[tool result (multimodal)]`
+    - assistant with `_compaction_summary` marker -> `[previous summary] <content>`
+    - assistant tool_calls       -> `[assistant tool_call: <name>(<args_json>)]`
+    - assistant plain text       -> content as-is
+    - content is None            -> skip (but still render tool_calls if present)
+    - content is list (multimodal)-> `<multimodal: N items>`
+    """
+    from cc_harness.tokens import SUMMARY_MARKER_KEY
+
+    lines: list[str] = []
+    for m in messages:
+        role = m.get("role")
+        content = m.get("content")
+
+        if role == "tool":
+            if isinstance(content, list):
+                lines.append("[tool result (multimodal)]")
+            elif content is not None:
+                lines.append(f"[tool result] {content}")
+            # content None for tool: nothing useful to summarize, skip
+            continue
+
+        if role == "assistant":
+            # Previous Tier-3 summary marker: render as [previous summary]
+            if m.get(SUMMARY_MARKER_KEY):
+                if isinstance(content, str) and content:
+                    lines.append(f"[previous summary] {content}")
+                continue
+            # Render text content first (if any)
+            if isinstance(content, list):
+                lines.append(f"<multimodal: {len(content)} items>")
+            elif isinstance(content, str) and content:
+                lines.append(content)
+            # content is None with no tool_calls -> nothing to render, skip
+            # Render tool_calls (assistant may have both text + tool_calls)
+            for tc in m.get("tool_calls") or []:
+                fn = tc.get("function", {}) or {}
+                name = fn.get("name", "")
+                args = fn.get("arguments", "")
+                lines.append(f"[assistant tool_call: {name}({args})]")
+            continue
+
+        if role == "user":
+            if isinstance(content, list):
+                lines.append(f"<multimodal: {len(content)} items>")
+            elif content is not None:
+                lines.append(str(content))
+            # None -> skip
+            continue
+
+        # system or any other role: render content best-effort
+        if isinstance(content, list):
+            lines.append(f"<multimodal: {len(content)} items>")
+        elif content is not None:
+            lines.append(str(content))
+
+    return "\n".join(lines)

@@ -322,3 +322,30 @@ def test_coding_mode_unaffected():
     from cc_harness.prompts import build_system_prompt
     prompt = build_system_prompt("/tmp", mode="coding")
     assert "TODO 块" in prompt  # coding 仍有
+
+
+# --- Tier 3 summary prompts (Plan3 Task3) ---
+
+def test_summary_user_prompt_renders_prev_and_delta():
+    from cc_harness.prompts import summary_user_prompt
+    s = summary_user_prompt("历史摘要", ["m1 text", "m2 text"])
+    assert "历史摘要" in s and "新增消息" in s
+
+def test_render_messages_preserves_user_codeblock():
+    """user 消息 ```代码块原样保留(不修正)。"""
+    from cc_harness.prompts import _render_messages_for_summary
+    msgs = [{"role": "user", "content": "```python\nx=1\n```"}]
+    text = _render_messages_for_summary(msgs)
+    assert "```python" in text and "x=1" in text
+
+def test_render_tool_message_prefix():
+    from cc_harness.prompts import _render_messages_for_summary
+    text = _render_messages_for_summary([{"role": "tool", "content": "result"}])
+    assert "[tool result]" in text
+
+def test_render_assistant_toolcall():
+    from cc_harness.prompts import _render_messages_for_summary
+    text = _render_messages_for_summary([
+        {"role": "assistant", "content": None, "tool_calls": [{"function": {"name": "f", "arguments": "{}"}}]}
+    ])
+    assert "tool_call" in text and "f" in text
