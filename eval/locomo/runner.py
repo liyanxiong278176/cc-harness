@@ -20,6 +20,7 @@ REPO = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(REPO))
 
 from dotenv import dotenv_values  # 已在 pyproject.toml(整个 cc-harness 都用,本 spec 不改)
+from cc_harness.config import ContextConfig  # Plan3: 压缩配置
 from eval.locomo import dataset as ds
 from eval.locomo.evaluator import evaluate_qa
 from eval.locomo.report import write_html_report
@@ -141,6 +142,7 @@ async def _run_sample(sample: dict, policy: dict, extras: list[dict], trace: Loc
                     messages, llm, mcp,
                     extra_native_specs=extras,
                     max_iter=4, mode="chat", cwd=str(REPO),
+                    context_config=ContextConfig(),  # Plan3: 长对话触发压缩
                 )
             except Exception as e:
                 trace.record_tool(span, "agent_crash", {"err": str(e)[:200]}, {"ok": False})
@@ -166,6 +168,7 @@ async def _run_sample(sample: dict, policy: dict, extras: list[dict], trace: Loc
                     qa_messages, llm, mcp,
                     extra_native_specs=extras,
                     max_iter=6, mode="chat", cwd=str(REPO),
+                    context_config=ContextConfig(),  # Plan3: QA 上下文触发压缩
                 )
                 predicted = qa_messages[-1].get("content", "") or ""
                 trace.record_llm(span, env.get("OPENAI_MODEL", "?"),
@@ -194,7 +197,7 @@ async def _run_sample(sample: dict, policy: dict, extras: list[dict], trace: Loc
                 "completion_tokens": stats.api_completion_tokens,
                 "cost_usd": cost_usd,
                 "tool_calls": stats.tool_call_log,  # Plan1: 从 tool_call_log 取(替代 [] TODO)
-                "compaction": None,                  # Plan1 占位,Plan3 压缩落地后填值
+                "compaction": _compaction_to_dict(stats.compaction),  # Plan3: 压缩统计(Plan4 消费)
             })
             trace.score("f1", eval_result["f1"])
             if eval_result["quality"] is not None:
@@ -203,6 +206,19 @@ async def _run_sample(sample: dict, policy: dict, extras: list[dict], trace: Loc
         return results
     finally:
         await mcp.shutdown()
+
+
+def _compaction_to_dict(cs) -> dict | None:
+    """CompactionStats → dict(Plan4 消费)。None → None。"""
+    if cs is None:
+        return None
+    return {
+        "tier": int(cs.tier),
+        "before_tokens": cs.before_tokens,
+        "after_tokens": cs.after_tokens,
+        "ratio_before": cs.ratio_before,
+        "ratio_after": cs.ratio_after,
+    }
 
 
 def _estimate_cost(prompt_tokens: int, completion_tokens: int) -> float:
