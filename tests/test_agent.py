@@ -819,3 +819,37 @@ async def test_denied_feedback_tells_agent_no_workaround(tmp_path, monkeypatch):
     assert denied, "没找到被拒 tool message(ask 分支未触发?)"
     assert any("不要主动建议绕道" in m["content"] for m in denied), \
         "被拒 feedback 缺'不绕道'指导——agent 仍会找绕道(L4 ASR 根因)"
+
+
+# --- chat mode (Plan1 Task2) ---
+
+def test_chat_mode_is_valid_mode():
+    """chat 在 _VALID_MODES 里。"""
+    from cc_harness.agent import _VALID_MODES
+    assert "chat" in _VALID_MODES
+
+
+@pytest.mark.asyncio
+async def test_chat_mode_receives_tools():
+    """chat 模式像 coding 一样给 LLM 工具(tool_specs 非 None)。"""
+    from cc_harness import agent as agent_mod
+
+    llm = FakeLLM(responses=[[
+        FakeStreamEvent(kind="content", text="hello!"),
+        FakeStreamEvent(kind="done", content="hello!", pending=[], finish_reason="stop"),
+    ]])
+    mcp = FakeMCP(tools_spec=[], results={}, calls=[])
+    messages = [{"role": "user", "content": "hi"}]
+
+    # 间谍 llm.chat 捕获 tool_specs 参数(FakeLLM.chat 是 async generator,spy 也得是)
+    captured = {}
+    orig_chat = llm.chat
+
+    async def spy(messages, tools=None, **kw):
+        captured["tool_specs"] = tools
+        async for ev in orig_chat(messages, tools, **kw):
+            yield ev
+
+    llm.chat = spy
+    await agent_mod.run_turn(messages, llm, mcp, mode="chat", max_iter=1, cwd=".")
+    assert captured["tool_specs"] is not None  # chat 给工具(非 None)

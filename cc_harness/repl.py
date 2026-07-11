@@ -29,7 +29,7 @@ from cc_harness.render import print_info, print_result, print_warn, print_token_
 from cc_harness.tokens import TokenCounter, SessionTokenStats
 from cc_harness.tools import init_session_executor, shutdown_session_executor
 
-_VALID_MODES = ("coding", "plan", "design")
+_VALID_MODES = ("coding", "plan", "design", "chat")
 
 # How far back to scan for disk changes after an LLM turn.
 _DISK_CHANGE_WINDOW_S = 30
@@ -40,7 +40,7 @@ _MAX_CHANGES_SHOWN = 10
 
 _HELP_TEXT = """\
 可用命令:
-  /plan, /design, /coding  切换粘性模式(后续消息以该模式处理)
+  /plan, /design, /coding, /chat  切换粘性模式(后续消息以该模式处理)
   /mode                    查看当前模式
   /help                    显示本帮助
   /clear                   清空会话历史(保留 system 消息)
@@ -77,7 +77,7 @@ def _handle_slash(cmd: str, state: ReplState, console: Console) -> bool:
     Commands are case-insensitive: /PLAN == /plan == /Plan.
     """
     cmd = cmd.lower()
-    if cmd in ("/plan", "/design", "/coding"):
+    if cmd in ("/plan", "/design", "/coding", "/chat"):
         new_mode = cmd[1:]
         if state.mode == new_mode:
             print_info(console, f"已经在 {new_mode} 模式")

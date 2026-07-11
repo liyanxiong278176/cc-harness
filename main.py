@@ -29,7 +29,7 @@ PROJECT_ROOT = Path(__file__).parent
 def _parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description="cc-harness: terminal coding agent with MCP tools")
     p.add_argument(
-        "--mode", choices=("coding", "plan", "design"),
+        "--mode", choices=("coding", "plan", "design", "chat"),
         default="coding",
         help="Initial sticky mode (switchable at runtime via /plan /design /coding)",
     )

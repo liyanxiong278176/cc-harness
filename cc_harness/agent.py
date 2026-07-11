@@ -11,6 +11,7 @@ Modes (see task #4 / #6):
     "coding"  — full ReAct loop, tools enabled (default)
     "plan"    — one-shot final answer, no tool execution, no tools passed to LLM
     "design"  — one-shot final answer, no tool execution, output saved to disk
+    "chat"    — same as coding (tools enabled, full ReAct loop)
 """
 from __future__ import annotations
 import json
@@ -29,7 +30,7 @@ from cc_harness.l5 import L5Engine
 from cc_harness.tools import confirm_tool, run_command, RUN_COMMAND_SPEC
 from cc_harness.tokens import TokenCounter, TurnTokenStats, UsageRecord
 
-_VALID_MODES = ("coding", "plan", "design")
+_VALID_MODES = ("coding", "plan", "design", "chat")
 
 # --- Native (non-MCP) tool registry ---
 # Tools registered here are exposed to the LLM alongside MCP tools, but
@@ -60,6 +61,7 @@ async def run_turn(
     """Run one user turn in the given mode.
 
     In `coding` mode: full ReAct loop with tool execution.
+    In `chat` mode: same as coding (tools enabled, full ReAct loop).
     In `plan` mode: one-shot LLM call (no tools passed, tool_calls dropped if any).
     In `design` mode: same as plan, plus the final assistant content is
         persisted to `design_dir` (default: ~/.cc-harness/designs/).
@@ -121,7 +123,7 @@ async def run_turn(
     # In plan/design mode, the LLM should not see any tool definitions, so
     # it physically cannot emit tool_calls. In coding mode, expose both the
     # MCP tool set and the native tool registry (built-in + caller-injected).
-    if mode == "coding":
+    if mode in ("coding", "chat"):
         tool_specs = list(mcp.list_tools())
         for native in NATIVE_TOOLS.values():
             tool_specs.append(native["spec"])
@@ -213,7 +215,7 @@ async def run_turn(
         # 2. Compute routing
         has_tool_calls = (finish_reason == "tool_calls") and bool(pending)
 
-        if has_tool_calls and mode == "coding":
+        if has_tool_calls and mode in ("coding", "chat"):
             # Coding mode: full ReAct loop with tool execution.
             if iter_count >= max_iter:
                 # Max-iter guard: drop the tool_calls, fall back to final.
@@ -341,9 +343,9 @@ async def run_turn(
             # 5. Continue the loop — feed tool results back to LLM
             continue
 
-        # Either: (a) coding mode with no tool_calls → final answer, or
+        # Either: (a) coding/chat mode with no tool_calls → final answer, or
         #         (b) plan/design mode regardless of tool_calls → force final
-        if has_tool_calls and mode != "coding":
+        if has_tool_calls and mode not in ("coding", "chat"):
             # Defensive: the LLM shouldn't emit tool_calls in plan/design
             # (we passed no tool specs), but if it does, drop them and warn.
             print_warn(console, f"mode={mode}: dropping {len(pending)} unexpected tool call(s)")

@@ -14,8 +14,8 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Iterable, Literal
 
-Mode = Literal["coding", "plan", "design"]
-_VALID_MODES: tuple[str, ...] = ("coding", "plan", "design")
+Mode = Literal["coding", "plan", "design", "chat"]
+_VALID_MODES: tuple[str, ...] = ("coding", "plan", "design", "chat")
 
 
 @dataclass(frozen=True)

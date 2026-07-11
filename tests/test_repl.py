@@ -782,3 +782,9 @@ async def test_repl_passes_l5_engine_to_run_turn(monkeypatch):
     await run_repl(_StoppingLLM(), _NoopMCP(), cwd="/x")
 
     assert captured["l5"] is not None        # build_l5_engine 返回引擎(default enabled)
+
+
+# --- chat mode (Plan1 Task2) ---
+
+def test_chat_mode_valid():
+    assert "chat" in _VALID_MODES

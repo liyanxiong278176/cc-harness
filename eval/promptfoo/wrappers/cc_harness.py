@@ -252,7 +252,7 @@ async def _call_api_inner(prompt: str, options: dict, context: dict) -> dict:
     repl_timeout = int(cfg.get("repl_timeout", 300))
     workdir = Path(cfg.get("workdir") or CC_HARNESS_ROOT)
 
-    if mode not in ("coding", "plan", "design"):
+    if mode not in ("coding", "plan", "design", "chat"):
         return {"output": "", "error": f"unknown mode: {mode}"}
     if not MAIN_PY.exists():
         # Show what we searched so debugging is easier in CI.
