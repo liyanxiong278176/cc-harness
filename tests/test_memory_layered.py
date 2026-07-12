@@ -124,3 +124,40 @@ async def test_pipeline_every_n_and_ratio(tmp_path):
                                session_id="sess1", turn_idx=1, every_n=None)  # every_n=None → 只 ratio
     assert r2 is not None
     await s.close()
+
+
+@pytest.mark.asyncio
+async def test_cluster_scenarios_writes_md(tmp_path):
+    """同 session L1 达 min_atoms → 聚类写 scenario md(含 atom_id 溯源)。"""
+    from cc_harness.memory.store import MemoryStore
+    from cc_harness.memory.scenario import cluster_scenarios
+    s = MemoryStore(db_path=tmp_path/"sc.db", embedding_dim=4); await s.init_schema()
+    for i in range(8):
+        await s.add(f"fact{i}", [0.1*i]*4, "pipeline", session_id="sess1")
+    scen_dir = tmp_path / "scenarios"; scen_dir.mkdir()
+    class FakeEmb:
+        async def embed(self, t): return [0.1]*4
+    out = await cluster_scenarios(s, FakeEmb(), "sess1", scen_dir, min_atoms=8, llm=None)
+    assert len(out) >= 1
+    md_files = list(scen_dir.glob("*.md"))
+    assert len(md_files) >= 1
+    txt = md_files[0].read_text(encoding="utf-8")
+    assert "atom" in txt.lower()  # 含溯源
+    await s.close()
+
+
+@pytest.mark.asyncio
+async def test_cluster_scenarios_below_min_atoms(tmp_path):
+    """不足 min_atoms → 返 [](不触发聚类)。"""
+    from cc_harness.memory.store import MemoryStore
+    from cc_harness.memory.scenario import cluster_scenarios
+    s = MemoryStore(db_path=tmp_path/"sc2.db", embedding_dim=4); await s.init_schema()
+    for i in range(3):
+        await s.add(f"fact{i}", [0.1*i]*4, "pipeline", session_id="sess2")
+    scen_dir = tmp_path / "scenarios2"; scen_dir.mkdir()
+    class FakeEmb:
+        async def embed(self, t): return [0.1]*4
+    out = await cluster_scenarios(s, FakeEmb(), "sess2", scen_dir, min_atoms=8, llm=None)
+    assert out == []
+    assert list(scen_dir.glob("*.md")) == []  # 不写 md
+    await s.close()
