@@ -125,6 +125,30 @@ async def run_turn(
         except Exception as e:
             print_warn(console, f"memory inject failed: {e}")
 
+    # --- Q4 Task6: pre-turn Mermaid 画布注入(预算 + 顺序)---
+    # canvas_inject 开关 + canvas.md 存在 + token<=预算(mermaid_max_token_ratio ×
+    # context_window)→ 系统段追加。顺序:基线 → Q3 persona → Q3 scenarios → Q4 mermaid
+    # (本块紧跟 Q3 之后,顺序由 placement 保证)。fail-soft:文件读/编码/计数异常 →
+    # 静默跳过,不崩主循环。canvas_path=None 或文件不存在(首次回合)→ 跳过。
+    # offload_deps=None → 不注入(向后兼容,test_agent.py / test_repl.py 不受影响)。
+    if offload_deps and offload_deps.get("canvas_inject", True) and messages:
+        try:
+            _canvas_path = offload_deps.get("canvas_path")
+            if _canvas_path is not None and messages[0].get("role") == "system":
+                _canvas_p = Path(_canvas_path)
+                if _canvas_p.exists():
+                    _tc = token_counter or TokenCounter()
+                    _ratio = offload_deps.get("mermaid_max_token_ratio", 0.2)
+                    _window = offload_deps.get("context_window", 1_000_000)
+                    _budget = _ratio * _window
+                    _canvas_text = _canvas_p.read_text(encoding="utf-8")
+                    if _tc.count_text(_canvas_text) <= _budget:
+                        messages[0]["content"] += (
+                            "\n\n## 任务画布(Mermaid)\n" + _canvas_text
+                        )
+        except Exception as e:
+            print_warn(console, f"mermaid inject failed: {e}")
+
     # --- L4 policy gate setup ---
     project_root = Path(cwd or ".").resolve()
     if policy is None:

@@ -457,3 +457,58 @@ async def test_agent_offload_canvas_failure_keeps_pointer(tmp_path, monkeypatch)
     first_node = _re.search(r"node=(\w+)", tool_msgs[0]["content"]).group(1)
     assert seen_edges[0] is None          # 首节点无前驱
     assert seen_edges[1] == first_node    # 二节点 edge 指向首节点(_last_node 已更新)
+
+
+# --- Task 6: agent.py pre-turn Mermaid 注入(预算 + 顺序)---
+
+
+@pytest.mark.asyncio
+async def test_pre_turn_mermaid_inject(tmp_path):
+    """canvas_inject + canvas.md → 系统段含 Mermaid;canvas_inject=False 不注。"""
+    from cc_harness.agent import run_turn
+    from tests.test_agent import FakeLLM, FakeMCP, FakeStreamEvent
+    canvas = tmp_path / "canvas.md"
+    canvas.write_text("graph LR\nn1[\"read\"]", encoding="utf-8")
+    events = [FakeStreamEvent(kind="done", content="ok", finish_reason="stop")]
+
+    def deps(inject):
+        return {"enabled": False, "threshold": 2000, "offload": None, "canvas": None,
+                "canvas_inject": inject, "canvas_path": canvas, "refs_dir": tmp_path / "refs",
+                "mermaid_max_token_ratio": 0.2, "context_window": 1_000_000}
+
+    msgs = [{"role": "system", "content": "sys"}, {"role": "user", "content": "hi"}]
+    await run_turn(msgs, FakeLLM(responses=[events]), FakeMCP(tools_spec=[], results={}, calls=[]),
+                   mode="plan", cwd=str(tmp_path), offload_deps=deps(True))
+    assert "graph LR" in msgs[0]["content"]
+
+    msgs2 = [{"role": "system", "content": "sys"}, {"role": "user", "content": "hi"}]
+    await run_turn(msgs2, FakeLLM(responses=[events]),
+                   FakeMCP(tools_spec=[], results={}, calls=[]),
+                   mode="plan", cwd=str(tmp_path), offload_deps=deps(False))
+    assert "graph LR" not in msgs2[0]["content"]
+
+
+@pytest.mark.asyncio
+async def test_pre_turn_inject_order(tmp_path):
+    """注入顺序:基线 → persona(Q3)→ scenarios(Q3)→ mermaid(Q4)。"""
+    from cc_harness.agent import run_turn
+    from tests.test_agent import FakeLLM, FakeMCP, FakeStreamEvent
+    from cc_harness.memory.models import Persona, Scenario, RecallResult
+    canvas = tmp_path / "canvas.md"
+    canvas.write_text("graph LR\nn1[\"r\"]", encoding="utf-8")
+
+    async def fake_recall(q, **kw):
+        return RecallResult(persona=Persona("P", [], "p"),
+                            scenarios=[Scenario(["a"], "SCEN", "s", "p")])
+
+    events = [FakeStreamEvent(kind="done", content="ok", finish_reason="stop")]
+    offload_deps = {"enabled": False, "offload": None, "canvas": None,
+                    "canvas_inject": True, "canvas_path": canvas, "refs_dir": tmp_path / "r",
+                    "mermaid_max_token_ratio": 0.2, "context_window": 1_000_000}
+    msgs = [{"role": "system", "content": "SYS"}, {"role": "user", "content": "hi"}]
+    await run_turn(msgs, FakeLLM(responses=[events]),
+                   FakeMCP(tools_spec=[], results={}, calls=[]),
+                   mode="plan", cwd=None,  # 跳 _refresh_system_prompt,保 messages[0]="SYS" 锚点
+                   memory_layer={"recall": fake_recall}, offload_deps=offload_deps)
+    c = msgs[0]["content"]
+    assert c.index("SYS") < c.index("P") < c.index("SCEN") < c.index("graph LR")  # 顺序
