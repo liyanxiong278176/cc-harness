@@ -305,6 +305,34 @@ async def run_turn(
         iter_count += 1
         iter_usage: UsageRecord | None = None   # usage for this iter (set on done)
 
+        # Q4 Task7: ratio 批量兜底(无 count_messages,用 sum count_text)。
+        # context 总 token 超 offload_ratio × context_window → 批量卸载剩余大 tool
+        # result(reversible pointer)。置于 Plan3 maybe_compact 之前:Q4 可逆卸载先
+        # 减载,Plan3 不可逆 summarize 后兜底(Q4 ratio 0.5 < Plan3 tier1 0.6,先触发)。
+        # fail-soft:外层 try(构造/读 key)+ 每条 offload 独立 try(单条失败不破批/不崩轮)。
+        # offload_deps=None 或 enabled=False → 跳过(向后兼容,test_agent/test_repl 无感)。
+        if offload_deps and offload_deps.get("enabled", True):
+            try:
+                _cw = offload_deps.get("context_window") or (
+                    context_config.context_window if context_config else 1_000_000)
+                _tc = token_counter or TokenCounter()
+                _total = sum(_tc.count_text(m.get("content", "")) for m in messages)
+                if _cw > 0 and _total / _cw > offload_deps.get("offload_ratio", 0.5):
+                    for m in messages:
+                        if (m.get("role") == "tool"
+                                and "offloaded" not in (m.get("content") or "")):
+                            if _tc.count_text(m.get("content") or "") > offload_deps["threshold"]:
+                                try:
+                                    _off = await offload_deps["offload"](
+                                        m["content"], "(batch)", {},
+                                        threshold=offload_deps["threshold"], token_counter=_tc)
+                                    if _off:
+                                        m["content"] = _off.pointer_msg
+                                except Exception:
+                                    pass
+            except Exception:
+                pass
+
         # Plan3: maybe compact context before LLM call (all modes). Catches own
         # errors (returns stats.error) so compaction never kills the ReAct loop.
         if context_config and context_config.enabled:

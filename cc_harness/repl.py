@@ -258,6 +258,14 @@ async def run_repl(
                 if state.mem_deps and mem_cfg.layered_inject
                 else None
             )
+            # Q4 Task7: offload_deps 注入(kill-switch:offload_enabled or 无 mem_deps → None)。
+            # mem_deps 已含 offload 锭(T4 extras:refs/canvas/closures/threshold/ratio/window);
+            # Q4 agent 代码只读 offload 专用 key,忽略 Q3 key,故直接传 mem_deps 安全。
+            offload_deps = (
+                state.mem_deps
+                if state.mem_deps and mem_cfg.offload_enabled
+                else None
+            )
             turn_stats = await run_turn(
                 state.messages, llm, mcp,
                 max_iter=max_iter,
@@ -270,6 +278,7 @@ async def run_repl(
                 extra_native_specs=state.memory_extras or None,  # Plan2: 记忆工具(chat/coding)
                 context_config=state.context_config,             # Plan3: 压缩配置
                 memory_layer=memory_layer,                        # Q3 Task8: 分层注入
+                offload_deps=offload_deps,                        # Q4 Task7: 短期符号化卸载
             )
             state.session_stats.add(turn_stats)
 

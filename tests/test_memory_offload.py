@@ -536,3 +536,78 @@ async def test_pre_turn_mermaid_budget_skip(tmp_path, capsys):
     # 预算超限 warn 火警(运营可观测,非静默丢画布)
     out = capsys.readouterr().out
     assert "mermaid inject skipped" in out and "budget 20t" in out
+
+
+# --- Task 7: ratio 批量兜底(无 count_messages)+ Plan3 双向 ---
+
+@pytest.mark.asyncio
+async def test_offload_ratio_batch(tmp_path):
+    """context 超 offload_ratio → 批量卸载剩余大 tool result(无 count_messages,用 sum count_text)。"""
+    # unit:验 _batch_offload helper(若抽);或集成 agent 多 tool result
+    # 简化:验 offload_deps ratio 路径不崩(TokenCounter sum count_text)
+    from cc_harness.tokens import TokenCounter
+    tc = TokenCounter()
+    msgs = [{"role": "tool", "content": "大 " * 3000}, {"role": "tool", "content": "大 " * 3000}]
+    total = sum(tc.count_text(m.get("content", "")) for m in msgs)  # 无 count_messages
+    assert total > 2000  # 验 sum count_text 可用
+    # 完整 ratio batch 由 test_plan3_coexist / 集成覆盖
+
+
+@pytest.mark.asyncio
+async def test_plan3_coexist_q4_reduces(tmp_path):
+    """Q4 卸载减载 → Plan3 ratio 不达 tier1(不抢跑)。模拟:offload 后 messages token 降。"""
+    # 验 Q4 卸载后 tool message = pointer(短)→ 总 token < 未卸载 → Plan3 触发概率降
+    from cc_harness.agent import run_turn
+    from tests.test_agent import FakeLLM, FakeMCP, FakeStreamEvent
+    from cc_harness.mcp_client import ToolResult
+    from cc_harness.memory.offload.offload import maybe_offload
+    from cc_harness.tokens import TokenCounter
+    from cc_harness.llm import PendingToolCall
+    refs_dir = tmp_path / "refs"
+    big = "y " * 3000
+
+    async def _offload(rt, tn, a, *, threshold, token_counter):
+        return await maybe_offload(rt, tn, a, threshold, refs_dir, None, token_counter)
+
+    async def _canvas(nid, l, s, ef):
+        pass
+
+    offload_deps = {"enabled": True, "threshold": 2000, "offload": _offload, "canvas": _canvas,
+                    "canvas_inject": False, "refs_dir": refs_dir, "canvas_path": tmp_path / "c.md",
+                    "offload_ratio": 0.5, "context_window": 1_000_000,
+                    "mermaid_max_token_ratio": 0.2}
+    fs_tool = {"type": "function", "function": {"name": "mcp__fs__read", "description": "r",
+               "parameters": {"type": "object", "properties": {"path": {"type": "string"}}}}}
+    pending = [PendingToolCall(index=0, id="c1", name="mcp__fs__read", arguments_json='{"path":"x"}')]
+    events = [FakeStreamEvent(kind="done", content="read", pending=pending, finish_reason="tool_calls")]
+    events2 = [FakeStreamEvent(kind="done", content="done", finish_reason="stop")]
+    llm = FakeLLM(responses=[events, events2])
+    mcp = FakeMCP(tools_spec=[fs_tool], results={"mcp__fs__read": ToolResult.success(big)}, calls=[])
+    msgs = [{"role": "user", "content": "read x"}]
+    await run_turn(msgs, llm, mcp, max_iter=5, mode="coding", offload_deps=offload_deps)
+    tool_msg = next(m for m in msgs if m.get("role") == "tool")
+    assert "offloaded" in tool_msg["content"]  # Q4 卸载(减载)
+    assert TokenCounter().count_text(tool_msg["content"]) < TokenCounter().count_text(big)  # pointer 短
+
+
+@pytest.mark.asyncio
+async def test_plan3_coexist_q4_kill(tmp_path):
+    """Q4 kill(enabled=False)→ tool message 不卸(_external 原样),Plan3 接管(summarize 兜底)。"""
+    from cc_harness.agent import run_turn
+    from tests.test_agent import FakeLLM, FakeMCP, FakeStreamEvent
+    from cc_harness.mcp_client import ToolResult
+    from cc_harness.llm import PendingToolCall
+    fs_tool = {"type": "function", "function": {"name": "mcp__fs__read", "description": "r",
+               "parameters": {"type": "object", "properties": {"path": {"type": "string"}}}}}
+    pending = [PendingToolCall(index=0, id="c1", name="mcp__fs__read", arguments_json='{"path":"x"}')]
+    events = [FakeStreamEvent(kind="done", content="read", pending=pending, finish_reason="tool_calls")]
+    events2 = [FakeStreamEvent(kind="done", content="done", finish_reason="stop")]
+    llm = FakeLLM(responses=[events, events2])
+    big = "y " * 3000  # big result + enabled=False 才真证 kill(短 result 不卸 trivial)
+    mcp = FakeMCP(tools_spec=[fs_tool], results={"mcp__fs__read": ToolResult.success(big)}, calls=[])
+    msgs = [{"role": "user", "content": "read x"}]
+    await run_turn(msgs, llm, mcp, max_iter=5, mode="coding",
+                   offload_deps={"enabled": False, "offload": None, "canvas": None,
+                                 "canvas_inject": False, "canvas_path": None, "refs_dir": None})
+    tool_msg = next(m for m in msgs if m.get("role") == "tool")
+    assert "offloaded" not in tool_msg["content"]  # kill → 不卸

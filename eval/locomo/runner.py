@@ -203,6 +203,14 @@ async def _run_sample(sample: dict, policy: dict, extras: list[dict], trace: Loc
                 if mem_deps and mem_cfg and mem_cfg.layered_inject
                 else None
             )
+            # Q4 Task7: offload_deps 注入(kill-switch:offload_enabled or 无 mem_deps → None)。
+            # mem_deps 已含 offload 锭(T4 extras),Q4 agent 代码只读 offload 专用 key,
+            # 忽略 Q3 key,故直接传 mem_deps 安全。
+            offload_deps = (
+                mem_deps
+                if mem_deps and mem_cfg and mem_cfg.offload_enabled
+                else None
+            )
             try:
                 stats = await run_turn(
                     messages, llm, mcp,
@@ -210,6 +218,7 @@ async def _run_sample(sample: dict, policy: dict, extras: list[dict], trace: Loc
                     max_iter=4, mode="chat", cwd=str(REPO),
                     context_config=ContextConfig(),  # Plan3: 长对话触发压缩
                     memory_layer=memory_layer,
+                    offload_deps=offload_deps,      # Q4 Task7: 短期符号化卸载
                 )
             except Exception as e:
                 trace.record_tool(span, "agent_crash", {"err": str(e)[:200]}, {"ok": False})
@@ -242,6 +251,7 @@ async def _run_sample(sample: dict, policy: dict, extras: list[dict], trace: Loc
                     max_iter=6, mode="chat", cwd=str(REPO),
                     context_config=ContextConfig(),  # Plan3: QA 上下文触发压缩
                     memory_layer=memory_layer,       # Q3 Task8: QA 也注入分层记忆
+                    offload_deps=offload_deps,       # Q4 Task7: QA 也走短期卸载
                 )
                 predicted = qa_messages[-1].get("content", "") or ""
                 trace.record_llm(span, env.get("OPENAI_MODEL", "?"),
