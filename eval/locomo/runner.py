@@ -266,7 +266,7 @@ async def _run_sample(sample: dict, policy: dict, extras: list[dict], trace: Loc
                 })
                 continue
 
-            eval_result = evaluate_qa(qa.question, predicted, qa.answer)
+            eval_result = await evaluate_qa(qa.question, predicted, qa.answer, judge_llm=llm)
             cost_usd = _estimate_cost(stats.api_prompt_tokens, stats.api_completion_tokens)
             results.append({
                 "sample_id": parsed.sample_id,
@@ -275,6 +275,7 @@ async def _run_sample(sample: dict, policy: dict, extras: list[dict], trace: Loc
                 "question": qa.question,  # Plan4: 对齐 evidence(compute_memory 按 (sample_id, question) 查)
                 "status": "ok" if eval_result["quality"] is not None else "quality_null",
                 "f1": eval_result["f1"],
+                "semantic_f1": eval_result["semantic_f1"],
                 "quality": eval_result["quality"],
                 "pass": eval_result["pass"],
                 "prompt_tokens": stats.api_prompt_tokens,
