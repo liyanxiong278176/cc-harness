@@ -2,10 +2,15 @@ import json
 import os
 from enum import Enum
 from pathlib import Path
-from typing import Literal
+from typing import Literal, TYPE_CHECKING
 
 from dotenv import load_dotenv
 from pydantic import BaseModel, model_validator
+
+if TYPE_CHECKING:
+    # Runtime import would be circular (memory.config re-exports load_memory_config).
+    # load_memory_config lazy-imports MemoryConfig inside its body instead.
+    from cc_harness.memory.config import MemoryConfig
 
 
 class MCPServerConfig(BaseModel):
@@ -235,3 +240,43 @@ def load_context_config(path: Path | None = None) -> ContextConfig:
     if pt:
         kw["protect_zone_tokens"] = int(pt)
     return ContextConfig(**kw)
+
+
+def load_memory_config(path: Path) -> "MemoryConfig":  # type: ignore[name-defined]
+    """读 policy.yaml 的 `memory:` 段 + MEMORY_* env 覆盖;path 缺失→默认 MemoryConfig()。
+
+    与 load_l2_config / load_policy_config 风格一致。MemoryConfig 定义在
+    `cc_harness.memory.config`,此处**函数体内** lazy import 以避免循环依赖
+    (memory/config.py 末尾 re-export 本函数)。env 覆盖优先于 yaml。
+
+    env: MEMORY_PIPELINE_EVERY_N / MEMORY_SCENARIO_MIN_ATOMS / MEMORY_PERSONA_TRIGGER_N
+    / MEMORY_RECALL_TOP_K / MEMORY_RECALL_TIMEOUT_S / MEMORY_LAYERED_INJECT
+    / MEMORY_CAPTURE_ENABLED / MEMORY_PIPELINE_ENABLED。
+    """
+    from cc_harness.memory.config import MemoryConfig  # lazy: dodge circular import
+    kw: dict = {}
+    if path.exists():
+        import yaml
+        raw = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
+        kw = dict(raw.get("memory") or {})
+    # 数值型 env 覆盖(无论 yaml 是否存在都生效,与 load_executor_config 一致)
+    for key, env_name, cast in [
+        ("pipeline_every_n", "MEMORY_PIPELINE_EVERY_N", int),
+        ("scenario_min_atoms", "MEMORY_SCENARIO_MIN_ATOMS", int),
+        ("persona_trigger_every_n", "MEMORY_PERSONA_TRIGGER_N", int),
+        ("recall_top_k", "MEMORY_RECALL_TOP_K", int),
+        ("recall_timeout_s", "MEMORY_RECALL_TIMEOUT_S", float),
+    ]:
+        v = os.getenv(env_name)
+        if v is not None and v.strip():
+            kw[key] = cast(v)
+    # 布尔型 env 覆盖
+    for key, env_name in [
+        ("layered_inject", "MEMORY_LAYERED_INJECT"),
+        ("capture_enabled", "MEMORY_CAPTURE_ENABLED"),
+        ("pipeline_enabled", "MEMORY_PIPELINE_ENABLED"),
+    ]:
+        v = os.getenv(env_name)
+        if v is not None and v.strip():
+            kw[key] = v.strip().lower() in ("1", "true", "yes", "on")
+    return MemoryConfig(**kw)

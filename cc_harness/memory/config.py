@@ -64,6 +64,16 @@ class MemoryConfig(BaseModel):
     retriever_top_k: int = 5
     injection_token_budget: int = 800
     embed_timeout_s: float = 10.0
+    # Q3 分层记忆(L0-L3)字段
+    pipeline_every_n: int = 5            # L0→L1 提取触发周期(每 N 轮)
+    scenario_min_atoms: int = 8          # L1→L2 场景聚合的最小原子数
+    persona_trigger_every_n: int = 50    # L2→L3 画像刷新触发周期
+    recall_top_k: int = 5                # L3 分层召回每层 top_k
+    recall_timeout_s: float = 5.0        # 召回超时(秒,float)
+    # kill-switches(对应三层管线)
+    layered_inject: bool = True          # pre-turn 分层注入开关
+    capture_enabled: bool = True         # L0 会话录制开关
+    pipeline_enabled: bool = True        # L1 提取 + L2/L3 聚合开关
 
     @field_validator("pipeline_threshold")
     @classmethod
@@ -80,9 +90,18 @@ class MemoryConfig(BaseModel):
         return v
 
     @field_validator("injection_token_budget", "retriever_top_k",
-                     "pipeline_recent_turns", "pipeline_max_delta_tokens")
+                     "pipeline_recent_turns", "pipeline_max_delta_tokens",
+                     "pipeline_every_n", "scenario_min_atoms",
+                     "persona_trigger_every_n", "recall_top_k")
     @classmethod
     def _check_positive_int(cls, v: int) -> int:
+        if v <= 0:
+            raise ValueError(f"must be > 0, got {v}")
+        return v
+
+    @field_validator("recall_timeout_s")
+    @classmethod
+    def _check_positive(cls, v: float) -> float:
         if v <= 0:
             raise ValueError(f"must be > 0, got {v}")
         return v
@@ -103,3 +122,12 @@ class MemoryConfig(BaseModel):
                     "Set EMBEDDING_BASE_URL / EMBEDDING_API_KEY / EMBEDDING_MODEL in .env, "
                     "or set MEMORY_ENABLED=false."
                 )
+
+
+# Re-export `load_memory_config`(定义在 cc_harness.config)以保持
+# `from cc_harness.memory.config import load_memory_config` 单一入口。放在模块**末尾**
+# 以避免循环:此时本模块的 MemoryConfig 已定义完毕,cc_harness.config 内的
+# load_memory_config 用函数体内 lazy import 拿 MemoryConfig,不会在 import 期触发回环。
+from cc_harness.config import load_memory_config  # noqa: E402
+
+__all__ = ["MemoryConfig", "load_memory_config"]
