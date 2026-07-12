@@ -7,17 +7,19 @@ from collections import defaultdict
 
 
 def compute_by_q_type(results: list[dict]) -> dict:
-    """按 q_type 分桶 f1/quality/pass。返回 {q_type: {n, f1_med, quality_med, pass}}。"""
+    """按 q_type 分桶 f1/semantic_f1/quality/pass。返回 {q_type: {n, f1_med, semantic_f1_med, quality_med, pass}}。"""
     by: dict[str, list[dict]] = defaultdict(list)
     for r in results:
         by[r.get("q_type", "unknown")].append(r)
     out: dict[str, dict] = {}
     for qt, rs in by.items():
         f1 = [r["f1"] for r in rs if r.get("f1") is not None]
+        sem = [r["semantic_f1"] for r in rs if r.get("semantic_f1") is not None]
         q = [r["quality"] for r in rs if r.get("quality") is not None]
         out[qt] = {
             "n": len(rs),
             "f1_med": st.median(f1) if f1 else None,
+            "semantic_f1_med": st.median(sem) if sem else None,
             "quality_med": st.median(q) if q else None,
             "pass": sum(1 for r in rs if r.get("pass")),
         }

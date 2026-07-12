@@ -2,14 +2,14 @@
 import pytest
 
 FIXTURE = [  # 3 条 result,2 类 q_type
-    {"q_type": "single-hop", "f1": 0.8, "quality": 0.9, "pass": True,
+    {"q_type": "single-hop", "f1": 0.8, "quality": 0.9, "pass": True, "semantic_f1": 0.85,
      "prompt_tokens": 50000, "completion_tokens": 100, "cost_usd": 0.01,
      "tool_calls": [{"name": "memory_recall", "args": {"query": "q"}, "ok": True, "result": "找到 1 条"}],
      "compaction": None, "turn_idx": -1, "sample_id": "conv-1"},
-    {"q_type": "multi-hop", "f1": 0.2, "quality": 0.3, "pass": False,
+    {"q_type": "multi-hop", "f1": 0.2, "quality": 0.3, "pass": False, "semantic_f1": 0.25,
      "prompt_tokens": 60000, "completion_tokens": 200, "cost_usd": 0.02,
      "tool_calls": [], "compaction": None, "turn_idx": -1, "sample_id": "conv-1"},
-    {"q_type": "single-hop", "f1": 0.6, "quality": None, "pass": False,
+    {"q_type": "single-hop", "f1": 0.6, "quality": None, "pass": False, "semantic_f1": None,
      "prompt_tokens": 70000, "completion_tokens": 150, "cost_usd": 0.01,
      "tool_calls": [], "compaction": {"tier": 2, "before_tokens": 180000, "after_tokens": 150000,
                                       "ratio_before": 0.18, "ratio_after": 0.15},
@@ -24,6 +24,9 @@ def test_compute_by_q_type():
     sh = out["single-hop"]
     assert sh["n"] == 2
     assert sh["pass"] == 1  # 1/2 pass
+    assert "semantic_f1_med" in sh                       # 新列存在
+    # single-hop 有 record0(0.85)+ record2(None)→ median of [0.85] == 0.85
+    assert sh["semantic_f1_med"] == pytest.approx(0.85)
 
 
 def test_compute_compaction():
