@@ -146,6 +146,10 @@ async def run_turn(
                         messages[0]["content"] += (
                             "\n\n## 任务画布(Mermaid)\n" + _canvas_text
                         )
+                    else:
+                        print_warn(console, (
+                            f"mermaid inject skipped: canvas "
+                            f"{_tc.count_text(_canvas_text)}t > budget {_budget:.0f}t"))
         except Exception as e:
             print_warn(console, f"mermaid inject failed: {e}")
 

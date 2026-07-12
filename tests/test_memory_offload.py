@@ -512,3 +512,27 @@ async def test_pre_turn_inject_order(tmp_path):
                    memory_layer={"recall": fake_recall}, offload_deps=offload_deps)
     c = msgs[0]["content"]
     assert c.index("SYS") < c.index("P") < c.index("SCEN") < c.index("graph LR")  # 顺序
+
+
+@pytest.mark.asyncio
+async def test_pre_turn_mermaid_budget_skip(tmp_path, capsys):
+    """canvas token > 预算(mermaid_max_token_ratio × context_window)→ 不注入 + warn。"""
+    from cc_harness.agent import run_turn
+    from tests.test_agent import FakeLLM, FakeMCP, FakeStreamEvent
+    canvas = tmp_path / "canvas.md"
+    # 5-node canvas = 28 tokens(tiktoken),budget = 0.2×100 = 20 → 超 预算 → skip
+    canvas.write_text('graph LR\nn1["read"]\nn2["scan"]\nn3["edit"]\nn4["run"]\nn5["test"]',
+                      encoding="utf-8")
+    events = [FakeStreamEvent(kind="done", content="ok", finish_reason="stop")]
+    offload_deps = {"enabled": False, "offload": None, "canvas": None,
+                    "canvas_inject": True, "canvas_path": canvas, "refs_dir": tmp_path / "r",
+                    "mermaid_max_token_ratio": 0.2, "context_window": 100}  # budget = 20 tokens
+    msgs = [{"role": "system", "content": "sys"}, {"role": "user", "content": "hi"}]
+    await run_turn(msgs, FakeLLM(responses=[events]),
+                   FakeMCP(tools_spec=[], results={}, calls=[]),
+                   mode="plan", cwd=str(tmp_path), offload_deps=offload_deps)
+    assert "任务画布" not in msgs[0]["content"]   # 超 预算 → 不注入
+    assert "graph LR" not in msgs[0]["content"]
+    # 预算超限 warn 火警(运营可观测,非静默丢画布)
+    out = capsys.readouterr().out
+    assert "mermaid inject skipped" in out and "budget 20t" in out
