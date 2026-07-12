@@ -34,13 +34,18 @@ class MemoryPipeline:
 
     async def maybe_run(
         self, messages: list[dict], counter: TokenCounter, context_window: int,
+        *, session_id: str | None = None, turn_idx: int | None = None,
+        every_n: int | None = None,
     ) -> PipelineResult | None:
-        if context_window <= 0:
-            return None
+        # 双触发:every-N(turn_idx % every_n == 0) OR ratio(>=threshold)。
+        # every-N 不依赖 context_window,故 context_window<=0 时仍可由 every-N 命中。
+        every_n_hit = (turn_idx is not None and every_n is not None and every_n > 0
+                       and turn_idx % every_n == 0)
         cats = counter.categorize(messages, tools=None)
         total = sum(cats.values())
-        ratio = total / context_window
-        if ratio < self.threshold:
+        ratio = (total / context_window) if context_window > 0 else 0.0
+        ratio_hit = context_window > 0 and ratio >= self.threshold
+        if not (every_n_hit or ratio_hit):
             return None
 
         delta = self._recent_turns(messages)
@@ -55,7 +60,7 @@ class MemoryPipeline:
         results = []
         for text in candidates:
             try:
-                r = await self._service.save(text, source="pipeline")
+                r = await self._service.save(text, source="pipeline", session_id=session_id)
                 results.append(r)
             except Exception as e:
                 from cc_harness.memory.service import SaveResult

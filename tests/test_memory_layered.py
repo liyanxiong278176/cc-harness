@@ -76,3 +76,51 @@ async def test_capture_records_and_idempotent(tmp_path):
     rows = await cur.fetchall()
     assert len(rows) == 2 and {r[0] for r in rows} == {"user","assistant"}  # 跳 system
     await s.close()
+
+
+@pytest.mark.asyncio
+async def test_service_save_with_session(tmp_path):
+    """service.save(text, source, session_id) 持久化 session_id。"""
+    from cc_harness.memory.store import MemoryStore
+    from cc_harness.memory.service import MemoryService
+    from cc_harness.memory.decider import Decision, DecisionResult
+    s = MemoryStore(db_path=tmp_path/"sv.db", embedding_dim=4); await s.init_schema()
+    class FakeEmb:
+        async def embed(self, t): return [0.1]*4
+    class FakeDec:
+        async def decide(self, t, sim): return DecisionResult(action=Decision.ADD)
+    svc = MemoryService(store=s, embedder=FakeEmb(), decider=FakeDec())
+    r = await svc.save("fact", source="pipeline", session_id="sess1")
+    assert r.action == "ADD" and (await s.list_all())[0].session_id == "sess1"
+    await s.close()
+
+
+@pytest.mark.asyncio
+async def test_pipeline_every_n_and_ratio(tmp_path):
+    """pipeline.maybe_run:every-N 触发(turn_idx%5==0)OR ratio 触发(>=threshold)。"""
+    from cc_harness.memory.pipeline import MemoryPipeline
+    from cc_harness.memory.store import MemoryStore
+    from cc_harness.memory.service import MemoryService
+    from cc_harness.memory.decider import Decision, DecisionResult
+    from tests.test_agent import FakeLLM, FakeStreamEvent
+    from cc_harness.tokens import TokenCounter
+    s = MemoryStore(db_path=tmp_path/"pl.db", embedding_dim=4); await s.init_schema()
+    class FakeEmb:
+        async def embed(self, t): return [0.1]*4
+    class FakeDec:
+        async def decide(self, t, sim): return DecisionResult(action=Decision.ADD)
+    svc = MemoryService(store=s, embedder=FakeEmb(), decider=FakeDec())
+    events = [FakeStreamEvent(kind="done", content='{"memories":["用户喜欢猫"]}', finish_reason="stop")]
+    llm = FakeLLM(responses=[events])
+    pipe = MemoryPipeline(llm=llm, service=svc, threshold=0.99)
+    msgs = [{"role":"user","content":"hi"},{"role":"assistant","content":"yo"}]
+    # every-N 触发(turn_idx=5,every_n=5);ratio 不达(threshold 0.99)
+    r = await pipe.maybe_run(msgs, TokenCounter(), context_window=1_000_000,
+                             session_id="sess1", turn_idx=5, every_n=5)
+    assert r is not None and len(r.results) == 1  # every-N 命中,抽出 1 candidate
+    # ratio-only 也触发(threshold 低)
+    pipe2 = MemoryPipeline(llm=FakeLLM(responses=[events]), service=svc, threshold=0.0)
+    r2 = await pipe2.maybe_run(msgs, TokenCounter(), context_window=1_000_000,
+                               session_id="sess1", turn_idx=1, every_n=None)  # every_n=None → 只 ratio
+    assert r2 is not None
+    await s.close()

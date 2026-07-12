@@ -31,7 +31,7 @@ class MemoryService:
         embedding = await self.embedder.embed(query)
         return await self.store.search_similar(embedding, k=top_k)
 
-    async def save(self, text: str, source: str) -> SaveResult:
+    async def save(self, text: str, source: str, session_id: str | None = None) -> SaveResult:
         t0 = time.time()
         try:
             embedding = await self.embedder.embed(text)
@@ -42,10 +42,11 @@ class MemoryService:
                 decision = await self.decider.decide(text, similar)
 
             if decision.action == Decision.ADD:
-                mem = await self.store.add(text, embedding, source)
+                mem = await self.store.add(text, embedding, source, session_id=session_id)
                 return SaveResult(action="ADD", memory=mem, duration_ms=_ms(t0))
 
             if decision.action == Decision.UPDATE:
+                # UPDATE 走 store.update(改 text+embedding),不改 session_id(保持原归属)
                 old = await self.store.get(decision.target_id)
                 new_embedding = await self.embedder.embed(decision.merged_text)
                 mem = await self.store.update(decision.target_id, decision.merged_text, new_embedding)
@@ -54,7 +55,7 @@ class MemoryService:
             if decision.action == Decision.DELETE:
                 old = await self.store.get(decision.target_id)
                 await self.store.delete(decision.target_id)
-                mem = await self.store.add(text, embedding, source)
+                mem = await self.store.add(text, embedding, source, session_id=session_id)
                 return SaveResult(action="DELETE_THEN_ADD", memory=mem, previous=old,
                                   deleted_id=decision.target_id, duration_ms=_ms(t0))
 
