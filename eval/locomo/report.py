@@ -38,10 +38,12 @@ def _summary_cards(results: list[dict], metrics: dict | None = None) -> str:
     n = len(results)
     n_pass = sum(1 for r in results if r.get("pass"))
     f1_vals = sorted(r["f1"] for r in results if r.get("f1") is not None)
+    sem_vals = sorted(r["semantic_f1"] for r in results if r.get("semantic_f1") is not None)
     quality_vals = sorted(r["quality"] for r in results if r.get("quality") is not None)
     total_cost = sum(r.get("cost_usd") or 0 for r in results)
     total_tool_calls = sum(len(r.get("tool_calls") or []) for r in results)
     f1_med = f1_vals[len(f1_vals) // 2] if f1_vals else 0.0
+    sem_med = sem_vals[len(sem_vals) // 2] if sem_vals else 0.0
     q_med = quality_vals[len(quality_vals) // 2] if quality_vals else 0.0
     # memory_recall 调用次数(跨所有 results 的 tool_calls 中 name == "memory_recall")
     n_recall = sum(
@@ -55,6 +57,7 @@ def _summary_cards(results: list[dict], metrics: dict | None = None) -> str:
     cards = [
         ("pass", pass_label),
         ("f1-median", f"{f1_med:.3f}"),
+        ("semantic-f1-median", f"{sem_med:.3f}"),
         ("quality-median", f"{q_med:.3f}"),
         ("cost-usd", f"${total_cost:.4f}"),
         ("tool-calls", f"{total_tool_calls}"),
@@ -89,6 +92,7 @@ def _row(r: dict) -> str:
         html.escape(str(r.get("q_type", ""))),
         status_cell,  # raw HTML
         f"{r.get('f1', ''):.3f}" if r.get("f1") is not None else "-",
+        f"{r.get('semantic_f1', ''):.3f}" if r.get("semantic_f1") is not None else "-",
         f"{r.get('quality', ''):.3f}" if r.get("quality") is not None else "-",
         "✓" if r.get("pass") else "✗",
         html.escape(str(r.get("prompt_tokens", ""))),
@@ -106,6 +110,7 @@ def _q_type_table(by_q_type: dict) -> str:
     rows = []
     for q_type, st in by_q_type.items():
         f1m = st.get("f1_med") if isinstance(st, dict) else None
+        sm = st.get("semantic_f1_med") if isinstance(st, dict) else None
         qm = st.get("quality_med") if isinstance(st, dict) else None
         n = st.get("n", "?") if isinstance(st, dict) else "?"
         p = st.get("pass", "?") if isinstance(st, dict) else "?"
@@ -114,13 +119,14 @@ def _q_type_table(by_q_type: dict) -> str:
             f"<td>{html.escape(str(q_type))}</td>"
             f"<td>{n}</td>"
             f"<td>{'-' if f1m is None else f'{f1m:.3f}'}</td>"
+            f"<td>{'-' if sm is None else f'{sm:.3f}'}</td>"
             f"<td>{'-' if qm is None else f'{qm:.3f}'}</td>"
             f"<td>{p}</td>"
             "</tr>"
         )
     return (
         '<h2>q_type 分桶</h2><table><thead><tr>'
-        "<th>q_type</th><th>n</th><th>f1-med</th><th>quality-med</th><th>pass</th>"
+        "<th>q_type</th><th>n</th><th>f1-med</th><th>semantic-f1-med</th><th>quality-med</th><th>pass</th>"
         "</tr></thead><tbody>" + "".join(rows) + "</tbody></table>"
     )
 
@@ -208,7 +214,7 @@ tr:hover {{ background: #1c1c1c; }}
 <table>
 <thead><tr>
 <th>sample_id</th><th>turn</th><th>q_type</th><th>status</th>
-<th>f1</th><th>quality</th><th>pass</th>
+<th>f1</th><th>semantic_f1</th><th>quality</th><th>pass</th>
 <th>prompt_tok</th><th>comp_tok</th><th>cost</th><th>tool_calls</th>
 </tr></thead>
 <tbody>{rows}</tbody>

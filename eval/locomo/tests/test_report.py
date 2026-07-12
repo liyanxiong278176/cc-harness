@@ -6,11 +6,11 @@ from eval.locomo.report import write_html_report, load_report_results
 def test_write_html_report_creates_file(tmp_path):
     results = [
         {"sample_id": "s1", "turn_idx": 0, "q_type": "single-hop", "status": "ok",
-         "f1": 0.8, "quality": 0.9, "pass": True,
+         "f1": 0.8, "semantic_f1": 0.8, "quality": 0.9, "pass": True,
          "prompt_tokens": 100, "completion_tokens": 50, "cost_usd": 0.001,
          "tool_calls": [{"name": "memory_recall", "args": {"query": "q"}, "ok": True, "result": "r"}]},
         {"sample_id": "s1", "turn_idx": 1, "q_type": "multi-hop", "status": "timeout",
-         "f1": None, "quality": None, "pass": False,
+         "f1": None, "semantic_f1": None, "quality": None, "pass": False,
          "prompt_tokens": 0, "completion_tokens": 0, "cost_usd": 0.0,
          "tool_calls": []},
     ]
@@ -27,7 +27,7 @@ def test_write_html_report_creates_file(tmp_path):
 def test_summary_cards_appear(tmp_path):
     results = [
         {"sample_id": "s1", "turn_idx": 0, "q_type": "x", "status": "ok",
-         "f1": 0.5, "quality": 0.6, "pass": True,
+         "f1": 0.5, "semantic_f1": 0.8, "quality": 0.6, "pass": True,
          "prompt_tokens": 10, "completion_tokens": 5, "cost_usd": 0.0001,
          "tool_calls": [{"name": "memory_recall", "args": {"query": "q"}, "ok": True, "result": "r"}]},
     ]
@@ -109,3 +109,39 @@ def test_write_html_report_renders_compaction(tmp_path):
     assert "上下文压缩" in text
     assert "触发 2 次" in text
     assert "tier 2" in text
+
+
+def test_summary_cards_semantic_median(tmp_path):
+    """_summary_cards 含 semantic-f1-median 卡。"""
+    results = [
+        {"sample_id": "s1", "turn_idx": 0, "q_type": "x", "status": "ok",
+         "f1": 0.1, "semantic_f1": 0.8, "quality": 0.6, "pass": True,
+         "prompt_tokens": 10, "completion_tokens": 5, "cost_usd": 0.0001, "tool_calls": []},
+    ]
+    write_html_report(results, tmp_path / "r.html")
+    text = (tmp_path / "r.html").read_text(encoding="utf-8")
+    assert "semantic-f1-median" in text
+
+
+def test_row_has_semantic_f1_col(tmp_path):
+    """主表 _row 含 semantic_f1 列。"""
+    results = [
+        {"sample_id": "s1", "turn_idx": -1, "q_type": "x", "status": "ok",
+         "f1": 0.1, "semantic_f1": 0.85, "quality": 0.6, "pass": True,
+         "prompt_tokens": 10, "completion_tokens": 5, "cost_usd": 0.0001, "tool_calls": []},
+    ]
+    write_html_report(results, tmp_path / "r.html")
+    text = (tmp_path / "r.html").read_text(encoding="utf-8")
+    assert "0.850" in text            # semantic_f1 格式化
+
+
+def test_q_type_table_has_semantic_col(tmp_path):
+    """_q_type_table 表头含 semantic-f1-med。"""
+    metrics = {"by_q_type": {"x": {"n": 1, "f1_med": 0.1, "semantic_f1_med": 0.8, "quality_med": 0.6, "pass": 1}},
+               "compaction": {"triggered": 0, "by_tier": {}, "avg_retain": None},
+               "utilization": {"avg": 0.0, "peak": 0.0},
+               "token_series": {"prompt": [], "completion": [], "cumulative_cost": 0},
+               "memory": "uncomputed", "tool_accuracy": "uncomputed"}
+    write_html_report([], tmp_path / "r.html", metrics=metrics)
+    text = (tmp_path / "r.html").read_text(encoding="utf-8")
+    assert "semantic-f1-med" in text
