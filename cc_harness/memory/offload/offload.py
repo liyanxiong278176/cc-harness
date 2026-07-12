@@ -2,7 +2,7 @@
 
 单次卸载动作:某个 ReAct 节点的 tool-call 结果 token 严格 > threshold →
 ① 原文逐字写 `refs/{node_id}.md`;
-② LLM 一句话摘要(llm=None fail-soft 取前 200 字);
+② LLM 一句话摘要(llm=None / LLM 失败 / 空 content → fail-soft 取前 200 字);
 ③ messages 历史里只留一行 `pointer_msg`(`node={node_id}`)。
 
 `node_id` 由 `gen_id()` 生成一次、三处复用(refs 文件名 / pointer_msg / refs_path),
@@ -53,7 +53,12 @@ async def maybe_offload(
     ref_file.write_text(result_text, encoding="utf-8")  # 逐字落盘
 
     if llm is not None:
-        summary = await _llm_summary(llm, result_text)
+        try:
+            summary = await _llm_summary(llm, result_text)
+        except Exception:
+            summary = ""
+        if not summary:  # 空 content(refusal / filter / mid-stream err)→ fail-soft
+            summary = result_text[:200]
     else:
         summary = result_text[:200]  # fail-soft:前 200 字,不调 LLM
 

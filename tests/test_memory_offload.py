@@ -107,3 +107,28 @@ async def test_node_id_three_way_consistent(tmp_path):
     assert refs_name == out.node_id                    # refs 文件名
     assert f"node={out.node_id}" in out.pointer_msg    # pointer_msg
     assert out.refs_path.endswith(f"{out.node_id}.md")  # refs_path
+
+
+@pytest.mark.asyncio
+async def test_maybe_offload_llm_failure_falls_back(tmp_path):
+    """llm raises or returns empty → summary falls back to result_text[:200] (not '')。"""
+    from cc_harness.memory.offload.offload import maybe_offload
+    from cc_harness.tokens import TokenCounter
+    big = "事实 " * 1000
+    expected = big[:200]
+
+    class RaisingLLM:
+        async def chat(self, msgs, tools):
+            raise RuntimeError("network down")
+            yield  # noqa — unreachable;仅作 async generator 标记,首帧即 raise
+
+    class EmptyLLM:
+        async def chat(self, msgs, tools):
+            from cc_harness.llm import StreamEvent
+            yield StreamEvent(kind="done", content="")  # empty content
+
+    out1 = await maybe_offload(big, "t", {}, 2000, tmp_path / "r1", RaisingLLM(), TokenCounter())
+    assert out1 is not None and out1.summary == expected
+
+    out2 = await maybe_offload(big, "t", {}, 2000, tmp_path / "r2", EmptyLLM(), TokenCounter())
+    assert out2 is not None and out2.summary == expected
