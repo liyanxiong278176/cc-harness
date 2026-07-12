@@ -74,6 +74,12 @@ class MemoryConfig(BaseModel):
     layered_inject: bool = True          # pre-turn 分层注入开关
     capture_enabled: bool = True         # L0 会话录制开关
     pipeline_enabled: bool = True        # L1 提取 + L2/L3 聚合开关
+    # Q4 短期符号化卸载字段
+    offload_enabled: bool = True            # 总开关:false = 不卸载,胖结果原样留历史
+    offload_threshold: int = 2000           # 单节点 tool-call 结果 token 上限,超过则卸载
+    offload_ratio: float = 0.5              # 占 context_window 比例,达此线触发批量卸载
+    mermaid_max_token_ratio: float = 0.2    # Mermaid canvas 注入 token 预算(占窗口比例)
+    offload_canvas_inject: bool = True      # 是否在 system 段注入 Mermaid task canvas
 
     @field_validator("pipeline_threshold")
     @classmethod
@@ -92,7 +98,8 @@ class MemoryConfig(BaseModel):
     @field_validator("injection_token_budget", "retriever_top_k",
                      "pipeline_recent_turns", "pipeline_max_delta_tokens",
                      "pipeline_every_n", "scenario_min_atoms",
-                     "persona_trigger_every_n", "recall_top_k")
+                     "persona_trigger_every_n", "recall_top_k",
+                     "offload_threshold")
     @classmethod
     def _check_positive_int(cls, v: int) -> int:
         if v <= 0:
@@ -104,6 +111,28 @@ class MemoryConfig(BaseModel):
     def _check_positive(cls, v: float) -> float:
         if v <= 0:
             raise ValueError(f"must be > 0, got {v}")
+        return v
+
+    @field_validator("offload_ratio")
+    @classmethod
+    def _check_offload_ratio(cls, v: float) -> float:
+        # offload_ratio 必须严格 < Plan3 tier1_threshold(0.6,
+        # 见 cc_harness/config.py:ContextConfig.tier1_threshold)。否则卸载会在
+        # tier1 Snip 之前抢跑,破坏 Plan3 的压缩层级顺序。
+        # 字面 0.6 比较:tier1 若调整,此处需同步(留 comment 防 drift)。
+        if v >= 0.6:
+            raise _get_memory_config_error()(
+                f"offload_ratio must be < 0.6 (Plan3 tier1_threshold), got {v}"
+            )
+        if v <= 0:
+            raise ValueError(f"offload_ratio must be > 0, got {v}")
+        return v
+
+    @field_validator("mermaid_max_token_ratio")
+    @classmethod
+    def _check_mermaid_ratio(cls, v: float) -> float:
+        if not (0 < v < 1):
+            raise ValueError(f"mermaid_max_token_ratio must be in (0, 1), got {v}")
         return v
 
     def model_post_init(self, __context) -> None:

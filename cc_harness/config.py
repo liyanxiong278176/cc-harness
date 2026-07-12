@@ -251,7 +251,9 @@ def load_memory_config(path: Path) -> "MemoryConfig":  # type: ignore[name-defin
 
     env: MEMORY_PIPELINE_EVERY_N / MEMORY_SCENARIO_MIN_ATOMS / MEMORY_PERSONA_TRIGGER_N
     / MEMORY_RECALL_TOP_K / MEMORY_RECALL_TIMEOUT_S / MEMORY_LAYERED_INJECT
-    / MEMORY_CAPTURE_ENABLED / MEMORY_PIPELINE_ENABLED。
+    / MEMORY_CAPTURE_ENABLED / MEMORY_PIPELINE_ENABLED
+    / MEMORY_OFFLOAD_ENABLED / MEMORY_OFFLOAD_THRESHOLD / MEMORY_OFFLOAD_RATIO
+    / MEMORY_MERMAID_MAX_TOKEN_RATIO / MEMORY_OFFLOAD_CANVAS_INJECT。
     """
     from cc_harness.memory.config import MemoryConfig  # lazy: dodge circular import
     kw: dict = {}
@@ -266,6 +268,9 @@ def load_memory_config(path: Path) -> "MemoryConfig":  # type: ignore[name-defin
         ("persona_trigger_every_n", "MEMORY_PERSONA_TRIGGER_N", int),
         ("recall_top_k", "MEMORY_RECALL_TOP_K", int),
         ("recall_timeout_s", "MEMORY_RECALL_TIMEOUT_S", float),
+        ("offload_threshold", "MEMORY_OFFLOAD_THRESHOLD", int),
+        ("offload_ratio", "MEMORY_OFFLOAD_RATIO", float),
+        ("mermaid_max_token_ratio", "MEMORY_MERMAID_MAX_TOKEN_RATIO", float),
     ]:
         v = os.getenv(env_name)
         if v is not None and v.strip():
@@ -275,6 +280,8 @@ def load_memory_config(path: Path) -> "MemoryConfig":  # type: ignore[name-defin
         ("layered_inject", "MEMORY_LAYERED_INJECT"),
         ("capture_enabled", "MEMORY_CAPTURE_ENABLED"),
         ("pipeline_enabled", "MEMORY_PIPELINE_ENABLED"),
+        ("offload_enabled", "MEMORY_OFFLOAD_ENABLED"),
+        ("offload_canvas_inject", "MEMORY_OFFLOAD_CANVAS_INJECT"),
     ]:
         v = os.getenv(env_name)
         if v is not None and v.strip():
