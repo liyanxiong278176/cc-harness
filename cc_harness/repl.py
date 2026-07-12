@@ -56,6 +56,9 @@ class ReplState:
     token_counter: TokenCounter = field(default_factory=TokenCounter)
     memory_extras: list = field(default_factory=list)  # Plan2: memory 工具 extras(session 级)
     context_config: ContextConfig = field(default_factory=ContextConfig)  # Plan3: 压缩配置
+    # Q3 Task8: session 标识 + mem_deps(pipeline/recall/store/persona_path/scenarios_dir)
+    session_id: str = ""
+    mem_deps: dict | None = None
 
 
 async def _read_user(prompt: str) -> str:
@@ -135,7 +138,12 @@ async def run_repl(
     state = ReplState(
         mode=default_mode,
         context_config=context_config or ContextConfig(),
+        session_id=f"repl-{int(time.time())}",
     )
+
+    # Q3 Task8: 加载分层记忆 config(kill-switches:layered_inject/capture_enabled/pipeline_enabled)
+    from cc_harness.memory.config import load_memory_config
+    mem_cfg = load_memory_config(Path("policy.yaml"))
 
     # Construct ONE PolicyEngine for the whole session. policy.yaml is optional
     # (missing → default enabled=True). project_root is the REPL's cwd so path
@@ -180,7 +188,7 @@ async def run_repl(
     _mem_env = {**os.environ, **{k: v for k, v in dotenv_values(Path(cwd) / ".env").items() if v}}
     try:
         from cc_harness.memory.extras import build_memory_extras
-        state.memory_extras, _mem_deps = await build_memory_extras(
+        state.memory_extras, state.mem_deps = await build_memory_extras(
             _mem_env, Path(cwd) / "logs" / "memory.db"
         )
         if state.memory_extras:
@@ -244,6 +252,12 @@ async def run_repl(
             state.messages.append({"role": "user", "content": user_content})
             turn_start = time.time()
             from cc_harness.agent import run_turn
+            # Q3 Task8: memory_layer 注入(kill-switch:layered_inject or 无 mem_deps → None)
+            memory_layer = (
+                {"recall": state.mem_deps["recall"]}
+                if state.mem_deps and mem_cfg.layered_inject
+                else None
+            )
             turn_stats = await run_turn(
                 state.messages, llm, mcp,
                 max_iter=max_iter,
@@ -255,6 +269,7 @@ async def run_repl(
                 l5=l5,
                 extra_native_specs=state.memory_extras or None,  # Plan2: 记忆工具(chat/coding)
                 context_config=state.context_config,             # Plan3: 压缩配置
+                memory_layer=memory_layer,                        # Q3 Task8: 分层注入
             )
             state.session_stats.add(turn_stats)
 
@@ -266,6 +281,9 @@ async def run_repl(
             if turn_stats.compaction and int(turn_stats.compaction.tier) > 0:
                 print_compaction_summary(console, "本轮", turn_stats.compaction)
 
+            # Q3 Task8: after-turn hook — L0 capture + L1 pipeline(every-N)+ L2 scenario + L3 persona
+            await _after_turn_memory(state, mem_cfg)
+
             # After the turn, show what actually changed on disk — so the user
             # can see real file state without F5-ing their file manager.
             _print_disk_changes(console, cwd, since=turn_start)
@@ -273,6 +291,55 @@ async def run_repl(
         # 主循环退出(正常 exit / EOF / Ctrl-C / 异常)→ shutdown 会话级 executor。
         # async,非 atexit;sandbox 时 kill 容器 + shutdown_owned_server,best-effort。
         await shutdown_session_executor()
+
+
+async def _after_turn_memory(state: ReplState, mem_cfg) -> None:
+    """Q3 Task8 after-turn hook:capture L0 + pipeline L1(every-N)+ scenario L2 + persona L3。
+
+    所有阶段 kill-switch 由 mem_cfg 控制(capture_enabled / pipeline_enabled);
+    缺 mem_deps(记忆未初始化)→ 整体 no-op。fail-soft:单阶段异常不阻塞后续。
+    """
+    if not state.mem_deps:
+        return
+    store = state.mem_deps["store"]
+    turn_idx = state.session_stats.turns
+
+    # L0: capture(幂等录制 conversation 表)
+    if mem_cfg.capture_enabled:
+        try:
+            from cc_harness.memory.capture import capture
+            await capture(store, state.session_id, state.messages, turn_idx=turn_idx)
+        except Exception as e:
+            print_warn(Console(), f"memory capture failed: {e}")
+
+    # L1 + L2 + L3: pipeline(every-N 提取 L1)+ scenario(聚类)+ persona(画像)
+    if mem_cfg.pipeline_enabled:
+        try:
+            await state.mem_deps["pipeline"].maybe_run(
+                state.messages, state.token_counter, context_window=1_000_000,
+                session_id=state.session_id, turn_idx=turn_idx,
+                every_n=mem_cfg.pipeline_every_n,
+            )
+        except Exception as e:
+            print_warn(Console(), f"memory pipeline failed: {e}")
+        try:
+            from cc_harness.memory.scenario import cluster_scenarios
+            # embedder 在当前 MVP 实现中未被 cluster_scenarios 使用(单簇 + texts[:3] 拼接),
+            # 传 None 安全;llm=None 退化为拼接 summary。
+            await cluster_scenarios(
+                store, None, state.session_id, state.mem_deps["scenarios_dir"],
+                min_atoms=mem_cfg.scenario_min_atoms, llm=None,
+            )
+        except Exception as e:
+            print_warn(Console(), f"memory scenario failed: {e}")
+        try:
+            from cc_harness.memory.persona import generate_persona
+            await generate_persona(
+                store, None, state.mem_deps["persona_path"],
+                trigger_every_n=mem_cfg.persona_trigger_every_n,
+            )
+        except Exception as e:
+            print_warn(Console(), f"memory persona failed: {e}")
 
 
 # --- Disk change summary (printed after each LLM turn) ---

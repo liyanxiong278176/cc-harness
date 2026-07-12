@@ -249,3 +249,25 @@ async def test_run_turn_memory_layer_injects(tmp_path):
     await run_turn(msgs2, FakeLLM(responses=[events]), FakeMCP(tools_spec=[], results={}, calls=[]),
                    mode="plan", cwd=str(tmp_path), memory_layer=None)
     assert "偏好简洁" not in msgs2[0]["content"]
+
+
+# --- Task8: after-turn hook + Plan3 注入幂等 ---
+
+@pytest.mark.asyncio
+async def test_injection_idempotent_across_turns(tmp_path):
+    """跨多 turn 注入:_refresh_system_prompt 每 turn 覆写 system → 不累积。turn2 最终只 1 处。"""
+    from cc_harness.agent import run_turn
+    from tests.test_agent import FakeLLM, FakeMCP, FakeStreamEvent
+    from cc_harness.memory.models import RecallResult, Persona
+
+    async def fake_recall(q, **kw):
+        return RecallResult(persona=Persona("P1", [], "p"))
+    events = [FakeStreamEvent(kind="done", content="ok", finish_reason="stop")]
+    msgs = [{"role": "system", "content": "sys"}, {"role": "user", "content": "hi"}]
+    await run_turn(msgs, FakeLLM(responses=[events]), FakeMCP(tools_spec=[], results={}, calls=[]),
+                   mode="plan", cwd=str(tmp_path), memory_layer={"recall": fake_recall})
+    msgs.append({"role": "user", "content": "again"})
+    await run_turn(msgs, FakeLLM(responses=[events]), FakeMCP(tools_spec=[], results={}, calls=[]),
+                   mode="plan", cwd=str(tmp_path), memory_layer={"recall": fake_recall})
+    # _refresh_system_prompt turn2 覆写 system 为纯基线 + 注入一次 → 只 1 处(拦累积)
+    assert msgs[0]["content"].count("## 用户画像") == 1

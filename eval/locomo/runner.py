@@ -105,16 +105,76 @@ async def _clear_memory_tags(tags: list[str]):
         print(f"[runner] clear_memory_tags failed: {e}")
 
 
-async def _run_sample(sample: dict, policy: dict, extras: list[dict], trace: LocomoTrace) -> list[dict]:
-    """Replay a single sample. Returns list of per-QA result dicts."""
+async def _after_turn_memory(mem_deps: dict, mem_cfg, session_id: str,
+                            messages: list[dict], turn_idx: int,
+                            context_window: int) -> None:
+    """Q3 Task8 after-turn hook(locomo runner 版):capture L0 + pipeline L1 + scenario L2 + persona L3。
+
+    fail-soft:单阶段异常 print 警告,不阻塞后续 / 主循环。
+    """
+    store = mem_deps["store"]
+
+    # L0: capture(幂等录制)
+    if mem_cfg.capture_enabled:
+        try:
+            from cc_harness.memory.capture import capture
+            await capture(store, session_id, messages, turn_idx=turn_idx)
+        except Exception as e:
+            print(f"[runner] memory capture failed: {e}")
+
+    # L1 + L2 + L3
+    if mem_cfg.pipeline_enabled:
+        from cc_harness.tokens import TokenCounter
+        try:
+            await mem_deps["pipeline"].maybe_run(
+                messages, TokenCounter(), context_window=context_window,
+                session_id=session_id, turn_idx=turn_idx,
+                every_n=mem_cfg.pipeline_every_n,
+            )
+        except Exception as e:
+            print(f"[runner] memory pipeline failed: {e}")
+        try:
+            from cc_harness.memory.scenario import cluster_scenarios
+            # embedder 当前 MVP 未使用(单簇 + texts[:3] 拼接),传 None 安全。
+            await cluster_scenarios(
+                store, None, session_id, mem_deps["scenarios_dir"],
+                min_atoms=mem_cfg.scenario_min_atoms, llm=None,
+            )
+        except Exception as e:
+            print(f"[runner] memory scenario failed: {e}")
+        try:
+            from cc_harness.memory.persona import generate_persona
+            await generate_persona(
+                store, None, mem_deps["persona_path"],
+                trigger_every_n=mem_cfg.persona_trigger_every_n,
+            )
+        except Exception as e:
+            print(f"[runner] memory persona failed: {e}")
+
+
+async def _run_sample(sample: dict, policy: dict, extras: list[dict], trace: LocomoTrace,
+                      mem_deps: dict | None = None) -> list[dict]:
+    """Replay a single sample. Returns list of per-QA result dicts.
+
+    Q3 Task8: mem_deps 非 None 时,turn 循环末接 after-turn hook(capture L0 +
+    pipeline L1 + scenario L2 + persona L3),QA run_turn 传 memory_layer。
+    """
     from cc_harness.llm import LLMClient
     from cc_harness.mcp_client import MCPClient
     from cc_harness.agent import run_turn
 
     parsed = ds.parse_sample(sample)
+    session_id = parsed.sample_id  # Q3 Task8: 每样本一个 session_id
     turns = list(ds.iter_turns(parsed))[: policy.get("max_turns_per_sample", 500)]
     started = time.time()
     sample_timeout_s = policy.get("sample_timeout_s", 1800)
+
+    # Q3 Task8: 加载分层记忆 config + context_window(env 可降窗口做烟测)
+    mem_cfg = None
+    context_window = int(os.environ.get("CONTEXT_WINDOW", "128000"))
+    if mem_deps:
+        from cc_harness.memory.config import load_memory_config
+        mem_cfg = load_memory_config(POLICY_LOCAL)
 
     # Construct LLM + MCP
     env = _env()
@@ -137,12 +197,19 @@ async def _run_sample(sample: dict, policy: dict, extras: list[dict], trace: Loc
             span = trace.start_turn(turn_idx, turn.text)
             # 追加新 turn 到累积 messages(不覆盖)
             messages.append({"role": "user", "content": f"[{turn.speaker}] {turn.text}"})
+            # Q3 Task8: memory_layer 注入(kill-switch:layered_inject or 无 mem_deps → None)
+            memory_layer = (
+                {"recall": mem_deps["recall"]}
+                if mem_deps and mem_cfg and mem_cfg.layered_inject
+                else None
+            )
             try:
                 stats = await run_turn(
                     messages, llm, mcp,
                     extra_native_specs=extras,
                     max_iter=4, mode="chat", cwd=str(REPO),
                     context_config=ContextConfig(),  # Plan3: 长对话触发压缩
+                    memory_layer=memory_layer,
                 )
             except Exception as e:
                 trace.record_tool(span, "agent_crash", {"err": str(e)[:200]}, {"ok": False})
@@ -158,6 +225,11 @@ async def _run_sample(sample: dict, policy: dict, extras: list[dict], trace: Loc
                              messages, stats, {"prompt_tokens": stats.api_prompt_tokens,
                                                "completion_tokens": stats.api_completion_tokens})
 
+            # Q3 Task8: after-turn hook — L0 capture + L1 pipeline + L2 scenario + L3 persona
+            if mem_deps and mem_cfg:
+                await _after_turn_memory(
+                    mem_deps, mem_cfg, session_id, messages, turn_idx, context_window)
+
         # Ask each QA(基于累积的 messages,带全对话上下文)
         results = []
         for qa in ds.iter_qa(parsed):
@@ -169,6 +241,7 @@ async def _run_sample(sample: dict, policy: dict, extras: list[dict], trace: Loc
                     extra_native_specs=extras,
                     max_iter=6, mode="chat", cwd=str(REPO),
                     context_config=ContextConfig(),  # Plan3: QA 上下文触发压缩
+                    memory_layer=memory_layer,       # Q3 Task8: QA 也注入分层记忆
                 )
                 predicted = qa_messages[-1].get("content", "") or ""
                 trace.record_llm(span, env.get("OPENAI_MODEL", "?"),
@@ -311,7 +384,7 @@ def main():
             print(f"[runner] sample {sample['sample_id']} ...", flush=True)
             trace = LocomoTrace(sample["sample_id"], enabled=enabled_trace)
             try:
-                results = await _run_sample(sample, policy, extras, trace)
+                results = await _run_sample(sample, policy, extras, trace, mem_deps=mem_deps)
             except Exception as e:
                 results = [{"sample_id": sample["sample_id"], "turn_idx": -1, "q_type": "n/a",
                             "status": "agent_crash", "f1": None, "quality": None, "pass": False,
