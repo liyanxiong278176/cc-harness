@@ -278,16 +278,17 @@ async def test_agent_after_tool_call_offloads(tmp_path):
         pass
     offload_deps = {"enabled": True, "threshold": 2000, "offload": _offload, "canvas": _canvas,
                     "canvas_inject": False, "refs_dir": refs_dir, "canvas_path": tmp_path/"c.md"}
-    fs_tool = {"type":"function","function":{"name":"run_command","description":"r",
-               "parameters":{"type":"object","properties":{"cmd":{"type":"string"}}}}}}
+    # 用 MCP 工具(非 native run_command)避开 schema(RunCommandArgs 要 command)+ native 真跑 shell 漏 FakeMCP + policy ASK 默认 no 三重坑(对齐 test_agent.py:56 范式)
+    fs_tool = {"type":"function","function":{"name":"mcp__fs__read","description":"r",
+               "parameters":{"type":"object","properties":{"path":{"type":"string"}}}}}}
     from cc_harness.llm import PendingToolCall
-    pending = [PendingToolCall(index=0, id="c1", name="run_command", arguments_json='{"cmd":"x"}')]
-    events = [FakeStreamEvent(kind="done", content="run", pending=pending, finish_reason="tool_calls")]
+    pending = [PendingToolCall(index=0, id="c1", name="mcp__fs__read", arguments_json='{"path":"x"}')]
+    events = [FakeStreamEvent(kind="done", content="read", pending=pending, finish_reason="tool_calls")]
     events2 = [FakeStreamEvent(kind="done", content="done", finish_reason="stop")]
     llm = FakeLLM(responses=[events, events2])
-    mcp = FakeMCP(tools_spec=[fs_tool], results={"run_command": ToolResult.success(big)}, calls=[])
-    msgs = [{"role":"user","content":"run"}]
-    await run_turn(msgs, llm, mcp, max_iter=5, mode="coding", cwd=str(tmp_path), offload_deps=offload_deps)
+    mcp = FakeMCP(tools_spec=[fs_tool], results={"mcp__fs__read": ToolResult.success(big)}, calls=[])
+    msgs = [{"role":"user","content":"read x"}]
+    await run_turn(msgs, llm, mcp, max_iter=5, mode="coding", offload_deps=offload_deps)
     tool_msg = next(m for m in msgs if m.get("role") == "tool")
     assert "offloaded" in tool_msg["content"] and big not in tool_msg["content"]
     assert list(refs_dir.glob("*.md"))  # refs 生成
@@ -350,7 +351,7 @@ async def test_pre_turn_inject_order(tmp_path):
                     "mermaid_max_token_ratio": 0.2, "context_window": 1_000_000}
     msgs = [{"role":"system","content":"SYS"},{"role":"user","content":"hi"}]
     await run_turn(msgs, FakeLLM(responses=[events]), FakeMCP(tools_spec=[],results={},calls=[]),
-                   mode="plan", cwd=str(tmp_path),
+                   mode="plan", cwd=None,  # 跳 _refresh_system_prompt,保 messages[0]="SYS" 锚点
                    memory_layer={"recall": fake_recall}, offload_deps=offload_deps)
     c = msgs[0]["content"]
     assert c.index("SYS") < c.index("P") < c.index("SCEN") < c.index("graph LR")  # 顺序
@@ -400,15 +401,15 @@ async def test_plan3_coexist_q4_reduces(tmp_path):
                     "canvas_inject": False, "refs_dir": refs_dir, "canvas_path": tmp_path/"c.md",
                     "offload_ratio": 0.5, "context_window": 1_000_000,
                     "mermaid_max_token_ratio": 0.2}
-    fs_tool = {"type":"function","function":{"name":"run_command","description":"r",
-               "parameters":{"type":"object","properties":{"cmd":{"type":"string"}}}}}}
-    pending = [PendingToolCall(index=0, id="c1", name="run_command", arguments_json='{"cmd":"x"}')]
-    events = [FakeStreamEvent(kind="done", content="run", pending=pending, finish_reason="tool_calls")]
+    fs_tool = {"type":"function","function":{"name":"mcp__fs__read","description":"r",
+               "parameters":{"type":"object","properties":{"path":{"type":"string"}}}}}}
+    pending = [PendingToolCall(index=0, id="c1", name="mcp__fs__read", arguments_json='{"path":"x"}')]
+    events = [FakeStreamEvent(kind="done", content="read", pending=pending, finish_reason="tool_calls")]
     events2 = [FakeStreamEvent(kind="done", content="done", finish_reason="stop")]
     llm = FakeLLM(responses=[events, events2])
-    mcp = FakeMCP(tools_spec=[fs_tool], results={"run_command": ToolResult.success(big)}, calls=[])
-    msgs = [{"role":"user","content":"run"}]
-    await run_turn(msgs, llm, mcp, max_iter=5, mode="coding", cwd=str(tmp_path), offload_deps=offload_deps)
+    mcp = FakeMCP(tools_spec=[fs_tool], results={"mcp__fs__read": ToolResult.success(big)}, calls=[])
+    msgs = [{"role":"user","content":"read x"}]
+    await run_turn(msgs, llm, mcp, max_iter=5, mode="coding", offload_deps=offload_deps)
     tool_msg = next(m for m in msgs if m.get("role")=="tool")
     assert "offloaded" in tool_msg["content"]  # Q4 卸载(减载)
     assert TokenCounter().count_text(tool_msg["content"]) < TokenCounter().count_text(big)  # pointer 短
@@ -420,15 +421,16 @@ async def test_plan3_coexist_q4_kill(tmp_path):
     from tests.test_agent import FakeLLM, FakeMCP, FakeStreamEvent
     from cc_harness.mcp_client import ToolResult
     from cc_harness.llm import PendingToolCall
-    fs_tool = {"type":"function","function":{"name":"run_command","description":"r",
-               "parameters":{"type":"object","properties":{"cmd":{"type":"string"}}}}}}
-    pending = [PendingToolCall(index=0, id="c1", name="run_command", arguments_json='{"cmd":"x"}')]
-    events = [FakeStreamEvent(kind="done", content="run", pending=pending, finish_reason="tool_calls")]
+    fs_tool = {"type":"function","function":{"name":"mcp__fs__read","description":"r",
+               "parameters":{"type":"object","properties":{"path":{"type":"string"}}}}}}
+    pending = [PendingToolCall(index=0, id="c1", name="mcp__fs__read", arguments_json='{"path":"x"}')]
+    events = [FakeStreamEvent(kind="done", content="read", pending=pending, finish_reason="tool_calls")]
     events2 = [FakeStreamEvent(kind="done", content="done", finish_reason="stop")]
     llm = FakeLLM(responses=[events, events2])
-    mcp = FakeMCP(tools_spec=[fs_tool], results={"run_command": ToolResult.success("short")}, calls=[])
-    msgs = [{"role":"user","content":"run"}]
-    await run_turn(msgs, llm, mcp, max_iter=5, mode="coding", cwd=str(tmp_path),
+    big = "y " * 3000  # big result + enabled=False 才真证 kill(短 result 不卸 trivial)
+    mcp = FakeMCP(tools_spec=[fs_tool], results={"mcp__fs__read": ToolResult.success(big)}, calls=[])
+    msgs = [{"role":"user","content":"read x"}]
+    await run_turn(msgs, llm, mcp, max_iter=5, mode="coding",
                    offload_deps={"enabled": False, "offload": None, "canvas": None,
                                  "canvas_inject": False, "canvas_path": None, "refs_dir": None})
     tool_msg = next(m for m in msgs if m.get("role")=="tool")
