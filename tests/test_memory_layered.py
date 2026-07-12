@@ -62,3 +62,17 @@ def test_load_memory_config_kill_switch(tmp_path):
     yaml.write_text("memory:\n  layered_inject: false\n", encoding="utf-8")
     c = load_memory_config(yaml)
     assert c.layered_inject is False
+
+
+@pytest.mark.asyncio
+async def test_capture_records_and_idempotent(tmp_path):
+    from cc_harness.memory.store import MemoryStore
+    from cc_harness.memory.capture import capture
+    s = MemoryStore(db_path=tmp_path/"cap.db", embedding_dim=4); await s.init_schema()
+    msgs = [{"role":"user","content":"hi"},{"role":"assistant","content":"yo"},{"role":"system","content":"sys"}]
+    await capture(s, "sess1", msgs, turn_idx=3)
+    await capture(s, "sess1", msgs, turn_idx=3)  # 幂等重录不翻倍
+    cur = await s._db.execute("SELECT role FROM conversation WHERE session_id=? AND turn_idx=3", ("sess1",))
+    rows = await cur.fetchall()
+    assert len(rows) == 2 and {r[0] for r in rows} == {"user","assistant"}  # 跳 system
+    await s.close()
