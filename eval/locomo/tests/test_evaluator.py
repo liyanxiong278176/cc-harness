@@ -96,3 +96,14 @@ async def test_evaluate_qa_fail_soft_token_fallback():
     assert result["semantic_f1"] is None
     assert result["f1"] > 0.5
     assert result["pass"] is True
+
+
+async def test_semantic_f1_clamps_range():
+    """judge 返超范围 score → clamp 到 [0,1](防聚合 mean 污染)。"""
+    from eval.locomo.evaluator import semantic_f1
+    async def over(s):
+        return '{"score": 1.5}'
+    async def under(s):
+        return '{"score": -0.2}'
+    assert await semantic_f1("q", "a", "b", over) == 1.0
+    assert await semantic_f1("q", "a", "b", under) == 0.0

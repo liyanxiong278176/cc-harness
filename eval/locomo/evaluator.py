@@ -96,7 +96,7 @@ async def semantic_f1(prompt, predicted, gold, judge_llm) -> Optional[float]:
     user = f"question: {prompt}\ngold: {gold}\npred: {predicted}"
     try:
         resp = await _judge(judge_llm, system, user)
-        return float(json.loads(resp)["score"])
+        return max(0.0, min(1.0, float(json.loads(resp)["score"])))
     except Exception as e:
         logger.warning("semantic_f1 judge failed: %s", e)
         return None
