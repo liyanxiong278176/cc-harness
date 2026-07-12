@@ -17,6 +17,10 @@ build/
 # Scope to this file only; logs/ also holds the tracked logs/mcp_server.log.
 /logs/policy.jsonl
 
+# Q4 offload refs — may contain raw tool output (cat .env etc.), L5-exempt at rest.
+# keep local; never commit.
+/logs/memory/refs/
+
 # locomo dataset (大,不入仓)
 eval/locomo/data/locomo10.json
 eval/locomo/.checkpoint.json

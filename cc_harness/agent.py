@@ -195,8 +195,10 @@ async def run_turn(
         返回应放入 tool message 的 content(pointer_msg 若卸载,否则原文 untrusted 包裹)。
 
         仅由 allow + ask-yes 分支调(其余 4 处短错误天然不撞阈值,不走 hook)。
-        fail-soft:offload/canvas 任何异常 → 回退原文,不崩主循环。更新 _last_node
-        以串 Mermaid edge 链(edge_from = 上一卸载节点)。kill-switch:
+        两层 fail-soft:外层 try(threshold-check + offload 调用,offload 自身 LLM/disk
+        失败 → 回退 _external);内层 try(canvas best-effort 装饰,失败不丢 pointer、
+        不留 refs 孤儿、不 stale edge)。_last_node 无论 canvas 成败都推进(它在
+        canvas 调用之后赋值,但内层 except 不 return,故赋值一定执行)。kill-switch:
         offload_deps=None 或 enabled=False → 直返 untrusted 原文。
         """
         nonlocal _last_node
@@ -210,9 +212,15 @@ async def run_turn(
                     result_text, tool_name, tool_args,
                     threshold=offload_deps["threshold"], token_counter=_tc)
                 if _off is not None:
-                    await offload_deps["canvas"](
-                        _off.node_id, tool_name, _off.summary, edge_from=_last_node)
-                    _last_node = _off.node_id
+                    # canvas 是 best-effort 装饰,失败不影响 offload 已达成的减载:
+                    # 独立 try/except — 否则 canvas 抛会丢 pointer(胖文回 messages)+
+                    # refs 孤儿 + _last_node 不更新(下次 edge 指向陈旧前驱)。
+                    try:
+                        await offload_deps["canvas"](
+                            _off.node_id, tool_name, _off.summary, edge_from=_last_node)
+                    except Exception as ce:
+                        print_warn(console, f"offload canvas (best-effort) failed: {ce}")
+                    _last_node = _off.node_id   # 无论 canvas 成败,edge 链推进
                     return _off.pointer_msg
         except Exception as e:
             print_warn(console, f"offload hook failed: {e}")

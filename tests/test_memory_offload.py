@@ -307,7 +307,6 @@ async def test_agent_after_tool_call_offloads(tmp_path):
     from tests.test_agent import FakeLLM, FakeMCP, FakeStreamEvent
     from cc_harness.mcp_client import ToolResult
     from cc_harness.memory.offload.offload import maybe_offload
-    from cc_harness.tokens import TokenCounter
     refs_dir = tmp_path / "refs"
     big = "y " * 3000
 
@@ -338,3 +337,123 @@ async def test_agent_after_tool_call_offloads(tmp_path):
     tool_msg = next(m for m in msgs if m.get("role") == "tool")
     assert "offloaded" in tool_msg["content"] and big not in tool_msg["content"]
     assert list(refs_dir.glob("*.md"))  # refs 生成
+
+
+@pytest.mark.asyncio
+async def test_agent_after_tool_call_offloads_ask_yes(tmp_path, monkeypatch):
+    """ask-yes 分支 wiring:policy ASK(shell)→ confirm "yes" → 执行 → offload。
+
+    镜像 test_agent.py:test_agent_tool_call_log_ask_confirmed_marked_ok 范式:
+    native run_command(policy 归 shell → ASK)+ monkeypatch handler 返大结果 +
+    monkeypatch builtins.input → "yes" 驱动 confirm_tool。offload LOGIC 与 allow 分支
+    共享同一 _maybe_offload_content 闭包,本测试断言 ask-yes WIRING(调用点接通)。
+    """
+    from cc_harness import agent as agent_mod
+    from cc_harness.agent import run_turn
+    from tests.test_agent import FakeLLM, FakeMCP, FakeStreamEvent
+    from cc_harness.mcp_client import ToolResult
+    from cc_harness.memory.offload.offload import maybe_offload
+    from cc_harness.policy import PolicyEngine
+    from cc_harness.llm import PendingToolCall
+
+    refs_dir = tmp_path / "refs"
+    big = "z " * 3000
+
+    async def _fake_run_command(args, *, cwd="."):
+        return ToolResult.success(big)
+
+    async def _offload(result_text, tool_name, args, *, threshold, token_counter):
+        return await maybe_offload(
+            result_text, tool_name, args, threshold, refs_dir, None, token_counter)
+
+    async def _canvas(node_id, label, summary, edge_from):
+        pass
+
+    offload_deps = {"enabled": True, "threshold": 2000, "offload": _offload, "canvas": _canvas,
+                    "canvas_inject": False, "refs_dir": refs_dir, "canvas_path": tmp_path / "c.md"}
+
+    # run_command → policy shell → ASK;替换 handler 避开真 shell
+    monkeypatch.setitem(agent_mod.NATIVE_TOOLS["run_command"], "handler", _fake_run_command)
+    monkeypatch.setattr("builtins.input", lambda *a, **k: "yes")  # confirm_tool → "yes"
+
+    pending = [PendingToolCall(index=0, id="c1", name="run_command",
+                               arguments_json='{"command":"echo big"}')]
+    llm = FakeLLM(responses=[
+        [FakeStreamEvent(kind="done", content="", pending=pending, finish_reason="tool_calls")],
+        [FakeStreamEvent(kind="done", content="done", pending=[], finish_reason="stop")],
+    ])
+    mcp = FakeMCP(tools_spec=[], results={}, calls=[])
+    msgs = [{"role": "user", "content": "跑 echo"}]
+    await run_turn(msgs, llm, mcp, mode="coding", cwd=str(tmp_path), max_iter=5,
+                   policy=PolicyEngine(project_root=tmp_path), offload_deps=offload_deps)
+    tool_msg = next(m for m in msgs if m.get("role") == "tool")
+    # ask-yes 调用点接通:tool content 被换 pointer,big 不在,refs 落盘
+    assert "offloaded" in tool_msg["content"], "ask-yes 分支未走 offload hook(wiring 断)"
+    assert big not in tool_msg["content"]
+    assert list(refs_dir.glob("*.md"))
+
+
+@pytest.mark.asyncio
+async def test_agent_offload_canvas_failure_keeps_pointer(tmp_path, monkeypatch):
+    """canvas 抛异常 → pointer 仍 commit + refs 不孤儿 + _last_node 更新(Important fix)。
+
+    两个大结果连续卸载:第一次 _canvas 抛 RuntimeError,第二次 _canvas 正常。
+    断言:两次 tool content 都是 pointer(非原文);refs 各落一份(无孤儿);
+    第二次 canvas 的 edge_from == 第一次的 node_id(_last_node 已推进,非陈旧)。
+    """
+    from cc_harness.agent import run_turn
+    from tests.test_agent import FakeLLM, FakeMCP, FakeStreamEvent
+    from cc_harness.mcp_client import ToolResult
+    from cc_harness.memory.offload.offload import maybe_offload
+    from cc_harness.llm import PendingToolCall
+
+    refs_dir = tmp_path / "refs"
+    big1 = "a " * 3000
+    seen_edges: list = []   # 记录两次 canvas 的 edge_from
+
+    async def _offload(result_text, tool_name, args, *, threshold, token_counter):
+        return await maybe_offload(
+            result_text, tool_name, args, threshold, refs_dir, None, token_counter)
+
+    async def _canvas(node_id, label, summary, edge_from):
+        seen_edges.append(edge_from)
+        if edge_from is None:   # 首节点 canvas 模拟失败
+            raise RuntimeError("canvas disk full")
+
+    offload_deps = {"enabled": True, "threshold": 2000, "offload": _offload, "canvas": _canvas,
+                    "canvas_inject": False, "refs_dir": refs_dir, "canvas_path": tmp_path / "c.md"}
+
+    fs_tool = {"type": "function", "function": {
+        "name": "mcp__fs__read", "description": "r",
+        "parameters": {"type": "object", "properties": {"path": {"type": "string"}}}}}
+    p1 = PendingToolCall(index=0, id="c1", name="mcp__fs__read", arguments_json='{"path":"x"}')
+    p2 = PendingToolCall(index=0, id="c2", name="mcp__fs__read", arguments_json='{"path":"y"}')
+    # 3 轮:两次 tool_call(同轮内两个 pending)+ 终答
+    events1 = [FakeStreamEvent(kind="done", content="r1", pending=[p1, p2],
+                               finish_reason="tool_calls")]
+    events2 = [FakeStreamEvent(kind="done", content="done", pending=[], finish_reason="stop")]
+    llm = FakeLLM(responses=[events1, events2])
+    mcp = FakeMCP(tools_spec=[fs_tool],
+                  results={"mcp__fs__read": ToolResult.success(big1)}, calls=[])
+    # 两次调用都返 big1(内容不重要,只要超阈值;_offload 各自生成独立 node_id)
+    mcp.results["mcp__fs__read"] = ToolResult.success(big1)
+    msgs = [{"role": "user", "content": "read x and y"}]
+    # 捕获 stdin 让 canvas 失败的 warn 不卡(无 input 需求,allow 分支)
+    import io
+    monkeypatch.setattr("sys.stdin", io.StringIO("exit\n"))
+    await run_turn(msgs, llm, mcp, max_iter=5, mode="coding", offload_deps=offload_deps)
+
+    tool_msgs = [m for m in msgs if m.get("role") == "tool"]
+    assert len(tool_msgs) == 2
+    # 两个 tool content 都是 pointer(canvas 失败不丢 pointer)
+    for tm in tool_msgs:
+        assert "offloaded" in tm["content"], "canvas 失败导致 pointer 丢失"
+        assert big1 not in tm["content"]
+    # refs 两份(无孤儿)
+    assert len(list(refs_dir.glob("*.md"))) == 2
+    # _last_node 推进:第二次 canvas edge_from 是第一次的 node_id(非 None/非陈旧)
+    # 从 pointer 提取首次 node_id,验证 seen_edges[1] 指向它
+    import re as _re
+    first_node = _re.search(r"node=(\w+)", tool_msgs[0]["content"]).group(1)
+    assert seen_edges[0] is None          # 首节点无前驱
+    assert seen_edges[1] == first_node    # 二节点 edge 指向首节点(_last_node 已更新)
