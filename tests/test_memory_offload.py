@@ -132,3 +132,94 @@ async def test_maybe_offload_llm_failure_falls_back(tmp_path):
 
     out2 = await maybe_offload(big, "t", {}, 2000, tmp_path / "r2", EmptyLLM(), TokenCounter())
     assert out2 is not None and out2.summary == expected
+
+
+# --- Task 3: update_canvas (Mermaid graph LR + node_id literal + edge chaining) ---
+
+
+@pytest.mark.asyncio
+async def test_update_canvas_appends_node(tmp_path):
+    """LLM 路径:node_id 字面入 Mermaid 节点 id,二次调用 chain edge;append 不重写头。"""
+    from cc_harness.memory.offload.mermaid import update_canvas
+    canvas_path = tmp_path / "canvas.md"
+
+    class FakeLLM:
+        async def chat(self, msgs, tools):
+            from cc_harness.llm import StreamEvent
+            yield StreamEvent(kind="done", content="读取文件")
+
+    # 首节点:无 edge_from
+    out1 = await update_canvas(
+        node_id="n1", label="read_file", summary="读了 README",
+        edge_from=None, canvas_path=canvas_path, llm=FakeLLM(),
+    )
+    assert isinstance(out1, str)
+    assert "graph LR" in out1
+    assert "n1" in out1                      # node_id 字面
+    assert 'n1["读取文件"]' in out1           # LLM 产标签 + node_id 锁前缀
+    assert canvas_path.exists()
+    on_disk = canvas_path.read_text(encoding="utf-8")
+    assert "graph LR" in on_disk and 'n1["读取文件"]' in on_disk
+    assert "--> n1" not in out1              # 首节点无 edge
+
+    # 二节点 chain:edge_from=n1
+    out2 = await update_canvas(
+        node_id="n2", label="grep", summary="grep 关键字",
+        edge_from="n1", canvas_path=canvas_path, llm=FakeLLM(),
+    )
+    assert "n1 --> n2" in out2               # 链边
+    assert 'n2["读取文件"]' in out2           # 第二节点
+    assert "n1" in out2                      # 首节点仍在(append 不重写)
+    # Mermaid 头只一次(append 不重复 graph LR)
+    assert out2.count("graph LR") == 1
+
+
+@pytest.mark.asyncio
+async def test_update_canvas_llm_none_fail_soft(tmp_path):
+    """llm=None → 确定性节点 {node_id}["{label}"] + edge chain;
+    LLM 异常/空 → 同确定性 fallback。父目录自动建。"""
+    from cc_harness.memory.offload.mermaid import update_canvas
+    canvas_path = tmp_path / "sub" / "canvas.md"  # 父目录不存在 → 应自动建
+
+    # 首节点(llm=None,无 edge_from)
+    out1 = await update_canvas(
+        node_id="n1", label="run_command", summary="跑了 pytest",
+        edge_from=None, canvas_path=canvas_path, llm=None,
+    )
+    assert isinstance(out1, str) and canvas_path.exists()
+    assert 'n1["run_command"]' in out1        # 确定性节点(label 作可见文本)
+    assert "--> n1" not in out1               # 首节点无 edge
+
+    # 二节点 chain(llm=None)
+    out2 = await update_canvas(
+        node_id="n2", label="read_file", summary="读结果",
+        edge_from="n1", canvas_path=canvas_path, llm=None,
+    )
+    assert "n1 --> n2" in out2
+    assert 'n2["read_file"]' in out2
+
+    # LLM 抛异常 → fail-soft 回确定性节点
+    class RaisingLLM:
+        async def chat(self, msgs, tools):
+            raise RuntimeError("down")
+            yield  # async gen 标记,unreachable
+
+    canvas2 = tmp_path / "raise.md"
+    out3 = await update_canvas(
+        node_id="x1", label="t", summary="s",
+        edge_from=None, canvas_path=canvas2, llm=RaisingLLM(),
+    )
+    assert 'x1["t"]' in out3                  # 回退到确定性 label
+
+    # LLM 返回空 content → fail-soft
+    class EmptyLLM:
+        async def chat(self, msgs, tools):
+            from cc_harness.llm import StreamEvent
+            yield StreamEvent(kind="done", content="")
+
+    canvas3 = tmp_path / "empty.md"
+    out4 = await update_canvas(
+        node_id="y1", label="t2", summary="s2",
+        edge_from=None, canvas_path=canvas3, llm=EmptyLLM(),
+    )
+    assert 'y1["t2"]' in out4                  # 空 content 也回退 label
