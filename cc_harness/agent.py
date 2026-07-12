@@ -60,6 +60,7 @@ async def run_turn(
     extra_native_specs: list[dict] | None = None,
     context_config: ContextConfig | None = None,
     memory_layer: dict | None = None,
+    offload_deps: dict | None = None,
 ) -> TurnTokenStats:
     """Run one user turn in the given mode.
 
@@ -85,6 +86,13 @@ async def run_turn(
     便于测试替身);pre-turn 调用,把 persona/scenarios 拼到 system 段。None
     或缺 "recall" 键 = kill-switch,不注入。fail-soft:recall 抛异常不崩主循环。
 
+    `offload_deps`(Q4 Task5)可选短期符号化卸载:after-tool-call hook,tool result
+    token > threshold → 落 refs + 摘要 + Mermaid canvas,messages 历史只留 pointer。
+    独立于 memory_layer(两参数,不合并)。None 或 ``enabled=False`` = kill-switch。
+    keys:enabled/threshold/offload(async closure)/canvas(async closure)。
+    仅 allow + ask-yes 分支走 hook(其余 4 处短错误天然不撞阈值)。fail-soft:
+    offload/canvas 抛异常 → 回退原文,不崩主循环。
+
     Mutates `messages` in place. Async so the repl can call it from its
     persistent event loop without `asyncio.run` overhead.
     """
@@ -96,6 +104,7 @@ async def run_turn(
     _empty_retried = False  # one-shot retry guard for empty-content turns
     tool_call_log: list = []  # Plan1 Task4: [{name, args, ok, result}] per tool dispatch
     last_compaction = None  # Plan3: CompactionStats from maybe_compact (or None)
+    _last_node = None  # Q4 Task5: offload edge chain — node_id of last offloaded tool result
 
     if cwd is not None:
         _refresh_system_prompt(messages, cwd, mode)
@@ -179,6 +188,35 @@ async def run_turn(
             h_kwargs = {"cwd": str(project_root), **extra_entry.get("deps", {})}
             return await extra_entry["handler"](args, **h_kwargs)
         return await mcp.call_tool(p.name, args)
+
+    async def _maybe_offload_content(result_text: str, tool_name: str,
+                                     tool_args: dict) -> str:
+        """Q4 Task5 offload hook:胖 tool result → refs + 摘要 + Mermaid canvas,
+        返回应放入 tool message 的 content(pointer_msg 若卸载,否则原文 untrusted 包裹)。
+
+        仅由 allow + ask-yes 分支调(其余 4 处短错误天然不撞阈值,不走 hook)。
+        fail-soft:offload/canvas 任何异常 → 回退原文,不崩主循环。更新 _last_node
+        以串 Mermaid edge 链(edge_from = 上一卸载节点)。kill-switch:
+        offload_deps=None 或 enabled=False → 直返 untrusted 原文。
+        """
+        nonlocal _last_node
+        _external = f"<untrusted>{result_text}</untrusted>"
+        if not (offload_deps and offload_deps.get("enabled", True)):
+            return _external
+        try:
+            _tc = token_counter or TokenCounter()
+            if _tc.count_text(result_text) > offload_deps["threshold"]:
+                _off = await offload_deps["offload"](
+                    result_text, tool_name, tool_args,
+                    threshold=offload_deps["threshold"], token_counter=_tc)
+                if _off is not None:
+                    await offload_deps["canvas"](
+                        _off.node_id, tool_name, _off.summary, edge_from=_last_node)
+                    _last_node = _off.node_id
+                    return _off.pointer_msg
+        except Exception as e:
+            print_warn(console, f"offload hook failed: {e}")
+        return _external
 
     def _stats() -> TurnTokenStats:
         """Build TurnTokenStats from current messages + tool_specs + iter_usages."""
@@ -292,6 +330,7 @@ async def run_turn(
                         f"{json.dumps({'id': p.id, 'arguments_json': p.arguments_json})}"
                     )
                     print_observation(console, error_llm_text)
+                    # 短错误串,天然不撞阈值,不走 offload hook
                     messages.append({
                         "role": "tool",
                         "tool_call_id": placeholder_id,
@@ -305,6 +344,7 @@ async def run_turn(
                     print_error(console, f"tool_call JSON parse failed: {e}")
                     error_text = f"[Tool Error] JSON parse failed: {p.arguments_json}"
                     print_observation(console, error_text)
+                    # 短错误串,天然不撞阈值,不走 offload hook
                     messages.append({
                         "role": "tool",
                         "tool_call_id": p.id or f"unknown_{i}",
@@ -320,6 +360,7 @@ async def run_turn(
                 if not ok:
                     error_text = f"[Tool Error] 参数校验失败: {msg}"
                     print_observation(console, error_text)
+                    # 短错误串,天然不撞阈值,不走 offload hook
                     messages.append({
                         "role": "tool",
                         "tool_call_id": p.id or f"unknown_{i}",
@@ -342,11 +383,12 @@ async def run_turn(
                     tool_call_log.append({"name": p.name, "args": args, "ok": True,
                                           "result": str(result.llm_text)[:500]})
                     print_observation(console, result.llm_text)
-                    _external = f"<untrusted>{result.llm_text}</untrusted>"
+                    _tool_content = await _maybe_offload_content(
+                        result.llm_text, p.name, args)
                     messages.append({
                         "role": "tool",
                         "tool_call_id": p.id or f"unknown_{i}",
-                        "content": _external,
+                        "content": _tool_content,
                     })
                 else:  # ask
                     print_warn(console, f"[需确认] {p.name} {decision.reason}")
@@ -362,11 +404,12 @@ async def run_turn(
                         tool_call_log.append({"name": p.name, "args": args, "ok": True,
                                               "result": str(result.llm_text)[:500]})
                         print_observation(console, result.llm_text)
-                        _external = f"<untrusted>{result.llm_text}</untrusted>"
+                        _tool_content = await _maybe_offload_content(
+                            result.llm_text, p.name, args)
                         messages.append({
                             "role": "tool",
                             "tool_call_id": p.id or f"unknown_{i}",
-                            "content": _external,
+                            "content": _tool_content,
                         })
                     else:
                         error_text = (
@@ -380,6 +423,7 @@ async def run_turn(
                                      rule_id=decision.rule_id, reason=decision.reason, mode=mode)
                         tool_call_log.append({"name": p.name, "args": args, "ok": False,
                                               "result": error_text[:500]})
+                        # 短错误串,天然不撞阈值,不走 offload hook
                         messages.append({
                             "role": "tool",
                             "tool_call_id": p.id or f"unknown_{i}",

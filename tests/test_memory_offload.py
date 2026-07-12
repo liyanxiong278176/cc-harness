@@ -291,3 +291,50 @@ async def test_read_ref_handler_rejects_traversal(tmp_path):
     r = await read_ref_handler({"node_id": "ghost"}, cwd=str(tmp_path), refs_dir=refs_dir)
     assert "秘密内容" not in getattr(r, "llm_text", "")
     # 不 raise 即通过(函数应返 ToolResult 而非抛)
+
+
+# --- Task 5: agent.py after-tool-call hook (allow + ask-yes) ---
+
+
+@pytest.mark.asyncio
+async def test_agent_after_tool_call_offloads(tmp_path):
+    """allow 分支:tool result 超 threshold → maybe_offload 换 pointer + canvas + refs 落盘。
+
+    用 MCP 工具(非 native run_command)避开 RunCommandArgs schema + native 真跑 shell
+    + policy ASK 默认 no 三重坑(对齐 test_agent.py:56 范式)。
+    """
+    from cc_harness.agent import run_turn
+    from tests.test_agent import FakeLLM, FakeMCP, FakeStreamEvent
+    from cc_harness.mcp_client import ToolResult
+    from cc_harness.memory.offload.offload import maybe_offload
+    from cc_harness.tokens import TokenCounter
+    refs_dir = tmp_path / "refs"
+    big = "y " * 3000
+
+    async def _offload(result_text, tool_name, args, *, threshold, token_counter):
+        return await maybe_offload(
+            result_text, tool_name, args, threshold, refs_dir, None, token_counter)
+
+    async def _canvas(node_id, label, summary, edge_from):  # canvas mock(防 KeyError)
+        pass
+
+    offload_deps = {"enabled": True, "threshold": 2000, "offload": _offload, "canvas": _canvas,
+                    "canvas_inject": False, "refs_dir": refs_dir, "canvas_path": tmp_path / "c.md"}
+    # 用 MCP 工具避开 native schema + policy ASK 三重坑
+    fs_tool = {"type": "function", "function": {
+        "name": "mcp__fs__read", "description": "r",
+        "parameters": {"type": "object", "properties": {"path": {"type": "string"}}}}}
+    from cc_harness.llm import PendingToolCall
+    pending = [PendingToolCall(index=0, id="c1", name="mcp__fs__read",
+                               arguments_json='{"path":"x"}')]
+    events = [FakeStreamEvent(kind="done", content="read", pending=pending,
+                              finish_reason="tool_calls")]
+    events2 = [FakeStreamEvent(kind="done", content="done", finish_reason="stop")]
+    llm = FakeLLM(responses=[events, events2])
+    mcp = FakeMCP(tools_spec=[fs_tool],
+                  results={"mcp__fs__read": ToolResult.success(big)}, calls=[])
+    msgs = [{"role": "user", "content": "read x"}]
+    await run_turn(msgs, llm, mcp, max_iter=5, mode="coding", offload_deps=offload_deps)
+    tool_msg = next(m for m in msgs if m.get("role") == "tool")
+    assert "offloaded" in tool_msg["content"] and big not in tool_msg["content"]
+    assert list(refs_dir.glob("*.md"))  # refs 生成
