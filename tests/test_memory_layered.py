@@ -161,3 +161,33 @@ async def test_cluster_scenarios_below_min_atoms(tmp_path):
     assert out == []
     assert list(scen_dir.glob("*.md")) == []  # 不写 md
     await s.close()
+
+
+@pytest.mark.asyncio
+async def test_generate_persona_writes_md(tmp_path):
+    """L1 总数达 trigger_every_n → 生成 persona md。"""
+    from cc_harness.memory.store import MemoryStore
+    from cc_harness.memory.persona import generate_persona
+    s = MemoryStore(db_path=tmp_path/"pe.db", embedding_dim=4); await s.init_schema()
+    for i in range(3):
+        await s.add(f"用户喜欢{i}", [0.1]*4, "pipeline", session_id="sess1")
+    persona_path = tmp_path / "persona.md"
+    out = await generate_persona(s, llm=None, persona_path=persona_path, trigger_every_n=3)
+    assert out is not None
+    assert persona_path.exists()
+    txt = persona_path.read_text(encoding="utf-8")
+    assert "画像" in txt
+    await s.close()
+
+
+@pytest.mark.asyncio
+async def test_generate_persona_below_trigger(tmp_path):
+    """L1 不足 trigger_every_n → 返 None,不写 md。"""
+    from cc_harness.memory.store import MemoryStore
+    from cc_harness.memory.persona import generate_persona
+    s = MemoryStore(db_path=tmp_path/"pe2.db", embedding_dim=4); await s.init_schema()
+    await s.add("一条", [0.1]*4, "pipeline", session_id="sess1")  # 1 < 3
+    persona_path = tmp_path / "persona.md"
+    out = await generate_persona(s, llm=None, persona_path=persona_path, trigger_every_n=3)
+    assert out is None and not persona_path.exists()
+    await s.close()
