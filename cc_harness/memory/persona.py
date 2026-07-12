@@ -11,15 +11,17 @@ async def generate_persona(store, llm, persona_path: Path,
     llm=None 退化为取最近 N 条 L1 文本拼接(MVP)。
     """
     assert store._db is not None
-    cur = await store._db.execute(
-        "SELECT text FROM memories WHERE layer='L1' ORDER BY created_at DESC LIMIT 50")
-    texts = [r[0] for r in await cur.fetchall()]
-    if len(texts) == 0 or len(texts) % trigger_every_n != 0:
+    cur = await store._db.execute("SELECT COUNT(*) FROM memories WHERE layer='L1'")
+    total = (await cur.fetchone())[0]
+    if total == 0 or total % trigger_every_n != 0:
         return None
+    cur2 = await store._db.execute(
+        "SELECT text FROM memories WHERE layer='L1' ORDER BY created_at DESC LIMIT 50")
+    texts = [r[0] for r in await cur2.fetchall()]
     summary = await _llm_persona(llm, texts) if llm else ("；".join(texts[:5]) + "...")
     persona_path.parent.mkdir(parents=True, exist_ok=True)
     persona_path.write_text(
-        f"# 用户画像\n\n{summary}\n\n(based on {len(texts)} atoms)", encoding="utf-8")
+        f"# 用户画像\n\n{summary}\n\n(based on {total} atoms)", encoding="utf-8")
     return Persona(summary=summary, scenario_ids=[], md_path=str(persona_path))
 
 
