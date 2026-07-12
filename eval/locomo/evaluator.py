@@ -1,9 +1,12 @@
-"""QA evaluation: token F1 (locomo official) + deepeval GEval (subjective quality)."""
+"""QA evaluation: semantic F1 (LLM judge, primary) + token F1 (auxiliary) + GEval (diagnostic)."""
 from __future__ import annotations
+import json
 import logging
 import os
 import re
 from typing import Optional
+
+from eval.locomo.metrics import _judge
 
 logger = logging.getLogger(__name__)
 
@@ -78,14 +81,47 @@ def quality_score(prompt: str, predicted: str, gold: str) -> Optional[float]:
         return None
 
 
-def evaluate_qa(prompt: str, predicted: str, gold: str) -> dict:
-    """Returns dict with f1, quality, pass, trace_payload."""
+async def semantic_f1(prompt, predicted, gold, judge_llm) -> Optional[float]:
+    """LLM judge 语义等价分(0.0-1.0)。复用 metrics._judge,fail-soft 返 None。
+
+    judge_llm is None → None(退化 token_f1);judge 返非 JSON / raise → None。
+    """
+    if judge_llm is None:
+        return None
+    system = (
+        '判 predicted answer 与 gold answer 语义是否等价(事实正确,忽略 phrasing/词形/语序)。'
+        '返 JSON {"score": 0.0-1.0}(1.0=完全等价,0.5=部分对,0.0=错)。'
+        '只返 JSON,不要其他文本。'
+    )
+    user = f"question: {prompt}\ngold: {gold}\npred: {predicted}"
+    try:
+        resp = await _judge(judge_llm, system, user)
+        return float(json.loads(resp)["score"])
+    except Exception as e:
+        logger.warning("semantic_f1 judge failed: %s", e)
+        return None
+
+
+async def evaluate_qa(prompt: str, predicted: str, gold: str, judge_llm=None) -> dict:
+    """Returns dict with f1, semantic_f1, quality, pass, trace_payload.
+
+    pass 重构(decision #1):semantic_f1>0.7 主;semantic=None(judge_llm=None 或
+    judge fail-soft)→ token_f1>0.5 fail-soft 兜底。quality 降为 diagnostic,不参与 pass。
+    token_f1 / quality 算法不动。
+    """
     f1 = token_f1(predicted, gold)
+    semantic = await semantic_f1(prompt, predicted, gold, judge_llm)
     quality = quality_score(prompt, predicted, gold)
-    pass_ = (f1 > 0.5) or (quality is not None and quality > 0.7)
+    pass_ = (semantic > 0.7) if semantic is not None else (f1 > 0.5)
     return {
         "f1": f1,
+        "semantic_f1": semantic,
         "quality": quality,
         "pass": pass_,
-        "trace_payload": {"f1": f1, "quality": quality, "pass": pass_},
+        "trace_payload": {
+            "f1": f1,
+            "semantic_f1": semantic,
+            "quality": quality,
+            "pass": pass_,
+        },
     }
