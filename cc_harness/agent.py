@@ -319,9 +319,12 @@ async def run_turn(
                 _total = sum(_tc.count_text(m.get("content", "")) for m in messages)
                 if _cw > 0 and _total / _cw > offload_deps.get("offload_ratio", 0.5):
                     for m in messages:
+                        # prefix match(非子串):pointer 形如 [offloaded node=...];
+                        # 子串 "offloaded" 会误跳含该字面的 legit 大 result(源码/log)。
+                        _content = m.get("content") or ""
                         if (m.get("role") == "tool"
-                                and "offloaded" not in (m.get("content") or "")):
-                            if _tc.count_text(m.get("content") or "") > offload_deps["threshold"]:
+                                and not _content.lstrip().startswith("[offloaded node=")):
+                            if _tc.count_text(_content) > offload_deps["threshold"]:
                                 try:
                                     _off = await offload_deps["offload"](
                                         m["content"], "(batch)", {},

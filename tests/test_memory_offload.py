@@ -555,8 +555,12 @@ async def test_offload_ratio_batch(tmp_path):
 
 @pytest.mark.asyncio
 async def test_plan3_coexist_q4_reduces(tmp_path):
-    """Q4 卸载减载 → Plan3 ratio 不达 tier1(不抢跑)。模拟:offload 后 messages token 降。"""
-    # 验 Q4 卸载后 tool message = pointer(短)→ 总 token < 未卸载 → Plan3 触发概率降
+    """Q4 卸载减载 → Plan3 ratio 不达 tier1(不抢跑)。模拟:offload 后 messages token 降。
+
+    注:本 test 不传 context_config → Plan3 不触发;此处验 Q4 自身 enabled 时大 result 被卸
+    (pointer 短 < big)。Q4↔Plan3 真交互(减载后 Plan3 不抢 / kill 后 Plan3 接管)由 T8 locomo
+    集成(CONTEXT_WINDOW=32768)覆盖。
+    """
     from cc_harness.agent import run_turn
     from tests.test_agent import FakeLLM, FakeMCP, FakeStreamEvent
     from cc_harness.mcp_client import ToolResult
@@ -569,7 +573,7 @@ async def test_plan3_coexist_q4_reduces(tmp_path):
     async def _offload(rt, tn, a, *, threshold, token_counter):
         return await maybe_offload(rt, tn, a, threshold, refs_dir, None, token_counter)
 
-    async def _canvas(nid, l, s, ef):
+    async def _canvas(nid, label, s, ef):
         pass
 
     offload_deps = {"enabled": True, "threshold": 2000, "offload": _offload, "canvas": _canvas,
@@ -592,7 +596,11 @@ async def test_plan3_coexist_q4_reduces(tmp_path):
 
 @pytest.mark.asyncio
 async def test_plan3_coexist_q4_kill(tmp_path):
-    """Q4 kill(enabled=False)→ tool message 不卸(_external 原样),Plan3 接管(summarize 兜底)。"""
+    """Q4 kill(enabled=False)→ tool message 不卸(_external 原样),Plan3 接管(summarize 兜底)。
+
+    注:本 test 不传 context_config → Plan3 不触发;此处验 Q4 自身 disabled 时大 result 不被卸
+    (content 原样,无 pointer)。Plan3 真接管(summarize 兜底)由 T8 locomo 集成覆盖。
+    """
     from cc_harness.agent import run_turn
     from tests.test_agent import FakeLLM, FakeMCP, FakeStreamEvent
     from cc_harness.mcp_client import ToolResult
