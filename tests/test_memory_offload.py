@@ -270,3 +270,24 @@ async def test_extras_deps_has_offload(tmp_path, monkeypatch):
         pytest.skip("memory deps 未就绪(依赖 init)")  # fail-soft 跳过
     assert "refs_dir" in deps and "canvas_path" in deps
     assert "offload" in deps and "canvas" in deps
+
+
+@pytest.mark.asyncio
+async def test_read_ref_handler_rejects_traversal(tmp_path):
+    """read_ref 拒绝路径穿越 + 缺文件返 error(不 raise,不泄露)。"""
+    from cc_harness.memory.offload.read_ref import read_ref_handler
+    refs_dir = tmp_path / "refs"
+    refs_dir.mkdir()
+    # 写一个"诱饵"文件在 refs_dir 之外,验证不被读
+    (tmp_path / "TOPSECRET.md").write_text("秘密内容", encoding="utf-8")
+
+    for bad in ["../TOPSECRET", "..\\TOPSECRET", "/etc/passwd", "", "a/b", "n1.md"]:
+        r = await read_ref_handler({"node_id": bad}, cwd=str(tmp_path), refs_dir=refs_dir)
+        assert getattr(r, "is_error", False) or "秘密内容" not in getattr(r, "llm_text", ""), \
+            f"node_id={bad!r} 应被拒"
+        assert "秘密内容" not in getattr(r, "llm_text", "")  # 绝不泄露
+
+    # 缺文件(valid node_id 但无 refs 文件)→ error 不 raise
+    r = await read_ref_handler({"node_id": "ghost"}, cwd=str(tmp_path), refs_dir=refs_dir)
+    assert "秘密内容" not in getattr(r, "llm_text", "")
+    # 不 raise 即通过(函数应返 ToolResult 而非抛)

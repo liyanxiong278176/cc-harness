@@ -88,12 +88,14 @@ async def build_memory_extras(env: dict, db_path: Path) -> tuple[list[dict], dic
         from cc_harness.memory.offload.mermaid import update_canvas
         from cc_harness.memory.offload.read_ref import READ_REF_SPEC, read_ref_handler
         from cc_harness.memory.config import load_memory_config
-        from cc_harness.config import ContextConfig
+        from cc_harness.config import load_context_config
 
         # load_memory_config:yaml 缺失 → 默认 MemoryConfig();env 覆盖(MEMORY_OFFLOAD_*)。
         # 与 Q3 把 persona.md / scenarios/ 放 db_path.parent 同源,policy.yaml 也从那找。
         mem_cfg = load_memory_config(db_path.parent / "policy.yaml")
-        ctx_cfg = ContextConfig()  # context_window 默认 1_000_000(config.py:L200)
+        # load_context_config 读 CONTEXT_WINDOW env(locomo smoke 用 32768 降窗口测压缩);
+        # 用裸 ContextConfig() 会硬编码 1M → T7 offload_ratio 算错 + smoke 下 Q4 不触发。
+        ctx_cfg = load_context_config()
 
         # refs/canvas 落 <db_path.parent>/memory/(与 db_path 同根,持久化跨轮)
         refs_dir = db_path.parent / "memory" / "refs"

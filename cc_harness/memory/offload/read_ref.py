@@ -77,7 +77,18 @@ async def read_ref_handler(
                 "请用 pointer 中 node= 后的字面值。"
             ),
         )
-    ref_file = Path(refs_dir) / f"{node_id}.md"
+    # Defense-in-depth:即便日后 regex 被放宽,resolve() containment 仍是第二道闸 ——
+    # 解析后路径必须仍在 refs_dir 内,否则拒。regex 是第一道(今天够用),这是第二道。
+    refs_root = Path(refs_dir).resolve()
+    ref_file = refs_root / f"{node_id}.md"
+    try:
+        # ref_file 此处是绝对路径(refs_root 已 resolve),relative_to 仅作 containment 校验。
+        ref_file.relative_to(refs_root)
+    except ValueError:
+        return ToolResult.error(
+            display=f"[read_ref] node_id 越界: {node_id}",
+            llm="[read_ref] invalid node_id",
+        )
     if not ref_file.is_file():
         return ToolResult.error(
             display=f"refs/{node_id}.md 不存在",
