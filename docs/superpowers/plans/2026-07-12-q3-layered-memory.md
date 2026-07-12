@@ -185,7 +185,7 @@ def test_load_memory_config_kill_switch(tmp_path):
     capture_enabled: bool = True      # kill-switch: L0 录制
     pipeline_enabled: bool = True     # kill-switch: L1 提取
 ```
-(加进 `_check_positive_int` validator 列表)
+(pipeline_every_n/scenario_min_atoms/persona_trigger_every_n/recall_top_k 加进 `_check_positive_int` validator;recall_timeout_s 是 float,加单独 `_check_positive` validator 或 float 不 validator)
 - [ ] **Step 4: 加 `load_memory_config(path)` 函数**(参考现有 `cc_harness/config.py:load_*_config` 风格):读 yaml `memory` 段 → MemoryConfig 字段 + env 覆盖(MEMORY_PIPELINE_EVERY_N 等)。未配置 → 默认值。
 - [ ] **Step 5: 跑 PASS**
 - [ ] **Step 6: Commit**
@@ -432,6 +432,8 @@ if memory_layer and memory_layer.get("recall"):
 from cc_harness.memory.pipeline import MemoryPipeline
 from cc_harness.memory.recall import layered_recall
 pipeline = MemoryPipeline(llm=decider_llm, service=service)
+persona_path = db_path.parent / "persona.md"        # 局部变量(closure 引用,必须先赋值)
+scenarios_dir = db_path.parent / "scenarios"
 async def _recall(q, **kw):
     return await layered_recall(retriever, persona_path, scenarios_dir, q,
                                 top_k=kw.get("top_k",5), timeout_s=kw.get("timeout_s",5.0))
@@ -481,7 +483,7 @@ async def test_injection_idempotent_across_turns(tmp_path):
                    mode="plan", cwd=str(tmp_path), memory_layer={"recall": fake_recall})
     # 系统段只含一次"用户画像"(每 turn 重建基 + 注入一次;若累积会 >1)
     # 注:plan/design mode _refresh_system_prompt 重建 messages[0] 为纯基线,注入追加一次
-    assert msgs[0]["content"].count("## 用户画像") <= 2  # 至多每 turn 一处(非无限累积)
+    assert msgs[0]["content"].count("## 用户画像") == 1  # _refresh_system_prompt 每 turn 覆写 system,turn2 最终只 1 处(拦累积 bug)
 ```
 (注:严格幂等需 _refresh_system_prompt 完全重置 system;若实现保留追加,plan 阶段定:重建基线 + 当 turn 注入一次。测试断言 ≤ turn 数。)
 - [ ] **Step 2: 跑 FAIL**
