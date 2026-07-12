@@ -59,6 +59,7 @@ async def run_turn(
     l5: L5Engine | None = None,
     extra_native_specs: list[dict] | None = None,
     context_config: ContextConfig | None = None,
+    memory_layer: dict | None = None,
 ) -> TurnTokenStats:
     """Run one user turn in the given mode.
 
@@ -79,6 +80,11 @@ async def run_turn(
     to match the current mode before the first LLM call. If `cwd` is None,
     the caller is responsible for having the right system prompt in place.
 
+    `memory_layer`(Q3 Task7)可选分层记忆注入:``{"recall": async callable(query)
+    -> RecallResult}``。recall 由 caller 注入(agent 不 import layered_recall,
+    便于测试替身);pre-turn 调用,把 persona/scenarios 拼到 system 段。None
+    或缺 "recall" 键 = kill-switch,不注入。fail-soft:recall 抛异常不崩主循环。
+
     Mutates `messages` in place. Async so the repl can call it from its
     persistent event loop without `asyncio.run` overhead.
     """
@@ -93,6 +99,22 @@ async def run_turn(
 
     if cwd is not None:
         _refresh_system_prompt(messages, cwd, mode)
+
+    # --- Q3 Task7: 分层记忆 pre-turn 注入 ---
+    # memory_layer = {"recall": async callable(query) -> RecallResult}
+    # recall 由 caller 注入(agent.py 不 import layered_recall);fail-soft。
+    if memory_layer and memory_layer.get("recall") and messages:
+        try:
+            _q = next((m.get("content", "") for m in reversed(messages)
+                       if m.get("role") == "user"), "")
+            recall = await memory_layer["recall"](_q)
+            if recall.persona and messages[0].get("role") == "system":
+                messages[0]["content"] += f"\n\n## 用户画像\n{recall.persona.summary[:200]}"
+            if recall.scenarios and messages[0].get("role") == "system":
+                messages[0]["content"] += "\n\n## 相关场景\n" + "\n".join(
+                    f"- {s.summary[:120]}" for s in recall.scenarios)
+        except Exception as e:
+            print_warn(console, f"memory inject failed: {e}")
 
     # --- L4 policy gate setup ---
     project_root = Path(cwd or ".").resolve()

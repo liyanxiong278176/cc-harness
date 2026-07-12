@@ -191,3 +191,61 @@ async def test_generate_persona_below_trigger(tmp_path):
     out = await generate_persona(s, llm=None, persona_path=persona_path, trigger_every_n=3)
     assert out is None and not persona_path.exists()
     await s.close()
+
+
+# --- Task7: recall 分层召回 + run_turn pre-turn 注入 ---
+
+@pytest.mark.asyncio
+async def test_layered_recall_timeout_skips(tmp_path):
+    """retriever 慢 → asyncio.wait_for 超时返空 RecallResult,不阻塞主循环。"""
+    from cc_harness.memory.recall import layered_recall
+
+    class SlowRet:
+        async def search(self, q, top_k=5):
+            import asyncio
+            await asyncio.sleep(10)
+            return []
+    out = await layered_recall(SlowRet(), tmp_path / "persona.md", tmp_path / "scen",
+                               "q", timeout_s=0.1)
+    assert out.persona is None and out.scenarios == [] and out.atoms == []
+
+
+@pytest.mark.asyncio
+async def test_drill_down_traceability(tmp_path):
+    """溯源 Persona→Scenario→Atom→Conversation 全链。"""
+    from cc_harness.memory.store import MemoryStore
+    from cc_harness.memory.recall import read_persona, read_top_scenarios
+    s = MemoryStore(db_path=tmp_path / "dr.db", embedding_dim=4); await s.init_schema()
+    mid = (await s.add("用户喜欢猫", [0.1] * 4, "pipeline", session_id="sess1")).id
+    await s.add_conversation("sess1", 0, "user", "我养了只猫", 1.0)
+    scen_dir = tmp_path / "scen"; scen_dir.mkdir()
+    (scen_dir / "sess1-1.md").write_text(f"summary: 养宠\natom_ids:\n- {mid}", encoding="utf-8")
+    (tmp_path / "persona.md").write_text("# 画像\n爱宠物", encoding="utf-8")
+    pe = read_persona(tmp_path / "persona.md"); assert pe and "宠物" in pe.summary
+    scs = read_top_scenarios(scen_dir, 5); assert mid in scs[0].atom_ids
+    mem = await s.get(mid); assert mem and mem.session_id == "sess1"
+    cur = await s._db.execute("SELECT content FROM conversation WHERE session_id=?", ("sess1",))
+    assert "猫" in (await cur.fetchone())[0]
+    await s.close()
+
+
+@pytest.mark.asyncio
+async def test_run_turn_memory_layer_injects(tmp_path):
+    """run_turn 加 memory_layer → 系统段含 persona;kill-switch(None)则不注入。"""
+    from cc_harness.agent import run_turn
+    from tests.test_agent import FakeLLM, FakeMCP, FakeStreamEvent
+    from cc_harness.memory.models import Persona, RecallResult
+
+    async def fake_recall(q, **kw):
+        return RecallResult(persona=Persona("偏好简洁", [], str(tmp_path / "p.md")))
+    events = [FakeStreamEvent(kind="content", text="ok"),
+              FakeStreamEvent(kind="done", content="ok", finish_reason="stop")]
+    msgs = [{"role": "system", "content": "sys"}, {"role": "user", "content": "hi"}]
+    await run_turn(msgs, FakeLLM(responses=[events]), FakeMCP(tools_spec=[], results={}, calls=[]),
+                   mode="plan", cwd=str(tmp_path), memory_layer={"recall": fake_recall})
+    assert "偏好简洁" in msgs[0]["content"]
+    # kill-switch:memory_layer=None 不注入
+    msgs2 = [{"role": "system", "content": "sys"}, {"role": "user", "content": "hi"}]
+    await run_turn(msgs2, FakeLLM(responses=[events]), FakeMCP(tools_spec=[], results={}, calls=[]),
+                   mode="plan", cwd=str(tmp_path), memory_layer=None)
+    assert "偏好简洁" not in msgs2[0]["content"]

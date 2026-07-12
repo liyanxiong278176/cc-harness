@@ -24,6 +24,8 @@ async def build_memory_extras(env: dict, db_path: Path) -> tuple[list[dict], dic
             MEMORY_RECALL_SPEC, MEMORY_SAVE_SPEC,
             memory_recall_handler, memory_save_handler,
         )
+        from cc_harness.memory.pipeline import MemoryPipeline
+        from cc_harness.memory.recall import layered_recall
         from cc_harness.llm import LLMClient
     except ImportError as e:
         print(f"[memory] import failed: {e}; running without memory tools")
@@ -49,8 +51,25 @@ async def build_memory_extras(env: dict, db_path: Path) -> tuple[list[dict], dic
         print(f"[memory] service init failed: {e}; running without memory tools")
         return [], None
 
+    # --- Q3 Task7: pipeline + 分层 recall callable(closure 绑定 retriever /
+    # persona_path / scenarios_dir)。persona_path/scenarios_dir 必须先赋值
+    # 再定义 _recall,否则 closure 引用会 NameError。 ---
+    pipeline = MemoryPipeline(llm=decider_llm, service=service)
+    persona_path = db_path.parent / "persona.md"
+    scenarios_dir = db_path.parent / "scenarios"
+
+    async def _recall(q, **kw):
+        return await layered_recall(
+            retriever, persona_path, scenarios_dir, q,
+            top_k=kw.get("top_k", 5), timeout_s=kw.get("timeout_s", 5.0),
+        )
+
     extras = [
         {"spec": MEMORY_RECALL_SPEC, "handler": memory_recall_handler, "deps": {"retriever": retriever}},
         {"spec": MEMORY_SAVE_SPEC, "handler": memory_save_handler, "deps": {"service": service}},
     ]
-    return extras, {"service": service, "retriever": retriever}
+    return extras, {
+        "service": service, "retriever": retriever, "pipeline": pipeline,
+        "recall": _recall, "store": store,
+        "persona_path": persona_path, "scenarios_dir": scenarios_dir,
+    }
