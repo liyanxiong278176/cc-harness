@@ -215,6 +215,7 @@ class ContextConfig(BaseModel):
             assert 0 < t < 1, f"threshold {t} not in (0,1)"
         assert self.tier1_threshold < self.tier2_threshold < self.tier3_threshold, \
             "thresholds must be strictly increasing"
+        # Plan3 tier1:若调整上限,MemoryConfig.offload_ratio validator 上限也需同步(< tier1)
         assert self.protect_zone_tokens >= 0 and self.context_window > 0
         return self
 

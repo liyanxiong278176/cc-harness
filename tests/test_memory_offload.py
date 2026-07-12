@@ -23,6 +23,8 @@ def test_memory_config_offload_ratio_lt_tier1():
     from pydantic import ValidationError
     with pytest.raises((MemoryConfigError, ValidationError)):
         MemoryConfig(offload_ratio=0.7)
+    with pytest.raises((MemoryConfigError, ValidationError)):
+        MemoryConfig(offload_ratio=0.6)   # strict boundary: == 0.6 also rejected
 
 
 def test_load_memory_config_offload_env(tmp_path, monkeypatch):

@@ -120,10 +120,11 @@ class MemoryConfig(BaseModel):
         # 见 cc_harness/config.py:ContextConfig.tier1_threshold)。否则卸载会在
         # tier1 Snip 之前抢跑,破坏 Plan3 的压缩层级顺序。
         # 字面 0.6 比较:tier1 若调整,此处需同步(留 comment 防 drift)。
+        # 两分支统一抛 ValueError:pydantic 统包为 ValidationError,与
+        # _check_positive_int / _check_mermaid_ratio 风格一致(非对称 MemoryConfigError
+        # 会让 `except MemoryConfigError` 漏接负值分支)。
         if v >= 0.6:
-            raise _get_memory_config_error()(
-                f"offload_ratio must be < 0.6 (Plan3 tier1_threshold), got {v}"
-            )
+            raise ValueError(f"offload_ratio must be < 0.6 (Plan3 tier1_threshold), got {v}")
         if v <= 0:
             raise ValueError(f"offload_ratio must be > 0, got {v}")
         return v
