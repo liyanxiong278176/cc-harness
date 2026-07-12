@@ -223,3 +223,50 @@ async def test_update_canvas_llm_none_fail_soft(tmp_path):
         edge_from=None, canvas_path=canvas3, llm=EmptyLLM(),
     )
     assert 'y1["t2"]' in out4                  # 空 content 也回退 label
+
+
+# --- Task 4: read_ref 工具 + extras deps offload 锭 + node_id 溯源链 ---
+
+
+@pytest.mark.asyncio
+async def test_read_ref_handler(tmp_path):
+    from cc_harness.memory.offload.read_ref import read_ref_handler, READ_REF_SPEC
+    refs_dir = tmp_path / "refs"
+    refs_dir.mkdir()  # test-only:create refs root so the write succeeds
+    (refs_dir / "n1.md").write_text("完整原文", encoding="utf-8")
+    r = await read_ref_handler({"node_id": "n1"}, cwd=str(tmp_path), refs_dir=refs_dir)
+    assert "完整原文" in r.llm_text
+    assert READ_REF_SPEC["function"]["name"] == "read_ref"
+
+
+@pytest.mark.asyncio
+async def test_node_id_traceability(tmp_path):
+    """溯源全链:offload → refs + pointer;read_ref(pointer.node_id) → refs 原文。"""
+    from cc_harness.memory.offload.offload import maybe_offload
+    from cc_harness.memory.offload.read_ref import read_ref_handler
+    from cc_harness.tokens import TokenCounter
+    refs_dir = tmp_path / "refs"
+    out = await maybe_offload("原始大结果 " * 1000, "run_command", {}, 2000, refs_dir,
+                              None, TokenCounter())
+    # pointer 含 node_id → read_ref 回查
+    assert "node=" in out.pointer_msg
+    r = await read_ref_handler({"node_id": out.node_id}, cwd=str(tmp_path), refs_dir=refs_dir)
+    assert "原始大结果" in r.llm_text  # 原文恢复
+
+
+@pytest.mark.asyncio
+async def test_extras_deps_has_offload(tmp_path, monkeypatch):
+    """build_memory_extras deps 含 offload 锭(self-contained:mock 依赖)。"""
+    import os
+    monkeypatch.setenv("OPENAI_API_KEY", "sk-test")
+    monkeypatch.setenv("OPENAI_BASE_URL", "http://x")
+    monkeypatch.setenv("OPENAI_MODEL", "m")
+    monkeypatch.setenv("EMBEDDING_BASE_URL", "http://x")
+    monkeypatch.setenv("EMBEDDING_API_KEY", "k")
+    monkeypatch.setenv("EMBEDDING_MODEL", "bge-m3")
+    from cc_harness.memory.extras import build_memory_extras
+    extras, deps = await build_memory_extras({**os.environ}, tmp_path / "mem.db")
+    if deps is None:
+        pytest.skip("memory deps 未就绪(依赖 init)")  # fail-soft 跳过
+    assert "refs_dir" in deps and "canvas_path" in deps
+    assert "offload" in deps and "canvas" in deps

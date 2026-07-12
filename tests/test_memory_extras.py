@@ -12,7 +12,9 @@ def test_build_memory_extras_returns_extras_when_deps_ok(monkeypatch, tmp_path):
            "EMBEDDING_BASE_URL": "u", "EMBEDDING_API_KEY": "k", "EMBEDDING_MODEL": "bge"}
     from cc_harness.memory.extras import build_memory_extras
     extras, deps = asyncio.run(build_memory_extras(env, tmp_path / "mem.db"))
-    assert len(extras) == 2
+    # Q3 建 2 个 memory_* tool;Q4 起 extras 也含 read_ref(offload 锭就绪时)。
+    # 用 >= 2 + 名字 in 检查,既守住 Q3 intent,又容纳 Q4+ 新增 tool。
+    assert len(extras) >= 2
     names = [e["spec"]["function"]["name"] for e in extras]
     assert "memory_recall" in names and "memory_save" in names
     assert deps is not None
