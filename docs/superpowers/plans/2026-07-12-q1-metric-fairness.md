@@ -55,8 +55,8 @@ async def test_evaluate_qa_returns_dict_with_expected_keys():
 async def test_evaluate_qa_fail_when_low_f1_and_no_quality():
     result = await evaluate_qa("q", "completely wrong answer xyzzy", "the cat sat on the mat")
     assert result["f1"] < 0.3
-    if result["quality"] is None:
-        assert result["pass"] is False          # f1<0.5 fallback
+    assert result["semantic_f1"] is None        # judge_llm=None → 无 semantic
+    assert result["pass"] is False              # f1<0.5 fallback;quality 已不参与 pass(decision #1)
 ```
 
 - [ ] **Step 2: 加 semantic_f1 + pass 重构 test**(追加 test_evaluator.py):
