@@ -159,3 +159,50 @@ async def test_extra_specs_dispatched_to_handler(monkeypatch):
     # deps are merged into kwargs
     assert call.kwargs.get("retriever") == "fake-retriever", \
         f"deps must be passed through as kwargs, got {call.kwargs!r}"
+
+
+# --- Phase 1 Q1 uplift: qa_context kwarg injects qa_intro into system prompt ---
+
+@pytest.mark.asyncio
+async def test_qa_context_injects_qa_intro_into_system_prompt(monkeypatch):
+    """传 qa_context={"q_type": N} → run_turn 重渲 system 段含 qa_intro + cat=N。"""
+    from cc_harness import agent as agent_mod
+    llm = _FakeLLM(responses=[[
+        _FakeStreamEvent(kind="content", text="hi"),
+        _FakeStreamEvent(kind="done", content="hi", pending=[], finish_reason="stop"),
+    ]])
+    mcp = _FakeMCP(tools_spec=[], results={})
+    monkeypatch.setattr(agent_mod, "confirm_tool", lambda *a, **k: "yes")
+    cwd = str(Path(os.getcwd()).resolve())
+    messages = [{"role": "user", "content": "Q: test?"}]
+    await agent_mod.run_turn(
+        messages, llm, mcp, max_iter=1, mode="chat", cwd=cwd,
+        qa_context={"q_type": 2, "must_answer": True},
+    )
+    sys = messages[0]
+    assert sys.get("role") == "system"
+    assert "当前问题类型:QA" in sys["content"]
+    assert "cat=2" in sys["content"]
+    # 必须答规则
+    assert "必须给出具体答案" in sys["content"]
+
+
+@pytest.mark.asyncio
+async def test_qa_context_none_keeps_legacy_prompt(monkeypatch):
+    """qa_context=None → 不渲染 qa_intro(向后兼容,test_agent.py 等不传 qa_context 不受影响)。"""
+    from cc_harness import agent as agent_mod
+    llm = _FakeLLM(responses=[[
+        _FakeStreamEvent(kind="content", text="ok"),
+        _FakeStreamEvent(kind="done", content="ok", pending=[], finish_reason="stop"),
+    ]])
+    mcp = _FakeMCP(tools_spec=[], results={})
+    monkeypatch.setattr(agent_mod, "confirm_tool", lambda *a, **k: "yes")
+    cwd = str(Path(os.getcwd()).resolve())
+    messages = [{"role": "user", "content": "hi"}]
+    await agent_mod.run_turn(
+        messages, llm, mcp, max_iter=1, mode="chat", cwd=cwd,
+        # 不传 qa_context
+    )
+    sys = messages[0]
+    assert "当前问题类型" not in sys["content"]
+

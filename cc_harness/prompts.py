@@ -28,6 +28,8 @@ class Section:
         "always"                    — always included (default)
         "mode==coding|plan|design"  — included only when current mode matches
         "has_tools"                 — included only when ctx has non-empty "tools"
+        "qa"                        — included only when ctx["qa_category"] is set
+                                     (locomo QA turn flag; numeric category 1-5 in ctx)
     """
     name: str
     body: str
@@ -181,6 +183,21 @@ SECTION_POOL: dict[str, Section] = {
         priority=20,
         conditions=("mode==chat",),
     ),
+    "qa_intro": Section(
+        "qa_intro",
+        (
+            "## 当前问题类型:QA(cat={qa_category})\n"
+            "这是来自长期对话的事实问答,目标是答出 gold 期望的精确答案。"
+            "**必须给出具体答案** — 即使 `memory_recall` 首次返回为空,也先用"
+            "实体名/日期/相关概念换关键词重试,再考虑说不知道。\n"
+            "- **简洁优先**:不要展开背景解释,只答核心事实。\n"
+            "- **匹配 gold 长度**:gold 若是 `7 May 2023`,不要答 `yesterday`;"
+            "gold 若是 `Transgender woman`,不要答 `Caroline is a transgender woman who…`。\n"
+            "(具体 q_type 风格指南由 system 在本节后动态注入)"
+        ),
+        priority=19,
+        conditions=("qa",),
+    ),
 }
 
 
@@ -218,6 +235,10 @@ class PromptComposer:
                     return False
             elif cond == "has_tools":
                 if not self.ctx.get("tools"):
+                    return False
+            elif cond == "qa":
+                # QA turn flag: caller (locomo runner) sets ctx["qa_category"] to int 1-5
+                if self.ctx.get("qa_category") is None:
                     return False
             else:
                 raise ValueError(

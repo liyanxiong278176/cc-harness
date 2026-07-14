@@ -61,6 +61,7 @@ async def run_turn(
     context_config: ContextConfig | None = None,
     memory_layer: dict | None = None,
     offload_deps: dict | None = None,
+    qa_context: dict | None = None,
 ) -> TurnTokenStats:
     """Run one user turn in the given mode.
 
@@ -93,6 +94,10 @@ async def run_turn(
     仅 allow + ask-yes 分支走 hook(其余 4 处短错误天然不撞阈值)。fail-soft:
     offload/canvas 抛异常 → 回退原文,不崩主循环。
 
+    `qa_context`(Phase 1 Q1 uplift)可选 QA 模式标记:``{"q_type": int, "must_answer": bool}``。
+    设了之后系统段会渲染 qa_intro 段(必须答规则 + 简洁风格),并把 q_type 注入
+    模板 `{qa_category}`。None = 不渲染(向后兼容,test_agent.py 不受影响)。
+
     Mutates `messages` in place. Async so the repl can call it from its
     persistent event loop without `asyncio.run` overhead.
     """
@@ -107,7 +112,14 @@ async def run_turn(
     _last_node = None  # Q4 Task5: offload edge chain — node_id of last offloaded tool result
 
     if cwd is not None:
-        _refresh_system_prompt(messages, cwd, mode)
+        # Phase 1 Q1 uplift: qa_context → render qa_intro section
+        if qa_context and qa_context.get("q_type") is not None:
+            _refresh_system_prompt(
+                messages, cwd, mode,
+                extra_ctx={"qa_category": qa_context["q_type"]},
+            )
+        else:
+            _refresh_system_prompt(messages, cwd, mode)
 
     # --- Q3 Task7: 分层记忆 pre-turn 注入 ---
     # memory_layer = {"recall": async callable(query) -> RecallResult}
@@ -557,10 +569,20 @@ def _pending_to_openai_tc(p) -> dict:
     }
 
 
-def _refresh_system_prompt(messages: list[dict], cwd: str, mode: str) -> None:
-    """Insert or update the system prompt at messages[0] for the current mode."""
+def _refresh_system_prompt(messages: list[dict], cwd: str, mode: str,
+                           extra_ctx: dict | None = None) -> None:
+    """Insert or update the system prompt at messages[0] for the current mode.
+
+    `extra_ctx` (Phase 1 Q1 uplift) is merged into the composer ctx so callers
+    can gate qa-aware sections (e.g. qa_intro needs ctx["qa_category"]).
+    """
     from cc_harness.prompts import build_system_prompt
-    prompt = build_system_prompt(cwd, mode=mode)
+    if extra_ctx:
+        from cc_harness.prompts import PromptComposer
+        ctx = {"cwd": cwd, **extra_ctx}
+        prompt = PromptComposer(mode=mode, ctx=ctx).render()
+    else:
+        prompt = build_system_prompt(cwd, mode=mode)
     if messages and messages[0].get("role") == "system":
         messages[0]["content"] = prompt
     else:

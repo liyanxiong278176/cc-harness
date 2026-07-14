@@ -349,3 +349,42 @@ def test_render_assistant_toolcall():
         {"role": "assistant", "content": None, "tool_calls": [{"function": {"name": "f", "arguments": "{}"}}]}
     ])
     assert "tool_call" in text and "f" in text
+
+
+# --- Phase 1 Q1 uplift: qa condition + qa_intro section ---
+
+def test_qa_condition_excludes_when_no_qa_category():
+    """没设 qa_category → qa_intro 不渲染(向后兼容 non-QA 路径)。"""
+    out = PromptComposer(mode="chat", ctx={"cwd": "/x"}).render()
+    assert "qa_intro" not in out
+    assert "当前问题类型" not in out
+
+def test_qa_condition_includes_when_qa_category_set():
+    """设 qa_category → qa_intro 渲染,且模板 {qa_category} 被填。"""
+    out = PromptComposer(mode="chat", ctx={"cwd": "/x", "qa_category": 2}).render()
+    assert "当前问题类型:QA" in out
+    assert "cat=2" in out
+    # 必须答规则出现
+    assert "必须给出具体答案" in out
+
+def test_qa_condition_works_in_plan_mode():
+    """qa condition 与 mode 解耦 — plan + qa 也会渲染(虽然不常见)。"""
+    out = PromptComposer(mode="plan", ctx={"cwd": "/x", "qa_category": 5}).render()
+    assert "cat=5" in out
+
+def test_qa_intro_section_in_pool_with_qa_condition():
+    """SECTION_POOL 注册了 qa_intro + 正确 condition 元数据。"""
+    s = SECTION_POOL["qa_intro"]
+    assert s.conditions == ("qa",)
+    assert s.priority == 19
+    assert "{qa_category}" in s.body
+
+def test_qa_intro_body_mentions_must_answer_rule():
+    """qa_intro 段必含"实体名/日期/相关概念换关键词重试" 的硬规则(下游 Phase 2 配合)。"""
+    s = SECTION_POOL["qa_intro"]
+    assert "实体名" in s.body or "日期" in s.body
+    assert "重试" in s.body or "换关键词" in s.body
+    # 简洁优先 + 长度匹配
+    assert "简洁" in s.body
+    assert "gold" in s.body
+

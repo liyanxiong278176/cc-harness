@@ -153,11 +153,17 @@ async def _after_turn_memory(mem_deps: dict, mem_cfg, session_id: str,
 
 
 async def _run_sample(sample: dict, policy: dict, extras: list[dict], trace: LocomoTrace,
-                      mem_deps: dict | None = None) -> list[dict]:
+                      mem_deps: dict | None = None,
+                      max_turns: int | None = None,
+                      qa_limit: int | None = None) -> list[dict]:
     """Replay a single sample. Returns list of per-QA result dicts.
 
     Q3 Task8: mem_deps 非 None 时,turn 循环末接 after-turn hook(capture L0 +
     pipeline L1 + scenario L2 + persona L3),QA run_turn 传 memory_layer。
+
+    小范围烟测用 cap:
+    - max_turns: turn loop 上限(默认 policy.max_turns_per_sample,None = 不 cap)
+    - qa_limit:  QA loop 上限(None = 跑全量)
     """
     from cc_harness.llm import LLMClient
     from cc_harness.mcp_client import MCPClient
@@ -165,7 +171,8 @@ async def _run_sample(sample: dict, policy: dict, extras: list[dict], trace: Loc
 
     parsed = ds.parse_sample(sample)
     session_id = parsed.sample_id  # Q3 Task8: 每样本一个 session_id
-    turns = list(ds.iter_turns(parsed))[: policy.get("max_turns_per_sample", 500)]
+    cap = max_turns if max_turns is not None else policy.get("max_turns_per_sample", 500)
+    turns = list(ds.iter_turns(parsed))[:cap]
     started = time.time()
     sample_timeout_s = policy.get("sample_timeout_s", 1800)
 
@@ -241,17 +248,22 @@ async def _run_sample(sample: dict, policy: dict, extras: list[dict], trace: Loc
 
         # Ask each QA(基于累积的 messages,带全对话上下文)
         results = []
-        for qa in ds.iter_qa(parsed):
+        qa_iter = ds.iter_qa(parsed)
+        if qa_limit is not None:
+            from itertools import islice
+            qa_iter = islice(qa_iter, qa_limit)
+        for qa in qa_iter:
             qa_messages = list(messages) + [{"role": "user", "content": qa.question}]
             span = trace.start_turn(-1, qa.question)
             try:
                 stats = await run_turn(
                     qa_messages, llm, mcp,
                     extra_native_specs=extras,
-                    max_iter=6, mode="chat", cwd=str(REPO),
+                    max_iter=8, mode="chat", cwd=str(REPO),  # Phase 1: 6→8 (qa 必须答需要 retry 余量)
                     context_config=ContextConfig(),  # Plan3: QA 上下文触发压缩
                     memory_layer=memory_layer,       # Q3 Task8: QA 也注入分层记忆
                     offload_deps=offload_deps,       # Q4 Task7: QA 也走短期卸载
+                    qa_context={"q_type": qa.category, "must_answer": True},  # Phase 1: 触发 qa_intro
                 )
                 predicted = qa_messages[-1].get("content", "") or ""
                 trace.record_llm(span, env.get("OPENAI_MODEL", "?"),
@@ -273,6 +285,8 @@ async def _run_sample(sample: dict, policy: dict, extras: list[dict], trace: Loc
                 "turn_idx": -1,
                 "q_type": qa.category,
                 "question": qa.question,  # Plan4: 对齐 evidence(compute_memory 按 (sample_id, question) 查)
+                "predicted": predicted,  # debug: q_type=2/5 诊断(judge 严 or 答错)
+                "gold": qa.answer,        # debug: 同上
                 "status": "ok" if eval_result["quality"] is not None else "quality_null",
                 "f1": eval_result["f1"],
                 "semantic_f1": eval_result["semantic_f1"],
@@ -338,6 +352,16 @@ def main():
     ap.add_argument("--resume", action="store_true")
     ap.add_argument("--no-memory-tools", action="store_true")
     ap.add_argument("--output-dir", type=Path, default=REPO / "eval" / "result")
+    # 小范围烟测用:限制单 sample 的 turn / QA 数量,默认 None = 跑全量
+    ap.add_argument("--max-turns", type=int, default=None,
+                    help="cap turn loop per sample (default: policy.max_turns_per_sample=500)")
+    ap.add_argument("--qa-limit", type=int, default=None,
+                    help="cap QA loop per sample (default: run all QAs)")
+    ap.add_argument("--keep-trace", dest="keep_trace", action="store_true", default=True,
+                    help="write per-turn trace.jsonl to <output>/<sample_id>.trace.jsonl "
+                         "(default: True; --no-keep-trace to disable)")
+    ap.add_argument("--no-keep-trace", dest="keep_trace", action="store_false",
+                    help="disable trace.jsonl writing")
     args = ap.parse_args()
 
     # Plan1: 让 memory_save 等 ASK 工具在 batch 模式放行
@@ -385,6 +409,13 @@ def main():
             print("[yellow]LANGFUSE_* env not set; trace will be no-op (graceful)")
             enabled_trace = False
 
+    # 启动时打印 trace 落盘路径(给用户/防自动清理 hook 监控用)
+    if args.keep_trace:
+        print(f"[trace] per-turn JSONL → {args.output_dir}/<sample_id>.trace.jsonl "
+              f"(keep=True)", flush=True)
+    else:
+        print("[trace] per-turn JSONL disabled (--no-keep-trace)", flush=True)
+
     async def amain():
         nonlocal all_results, done
         extras, mem_deps = await _build_memory_extras(
@@ -393,9 +424,17 @@ def main():
 
         for sample in samples:
             print(f"[runner] sample {sample['sample_id']} ...", flush=True)
-            trace = LocomoTrace(sample["sample_id"], enabled=enabled_trace)
+            trace = LocomoTrace(
+                sample["sample_id"],
+                enabled=enabled_trace,
+                jsonl_path=(args.output_dir / f"{sample['sample_id']}.trace.jsonl")
+                            if args.keep_trace else None,
+            )
             try:
-                results = await _run_sample(sample, policy, extras, trace, mem_deps=mem_deps)
+                results = await _run_sample(
+                sample, policy, extras, trace, mem_deps=mem_deps,
+                max_turns=args.max_turns, qa_limit=args.qa_limit,
+            )
             except Exception as e:
                 results = [{"sample_id": sample["sample_id"], "turn_idx": -1, "q_type": "n/a",
                             "status": "agent_crash", "f1": None, "quality": None, "pass": False,
