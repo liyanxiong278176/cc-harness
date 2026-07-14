@@ -91,6 +91,34 @@
 
 ### Task 1.1: 数据类 models.py
 
+- [ ] **Step 0: 准备 fixtures 目录**(基础设施,后续 task 复用)
+
+```bash
+mkdir -p tests/fixtures/project_minimal/.cc-harness/todos
+mkdir -p tests/fixtures/project_with_tasks/.cc-harness/todos
+mkdir -p tests/fixtures/project_invalid/.cc-harness/todos
+```
+
+同时在 `tests/conftest.py` 加 fixture factory:
+```python
+@pytest.fixture
+def tmp_project(tmp_path):
+    """Create minimal project layout. Returns Path to project root."""
+    proj = tmp_path / "proj"
+    proj.mkdir()
+    cc = proj / ".cc-harness"
+    cc.mkdir()
+    (cc / "todos").mkdir()
+    (cc / "todos" / "todos.yaml").write_text("tasks: []\n", encoding="utf-8")
+    return proj
+
+@pytest.fixture
+def tmp_project_with_tasks(tmp_path):
+    """Create project with 6 sample tasks. See Task 1.3 for fixture content."""
+    # 由 Task 1.3 步骤产出
+    ...
+```
+
 - [ ] **Step 1: 写失败测试**
 
 ```python
@@ -251,9 +279,12 @@ def test_storage_save_and_load(storage):
 
 实现要点(spec 组件 5):
 - `todos.yaml` 格式:`tasks:\n  - id: ...\n    title: ...\n    ...`(单层 list)
-- md 文件 frontmatter:```---\nid: ...\ntitle: ...\n...\n---\n\n{description body}```
-- 合并 policy:`load_all` 时以 yaml 为主索引,md frontmatter 仅作 description 来源;md 缺失 → warn + description="";md 多余 → warn + 不引入
-- 原子写:`todos.yaml.tmp` → `os.replace`
+- md 文件 frontmatter:`---\nid: ...\ntitle: ...\n...\n---\n\n{description body}`(**save 时 frontmatter 写 T15 全字段**,便于人直接 cat 看)
+- **save / load 行为对应**(单向):
+  - **save**:md frontmatter = yaml T15 全字段(含 active_sessions / id / created_at / updated_at);body = description markdown 原文
+  - **load**:yaml 是主索引,所有字段以 yaml 为准;md frontmatter **仅当 yaml 缺 description 字段时回退填入**(即 yaml.description 为空字符串 + md 存在 → 用 md.body 填充);md frontmatter 其他字段冲突 → warn log + 以 yaml 为准
+- md 缺失 → warn + description="";md 多余(yaml 不引用)→ warn + 询问用户,绝不静默 prune
+- 原子写:`todos.yaml.tmp` → `os.replace`;md 写前先 `mkdir -p todos/`
 - `active_sessions` prune:长度 > 50 → 截断为最近 50 + `# earlier N truncated at {ts}`
 
 - [ ] **Step 6: 补 md frontmatter 序列化测试 + commit**
@@ -275,7 +306,7 @@ git commit -m "feat(project): TodoStorage yaml+md 双文件,合并策略,active_
 
 ### Task 2.1: 状态守卫 status.py
 
-- [ ] **Step 1: 写失败测试**
+- [ ] **Step 1: 写失败测试(parametrize 全 19 转移)**
 
 ```python
 # tests/test_project_status.py
@@ -293,35 +324,45 @@ def _task(status="pending"):
                     effort_estimate=None, acceptance_criteria=[],
                     active_sessions=[])
 
-def test_status_guard_pending_to_in_progress():
-    status_guard(_task("pending"), "in_progress")  # OK,不抛
+# 合法转移 13 个(spec 组件 3 完整规则表)
+VALID_TRANSITIONS = [
+    ("pending", "in_progress"), ("pending", "cancelled"), ("pending", "blocked"),
+    ("in_progress", "pending"), ("in_progress", "done"), ("in_progress", "blocked"),
+    ("in_progress", "cancelled"),
+    ("blocked", "in_progress"), ("blocked", "cancelled"), ("blocked", "pending"),
+    ("cancelled", "pending"),
+    # 同状态 idempotent 也算合法(spec 隐含;实际实现允许)
+    ("pending", "pending"), ("in_progress", "in_progress"),
+]
 
-def test_status_guard_done_is_terminal():
+@pytest.mark.parametrize("current,target", VALID_TRANSITIONS)
+def test_status_guard_valid_transitions(current, target):
+    status_guard(_task(current), target)  # OK,不抛
+
+# 非法转移 5 个(done 终态 4 种 + unknown status 1 种)
+INVALID_TRANSITIONS = [
+    ("done", "pending"), ("done", "in_progress"), ("done", "blocked"), ("done", "cancelled"),
+    ("pending", "garbage"),
+]
+
+@pytest.mark.parametrize("current,target", INVALID_TRANSITIONS)
+def test_status_guard_invalid_transitions(current, target):
+    with pytest.raises(StatusGuardError):
+        status_guard(_task(current), target)
+
+def test_status_guard_done_terminal_message():
     with pytest.raises(StatusGuardError, match="done is terminal"):
         status_guard(_task("done"), "pending")
-
-def test_status_guard_pending_to_cancelled():
-    status_guard(_task("pending"), "cancelled")
-
-def test_status_guard_in_progress_to_blocked():
-    status_guard(_task("in_progress"), "blocked")
-
-def test_status_guard_cancelled_to_pending():
-    status_guard(_task("cancelled"), "pending")
-
-def test_status_guard_unknown_status():
-    with pytest.raises(StatusGuardError, match="unknown status"):
-        status_guard(_task("pending"), "garbage")
 ```
 
 - [ ] **Step 2-4**:失败 → 实现 → 通过
 
 实现:按 spec 组件 3 规则表实现 `status_guard(current: TodoTask, new_status: str) -> None`,raise `StatusGuardError` on illegal transition。
 
-- [ ] **Step 5: 100% 覆盖验证**
+- [ ] **Step 5: 100% 覆盖验证(branch coverage)**
 
-Run: `.venv/Scripts/python.exe -m pytest tests/test_project_status.py --cov=cc_harness/project/status --cov-report=term-missing`
-Expected: 100% line + branch coverage
+Run: `.venv/Scripts/python.exe -m pytest tests/test_project_status.py --cov=cc_harness/project/status --cov-branch --cov-report=term-missing`
+Expected: 100% line + branch coverage(parametrize 13 valid + 5 invalid + done_message = 19 cases 真正覆盖所有分支)
 
 - [ ] **Step 6: commit**
 
@@ -467,11 +508,11 @@ async def test_resolve_returns_chain(svc):
 
 - [ ] **Step 2-4**:失败 → 实现 → 通过
 
-实现要点(spec 组件 2 + 7):
-- `TodoService(project_root, manifest, llm=None, memory_service=None)`
+实现要点(spec 组件 2 + 7 + 10):
+- `TodoService(project_root, manifest, llm=None, memory_service: MemoryService | None = None)` — **memory_service 是 opt-in completion_capture 钩子的依赖,REPL 接线时由 `state.mem_deps["service"]` 注入(见 Task 6.3 step 2)**
 - 7 操作:list/get/create/update/delete/resolve/validate(签名照 spec)
 - `subscribe(callback) / unsubscribe(callback)`(callback 收 TodoTask + TodoEvent)
-- `update()` 内部:`prev_status != "done" and task.status == "done"` 时 await `_on_completion(task)`(Task 3.2 接通)
+- `update()` 内部:`prev_status != "done" and task.status == "done"` 时 await `self._on_completion(task)`(`_on_completion` 内部 await `on_task_completion(task, self.manifest, self.memory_service)`,memory_service 为 None 或 completion_capture=False 时立即 return)
 - `create()` 自动 gen id(uuid4 hex[:8])+ created_at + updated_at;session_id append 到 active_sessions
 - `update(task_id, *, session_id=None, **fields)` 走状态守卫 + 依赖子图校验
 - `delete(task_id, force=False)`:force=False 拒绝 done/有 dependents;force=True 强制,产生 dangling refs(不级联删)
@@ -584,31 +625,29 @@ def test_all_specs_have_function():
 
 async def test_create_handler_returns_llm_visible_text(deps):
     result = await todo_create_handler({"title": "hello"}, **deps)
-    text = result.llm_text  # 或 handler 返回的字符串
-    assert "[todo_create]" in text
-    assert "hello" in text
-    assert "abc" not in text  # id 应该出现
+    # ToolResult 是 dataclass,不是字符串;对齐 cc_harness/mcp_client.py:ToolResult
+    assert "[todo_create]" in result.llm
+    assert "hello" in result.llm
 
 async def test_create_handler_error_message_llm_friendly(deps):
-    # create 一个会形成环的 task → handler 应返回 LLM 友好错误
     a = await deps["service"].create(title="a")
-    result = await todo_create_handler(
-        {"title": "b", "depends_on": [a.id]}, **deps)
-    # 第二次 create 让 a 依赖 b 会成环,模拟
-    result = await todo_update_handler({"task_id": a.id, "depends_on": [a.id]}, **deps)
-    text = result.llm_text if hasattr(result, "llm_text") else str(result)
-    assert "cycle" in text.lower() or "DependencyCycleError" in text
+    # 让 a 依赖自己 → 子图环检测抛 DependencyCycleError
+    result = await todo_update_handler(
+        {"task_id": a.id, "depends_on": [a.id]}, **deps)
+    assert "DependencyCycleError" in result.llm
+    assert "cycle" in result.llm.lower()  # 链式路径保留
 ```
 
-> **注**:handler 返回格式与现有 `run_command` 兼容(mcp_client.ToolResult),具体签名照 spec 组件 7 文本示例。
+> **注**:handler 返回 `cc_harness.mcp_client.ToolResult(llm=..., display=...)`(不是字符串或 `.llm_text`)。`llm` 字段给 LLM 看的紧凑文本,`display` 给 Rich 渲染用(可省略)。
 
 - [ ] **Step 2-4**:失败 → 实现 → 通过
 
 实现要点(spec 组件 7):
 - 7 个 SPEC dict 完整定义(参数 schema 照 spec)
-- 7 个 handler:`async def xxx_handler(args, *, service, session_id, cwd)` 返回 `ToolResult`(看 `cc_harness/tools.py:run_command` 现有签名)
+- 7 个 handler:`async def xxx_handler(args, *, service, session_id, cwd) -> ToolResult`
+  - 成功例:```ToolResult(llm=f"[todo_create] ✓ created task {t.id}\ntitle: {t.title}\nstatus: {t.status}\nid: {t.id}", display=None)```
+  - 错误例:```ToolResult(llm=f"[todo_create] ✗ {type(e).__name__}: {detail}\n  {chain_path}", display=None)```(保留 spec 示例的循环路径 `jkl-012 -> xyz-789 -> jkl-012`)
 - `inject_todo_tools(service, session_id) -> list[dict]`:返 `[{"spec": ..., "handler": ..., "deps": {"service": service, "session_id": session_id}}, ...]`
-- 错误格式:`[todo_xxx] ✗ {ExceptionName}: {detail}`
 
 - [ ] **Step 5: commit**
 
@@ -665,6 +704,7 @@ git commit -m "feat(cli): shared helpers — load_manifest_or_exit + cli_session
 # tests/test_cli_init.py
 import pytest
 from pathlib import Path
+from unittest.mock import patch
 from cc_harness.cli.init import init_noninteractive
 
 def test_init_noninteractive_creates_files(tmp_path):
@@ -673,13 +713,30 @@ def test_init_noninteractive_creates_files(tmp_path):
     assert (tmp_path / ".cc-harness" / "todos" / "todos.yaml").exists()
     assert m.name == "myapp"
     assert m.project_id  # uuid 生成
+
+def test_init_noninteractive_no_git_skips_gitignore(tmp_path):
+    """tmp_path 不是 git repo → 不写 .gitignore。"""
+    init_noninteractive(tmp_path, name="x")
+    assert not (tmp_path / ".gitignore").exists()
+
+def test_init_noninteractive_in_git_writes_gitignore(tmp_path):
+    """git 探测成功 → 自动写 .gitignore(只排除 .md,保留 project.yaml)。"""
+    # mock git rev-parse 返回 success
+    with patch("subprocess.run") as mock_run:
+        from unittest.mock import MagicMock
+        mock_run.return_value = MagicMock(returncode=0, stdout="true", stderr="")
+        init_noninteractive(tmp_path, name="x")
+    gitignore = (tmp_path / ".gitignore").read_text(encoding="utf-8")
+    assert ".cc-harness/todos/*.md" in gitignore
+    assert ".cc-harness/project.yaml" not in gitignore  # manifest 不排除
 ```
 
 - [ ] **Step 2-4**:失败 → 实现 → 通过
 
-实现:
-- `init_noninteractive(cwd, name) -> Manifest`:写 project.yaml + 空 todos.yaml + 空 todos/.gitkeep;不写 .gitignore(spec:非交互模式 default,git 探测后再决定写)
-- `init_interactive(cwd)` 用 `rich.prompt` 询问 name/description/resume-mode;存在则询问 re-init
+实现要点:
+- `init_noninteractive(cwd, name) -> Manifest`:写 project.yaml + 空 todos.yaml + todos/.gitkeep
+  - **git 探测**:`subprocess.run(["git", "rev-parse", "--is-inside-work-tree"], cwd=cwd, capture_output=True)` 命中则**自动写** `.gitignore`(追加 `.cc-harness/todos/*.md`、`!*.yaml`、保留 `project.yaml`);非 git → skip
+- `init_interactive(cwd)` 用 `rich.prompt` 询问 name/description/resume-mode/live/gitignore;存在时询问 re-init/merge/abort
 
 - [ ] **Step 5: commit**
 
@@ -690,37 +747,47 @@ git commit -m "feat(cli): init 交互 + 非交互 + 已存在时询问"
 
 ### Task 5.3: todo 子命令(7 个)
 
-- [ ] **Step 1: 写失败测试**
+- [ ] **Step 1: 写失败测试(in-process,不用 subprocess)**
 
 ```python
 # tests/test_cli_todo.py
-import subprocess, sys, os
-from pathlib import Path
 import pytest
+from cc_harness.cli.init import init_noninteractive
+from cc_harness.cli.todo import cmd_todo
 
 @pytest.fixture
-def project_dir(tmp_path):
+def project_dir(tmp_path, monkeypatch):
     proj = tmp_path / "proj"
     proj.mkdir()
-    # 用 init_noninteractive 初始化
-    from cc_harness.cli.init import init_noninteractive
     init_noninteractive(proj, name="t")
+    monkeypatch.chdir(proj)
     return proj
 
-def test_cli_todo_create_and_list(project_dir):
-    env = {**os.environ, "PYTHONPATH": str(Path(__file__).parent.parent)}
+def test_cli_todo_create_and_list(project_dir, capsys):
+    from argparse import Namespace
     # create
-    r = subprocess.run(
-        [sys.executable, "-m", "cc_harness.main", "todo", "create", "hello"],
-        cwd=project_dir, env=env, capture_output=True, text=True)
-    assert r.returncode == 0
-    assert "[todo_create]" in r.stdout
+    args = Namespace(
+        subcommand="create", title="hello",
+        description="", depends_on=None, parent=None,
+        assigned_to=None, priority=None, label=None,
+        due_date=None, effort_estimate=None,
+        acceptance_criteria=None, json=False,
+    )
+    rc = cmd_todo(args, project_dir)
+    out = capsys.readouterr().out
+    assert rc == 0
+    assert "[todo_create]" in out
     # list
-    r = subprocess.run(
-        [sys.executable, "-m", "cc_harness.main", "todo", "list"],
-        cwd=project_dir, env=env, capture_output=True, text=True)
-    assert "[todo_list]" in r.stdout
-    assert "hello" in r.stdout
+    args2 = Namespace(
+        subcommand="list", status=None, parent=None,
+        no_done=False, json=False, format="table",
+        sort="status", limit=20,
+    )
+    rc = cmd_todo(args2, project_dir)
+    out = capsys.readouterr().out
+    assert rc == 0
+    assert "[todo_list]" in out
+    assert "hello" in out
 ```
 
 - [ ] **Step 2-4**:失败 → 实现 → 通过
@@ -770,15 +837,22 @@ git commit -m "feat(cli): resume --resume / --resume-id / --no-resume"
 
 ### Task 6.1: TodoLivePanel._render()(单测先)
 
-- [ ] **Step 1: 写失败测试**
+- [ ] **Step 1: 写失败测试(render + _read_user monkeypatch 兼容)**
 
 ```python
 # tests/test_project_live.py
+import asyncio
 from rich.console import Console
 from io import StringIO
+from unittest.mock import patch, AsyncMock
 from cc_harness.project.live import TodoLivePanel
+from cc_harness.project.service import TodoService
 from cc_harness.project.models import Manifest, TodoTask
 from datetime import datetime
+
+def _make_manifest():
+    return Manifest(project_id="abc", name="x", todos_path=".cc-harness/todos",
+                    created_at=datetime.now())
 
 def test_render_empty():
     console = Console(file=StringIO(), force_terminal=True, width=80)
@@ -787,11 +861,54 @@ def test_render_empty():
     assert "x" in text
     assert "abc" in text
     assert "no tasks" in text.lower() or "0 tasks" in text
+
+def test_render_with_tasks():
+    console = Console(file=StringIO(), force_terminal=True, width=80)
+    now = datetime.now()
+    tasks = [
+        TodoTask(id="aaa11111", title="done task", status="done",
+                 created_at=now, updated_at=now, description="",
+                 depends_on=[], parent_task=None, assigned_to=None,
+                 priority=None, labels=[], due_date=None,
+                 effort_estimate=None, acceptance_criteria=[], active_sessions=[]),
+        TodoTask(id="bbb22222", title="active task", status="in_progress",
+                 created_at=now, updated_at=now, description="",
+                 depends_on=[], parent_task=None, assigned_to=None,
+                 priority="high", labels=[], due_date=None,
+                 effort_estimate=None, acceptance_criteria=[], active_sessions=[]),
+    ]
+    TodoLivePanel._render_static(console, tasks, project_name="x", project_id="abc")
+    text = console.file.getvalue()
+    assert "done task" in text
+    assert "active task" in text
+    assert "high" in text
+
+async def test_live_panel_does_not_break_read_user(tmp_path):
+    """Live panel start 后, monkeypatch _read_user 仍能被调(REPL 测试兼容)。
+    验证方式:起 Live → 调 _read_user mock → Live.stop,确认无异常。"""
+    proj = tmp_path / "proj"
+    proj.mkdir()
+    (proj / ".cc-harness" / "todos").mkdir(parents=True)
+    (proj / ".cc-harness" / "todos" / "todos.yaml").write_text("tasks: []\n")
+    svc = TodoService(project_root=proj, manifest=_make_manifest())
+    panel = TodoLivePanel(Console(), svc, _make_manifest())
+    panel.start()
+    # 模拟 _read_user 返回 "exit"
+    with patch("cc_harness.repl._read_user", new=AsyncMock(return_value="exit")):
+        from cc_harness.repl import _read_user as mocked
+        result = await mocked()
+        assert result == "exit"
+    panel.stop()  # 必须能正常 stop,不抛
 ```
 
 - [ ] **Step 2-4**:失败 → 实现 → 通过
 
-实现:`TodoLivePanel._render_static(console, tasks, project_name, project_id) -> Panel`(纯函数,可单测);`start()` / `stop()` / `_on_change(task, event)` 围绕 Rich `Live` context manager(方案 B)。
+实现:
+- `TodoLivePanel._render_static(console, tasks, project_name, project_id) -> Panel`(**纯函数**,可单测)
+- `TodoLivePanel.start()` / `.stop()` / `_on_change(task, event)` 围绕 Rich `Live` context manager(方案 B)
+- `_on_change` 内部:`_tasks = asyncio.run_coroutine_threadsafe(service.list(), get_event_loop()).result()` + `self._live.update(self._render())`
+- **monkeypatch 兼容**:`_read_user` 用 `asyncio.to_thread(input)` 时,Rich Live 自动让出 stdout 控制权;现有 `tests/test_repl.py` 的 `monkeypatch.setattr(repl_mod, "_read_user", ...)` 仍生效(Task 6.3 step 3 测试 + 该 test 共同验证)
+- **conftest fixture 提供 no-op Live 模式**:`fake_todo_service` 测试不走真 Live,只过订阅路径
 
 - [ ] **Step 5: 补多任务 + 折叠 + 截断测试 + commit**
 
@@ -802,12 +919,34 @@ git commit -m "feat(project): TodoLivePanel _render + Live context(方案 B)"
 
 ### Task 6.2: agent.py — run_turn + _refresh_system_prompt
 
-- [ ] **Step 1: 改 run_turn 签名**
+- [ ] **Step 1: 改 run_turn 签名 + PromptComposer 注入路径**
 
 修改 `cc_harness/agent.py`:
-- `run_turn(..., resume_task: TodoTask | None = None)` 新增参数
+- `run_turn(..., resume_task: TodoTask | None = None)` 新增参数(末尾参数,不破坏现有调用)
 - `_refresh_system_prompt(messages, cwd, mode, resume_task=None)` 加参数
-- `_refresh_system_prompt` 末尾:若 `mode == "coding" and resume_task is not None`,追加 SECTION_POOL 一段(`## Resume Task (跨 session 续干)\n...` 照 spec)
+- **SECTION_POOL 注入路径**(关键,spec 没完全写明):
+  ```python
+  # 在 _refresh_system_prompt 末尾:
+  if mode == "coding" and resume_task is not None:
+      from cc_harness.prompts import Section
+      resume_section = Section(
+          name="resume_task",
+          content=f"## Resume Task (跨 session 续干)\n"
+                  f"id:    {resume_task.id}\n"
+                  f"title: {resume_task.title}\n"
+                  f"status:{resume_task.status}\n"
+                  f"priority:{resume_task.priority or 'none'}\n"
+                  f"active_sessions: {resume_task.active_sessions}\n\n"
+                  f"## Acceptance Criteria\n"
+                  + "\n".join(f"- {c}" for c in resume_task.acceptance_criteria),
+          priority=30,
+          conditions=("mode==coding",),
+      )
+      messages[0]["content"] = build_system_prompt(
+          cwd, mode, extra_sections=[resume_section]
+      )
+  ```
+- 改 `build_system_prompt(cwd, mode, extra_sections=None)` 加可选参数,内部传给 `PromptComposer(..., extra=extra_sections)`
 
 - [ ] **Step 2: 测试验证不破坏现有**
 
@@ -817,13 +956,13 @@ Expected: PASS(没改默认行为,新参数默认 None)
 - [ ] **Step 3: commit**
 
 ```bash
-git add cc_harness/agent.py
-git commit -m "feat(agent): run_turn + _refresh_system_prompt 支持 resume_task"
+git add cc_harness/agent.py cc_harness/prompts.py
+git commit -m "feat(agent): run_turn + _refresh_system_prompt 支持 resume_task (SECTION_POOL 注入)"
 ```
 
 ### Task 6.3: repl.py — 6 处接线
 
-- [ ] **Step 1: 改 ReplState**
+- [ ] **Step 1: 改 ReplState + session_id 格式**
 
 ```python
 # cc_harness/repl.py
@@ -835,9 +974,10 @@ class ReplState:
     token_counter: TokenCounter = field(default_factory=TokenCounter)
     memory_extras: list = field(default_factory=list)
     context_config: ContextConfig = field(default_factory=ContextConfig)
-    session_id: str = ""
+    session_id: str = ""  # 改为 "repl-{int(time.time())}-{uuid4().hex[:8]}"(spec 开放问题 8)
     mem_deps: dict | None = None
     # Plan A 新增:
+    project_root: Path | None = None        # 统一锚点(避免裸 cwd 漂移)
     manifest: object | None = None         # cc_harness.project.models.Manifest
     todo_service: object | None = None     # cc_harness.project.service.TodoService
     todo_extras: list = field(default_factory=list)  # Plan A task tools
@@ -848,13 +988,23 @@ class ReplState:
 - [ ] **Step 2: run_repl 接线**
 
 按 spec 组件 9 步骤 1-5 改 `run_repl()`:
-1. 启动检测 + 自动 init(无 manifest → `init_noninteractive`)
-2. 加载 TodoService + Live.start()
-3. `state.todo_extras = inject_todo_tools(svc, session_id)`,拼接 `extra_native_specs` 时 None-safe
-4. resume 询问(只 `resume_mode == "ask"` 且 `turns == 0`)→ `_select_resume_task` → 设 `state.resume_task`
+0. **统一锚点**:`state.project_root = Path(cwd).resolve()`,TodoService / TodoStorage / policy / executor 全部用 `state.project_root`(避免裸 cwd 漂移导致 sandbox mount 边界错位)
+1. **启动检测 + 自动 init**:无 manifest → `init_noninteractive(state.project_root, name=state.project_root.name)`
+2. **加载 TodoService**(关键:注入 memory_service):
+   ```python
+   memory_svc = state.mem_deps.get("service") if state.mem_deps else None
+   state.todo_service = TodoService(
+       project_root=state.project_root, manifest=manifest,
+       memory_service=memory_svc,  # opt-in completion_capture 钩子依赖
+   )
+   state.live_panel = TodoLivePanel(console, state.todo_service, manifest)
+   state.live_panel.start()
+   ```
+3. `state.todo_extras = inject_todo_tools(state.todo_service, session_id=state.session_id)`,拼接 `extra_native_specs` 时 **None-safe**:`_all_extras = list(state.memory_extras or []) + list(state.todo_extras or []); extra_native_specs=_all_extras or None`
+4. resume 询问(只 `resume_mode == "ask"` 且 `turns == 0`)→ `_select_resume_task(tasks)`(规则:max(updated_at) among in_progress,None if 0)→ 设 `state.resume_task`
 5. `run_turn` 调用传 `resume_task=state.resume_task`
-6. after-turn:`_after_turn_todo(state, todo_service)`(占位 pass)
-7. exit 时 `await shutdown_session_executor()` 前 `live_panel.stop()`
+6. after-turn:`_after_turn_todo(state, todo_service)`(占位 pass,B 阶段填 verify)
+7. exit 时 `await shutdown_session_executor()` 前 `await state.live_panel.stop()`
 
 - [ ] **Step 3: 测试**
 
@@ -893,17 +1043,39 @@ git commit -m "feat(repl): Plan A 6 处接线 — 自动 init + Live + resume_ta
 
 ### Task 6.4: main.py — argparse CLI 分派
 
-- [ ] **Step 1: 改 argparse**
+- [ ] **Step 1: 改 argparse(sub-commands pattern,向后兼容)**
 
 ```python
 # cc_harness/main.py:_parse_args()
-p.add_argument("command", nargs="?", choices=("init", "todo", "resume"), default=None)
-p.add_argument("subcommand", nargs="?", default=None)
-p.add_argument("--resume-id", type=str, default=None)
-p.add_argument("--no-resume", action="store_true")
-p.add_argument("--no-live", action="store_true")
-# ... 既有 --mode / --design-dir 不动
+# 关键:用 sub-commands 避免 positional 冲突 + 保留 --mode/--design-dir 兜底 REPL 入口
+sub = p.add_subparsers(dest="command")
+
+p_init = sub.add_parser("init", help="Initialize .cc-harness/project.yaml")
+p_init.add_argument("--name", type=str)
+p_init.add_argument("--no-prompt", action="store_true")
+p_init.add_argument("--resume-mode", choices=("ask", "auto", "manual"))
+p_init.add_argument("--no-live", action="store_true")
+p_init.add_argument("--force-reinit", action="store_true")
+
+p_todo = sub.add_parser("todo", help="Manage todos")
+p_todo.add_argument("subcommand", choices=("list", "get", "create", "update", "delete", "resolve", "validate"))
+# 各种 --flag ...
+
+p_resume = sub.add_parser("resume", help="Resume in-progress task")
+p_resume.add_argument("--resume-id", type=str)
+p_resume.add_argument("--no-resume", action="store_true")
+
+# 保留 REPL 默认入口(无 command 时):
+p.add_argument("--mode", choices=("coding", "plan", "design", "chat"), default="coding")
+p.add_argument("--design-dir", type=Path, default=None)
 ```
+
+**向后兼容守卫**:
+- `python main.py` 无参数 → 走 REPL(原有行为)
+- `python main.py --mode coding` → 走 REPL(原有行为)
+- `python main.py init` → CLI 分派
+- `python main.py todo create "x"` → CLI 分派
+- `python main.py resume` → CLI 分派
 
 - [ ] **Step 2: main() 分派**
 
@@ -919,15 +1091,16 @@ def main():
     elif args.command == "resume":
         from cc_harness.cli.resume import cmd_resume
         sys.exit(cmd_resume(args, PROJECT_ROOT))
-    # else: REPL 模式(原有逻辑)
-    ...
+    else:
+        # 走原 REPL 逻辑(不破坏)
+        ...
 ```
 
 - [ ] **Step 3: 跑现有测试 + commit**
 
 ```bash
 git add cc_harness/main.py
-git commit -m "feat(main): argparse 接受 init/todo/resume CLI 子命令分派"
+git commit -m "feat(main): argparse sub-commands(init/todo/resume) + REPL 向后兼容守卫"
 ```
 
 ---
@@ -941,23 +1114,66 @@ git commit -m "feat(main): argparse 接受 init/todo/resume CLI 子命令分派"
 
 ```python
 # tests/_test_project_e2e.py
-"""E2E 跑真实 LLM。手动跑:`pytest tests/_test_project_e2e.py --no-header -s`"""
-import pytest, os
+"""E2E 跑真实 LLM。手动跑:`pytest tests/_test_project_e2e.py --no-header -s`
+
+默认跳过(无 OPENAI_API_KEY 时)。前缀下划线,pytest 默认不收集。
+"""
+import os
+import pytest
+from cc_harness.cli.init import init_noninteractive
+from cc_harness.project.service import TodoService
+from cc_harness.project.models import Manifest
+from datetime import datetime
 
 pytestmark = pytest.mark.skipif(
     not os.getenv("OPENAI_API_KEY"),
-    reason="needs OPENAI_API_KEY for real LLM"
+    reason="needs OPENAI_API_KEY for real LLM",
 )
 
+def _manifest(tmp_path) -> Manifest:
+    return init_noninteractive(tmp_path, name="e2e")
+
 @pytest.mark.asyncio
-async def test_agent_creates_and_completes_todo(tmp_path):
-    # 1. init project
-    # 2. 跑 REPL(用 FakeLLM 预编程 emit todo_create + todo_update)
-    # 3. 验证 todos.yaml 落盘 + Live 显示更新
-    pass  # 实现细节见 cc_harness.eval.locomo.runner 模式
+async def test_service_lifecycle_full(tmp_path):
+    """纯 Service 层 E2E(无 REPL / LLM):完整 create → update → delete 循环。"""
+    manifest = _manifest(tmp_path)
+    svc = TodoService(project_root=tmp_path, manifest=manifest)
+    t1 = await svc.create(title="task 1")
+    t2 = await svc.create(title="task 2", depends_on=[t1.id])
+    # 完成 t1,触发 completion_capture(若 opt-in),完成 t2
+    await svc.update(t1.id, status="done")
+    await svc.update(t2.id, status="in_progress")
+    # 验证 active_sessions 累计
+    fetched1 = await svc.get(t1.id)
+    fetched2 = await svc.get(t2.id)
+    assert fetched1.status == "done"
+    assert fetched2.status == "in_progress"
+    assert t2.id in (await svc.resolve(t2.id))[0].id  # resolve 含自己
+    # 删 t1(force,因 t2 depends_on)
+    await svc.delete(t1.id, force=True)
+    issues = await svc.validate()
+    assert any(i.rule_id == "missing_dependency" for i in issues)
+
+
+@pytest.mark.asyncio
+async def test_repl_with_real_llm(tmp_path):
+    """完整 REPL + 真实 LLM E2E:模拟用户输入,LLM 调 todo tool,验证落盘。"""
+    # 复用 cc_harness.eval.locomo.runner 的 REPL 启动模式 + FakeLLM 预编程
+    # 实际实现见 locomo runner 风格;这里给骨架
+    from unittest.mock import AsyncMock, patch
+    manifest = _manifest(tmp_path)
+    # ... build llm with tool_calls emit todo_create + todo_update
+    # ... run repl with monkeypatched _read_user yielding prompts
+    # ... assert (tmp_path / ".cc-harness/todos/todos.yaml") contains expected tasks
+    pass
 ```
 
-- [ ] **Step 2: 跑通(若 OPENAI_API_KEY 已配) + commit**
+- [ ] **Step 2: 跑通(若 OPENAI_API_KEY 已配)+ commit**
+
+```bash
+git add tests/_test_project_e2e.py
+git commit -m "test(project): E2E Service 完整 lifecycle + REPL 骨架(默认跳过)"
+```
 
 ```bash
 git add tests/_test_project_e2e.py
