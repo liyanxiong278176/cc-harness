@@ -2,7 +2,7 @@
 
 > **范围**:cc-harness AI 工程目标"其一·长程任务" 5 红 + 3 黄中的 **A 子集**——任务追踪底座(Project 容器 + Todo 任务清单 + 跨 session resume)。B(外层 loop + DAG)/ C(HTN + checkpoint 自检)在 A 完成后另立 spec。
 >
-> **字段计数约定**(全文统一):TodoTask 共 **15 字段** = **13 用户可控**(title / description / status / depends_on / parent_task / assigned_to / priority / labels / due_date / effort_estimate / acceptance_criteria + id / created_at / updated_at 由系统自动生成)+ **1 系统**(active_sessions)。全文出现 "13" 指**用户可控字段**;"14" 指**用户可控 + 自动生成**;"15" 指**完整 dataclass**。下文用"T13" / "T14" / "T15"区分以避免歧义。
+> **字段计数约定**(全文统一):TodoTask 共 **15 字段** = **11 用户可控**(title / description / status / depends_on / parent_task / assigned_to / priority / labels / due_date / effort_estimate / acceptance_criteria)+ **3 自动生成**(id / created_at / updated_at)+ **1 系统**(active_sessions)。brainstorm 阶段"13 字段"为表述误差,实际 dataclass 权威定义为 15 = 11+3+1。下文用"T11"指用户可控字段、"T14"指用户+自动生成、"T15"指完整 dataclass。
 >
 > **For agentic workers:** REQUIRED SUB-SKILL: superpowers:subagent-driven-development。
 
@@ -327,7 +327,7 @@ class TodoStorage:
 **约束**:
 1. **单源真相**——只有 TodoService 调 Storage,不允许 CLI / tool 直接读写
 2. **原子写**——yaml 写前 `.tmp` + `os.replace`
-3. **md 文件 frontmatter 序列化** T13 字段(用户可控字段)+ id/created_at/updated_at/active_sessions;body = description markdown
+3. **md 文件 frontmatter 序列化** T11 字段(用户可控字段)+ id/created_at/updated_at/active_sessions;body = description markdown
 4. **空目录创建**:`todos/` 不存在 → 自动创建 + 空 `todos.yaml`
 5. **active_sessions 自动 prune**:`_add_active_session()` 时若长度 > 50 → 截断为最近 50 条 + 一行注释 `# earlier N sessions truncated at <timestamp>`。防止无界增长导致 yaml/md 膨胀。
 
@@ -744,7 +744,7 @@ docs/superpowers/plans/
 | project_id 试图改 | 拒绝,必须 `cc-harness init --force-reinit`(CLI flag,见组件 8) |
 | 已 done 任务 status 改 in_progress | StatusGuardError |
 | depends_on 含自身 | DependencyCycleError |
-| md 文件外部编辑改 | 下次 TodoService 读合并回 yaml(详见组件 5 合并策略) |
+| md 文件外部编辑改(非 description) | 下次 TodoService 读忽略 md frontmatter 的其他字段(以 yaml 为准,warn log),validate() 报 orphan_md 或 missing_md issue;description 字段以 md frontmatter 为准(若存在则覆盖 yaml 的 description) |
 | Live 启动时无任务 | "📋 no tasks yet" |
 | 1000 任务全表 validate | <100ms |
 | 1000 任务 Live 渲染 | **<30ms/帧**(只渲染折叠 top N,不渲染全表) |
