@@ -280,18 +280,41 @@ def test_storage_save_and_load(storage):
 实现要点(spec 组件 5):
 - `todos.yaml` 格式:`tasks:\n  - id: ...\n    title: ...\n    ...`(单层 list)
 - md 文件 frontmatter:`---\nid: ...\ntitle: ...\n...\n---\n\n{description body}`(**save 时 frontmatter 写 T15 全字段**,便于人直接 cat 看)
-- **save / load 行为对应**(单向):
-  - **save**:md frontmatter = yaml T15 全字段(含 active_sessions / id / created_at / updated_at);body = description markdown 原文
-  - **load**:yaml 是主索引,所有字段以 yaml 为准;md frontmatter **仅当 yaml 缺 description 字段时回退填入**(即 yaml.description 为空字符串 + md 存在 → 用 md.body 填充);md frontmatter 其他字段冲突 → warn log + 以 yaml 为准
-- md 缺失 → warn + description="";md 多余(yaml 不引用)→ warn + 询问用户,绝不静默 prune
+- **save / load 行为对应**(**md description 优先**,这是 spec 关键决策):
+  - **save**:yaml + md frontmatter 都写 T15 全字段(含 active_sessions / id / created_at / updated_at);md body = description markdown 原文
+  - **load**:yaml 是**其他字段**的主索引(id/title/status/depends_on/...);**description 字段以 md frontmatter 为准**——md 存在 → 用 md.frontmatter.description(或 md body);md 不存在 → 用 yaml.description;md 不引用 → warn log
+  - 字段冲突(non-description):md frontmatter 与 yaml 不一致 → warn log + **以 yaml 为准**(避免 md 外部编辑意外改 status/priority)
+- md 缺失 → warn + description 从 yaml 兜底;md 多余(yaml 不引用)→ warn + 询问用户,绝不静默 prune
 - 原子写:`todos.yaml.tmp` → `os.replace`;md 写前先 `mkdir -p todos/`
 - `active_sessions` prune:长度 > 50 → 截断为最近 50 + `# earlier N truncated at {ts}`
 
 - [ ] **Step 6: 补 md frontmatter 序列化测试 + commit**
 
+补一个测试:**md description 优先于 yaml**(用户外部编辑 md 时不被覆盖):
+```python
+def test_storage_md_description_overrides_yaml(tmp_path, storage):
+    # 创建 task 时 description="yaml version"
+    now = datetime.now()
+    task = TodoTask(id="aaa11111", title="t", status="pending",
+                    created_at=now, updated_at=now, description="yaml version",
+                    depends_on=[], parent_task=None, assigned_to=None,
+                    priority=None, labels=[], due_date=None,
+                    effort_estimate=None, acceptance_criteria=[],
+                    active_sessions=[])
+    storage.save_all([task])
+    # 外部编辑 md 的 description
+    md_path = tmp_path / "proj" / ".cc-harness" / "todos" / "aaa11111.md"
+    md_content = md_path.read_text(encoding="utf-8")
+    md_content = md_content.replace("yaml version", "md version")
+    md_path.write_text(md_content, encoding="utf-8")
+    # reload — description 应是 md 版本(spec 组件 5 + spec 风险与缓解表)
+    loaded = storage.load_all()
+    assert loaded[0].description == "md version"
+```
+
 ```bash
 git add cc_harness/project/storage.py tests/test_project_storage.py
-git commit -m "feat(project): TodoStorage yaml+md 双文件,合并策略,active_sessions prune"
+git commit -m "feat(project): TodoStorage yaml+md 双文件,md description 优先,active_sessions prune"
 ```
 
 ---
@@ -614,7 +637,9 @@ def deps(tmp_path):
     manifest = Manifest(project_id="x", name="x", todos_path=".cc-harness/todos",
                         created_at=datetime.now())
     svc = TodoService(project_root=proj, manifest=manifest)
-    return {"service": svc, "session_id": "test-session"}
+    # 注意:cwd 必须给 — handler 签名 `async def xxx_handler(args, *, service, session_id, cwd) -> ToolResult` 需要 cwd
+    # (生产 dispatch 路径 agent.py:216 自动加 cwd,直接调 handler 测试要手动传)
+    return {"service": svc, "session_id": "test-session", "cwd": str(proj)}
 
 def test_all_specs_have_function():
     for s in [TODO_LIST_SPEC, TODO_GET_SPEC, TODO_CREATE_SPEC, TODO_UPDATE_SPEC,
@@ -1027,7 +1052,9 @@ class ReplState:
     token_counter: TokenCounter = field(default_factory=TokenCounter)
     memory_extras: list = field(default_factory=list)
     context_config: ContextConfig = field(default_factory=ContextConfig)
-    session_id: str = ""  # 改为 "repl-{int(time.time())}-{uuid4().hex[:8]}"(spec 开放问题 8)
+    # 注:session_id 默认值在 run_repl() 里构造(显式调用 uuid4() 拿 hex[:8] 后缀),
+    # 不用 dataclass default_factory,因为需要 cwd-aware 一致性。
+    session_id: str = ""
     mem_deps: dict | None = None
     # Plan A 新增:
     project_root: Path | None = None        # 统一锚点(避免裸 cwd 漂移)
@@ -1036,6 +1063,16 @@ class ReplState:
     todo_extras: list = field(default_factory=list)  # Plan A task tools
     live_panel: object | None = None       # cc_harness.project.live.TodoLivePanel
     resume_task: object | None = None      # cc_harness.project.models.TodoTask | None
+```
+
+**显式修改 `cc_harness/repl.py:141`**(必须改,spec 开放问题 8):
+```python
+# 原代码(repl.py:141):
+session_id=f"repl-{int(time.time())}"
+
+# 新代码:
+import uuid as _uuid
+session_id=f"repl-{int(time.time())}-{_uuid.uuid4().hex[:8]}"
 ```
 
 - [ ] **Step 2: run_repl 接线**
