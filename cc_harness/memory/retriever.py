@@ -23,6 +23,60 @@ class MemoryRetriever:
         embedding = await self._embedder.embed(query)
         return await self._store.search_similar(embedding, k=top_k)
 
+    async def search_hybrid(
+        self, query: str, top_k: int = 5, alpha: float = 0.5, rrf_k: int = 60,
+    ) -> list:
+        """混合召回:vector + FTS5 → RRF 合并(Phase 4)。
+
+        alpha: vec vs fts 权重(0=纯 FTS,1=纯 vec,默认 0.5=平衡)。
+        rrf_k: RRF 平滑常数(论文 60)。
+
+        算法:
+        1. 并发跑 vector search + FTS5 BM25 search
+        2. 每个 hit 算 RRF score = alpha/(vec_rank+rrf_k) + (1-alpha)/(fts_rank+rrf_k)
+           (未在某路召回的 → 那一路分数为 0,等价于 1/rrf_k)
+        3. 按 RRF 降序取 top_k
+
+        FTS5 不可用时 → 退化为纯 vector search(向后兼容)。
+        """
+        import asyncio
+        # 并行查两个
+        vec_task = asyncio.create_task(self._search_vec_only(query, top_k * 2))
+        fts_task = asyncio.create_task(self._search_fts_only(query, top_k * 2))
+        vec_results, fts_results = await asyncio.gather(vec_task, fts_task)
+
+        # 建 (id → (mem, vec_rank, fts_rank))
+        scores: dict[str, tuple[Memory, float, float]] = {}
+        for rank, (mem, _dist) in enumerate(vec_results, 1):
+            scores[mem.id] = (mem, 1.0 / (rank + rrf_k), 0.0)
+        for rank, (mem, _bm25) in enumerate(fts_results, 1):
+            fts_score = 1.0 / (rank + rrf_k)
+            if mem.id in scores:
+                mem, vec_s, _ = scores[mem.id]
+                scores[mem.id] = (mem, vec_s, fts_score)
+            else:
+                scores[mem.id] = (mem, 0.0, fts_score)
+
+        # RRF 加权合并
+        merged = []
+        for mem, vec_s, fts_s in scores.values():
+            rrf = alpha * vec_s + (1 - alpha) * fts_s
+            merged.append((mem, rrf))
+        merged.sort(key=lambda x: -x[1])
+        return merged[:top_k]
+
+    async def _search_vec_only(self, query: str, k: int) -> list:
+        try:
+            return await self.search(query, top_k=k)
+        except Exception:
+            return []
+
+    async def _search_fts_only(self, query: str, k: int) -> list:
+        try:
+            return await self._store.search_fts(query, k=k)
+        except Exception:
+            return []
+
     async def build_injection_block(self, query: str) -> str:
         if not (query or "").strip():
             return ""

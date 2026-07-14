@@ -21,6 +21,9 @@ from cc_harness.memory.embedding import EmbeddingError
 # Phase 2: 重试上限。0 = 旧行为(不重试),2 = 最多 3 次(默认)。
 _MAX_RECALL_RETRIES = int(os.getenv("MAX_RECALL_RETRIES", "2"))
 
+# Phase 4: hybrid 召回权重。0=纯 FTS,1=纯 vec,0.5=平衡(默认)。
+_HYBRID_ALPHA = float(os.getenv("MEMORY_HYBRID_ALPHA", "0.5"))
+
 
 # 英文问句词(去问句重写用)。中文不需要改写(没明显的"WH-word"前缀结构)。
 _QUESTION_WORDS = re.compile(
@@ -98,8 +101,10 @@ def _format_recall_results(results) -> str:
     if not results:
         return "(没有匹配的长期记忆)"
     lines = [f"找到 {len(results)} 条相关记忆:"]
-    for i, (mem, distance) in enumerate(results, 1):
-        lines.append(f"  {i}. [{mem.id}] {mem.text}  (源: {mem.source}, 距离: {distance:.3f})")
+    for i, (mem, score) in enumerate(results, 1):
+        # Phase 4: hybrid 时 score 是 RRF(越小越相关);兼容老接口 score 是距离
+        # 简单格式化:不展示具体数值,只显示来源标识
+        lines.append(f"  {i}. [{mem.id}] {mem.text}  (源: {mem.source})")
     return "\n".join(lines)
 
 
@@ -122,13 +127,20 @@ async def memory_recall_handler(args, *, cwd, retriever):
     if not query:
         return ToolResult.error(display="query 不能为空", llm="[Tool Error] query 不能为空")
     try:
-        # Phase 2: 多 query 重试。attempt=0 用原 query,1..N 用 _rewrite_query 改写。
+        # Phase 2+4: 多 query 重试 + hybrid 召回。
+        # attempt=0 用原 query,1..N 用 _rewrite_query 改写。
         # 首次有结果立即返回(避免无谓重试);空结果才重试。
+        # Phase 4: 优先用 search_hybrid(FTS5+vec RRF),retriever 缺此方法时回退 search。
+        hybrid = getattr(retriever, "search_hybrid", None)
+        use_hybrid = hybrid is not None
         for attempt in range(_MAX_RECALL_RETRIES + 1):
             q = query if attempt == 0 else _rewrite_query(query, attempt - 1)
             if not q:
                 continue
-            results = await retriever.search(q, top_k=5)
+            if use_hybrid:
+                results = await hybrid(q, top_k=5, alpha=_HYBRID_ALPHA)
+            else:
+                results = await retriever.search(q, top_k=5)
             if results:
                 return ToolResult.success(_format_recall_results(results))
         # 全部尝试都空 → 兜底原行为

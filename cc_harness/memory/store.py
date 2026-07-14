@@ -52,6 +52,8 @@ class MemoryStore:
         await self._db.enable_load_extension(True)
         await self._db.load_extension(sqlite_vec.loadable_path())
         await self._db.enable_load_extension(False)
+        # Phase 4: 探测 FTS5 编译(connect 时若 FTS5 不可用则降级 vector-only)
+        self._has_fts5 = await self._probe_fts5()
         await self._db.execute("""
             CREATE TABLE IF NOT EXISTS memories (
                 id TEXT PRIMARY KEY,
@@ -62,6 +64,35 @@ class MemoryStore:
                 source TEXT NOT NULL
             )
         """)
+        # Phase 4: FTS5 关键词索引(contentless mode,触发器同步)。
+        # 仅在 SQLite 编译含 FTS5 时建表,否则 _has_fts5=False 走 vector-only。
+        if self._has_fts5:
+            await self._db.execute("""
+                CREATE VIRTUAL TABLE IF NOT EXISTS memories_fts USING fts5(
+                    text,
+                    content='memories', content_rowid='rowid',
+                    tokenize='unicode61'
+                )
+            """)
+            # 同步触发器:INSERT/UPDATE/DELETE 都同步到 FTS
+            await self._db.execute("""
+                CREATE TRIGGER IF NOT EXISTS memories_ai AFTER INSERT ON memories BEGIN
+                    INSERT INTO memories_fts(rowid, text) VALUES (new.rowid, new.text);
+                END
+            """)
+            await self._db.execute("""
+                CREATE TRIGGER IF NOT EXISTS memories_ad AFTER DELETE ON memories BEGIN
+                    INSERT INTO memories_fts(memories_fts, rowid, text)
+                    VALUES('delete', old.rowid, old.text);
+                END
+            """)
+            await self._db.execute("""
+                CREATE TRIGGER IF NOT EXISTS memories_au AFTER UPDATE ON memories BEGIN
+                    INSERT INTO memories_fts(memories_fts, rowid, text)
+                    VALUES('delete', old.rowid, old.text);
+                    INSERT INTO memories_fts(rowid, text) VALUES (new.rowid, new.text);
+                END
+            """)
         await self._db.execute(
             "CREATE INDEX IF NOT EXISTS idx_memories_updated_at ON memories(updated_at DESC)"
         )
@@ -243,6 +274,62 @@ class MemoryStore:
         cur = await self._db.execute("SELECT COUNT(*) FROM memories")
         row = await cur.fetchone()
         return row[0] if row else 0
+
+    # --- Phase 4: FTS5 关键词召回 ---
+
+    async def _probe_fts5(self) -> bool:
+        """探测当前 SQLite 编译是否含 FTS5。contentless 模式需 FTS5。"""
+        assert self._db is not None
+        try:
+            await self._db.execute(
+                "CREATE VIRTUAL TABLE _fts5_probe USING fts5(x)"
+            )
+            await self._db.execute("DROP TABLE _fts5_probe")
+            return True
+        except Exception:
+            return False
+
+    @property
+    def has_fts5(self) -> bool:
+        """True if FTS5 is available (set in init_schema)."""
+        return getattr(self, "_has_fts5", False)
+
+    async def search_fts(self, query: str, k: int = 5) -> list[tuple[Memory, float]]:
+        """FTS5 BM25 关键词召回。返 [(Memory, bm25_score)]。
+
+        bm25_score 越小越相关(BM25 convention)。
+        失败(SQL 异常 / FTS5 不可用)返 [],不抛。
+        """
+        if not self._has_fts5 or not query.strip():
+            return []
+        assert self._db is not None
+        try:
+            cur = await self._db.execute(
+                "SELECT rowid, bm25(memories_fts) FROM memories_fts "
+                "WHERE memories_fts MATCH ? ORDER BY bm25(memories_fts) LIMIT ?",
+                (query, k),
+            )
+            rows = await cur.fetchall()
+            if not rows:
+                return []
+            rowids = [r[0] for r in rows]
+            scores = [r[1] for r in rows]
+            placeholders = ",".join("?" * len(rowids))
+            mem_cur = await self._db.execute(
+                f"SELECT id, text, embedding, created_at, updated_at, source, layer, session_id "
+                f"FROM memories WHERE rowid IN ({placeholders})",
+                rowids,
+            )
+            mem_rows = await mem_cur.fetchall()
+            mem_by_rowid = {
+                idx: Memory(id=r[0], text=r[1], embedding=_blob_to_vec(r[2]),
+                            created_at=r[3], updated_at=r[4], source=r[5],
+                            layer=r[6], session_id=r[7])
+                for idx, r in zip(rowids, mem_rows)
+            }
+            return [(mem_by_rowid[i], s) for i, s in zip(rowids, scores) if i in mem_by_rowid]
+        except Exception:
+            return []
 
     async def close(self) -> None:
         if self._db is not None:
