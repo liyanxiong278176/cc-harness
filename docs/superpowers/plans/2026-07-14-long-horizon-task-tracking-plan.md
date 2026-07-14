@@ -625,28 +625,35 @@ def test_all_specs_have_function():
 
 async def test_create_handler_returns_llm_visible_text(deps):
     result = await todo_create_handler({"title": "hello"}, **deps)
-    # ToolResult 是 dataclass,不是字符串;对齐 cc_harness/mcp_client.py:ToolResult
-    assert "[todo_create]" in result.llm
-    assert "hello" in result.llm
+    # ToolResult 字段是 cc_harness/mcp_client.py:ToolResult.is_error / display_text / llm_text
+    # (不是 .llm / .display — 已核实)
+    assert result.is_error is False
+    assert "[todo_create]" in result.llm_text
+    assert "hello" in result.llm_text
 
 async def test_create_handler_error_message_llm_friendly(deps):
     a = await deps["service"].create(title="a")
     # 让 a 依赖自己 → 子图环检测抛 DependencyCycleError
     result = await todo_update_handler(
         {"task_id": a.id, "depends_on": [a.id]}, **deps)
-    assert "DependencyCycleError" in result.llm
-    assert "cycle" in result.llm.lower()  # 链式路径保留
+    assert result.is_error is True
+    assert "DependencyCycleError" in result.llm_text
+    assert "cycle" in result.llm_text.lower()  # 链式路径保留
 ```
 
-> **注**:handler 返回 `cc_harness.mcp_client.ToolResult(llm=..., display=...)`(不是字符串或 `.llm_text`)。`llm` 字段给 LLM 看的紧凑文本,`display` 给 Rich 渲染用(可省略)。
+> **注**(基于实际代码核实 `cc_harness/mcp_client.py:ToolResult`):
+> - 字段:`is_error: bool` / `display_text: str` / `llm_text: str`
+> - 成功:`ToolResult(is_error=False, display_text=text, llm_text=text)`(也可用 `ToolResult.success(text)`)
+> - 错误:`ToolResult(is_error=True, display_text=display, llm_text=llm)`(也可用 `ToolResult.error(display, llm)`)
+> - 本 plan handler 一律返 `ToolResult.success(text)` / `ToolResult.error(display_for_user, llm_for_llm)`
 
 - [ ] **Step 2-4**:失败 → 实现 → 通过
 
 实现要点(spec 组件 7):
 - 7 个 SPEC dict 完整定义(参数 schema 照 spec)
 - 7 个 handler:`async def xxx_handler(args, *, service, session_id, cwd) -> ToolResult`
-  - 成功例:```ToolResult(llm=f"[todo_create] ✓ created task {t.id}\ntitle: {t.title}\nstatus: {t.status}\nid: {t.id}", display=None)```
-  - 错误例:```ToolResult(llm=f"[todo_create] ✗ {type(e).__name__}: {detail}\n  {chain_path}", display=None)```(保留 spec 示例的循环路径 `jkl-012 -> xyz-789 -> jkl-012`)
+  - 成功例:`ToolResult.success(f"[todo_create] ✓ created task {t.id}\ntitle: {t.title}\nstatus: {t.status}\nid: {t.id}")`
+  - 错误例:`ToolResult.error(display=..., llm=f"[todo_create] ✗ {type(e).__name__}: {detail}\n  {chain_path}")`(保留 spec 示例的循环路径 `jkl-012 -> xyz-789 -> jkl-012`)
 - `inject_todo_tools(service, session_id) -> list[dict]`:返 `[{"spec": ..., "handler": ..., "deps": {"service": service, "session_id": session_id}}, ...]`
 
 - [ ] **Step 5: commit**
@@ -919,45 +926,91 @@ git commit -m "feat(project): TodoLivePanel _render + Live context(方案 B)"
 
 ### Task 6.2: agent.py — run_turn + _refresh_system_prompt
 
-- [ ] **Step 1: 改 run_turn 签名 + PromptComposer 注入路径**
+**关键约束**(基于实际代码核实):
+- `mcp_client.ToolResult` 字段是 `is_error` / `display_text` / `llm_text`(不是 `.llm` / `.display`)—— Task 4.1 测试断言需对齐
+- `build_system_prompt(cwd, mode)` **不加** extra_sections 参数(保持原样,避免 clobber Q3 persona / Q4 mermaid canvas)
+- `_refresh_system_prompt` 已经 rebuild messages[0]["content"];Q3/Q4 在 `agent.py:121,123,148` 已经用 `messages[0]["content"] += "..."` 追加。resume 段也用同样模式,**不**整段重建
+
+- [ ] **Step 1: 改 run_turn 签名 + _refresh_system_prompt append resume 段**
 
 修改 `cc_harness/agent.py`:
 - `run_turn(..., resume_task: TodoTask | None = None)` 新增参数(末尾参数,不破坏现有调用)
 - `_refresh_system_prompt(messages, cwd, mode, resume_task=None)` 加参数
-- **SECTION_POOL 注入路径**(关键,spec 没完全写明):
+- **注入路径**(**关键:用 append,不用 rebuild**,与 Q3/Q4 同模式):
   ```python
-  # 在 _refresh_system_prompt 末尾:
-  if mode == "coding" and resume_task is not None:
-      from cc_harness.prompts import Section
-      resume_section = Section(
-          name="resume_task",
-          content=f"## Resume Task (跨 session 续干)\n"
-                  f"id:    {resume_task.id}\n"
-                  f"title: {resume_task.title}\n"
-                  f"status:{resume_task.status}\n"
-                  f"priority:{resume_task.priority or 'none'}\n"
-                  f"active_sessions: {resume_task.active_sessions}\n\n"
-                  f"## Acceptance Criteria\n"
-                  + "\n".join(f"- {c}" for c in resume_task.acceptance_criteria),
-          priority=30,
-          conditions=("mode==coding",),
-      )
-      messages[0]["content"] = build_system_prompt(
-          cwd, mode, extra_sections=[resume_section]
+  # cc_harness/agent.py:_refresh_system_prompt 末尾:
+  if mode == "coding" and resume_task is not None and messages and messages[0].get("role") == "system":
+      # 先清掉上次的 resume 段(避免重复)
+      old = messages[0]["content"]
+      # 移除之前注入的 <resume_task>...</resume_task> 块(若有)
+      import re
+      old = re.sub(r"\n\n<resume_task>.*?</resume_task>\s*$", "", old, flags=re.DOTALL)
+      messages[0]["content"] = old + (
+          f"\n\n<resume_task>\n"
+          f"id:    {resume_task.id}\n"
+          f"title: {resume_task.title}\n"
+          f"status:{resume_task.status}\n"
+          f"priority:{resume_task.priority or 'none'}\n"
+          f"active_sessions: {resume_task.active_sessions}\n\n"
+          f"## Acceptance Criteria\n"
+          + "\n".join(f"- {c}" for c in resume_task.acceptance_criteria)
+          + "\n</resume_task>"
       )
   ```
-- 改 `build_system_prompt(cwd, mode, extra_sections=None)` 加可选参数,内部传给 `PromptComposer(..., extra=extra_sections)`
+- **不**改 `build_system_prompt` 签名;不引入 SECTION_POOL 静态 section(动态条件评估是坑,直接 inline if 守卫即可)
+- **不**改 `cc_harness/prompts.py`(本 task 不动它)
 
-- [ ] **Step 2: 测试验证不破坏现有**
+- [ ] **Step 2: 测试验证不破坏现有 + 验证 resume 行为**
+
+```python
+# tests/test_agent.py(append,不动既有)
+def test_refresh_system_prompt_no_resume_baseline(messages, tmp_path):
+    """resume_task=None → system prompt 与旧实现 byte-equal。"""
+    from cc_harness.agent import _refresh_system_prompt
+    cwd = str(tmp_path)
+    _refresh_system_prompt(messages, cwd, "coding", resume_task=None)
+    # 再调一次,断言幂等
+    before = messages[0]["content"]
+    _refresh_system_prompt(messages, cwd, "coding", resume_task=None)
+    assert messages[0]["content"] == before
+
+def test_refresh_system_prompt_with_resume_appends_block(messages, tmp_path):
+    """resume_task 非空 → 追加 <resume_task>...</resume_task>,且 idempotent(两次调只一份)。"""
+    from cc_harness.agent import _refresh_system_prompt
+    from cc_harness.project.models import TodoTask
+    from datetime import datetime
+    cwd = str(tmp_path)
+    t = TodoTask(id="aaa", title="x", status="in_progress",
+                 created_at=datetime.now(), updated_at=datetime.now(),
+                 description="", depends_on=[], parent_task=None,
+                 assigned_to=None, priority="high", labels=[],
+                 due_date=None, effort_estimate=None,
+                 acceptance_criteria=["c1"], active_sessions=[])
+    _refresh_system_prompt(messages, cwd, "coding", resume_task=t)
+    assert messages[0]["content"].count("<resume_task>") == 1
+    _refresh_system_prompt(messages, cwd, "coding", resume_task=t)
+    assert messages[0]["content"].count("<resume_task>") == 1  # 幂等
+
+def test_refresh_system_prompt_resume_does_not_clobber_q3_q4(messages, tmp_path):
+    """Q3 persona / Q4 canvas 标记必须保留。"""
+    from cc_harness.agent import _refresh_system_prompt
+    # 在 messages[0] 注入 Q3/Q4 标记
+    messages[0]["content"] += "\n\n## 用户画像\nPERSONA_MARKER\n## 任务画布(Mermaid)\nCANVAS_MARKER"
+    t = ...  # TodoTask
+    _refresh_system_prompt(messages, str(tmp_path), "coding", resume_task=t)
+    assert "PERSONA_MARKER" in messages[0]["content"]
+    assert "CANVAS_MARKER" in messages[0]["content"]
+    assert "<resume_task>" in messages[0]["content"]
+```
 
 Run: `.venv/Scripts/python.exe -m pytest tests/test_agent.py -v`
-Expected: PASS(没改默认行为,新参数默认 None)
+Expected: PASS(全部 3 个新 test + 既有 ~30 test)
 
 - [ ] **Step 3: commit**
 
 ```bash
-git add cc_harness/agent.py cc_harness/prompts.py
-git commit -m "feat(agent): run_turn + _refresh_system_prompt 支持 resume_task (SECTION_POOL 注入)"
+git add cc_harness/agent.py tests/test_agent.py
+git commit -m "feat(agent): run_turn + _refresh_system_prompt 支持 resume_task (append,不 clobber Q3/Q4)"
 ```
 
 ### Task 6.3: repl.py — 6 处接线
