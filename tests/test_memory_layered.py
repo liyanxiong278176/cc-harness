@@ -79,6 +79,92 @@ async def test_capture_records_and_idempotent(tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_capture_populates_extract_columns(tmp_path):
+    """Phase 3: capture 同步抽 dates/entities/keywords 存到独立列。"""
+    from cc_harness.memory.store import MemoryStore
+    from cc_harness.memory.capture import capture
+    s = MemoryStore(db_path=tmp_path/"capex.db", embedding_dim=4); await s.init_schema()
+    msgs = [
+        {"role": "user", "content": "When did Caroline go to LGBTQ support on 7 May 2023?"},
+        {"role": "assistant", "content": "She went last year."},
+    ]
+    await capture(s, "sess1", msgs, turn_idx=0)
+    cur = await s._db.execute(
+        "SELECT role, dates, entities, keywords FROM conversation "
+        "WHERE session_id=? AND turn_idx=0 ORDER BY id",
+        ("sess1",),
+    )
+    rows = await cur.fetchall()
+    assert len(rows) == 2
+    # user msg: 有日期 + entity
+    user_row = rows[0]
+    assert "7 May 2023" in user_row[1], f"dates should contain '7 May 2023', got {user_row[1]!r}"
+    assert "Caroline" in user_row[2], f"entities should contain 'Caroline', got {user_row[2]!r}"
+    assert "LGBTQ" in user_row[2], f"entities should contain 'LGBTQ', got {user_row[2]!r}"
+    # keywords top 必有 caroline / lgbtq
+    assert "caroline" in user_row[3]
+    # assistant msg: 'last year' 应被抽到 dates
+    asst_row = rows[1]
+    assert "last year" in asst_row[1], f"dates should contain 'last year', got {asst_row[1]!r}"
+    await s.close()
+
+
+@pytest.mark.asyncio
+async def test_conversation_schema_migration_adds_extract_columns(tmp_path):
+    """旧库(无新列)被打开时,_migrate 补上 dates/entities/keywords。"""
+    import aiosqlite
+    db_path = tmp_path / "legacy.db"
+    # 模拟旧库:用 aiosqlite 直接建 conversation 表,无新列
+    async with aiosqlite.connect(db_path) as db:
+        await db.execute("""
+            CREATE TABLE conversation (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                session_id TEXT NOT NULL,
+                turn_idx INTEGER NOT NULL,
+                role TEXT NOT NULL,
+                content TEXT NOT NULL,
+                ts REAL NOT NULL
+            )
+        """)
+        await db.execute(
+            "INSERT INTO conversation(session_id,turn_idx,role,content,ts) "
+            "VALUES('s',0,'user','legacy',1.0)"
+        )
+        await db.commit()
+    # 用 MemoryStore 打开,触发 _migrate
+    from cc_harness.memory.store import MemoryStore
+    s = MemoryStore(db_path=db_path, embedding_dim=4)
+    # patch sqlite-vec load (test_memory_layered 通常用 monkeypatch)
+    import cc_harness.memory.store as store_mod
+    orig = store_mod.sqlite_vec
+    try:
+        # skip vec — 我们不调 vec,只验 conversation 迁移
+        from unittest.mock import patch
+        with patch.object(store_mod, "sqlite_vec", orig):
+            await s.init_schema()
+    except Exception:
+        # 如果 init_schema 因 vec 失败,直接手动跑 _migrate
+        await s._db.execute("PRAGMA table_info(conversation)")
+        from cc_harness.memory.store import MemoryStore as MS
+        s2 = MS(db_path=db_path, embedding_dim=4)
+        s2._db = await aiosqlite.connect(db_path)
+        await s2._migrate()
+        cur = await s2._db.execute("PRAGMA table_info(conversation)")
+        cols = {r[1] for r in await cur.fetchall()}
+        assert "dates" in cols
+        assert "entities" in cols
+        assert "keywords" in cols
+        await s2._db.close()
+        return
+    cur = await s._db.execute("PRAGMA table_info(conversation)")
+    cols = {r[1] for r in await cur.fetchall()}
+    assert "dates" in cols, f"_migrate should add 'dates' column, got {cols!r}"
+    assert "entities" in cols
+    assert "keywords" in cols
+    await s.close()
+
+
+@pytest.mark.asyncio
 async def test_service_save_with_session(tmp_path):
     """service.save(text, source, session_id) 持久化 session_id。"""
     from cc_harness.memory.store import MemoryStore

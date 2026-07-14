@@ -77,7 +77,10 @@ class MemoryStore:
             turn_idx INTEGER NOT NULL,
             role TEXT NOT NULL,
             content TEXT NOT NULL,
-            ts REAL NOT NULL
+            ts REAL NOT NULL,
+            dates TEXT NOT NULL DEFAULT '',
+            entities TEXT NOT NULL DEFAULT '',
+            keywords TEXT NOT NULL DEFAULT ''
         )""")
         await self._db.execute(
             "CREATE INDEX IF NOT EXISTS idx_conv_session ON conversation(session_id, turn_idx)"
@@ -85,23 +88,37 @@ class MemoryStore:
         await self._migrate()
 
     async def _migrate(self) -> None:
-        """旧库兼容:探测 memories 缺列则 ALTER 补上 layer/session_id。"""
+        """旧库兼容:探测 memories 缺列则 ALTER 补上 layer/session_id;conversation
+        缺列补 dates/entities/keywords(Phase 3 L0 结构化抽取)。"""
         assert self._db is not None
-        cols = {r[1] for r in (await (await self._db.execute("PRAGMA table_info(memories)")).fetchall())}
-        if "layer" not in cols:
+        m_cols = {r[1] for r in (await (await self._db.execute("PRAGMA table_info(memories)")).fetchall())}
+        if "layer" not in m_cols:
             await self._db.execute("ALTER TABLE memories ADD COLUMN layer TEXT DEFAULT 'L1'")
-        if "session_id" not in cols:
+        if "session_id" not in m_cols:
             await self._db.execute("ALTER TABLE memories ADD COLUMN session_id TEXT")
+        c_cols = {r[1] for r in (await (await self._db.execute("PRAGMA table_info(conversation)")).fetchall())}
+        for col in ("dates", "entities", "keywords"):
+            if col not in c_cols:
+                await self._db.execute(
+                    f"ALTER TABLE conversation ADD COLUMN {col} TEXT NOT NULL DEFAULT ''"
+                )
         await self._db.commit()
 
     async def add_conversation(
         self, session_id: str, turn_idx: int, role: str, content: str, ts: float,
+        dates: str = "", entities: str = "", keywords: str = "",
     ) -> None:
-        """L0:写入单条会话消息(user/assistant/tool)。"""
+        """L0:写入单条会话消息(user/assistant/tool)。
+
+        Phase 3: dates/entities/keywords 是 cc_harness.memory.extract 的产物,
+        用 `\x1f`(unit separator)分隔多个值。空串 = 未抽取/未提供。
+        旧调用方不传时退化为空串(向后兼容)。
+        """
         assert self._db is not None
         await self._db.execute(
-            "INSERT INTO conversation(session_id, turn_idx, role, content, ts) VALUES (?, ?, ?, ?, ?)",
-            (session_id, turn_idx, role, content, ts),
+            "INSERT INTO conversation(session_id, turn_idx, role, content, ts, "
+            "dates, entities, keywords) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            (session_id, turn_idx, role, content, ts, dates, entities, keywords),
         )
         await self._db.commit()
 
