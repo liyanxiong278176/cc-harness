@@ -2,6 +2,8 @@
 
 > **范围**:cc-harness AI 工程目标"其一·长程任务" 5 红 + 3 黄中的 **A 子集**——任务追踪底座(Project 容器 + Todo 任务清单 + 跨 session resume)。B(外层 loop + DAG)/ C(HTN + checkpoint 自检)在 A 完成后另立 spec。
 >
+> **字段计数约定**(全文统一):TodoTask 共 **15 字段** = **13 用户可控**(title / description / status / depends_on / parent_task / assigned_to / priority / labels / due_date / effort_estimate / acceptance_criteria + id / created_at / updated_at 由系统自动生成)+ **1 系统**(active_sessions)。全文出现 "13" 指**用户可控字段**;"14" 指**用户可控 + 自动生成**;"15" 指**完整 dataclass**。下文用"T13" / "T14" / "T15"区分以避免歧义。
+>
 > **For agentic workers:** REQUIRED SUB-SKILL: superpowers:subagent-driven-development。
 
 ## Goal
@@ -9,7 +11,7 @@
 把当前缺失的 **3 红**(Todo / 项目容器 / 跨 session resume)一次落地,提供:
 
 1. **项目容器** —— `.cc-harness/project.yaml` manifest,跨 session/跨机器稳定识别项目身份
-2. **Todo 任务清单** —— 文件式持久化(yaml 主索引 + 每任务 md),13 字段完整建模,人/agent 双通道读写
+2. **Todo 任务清单** —— 文件式持久化(yaml 主索引 + 每任务 md),T13 字段完整建模,人/agent 双通道读写
 3. **跨 session resume** —— 启动检测 + 询问续干上次 in_progress 任务,session_id 累加到 task 的 `active_sessions`
 
 完成 A 后,B/C 阶段不用改 schema 直接接入(字段集已预留 `depends_on` / `parent_task` / `acceptance_criteria` / `assigned_to`)。
@@ -31,7 +33,7 @@
 
 1. **A → B → C 串行**:本 spec 只做 A,B/C 在 A 完成后独立 spec
 2. **Project = 显式 manifest**(`.cc-harness/project.yaml`),不动 cwd 隐式方案
-3. **Todo 字段集 = 完整档 13 字段**(id/title/status/created_at/updated_at/description + depends_on/parent_task/assigned_to + priority/labels/due_date/effort_estimate/acceptance_criteria)
+3. **Todo 字段集 = T13 字段**(用户可控 13 字段;id/created_at/updated_at 由系统生成 + active_sessions 追加,共 T15)
 4. **Todo 文件 = 混合**(主索引 `todos.yaml` + 每任务 `todos/<id>.md` frontmatter)
 5. **Todo 操作集 = 完整集**(list/get/create/update/delete/resolve/validate + 内部状态守卫 + 依赖校验)
 6. **提供方式 = CLI + agent tool 双通道**,共享 TodoService
@@ -179,8 +181,13 @@ live:
 
 **约束**:
 1. `project_id` 不可改(防止跨 session 引用断裂)
-2. 启动时校验:`project_id` / `name` / `todos_path` / `created_at` 必填;`schema_version` 已知;`resume_mode` 合法
-3. 可选字段缺省走默认,绝不抛错
+2. 启动时校验:
+   - `project_id` / `name` / `todos_path` / `created_at` 必填
+   - `schema_version` 已知(未知 → `ManifestError`,fail-closed,提示升级 cc-harness)
+   - `resume_mode` 合法(枚举内)
+   - **未知字段** → warn log,**不报错**(`extra='ignore'` 风格,允许用户手编加 `experimental: true` 类字段)
+   - **可选字段缺省** → 走默认,绝不抛错
+3. `project.yaml` 用 PyYAML `safe_load`,UTF-8,2-space 缩进(与现有 pyproject 一致)
 
 ### 组件 2:TodoService(`cc_harness/project/service.py`)
 
@@ -189,21 +196,37 @@ live:
 ```python
 @dataclass
 class TodoTask:
-    id: str                              # UUID 短码(8 hex)
-    title: str
-    status: Literal["pending","in_progress","done","blocked","cancelled"]
-    created_at: datetime
-    updated_at: datetime
+    # T13 用户可控字段
+    id: str                              # 系统生成(UUID 短码 8 hex)
+    title: str                           # 必填
+    status: Literal["pending","in_progress","done","blocked","cancelled"]  # 必填
     description: str                     # markdown
-    depends_on: list[str]
-    parent_task: str | None
-    assigned_to: str | None
+    depends_on: list[str]                # task id 列表
+    parent_task: str | None              # 父 task id(给 HTN 嵌套留口)
+    assigned_to: str | None              # "user" 或 agent name(给 SubAgent 留口)
     priority: Literal["low","medium","high","critical"] | None
     labels: list[str]
     due_date: datetime | None
     effort_estimate: float | None
-    acceptance_criteria: list[str]
-    active_sessions: list[str]           # append-only
+    acceptance_criteria: list[str]       # 给 checkpoint 自检留口
+
+    # T14 自动生成
+    created_at: datetime                 # 系统生成
+    updated_at: datetime                 # 系统生成
+
+    # T15 系统字段
+    active_sessions: list[str]           # append-only,最多 50 条(超过自动 prune)
+```
+
+**辅助数据类**:
+
+```python
+@dataclass
+class ValidationIssue:
+    task_id: str | None                  # 哪个 task;None 表示全局
+    severity: Literal["error", "warning"]
+    rule_id: str                         # 'missing_dependency' / 'cycle' / 'self_parent' / ...
+    message: str                         # 人类/LLM 友好的描述
 ```
 
 **Service API**:
@@ -257,12 +280,14 @@ class ManifestError(TodoError): ...
 
 ### 组件 4:依赖校验(`cc_harness/project/dependency.py`)
 
-四种校验:
+三种校验:
 
 1. **引用完整性**(`_check_references`):`depends_on` / `parent_task` 引用的 task 必须存在;parent 不能 self
 2. **全表环检测**(`_check_no_cycle`):DFS white/gray/black,O(V+E),`validate()` 时跑
 3. **子图环检测**(`_dep_check`):`create()` / `update(depends_on=)` 时跑,只看相关子图
-4. **拓扑排序**(`topo_sort`):Kahn 算法,O(V+E),**A 阶段实现不调用**,给 B 留口
+
+**A 阶段不做的事**(明确 YAGNI):
+- ❌ **拓扑排序** `topo_sort()` —— A 不实现。B spec 在 `dependency.py` 里加 `# TODO: B 阶段实现 Kahn` 注释占位,A 阶段不要写不会被调用的代码。
 
 ### 组件 5:Storage(`cc_harness/project/storage.py`)
 
@@ -280,12 +305,55 @@ class TodoStorage:
 **约束**:
 1. **单源真相**——只有 TodoService 调 Storage,不允许 CLI / tool 直接读写
 2. **原子写**——yaml 写前 `.tmp` + `os.replace`
-3. **md 文件 frontmatter 序列化** 13 字段;body = description markdown
+3. **md 文件 frontmatter 序列化** T13 字段(用户可控字段)+ id/created_at/updated_at/active_sessions;body = description markdown
 4. **空目录创建**:`todos/` 不存在 → 自动创建 + 空 `todos.yaml`
+5. **active_sessions 自动 prune**:`_add_active_session()` 时若长度 > 50 → 截断为最近 50 条 + 一行注释 `# earlier N sessions truncated at <timestamp>`。防止无界增长导致 yaml/md 膨胀。
+
+**yaml ↔ md 合并策略**(A 阶段定义,防止外部编辑导致漂移):
+
+- **load 时**:
+  - yaml 是主索引,所有字段以 yaml 为准
+  - md frontmatter 仅作 description 字段的来源(md frontmatter 的其他字段若与 yaml 冲突 → warning log,以 yaml 为准)
+  - yaml 中引用但 md 文件不存在 → warning log + 把 description 字段置空字符串,**不报错**(允许只有 yaml 索引,无 md 文件)
+  - md 文件存在但 yaml 不引用 → warning log + 询问用户(LLM tool 中返回 issue;CLI 中询问);**绝不静默 prune**
+
+- **save 时**:
+  - 任何 update/create 后,Service 自动同步 yaml + 对应 md 文件
+  - 写 md 时:frontmatter = yaml 全字段(T15);body = description markdown
+  - 删除 task 时(force=True 且无依赖):同步删 yaml 行 + md 文件
+
+- **冲突检测**:`validate()` 检查"yaml 引用但 md 缺失"和"md 文件无 yaml 引用",返回 ValidationIssue
 
 ### 组件 6:Live 组件(`cc_harness/project/live.py`)
 
 Rich `Live` 上下文管理器,REPL 顶部常驻。
+
+**渲染策略决策**(spec 范围内选定 — `方案 B:Live + input 显式 stop/start`):
+
+| 方案 | 优劣 | 选择 |
+|---|---|---|
+| A. `Console.status` 单行 spinner | 简单,但只能显示当前 task,不能显示完整列表 | ❌ 不符合"列表 + 进度条"需求 |
+| **B. Rich Live 占顶部 N 行 + `input()` 期间显式 stop/start** | Live 全功能 + REPL 兼容,实现稍复杂 | ✅ **A 阶段选定** |
+| C. 不持续刷新,每 turn 打印一次状态摘要 | 最简单,但无 spinner 动画 | ❌ 不符合"Claude Code 体验" |
+
+**方案 B 实现要点**:
+```python
+class TodoLivePanel:
+    def __enter__(self): self.start()
+    def __exit__(self, *a): self.stop()
+
+# REPL 主循环中:
+with TodoLivePanel(...) as panel:
+    while True:
+        raw = await _read_user(prompt)   # Live 仍 active,Rich 管光标位置
+        if raw.startswith("/"): ...       # slash 命令不走 LLM,Live 暂停显示
+        await run_turn(...)              # 输出流向 Live 下方的 buffer
+        panel.refresh()                  # 显式 refresh
+```
+
+**实测**:`_read_user` 用 `asyncio.to_thread(input, prompt)` 阻塞 stdin,Rich Live 自动让出控制权给 prompt;run_turn 输出到 stdout 通过 Live 的 refresh 区间**之外**,不会与 Live 重叠。spec 范围内验证一次。
+
+> **后续 issue 追踪**:Windows 终端无 SIGWINCH,resize 不自动重渲染(spec 不解决);B 阶段如需可加 stdin 轮询 width。
 
 **视觉布局**:
 
@@ -330,22 +398,68 @@ class TodoLivePanel:
 
 7 个 tool specs,通过 `extra_native_specs` 注入 `run_turn`:
 
-1. **todo_list**:列出(可按 status/parent_task 过滤)
+1. **todo_list**:列出(可按 status/parent_task 过滤,默认 limit=20)
 2. **todo_get**:单个任务详情
-3. **todo_create**:创建(13 字段除 id/created_at/updated_at/active_sessions 自动生成)
+3. **todo_create**:创建(T13 字段 + 系统自动生成 id/created_at/updated_at + active_sessions append)
 4. **todo_update**:更新任一字段
 5. **todo_delete**:删除(`--force` 才能删 done / 受依赖的)
 6. **todo_resolve**:依赖链解析(返回 task + 所有传递依赖)
 7. **todo_validate**:全表校验
 
-**session_id 传递**:handler 内 `os.environ.get("CC_HARNESS_SESSION_ID")`,REPL 启动时注入 env。**不改 dispatch 机制**。
+**session_id 注入**(显式,不靠 env var):
+
+```python
+# cc_harness/project/tools.py
+def inject_todo_tools(service: TodoService, session_id: str) -> list[dict]:
+    """Return extra_native_specs entries. session_id 显式传入,handler 内通过 deps['session_id'] 读。"""
+    deps = {"service": service, "session_id": session_id}
+    return [
+        {"spec": TODO_LIST_SPEC,       "handler": todo_list_handler,       "deps": deps},
+        {"spec": TODO_GET_SPEC,        "handler": todo_get_handler,        "deps": deps},
+        {"spec": TODO_CREATE_SPEC,     "handler": todo_create_handler,     "deps": deps},
+        {"spec": TODO_UPDATE_SPEC,     "handler": todo_update_handler,     "deps": deps},
+        {"spec": TODO_DELETE_SPEC,     "handler": todo_delete_handler,     "deps": deps},
+        {"spec": TODO_RESOLVE_SPEC,    "handler": todo_resolve_handler,    "deps": deps},
+        {"spec": TODO_VALIDATE_SPEC,   "handler": todo_validate_handler,   "deps": deps},
+    ]
+```
+
+CLI 模式(无 REPL)由 `cc_harness/cli/_shared.py` 生成一次性 session_id:`cli-{int(time.time())}-{uuid4().hex[:8]}`。
 
 **handler 返回文本格式**(LLM 可见):
+
 ```
+# todo_create 成功
 [todo_create] ✓ created task xyz-789
 title:    添加单元测试
 status:   pending
 id:       xyz-789
+
+# todo_list(默认 limit=20,按 status 优先级 + updated_at desc)
+[todo_list] 6 tasks (2 done / 1 in_progress / 3 pending)
+✓ abc-123  完成 hello.py                          [done]
+✓ def-456  设计新 API                              [done]
+⠋ jkl-012  实现 todo 持久化          [high]   [in_progress]
+○ mno-345  添加单元测试              [medium]     [pending]
+○ pqr-678  集成 Locomo eval                         [pending]
+○ stu-901  写文档                                   [pending]
+# (limit=20 后省略更早任务,LLM 用 status filter 再取)
+
+# todo_resolve(target=jkl-012,BFS 传递依赖,indented)
+[todo_resolve] jkl-012 chain (3 tasks)
+✓ abc-123  完成 hello.py                  [done]    ← depth 2
+✓ def-456  设计新 API                       [done]    ← depth 1
+⠋ jkl-012  实现 todo 持久化    [high]   [in_progress]  ← target
+
+Ready to work: all upstream done.
+
+# todo_validate
+[todo_validate] ✓ all 6 tasks valid
+# 或:
+[todo_validate] ✗ 2 issues found:
+  - [error] jkl-012: missing_dependency 'abc-123' (refers to non-existent task)
+  - [error] mno-345: cycle 'mno-345 -> pqr-678 -> mno-345'
+Fix with: cc-harness todo update <id> --depends-on ...
 ```
 
 **错误消息格式**(LLM 友好):
@@ -354,6 +468,8 @@ id:       xyz-789
   jkl-012 -> xyz-789 -> jkl-012
   Remove one edge.
 ```
+
+**todo_list 默认 limit**:20(防爆 context window)。LLM 想看更多 → 显式传 `limit=N` 或 `status=` 过滤。LLM 想看 done → 用 `todo_get` 单取或 `status=done` 过滤。
 
 ### 组件 8:CLI 命令(`cc_harness/cli/`)
 
@@ -379,48 +495,64 @@ id:       xyz-789
 
 修改点:
 
-1. 启动时检测 manifest:
+1. **启动时检测 manifest** —— **Breaking change**:`python main.py` 现要求 `.cc-harness/project.yaml` 存在。详见"风险与缓解"章节的迁移计划。
+
    ```python
    from cc_harness.project.manifest import load_manifest
    manifest = load_manifest(cwd)
    if manifest is None:
-       # 提示 init(不静默 fallback)
        print_info(console, "No .cc-harness/project.yaml found. Run: cc-harness init")
        sys.exit(1)
    ```
 
-2. 加载 TodoService + Live:
+2. **加载 TodoService + Live**:
    ```python
    todo_service = TodoService(project_root=Path(cwd), manifest=manifest)
    live_panel = TodoLivePanel(console, todo_service, manifest)
    live_panel.start()
    ```
 
-3. 注入 todo tools(同 memory 模式):
+3. **注入 todo tools**(同 memory 模式,但 `extras` 拼接需 None-safe):
    ```python
    from cc_harness.project.extras import inject_todo_tools
-   state.todo_extras = inject_todo_tools(todo_service)
-   # extra_native_specs=state.memory_extras + state.todo_extras
+   state.todo_extras = inject_todo_tools(todo_service, session_id=state.session_id)
+   # extra_native_specs 必须 None-safe(plan/design 模式时 None)
+   _all_extras = list(state.memory_extras or []) + list(state.todo_extras or [])
+   extra_native_specs=_all_extras or None
    ```
 
-4. Resume 询问(只在 manifest.resume_mode == "ask" 时):
+4. **Resume 注入走 SECTION_POOL**,**不** append 到 messages:
    ```python
-   if state.session_stats.turns == 0:    # 首 turn
-       in_progress = next((t for t in tasks if t.status == "in_progress"), None)
+   if state.session_stats.turns == 0 and manifest.resume_mode == "ask":
+       in_progress = _select_resume_task(tasks)   # 见下面策略
        if in_progress:
-           print_resume_prompt(console, in_progress, tasks)
-           choice = await _read_user("Continue? [y/n/skip]: ")
-           # 注入到 system prompt
-           if choice == "y":
-               state.messages.append({"role": "system", "content": f"## Resume task\n{in_progress.title}\n..."})
+           state.resume_task = in_progress         # ReplState 新增字段
+   # agent._refresh_system_prompt(messages, cwd, mode) 检测 state.resume_task,
+   # 追加 SECTION_POOL 一段(满足 mode==coding and resume_task is not None 条件),
+   # 自然 rebuild 不会污染 messages 末尾
    ```
 
-5. After-turn 钩子(暂不实现 L2 scenario 自动覆盖):
+   **`_select_resume_task` 规则**(决定性):
+   ```python
+   def _select_resume_task(tasks: list[TodoTask]) -> TodoTask | None:
+       """选择规则:updated_at desc 最新的 in_progress task。
+       若 0 个 in_progress → 返回 None(resume prompt 跳过,直接进 REPL)。
+       若多个 in_progress → 取 updated_at 最新(假设最近动的那个最相关)。
+       """
+       in_progress = [t for t in tasks if t.status == "in_progress"]
+       if not in_progress:
+           return None
+       return max(in_progress, key=lambda t: t.updated_at)
+   ```
+
+5. **After-turn 钩子**(暂不实现 L2 scenario 自动覆盖):
    ```python
    async def _after_turn_todo(state: ReplState, todo_service: TodoService) -> None:
        """暂为空函数,B 阶段填 verify hook"""
        pass
    ```
+
+6. **mode 适配**:plan / design mode 下 `tool_specs=None` 已由现有 agent.py 处理(物理屏蔽 tool_calls);但 todo_create 在 plan mode 是合法的("设计阶段也要记 todo")。具体:plan/design 模式下 `state.todo_extras` 仍注入,但 LLM 看不到(因为 tool_specs=None),**用户**可通过 CLI 创建。A 不特殊处理。
 
 ### 组件 10:Memory 集成(`cc_harness/project/memory_bridge.py`)
 
@@ -599,17 +731,46 @@ docs/superpowers/plans/
 
 | 风险 | 缓解 |
 |---|---|
+| **Breaking change:`python main.py` 现要求 project.yaml** | 详见下方"迁移计划"段 |
 | 并发写同一 task 导致数据竞争 | LWW(后写赢)+ git 自然冲突检测 + validate() 给清晰错误 |
-| md 文件外部编辑改导致 yaml 索引漂移 | TodoService.update 自动重写 yaml 索引;`mtime` 比对 + 提醒 |
-| Live 组件与 Rich 现有 REPL 输出冲突 | Live 占顶部固定 N 行,Rich 自动管光标;单元测覆盖 _render 隔离 |
+| md 文件外部编辑改导致 yaml 索引漂移 | TodoService.update 自动重写 yaml 索引;`validate()` 报"yaml 引用但 md 缺失" / "md 文件无 yaml 引用"两类 issue(详见组件 5 合并策略) |
+| Live 组件与 Rich 现有 REPL 输出冲突 | **方案 B**:Live 占顶部 N 行 + `_read_user` 期间 stop/start + `panel.refresh()` 显式触发。`_print_disk_changes` 也走 Live 下方 buffer,不重叠。单元测覆盖 _render 隔离。 |
 | agent 滥用 todo_create 大量创建任务 | 不在 A 范围硬限;LLM 用 token 成本自约束;B 阶段加 DAG 拓扑约束 |
-| session_id 漂移 | env var 统一,REPL 启动写入,todo handler 内读 |
+| session_id 漂移 | **显式注入**(TodoService constructor + handler deps),不靠 env var;CLI 模式生成 `cli-{ts}-{hex}` |
 | yaml 损坏/格式错误 | Storage 层 try/except → 启动报错 + 提示修复,绝不静默 fallback 到空表 |
-| .gitignore 默认行为 | init 时询问用户(默认开);用户主动 add 进 git 也支持 |
+| .gitignore 默认行为 | init 时询问用户(默认开);git repo 写 `.gitignore` 排除 `.cc-harness/todos/*.md`(只 track `project.yaml`);**非 git repo → skip .gitignore 步骤**(一次性 sandbox / sub-project) |
+| active_sessions 无界增长 | 自动 prune:超过 50 条 → 截断为最近 50 + 注释行 |
+| terminal resize | **A 阶段不处理**(Windows 无 SIGWINCH);spec 范围内不实现,B 阶段按需 |
+| manifest schema_version > 已知 | `ManifestError` fail-closed,提示升级 cc-harness(不静默降级) |
+| 未知 manifest 字段 | warn log 不报错(`extra='ignore'`),允许手编加 `experimental: true` 类字段 |
+
+### 迁移计划(Breaking change)
+
+**影响面**:
+- `eval/locomo/runner.py`(eval 入口)
+- `run_verify.py`(Phase-1 回归)
+- `eval/promptfoo/wrappers/cc_harness.py`(红队 wrapper)
+- 现有用户 clone 仓库后直接跑 `python main.py` 会失败
+
+**迁移方案**:
+1. **eval 路径**:在每个 eval 入口脚本(`runner.py`、`run_verify.py`、`cc_harness.py`)开头加 2 行:
+   ```python
+   from pathlib import Path
+   _manifest = Path(".cc-harness/project.yaml")
+   if not _manifest.exists():
+       from cc_harness.cli.init import init_noninteractive
+       init_noninteractive(Path.cwd(), name=Path.cwd().name)
+   ```
+2. **新用户友好**:`python main.py` 缺 manifest 时,**不 sys.exit**,而是自动调 `init_noninteractive`(默认 name=目录名,resume_mode=ask,启用 Live)→ 创建 manifest → 继续启动 REPL。这样新用户零摩擦。
+3. **显式 init 仍支持**:`cc-harness init`(交互模式)用于想自定义的。
+4. **CI / sandbox**:用 `--no-live --no-resume` flag 跳交互环节(spec 包含此 flag)。
+5. **旧 `python main.py` 行为**变更为"自动 init + 进 REPL",对外黑盒;所有现有测试需更新但不需要改业务逻辑。
+
+**backout**:若 breaking change 影响太大,fallback 是 `manifest = load_manifest(cwd) or Manifest.default_ephemeral()`(adhoc 模式,只读 todos 不持久),允许 REPL 在无 manifest 时运行。**A 阶段倾向于"自动 init"** 方案,backout 留作 escape hatch。
 
 ## 实施优先级(供 writing-plans 阶段参考)
 
-A 阶段的 8 节拆解为以下 6 个实现 task(由 writing-plans 阶段细化):
+A 阶段拆解为以下 6 个实现 task(按数据/逻辑/集成层次),由 writing-plans 阶段细化:
 
 1. **manifest + models + storage** — 数据层基础
 2. **status + dependency** — 校验逻辑(100% 覆盖)
@@ -620,10 +781,13 @@ A 阶段的 8 节拆解为以下 6 个实现 task(由 writing-plans 阶段细化
 
 依赖链:1 → 2 → 3 → {4, 5, 6 并行} → 集成测试。
 
-## 开放问题(写作 plan 时确认)
+## 开放问题(写作 plan 时必须答)
 
-1. `topo_sort()` 是否在 A 阶段导出给外部用?——决定是否加 `__all__` 标注
-2. `--resume-id` flag 是否默认行为(无 flag 时也允许)?——影响 CLI 解析
-3. Live 组件与 `_print_disk_changes` 的位置冲突(都在 REPL 顶部)?——可能需要合并或上下分置
-4. `cc-harness init` 在已有 `project.yaml` 时是否提供 "merge" 选项(保留旧配置)?
-5. session_id 长度限制?(现在用 `repl-{int(time.time())}`,如果加 nanosecond 更唯一)
+1. **init 行为最终选 "自动 init" 还是 "adhoc fallback"?** —— spec 推荐自动 init,plan 阶段评估实现成本与 breaking change 风险。
+2. **`cc-harness init` 二次执行是否提供 "merge" 选项**(保留旧配置、只补缺失字段)?——影响 init 命令复杂度。
+3. **`--resume-id <id>` flag 是否允许非交互模式?** —— 影响 CLI 解析(若允许,需要在 `cc-harness --resume` 后接可选 id)。
+4. **todo_update 触发 status=done 时,是否联动 `completion_capture`?** —— 还是只在 `validate()` 时扫?spec 默认"完成即触发 capture"(已勾上)。
+5. **并发 session 写入同一 yaml 的 conflict 解决?** —— LWW 在 yaml+md 双写下需具体到哪个文件,要不要 file lock(简单但慢)/ git 冲突(自然但需要 user 介入)?
+6. **Live panel 的 stderr/stdout 路由?** —— REPL 主用 stdout tty;4-phase 输出也走 stdout;Live 区域与下方输出怎么严格划分(靠 refresh 区间?靠 Console.file 分流?)?
+7. **plan/design mode 下 todo_create 是否允许?** —— spec 默认"工具不注入到 plan/design(物理屏蔽),但 CLI 可手动创建",需 plan 阶段确认无歧义。
+8. **session_id 长度限制?** —— 现在用 `repl-{int(time.time())}` (12 字符);要不要加 nanosecond 或 hex 后缀避免同秒重复?
