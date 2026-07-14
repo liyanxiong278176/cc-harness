@@ -97,15 +97,18 @@
 ```
 main.py 启动
   → 检查 cwd 是否有 .cc-harness/project.yaml
-    → 无:提示 cc-harness init(进入 init wizard)
+    → 无:自动调 init_noninteractive 创建 + 进 REPL
     → 有:加载 manifest
       → TodoService 读 todos.yaml + todos/*.md
         → TodoLivePanel 启动(spinner + 列表)
           → 打印: "📂 Project: cc-harness (id=xxx)"
                   "📋 5 tasks: 3 done / 1 in_progress / 1 pending"
-          → 询问: "上次 in_progress 是 [abc-123] 完成 hello.py,继续?(y/n/选其他)"
-            → y:继续该 task,agent 在 system prompt 注入该 task 上下文
-            → n:用户选其他或新建
+          → 询问(只在 resume_mode == "ask"):
+              "上次 in_progress 是 [abc-123] 完成 hello.py,继续?(y/n/pick)"
+            → y:attach 到 SECTION_POOL(注入 acceptance_criteria 等 context)
+            → n:跳过 resume,直接进 REPL
+            → pick:展示 non-cancelled task 列表(按 status 优先级 + updated_at desc,limit 20,超过则 `... +N more`)
+                  用户输入编号或 task id → attach 对应 task 到 SECTION_POOL
 ```
 
 ### 流 2:agent 在 ReAct 循环里操作 todo
@@ -221,12 +224,31 @@ class TodoTask:
 **辅助数据类**:
 
 ```python
+from typing import Literal
+
+RuleId = Literal[
+    "missing_dependency",   # depends_on 引用不存在
+    "cycle",                # 依赖图有环
+    "self_parent",          # parent_task == self
+    "missing_parent",       # parent_task 引用不存在
+    "orphan_md",            # md 文件存在但 yaml 不引用
+    "missing_md",           # yaml 引用但 md 文件不存在
+    "duplicate_id",         # 重复 task id
+    "dangling_parent",      # parent_task 引用已删 task(force-delete 副作用)
+]
+
 @dataclass
 class ValidationIssue:
     task_id: str | None                  # 哪个 task;None 表示全局
     severity: Literal["error", "warning"]
-    rule_id: str                         # 'missing_dependency' / 'cycle' / 'self_parent' / ...
+    rule_id: RuleId
     message: str                         # 人类/LLM 友好的描述
+
+@dataclass
+class TodoEvent:
+    """subscribe callback 第二参数。"""
+    kind: Literal["created", "updated", "deleted", "status_changed"]
+    prev_status: str | None = None       # status_changed 时填旧值
 ```
 
 **Service API**:
@@ -250,7 +272,7 @@ class TodoService:
     async def delete(self, task_id: str, *, force=False) -> None: ...
 
     # 事件订阅(Live 组件用)
-    def subscribe(self, callback: Callable[[TodoTask, str], None]) -> None: ...
+    def subscribe(self, callback: Callable[[TodoTask, TodoEvent], None]) -> None: ...
     def unsubscribe(self, callback) -> None: ...
 ```
 
@@ -389,10 +411,11 @@ class TodoLivePanel:
 
 **边界 case**:
 - 任务 0 个 → "📋 no tasks yet"
-- 任务 > 终端高度 → 按状态优先级折叠,底部 `... +N more`
+- 任务 > 终端高度 → 按状态优先级折叠,底部 `... +N more`(由 manifest.live.max_height 默认 10 + fold_done 默认 5 控制;**Live 渲染只展示折叠后的 top N,不渲染全表**)
 - done 任务超过 `fold_done` → 折叠前 N 个
 - 标题超长 → 自动截断 + `…`
-- 终端 resize → Rich Live 自动重渲染
+- description 超长(>200 字符) → Live 不展示 description 全文,只渲染 title + status + priority
+- 终端 resize → Rich Live **不自动**重渲染(Windows 无 SIGWINCH);width 变化只影响 panel 内截断/换行,下次 refresh 自然更新
 
 ### 组件 7:Agent tools(`cc_harness/project/tools.py`)
 
@@ -402,7 +425,7 @@ class TodoLivePanel:
 2. **todo_get**:单个任务详情
 3. **todo_create**:创建(T13 字段 + 系统自动生成 id/created_at/updated_at + active_sessions append)
 4. **todo_update**:更新任一字段
-5. **todo_delete**:删除(`--force` 才能删 done / 受依赖的)
+5. **todo_delete**:删除(`--force` 才能删 done / 受依赖的;**force 语义明确**:force=False → 删除被拒绝若 status==done 或有 dependents;force=True → 强制删除,**保留 dangling references**(dependents 的 depends_on 仍指向已删 id),validate() 兜底报 `missing_dependency` issue。**不级联删 dependents**。)
 6. **todo_resolve**:依赖链解析(返回 task + 所有传递依赖)
 7. **todo_validate**:全表校验
 
@@ -473,17 +496,17 @@ Fix with: cc-harness todo update <id> --depends-on ...
 
 ### 组件 8:CLI 命令(`cc_harness/cli/`)
 
-| 命令 | 用途 |
-|---|---|
-| `cc-harness init` | 创建 `.cc-harness/project.yaml` |
-| `cc-harness todo list [filters]` | 列出任务 |
-| `cc-harness todo get <id>` | 单个详情 |
-| `cc-harness todo create [flags]` | 创建(支持 13 字段 flags) |
-| `cc-harness todo update <id> [flags]` | 更新 |
-| `cc-harness todo delete <id> [--force]` | 删除 |
-| `cc-harness todo resolve <id>` | 依赖链 |
-| `cc-harness todo validate` | 全表校验 |
-| `cc-harness --resume [--resume-id <id>]` | 显式 resume |
+| 命令 | 用途 | 关键 flags |
+|---|---|---|
+| `cc-harness init` | 创建 `.cc-harness/project.yaml` | `--no-prompt` / `--name` / `--resume-mode` / `--no-live` / `--force-reinit`(覆盖现有 manifest) |
+| `cc-harness todo list [filters]` | 列出任务 | `--status` / `--parent` / `--no-done` / `--json` / `--format` / `--sort` / `--limit`(默认 20) |
+| `cc-harness todo get <id>` | 单个详情 | `--json` / `--description-only` / `--raw` |
+| `cc-harness todo create [flags]` | 创建(支持 T13 字段 flags) | `--title`(必填) / `--description` / `--depends-on` / `--parent` / `--assigned-to` / `--priority` / `--label` / `--due-date` / `--effort-estimate` / `--acceptance-criteria`(可重复) |
+| `cc-harness todo update <id> [flags]` | 更新 | 对应 T13 字段 flags + `--clear-*`(清空可空字段) / `--append-acceptance-criteria` |
+| `cc-harness todo delete <id> [--force]` | 删除 | `--force` |
+| `cc-harness todo resolve <id>` | 依赖链 | `--no-done` / `--json` |
+| `cc-harness todo validate` | 全表校验 | `--json` / `--strict` |
+| `cc-harness --resume [--resume-id <id>]` | 显式 resume | `--resume-id` / `--no-resume`(纯净模式) |
 
 **TTY vs pipe**:
 - TTY → Rich 彩色 + 表格
@@ -493,16 +516,21 @@ Fix with: cc-harness todo update <id> --depends-on ...
 
 ### 组件 9:REPL 集成(`cc_harness/repl.py`)
 
+**最终行为**(spec 决策,与"迁移计划"步骤 2 一致):
+- 启动时缺 manifest → **不 sys.exit**,而是自动调 `init_noninteractive(cwd, name=dir_name)` 创建 manifest → 继续启动 REPL
+- 用户零摩擦(无需手动 `cc-harness init`)
+
 修改点:
 
-1. **启动时检测 manifest** —— **Breaking change**:`python main.py` 现要求 `.cc-harness/project.yaml` 存在。详见"风险与缓解"章节的迁移计划。
-
+1. **启动时检测 manifest + 自动 init**:
    ```python
    from cc_harness.project.manifest import load_manifest
+   from cc_harness.cli.init import init_noninteractive
    manifest = load_manifest(cwd)
    if manifest is None:
-       print_info(console, "No .cc-harness/project.yaml found. Run: cc-harness init")
-       sys.exit(1)
+       print_info(console, "No .cc-harness/project.yaml found. Auto-initializing...")
+       manifest = init_noninteractive(Path(cwd), name=Path(cwd).name)
+       print_info(console, "✓ Created .cc-harness/project.yaml (run `cc-harness init` to customize)")
    ```
 
 2. **加载 TodoService + Live**:
@@ -521,16 +549,22 @@ Fix with: cc-harness todo update <id> --depends-on ...
    extra_native_specs=_all_extras or None
    ```
 
-4. **Resume 注入走 SECTION_POOL**,**不** append 到 messages:
-   ```python
-   if state.session_stats.turns == 0 and manifest.resume_mode == "ask":
-       in_progress = _select_resume_task(tasks)   # 见下面策略
-       if in_progress:
-           state.resume_task = in_progress         # ReplState 新增字段
-   # agent._refresh_system_prompt(messages, cwd, mode) 检测 state.resume_task,
-   # 追加 SECTION_POOL 一段(满足 mode==coding and resume_task is not None 条件),
-   # 自然 rebuild 不会污染 messages 末尾
-   ```
+4. **Resume 注入走 SECTION_POOL**,**不** append 到 messages。**接线路径明确**:
+   - `repl.py` 选好 resume task 后 → 写入 `state.resume_task`
+   - `run_turn(..., resume_task=None)` 新增参数 → 透传给 `_refresh_system_prompt(messages, cwd, mode, resume_task=None)`
+   - `_refresh_system_prompt` 在 SECTION_POOL 中追加新段(条件:`mode == "coding" and resume_task is not None`),内容:
+     ```
+     ## Resume Task (跨 session 续干)
+     id:      {task.id}
+     title:   {task.title}
+     status:  {task.status}
+     priority:{task.priority}
+     active_sessions: {task.active_sessions}
+
+     ## Acceptance Criteria
+     {逐条列出 acceptance_criteria}
+     ```
+   - **每次 turn 重写 system prompt**(CLAUDE.md 既有约定)→ 自然刷新,无 messages 漂移
 
    **`_select_resume_task` 规则**(决定性):
    ```python
@@ -545,21 +579,52 @@ Fix with: cc-harness todo update <id> --depends-on ...
        return max(in_progress, key=lambda t: t.updated_at)
    ```
 
-5. **After-turn 钩子**(暂不实现 L2 scenario 自动覆盖):
+   **`resume_mode` 三档行为**(spec 全定义):
+   | mode | 行为 |
+   |---|---|
+   | `ask` | `turn==0` 时打印 resume prompt + 询问 `y/n/选其他`,用户选后 attach 到 SECTION_POOL |
+   | `auto` | `turn==0` 时静默调 `_select_resume_task`,非 None 则 attach 到 SECTION_POOL(不询问) |
+   | `manual` | REPL 默认不主动 resume;只在用户显式传 `--resume` 或 `--resume-id <id>` 时才 attach |
+
+5. **After-turn 钩子**(占位,B 阶段填):
    ```python
    async def _after_turn_todo(state: ReplState, todo_service: TodoService) -> None:
-       """暂为空函数,B 阶段填 verify hook"""
+       """A 阶段空占位,B 阶段填 verify hook。接口预留,接入 repl.py 主循环(_after_turn_memory 旁)。"""
        pass
    ```
 
-6. **mode 适配**:plan / design mode 下 `tool_specs=None` 已由现有 agent.py 处理(物理屏蔽 tool_calls);但 todo_create 在 plan mode 是合法的("设计阶段也要记 todo")。具体:plan/design 模式下 `state.todo_extras` 仍注入,但 LLM 看不到(因为 tool_specs=None),**用户**可通过 CLI 创建。A 不特殊处理。
+6. **mode 适配**:plan / design mode 下 `tool_specs=None` 已由现有 agent.py 处理(物理屏蔽 tool_calls);但 todo_create 在 plan mode 是合法的("设计阶段也要记 todo")。具体:plan/design 模式下 `state.todo_extras` 仍注入,但 LLM 看不到(因为 tool_specs=None),**用户**可通过 CLI 创建。
+   - resume SECTION_POOL 的 condition 是 `mode==coding and resume_task is not None` → plan/design 模式下 resume 段不渲染(LLM 不调工具,无需 task context 注入);用户切回 /coding 时 turn 已 > 0,resume 不再触发(只在新 session `turn==0` 时询问)。
 
 ### 组件 10:Memory 集成(`cc_harness/project/memory_bridge.py`)
 
 **默认:互不写入**(可选 opt-in `completion_capture`)。
 
+**挂载点明确**:`TodoService.update` 内部,在 status 从非 done → done 转移时直接 await `on_task_completion()`(self-contained,sync within service):
+
 ```python
+class TodoService:
+    def __init__(self, project_root, manifest, llm=None, memory_service=None):
+        ...
+        self.memory_service = memory_service    # 可选,None 时 completion_capture 无效
+
+    async def update(self, task_id, *, session_id=None, **fields):
+        ...
+        prev_status = task.status
+        task = self._apply_update(task, fields)        # 内部字段更新
+        if "status" in fields and prev_status != "done" and task.status == "done":
+            await self._on_completion(task)           # 挂载点
+        ...
+
+    async def _on_completion(self, task: TodoTask) -> None:
+        """self-contained: 直接调 memory_bridge,不抛异常冒泡。"""
+        try:
+            await on_task_completion(task, self.manifest, self.memory_service)
+        except Exception as e:
+            print_warn(Console(), f"task completion capture failed: {e}")
+
 async def on_task_completion(task: TodoTask, manifest: Manifest, memory_service: MemoryService | None) -> None:
+    """completion_capture=false → return。memory_service=None → return。"""
     if not manifest.memory.integration.completion_capture:
         return
     if memory_service is None:
@@ -568,6 +633,8 @@ async def on_task_completion(task: TodoTask, manifest: Manifest, memory_service:
     session_id = task.active_sessions[-1] if task.active_sessions else None
     await memory_service.save(text, source="todo/completion", session_id=session_id)
 ```
+
+**TodoService constructor 接受可选 `memory_service`**:REPL 启动时若有 memory init 成功,把 `memory_service` 实例传给 `TodoService(...)`,否则传 None(graceful degrade)。
 
 ## 触发参数
 
@@ -674,13 +741,15 @@ docs/superpowers/plans/
 | 并发两个 update 同一 task | 后写赢(LWW),不引入锁 |
 | todo_update 给未注册字段 | 静默忽略 + warn |
 | session_id 含特殊字符 | 自动 sanitize 为 `[a-z0-9-]` |
-| project_id 试图改 | 拒绝,必须 `--force-reinit` |
+| project_id 试图改 | 拒绝,必须 `cc-harness init --force-reinit`(CLI flag,见组件 8) |
 | 已 done 任务 status 改 in_progress | StatusGuardError |
 | depends_on 含自身 | DependencyCycleError |
-| md 文件外部编辑改 | 下次 TodoService 读合并回 yaml |
+| md 文件外部编辑改 | 下次 TodoService 读合并回 yaml(详见组件 5 合并策略) |
 | Live 启动时无任务 | "📋 no tasks yet" |
 | 1000 任务全表 validate | <100ms |
-| 1000 任务 Live 渲染 | <50ms/帧 |
+| 1000 任务 Live 渲染 | **<30ms/帧**(只渲染折叠 top N,不渲染全表) |
+| description > 50KB | Storage 写入前 warn + 截断到 50KB |
+| force delete 产生 dangling ref | 保留依赖引用,validate() 报 `[error] xxx: missing_dependency` |
 
 ### 覆盖率目标
 
@@ -742,7 +811,9 @@ docs/superpowers/plans/
 | active_sessions 无界增长 | 自动 prune:超过 50 条 → 截断为最近 50 + 注释行 |
 | terminal resize | **A 阶段不处理**(Windows 无 SIGWINCH);spec 范围内不实现,B 阶段按需 |
 | manifest schema_version > 已知 | `ManifestError` fail-closed,提示升级 cc-harness(不静默降级) |
+| manifest schema_version < 已知 | warn log 通过(向后兼容老 manifest,不阻塞) |
 | 未知 manifest 字段 | warn log 不报错(`extra='ignore'`),允许手编加 `experimental: true` 类字段 |
+| description 字段 > 50KB | Storage 写入前 warn + 截断到 50KB(避免 yaml/md 膨胀;Live 不展示全文) |
 
 ### 迁移计划(Breaking change)
 
@@ -753,18 +824,12 @@ docs/superpowers/plans/
 - 现有用户 clone 仓库后直接跑 `python main.py` 会失败
 
 **迁移方案**:
-1. **eval 路径**:在每个 eval 入口脚本(`runner.py`、`run_verify.py`、`cc_harness.py`)开头加 2 行:
-   ```python
-   from pathlib import Path
-   _manifest = Path(".cc-harness/project.yaml")
-   if not _manifest.exists():
-       from cc_harness.cli.init import init_noninteractive
-       init_noninteractive(Path.cwd(), name=Path.cwd().name)
-   ```
-2. **新用户友好**:`python main.py` 缺 manifest 时,**不 sys.exit**,而是自动调 `init_noninteractive`(默认 name=目录名,resume_mode=ask,启用 Live)→ 创建 manifest → 继续启动 REPL。这样新用户零摩擦。
-3. **显式 init 仍支持**:`cc-harness init`(交互模式)用于想自定义的。
-4. **CI / sandbox**:用 `--no-live --no-resume` flag 跳交互环节(spec 包含此 flag)。
-5. **旧 `python main.py` 行为**变更为"自动 init + 进 REPL",对外黑盒;所有现有测试需更新但不需要改业务逻辑。
+1. **单点修改**:**只改 `main.py` 一处**,自动 init 逻辑全部在 `run_repl` 入口完成。
+2. **eval 脚本无需改**:`eval/locomo/runner.py`、`run_verify.py`、`eval/promptfoo/wrappers/cc_harness.py` 等所有 eval 入口继续调 `python main.py` 或 `from main import main`,自动 init 由 main.py 内部兜底——零冗余。
+3. **新用户友好**:`python main.py` 缺 manifest 时,**不 sys.exit**,而是自动调 `init_noninteractive`(默认 name=目录名,resume_mode=ask,启用 Live)→ 创建 manifest → 继续启动 REPL。
+4. **显式 init 仍支持**:`cc-harness init`(交互模式)用于想自定义 name/options 的。
+5. **CI / sandbox**:用 `--no-live --no-resume` flag 跳交互环节(spec 包含此 flag)。
+6. **旧 `python main.py` 行为**变更为"自动 init + 进 REPL",对外黑盒;现有测试需更新(加 fixtures/project_minimal 兜底),不需要改业务逻辑。
 
 **backout**:若 breaking change 影响太大,fallback 是 `manifest = load_manifest(cwd) or Manifest.default_ephemeral()`(adhoc 模式,只读 todos 不持久),允许 REPL 在无 manifest 时运行。**A 阶段倾向于"自动 init"** 方案,backout 留作 escape hatch。
 
