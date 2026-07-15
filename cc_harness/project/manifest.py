@@ -13,6 +13,7 @@
 from __future__ import annotations
 
 import logging
+import os
 from pathlib import Path
 
 import yaml
@@ -92,7 +93,6 @@ def save_manifest(project_root: Path, manifest: Manifest) -> Path:
         yaml.safe_dump(payload, allow_unicode=True, sort_keys=False, default_flow_style=False, indent=2),
         encoding="utf-8",
     )
-    import os
     os.replace(tmp_path, manifest_path)
     return manifest_path
 

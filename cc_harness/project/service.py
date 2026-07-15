@@ -458,7 +458,7 @@ class TodoService:
     # ------------------------------------------------------------------ #
 
     async def _on_completion(self, task: TodoTask) -> None:
-        """status 非 done → done 时调用。失败 swallow(spec line 624)。"""
+        """status 非 done → done 时调用;异常会被吞掉并记录 warning。"""
         try:
             await on_task_completion(task, self.manifest, self.memory_service)
         except Exception as e:  # noqa: BLE001 — spec 要求 swallow

@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import logging
 import os
+from dataclasses import replace as _replace
 from datetime import datetime
 from pathlib import Path
 from typing import Iterable
@@ -348,13 +349,6 @@ class StorageError(Exception):
 # ---------------------------------------------------------------------------
 # 内部 helpers
 # ---------------------------------------------------------------------------
-
-
-def _replace(task: TodoTask, **changes) -> TodoTask:
-    """dataclass 不可变更新。"""
-    from dataclasses import replace
-
-    return replace(task, **changes)
 
 
 def _yaml_equal(a, b) -> bool:
