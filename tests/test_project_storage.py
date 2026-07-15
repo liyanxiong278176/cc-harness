@@ -459,7 +459,6 @@ def test_parse_frontmatter_unclosed():
 
 
 def test_render_md_includes_body():
-    now = datetime(2026, 7, 14, 10, 0, 0, tzinfo=timezone.utc)
     t = _make_task(description="hello")
     out = _render_md(t)
     assert out.startswith("---\n")
