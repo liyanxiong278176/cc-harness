@@ -7,50 +7,52 @@
       真正的 attach to REPL 不在本任务范围。
 
 实现策略:
-    - TodoService.list/get 是 async 但底层走 sync storage;
-    - 命令行运行时无 event loop — 直接 `asyncio.run()` 调一次;
-    - 测试时(在 pytest-asyncio loop 内)需要同步拿到结果 — 通过 `_run_async()`
-      自适应:有 running loop 时跑 sync 副本;否则 asyncio.run。
+    - 通过 TodoService(spec 组件 2 唯一入口)走 list / get,不直接碰 storage;
+    - 命令行运行时无 event loop — `asyncio.run()` 调一次;
+    - 测试在同步上下文中跑,asyncio.run 是 OK 的(没在 running loop 中)。
 """
 from __future__ import annotations
 
+import asyncio
 from argparse import Namespace
 from pathlib import Path
 
 from rich.console import Console
 
 from cc_harness.cli._shared import (
+    load_manifest_or_exit,
     print_error,
     print_text,
 )
-from cc_harness.project.exceptions import TaskNotFound
+from cc_harness.project.exceptions import TodoError
 from cc_harness.project.models import TodoTask
-from cc_harness.project.storage import TodoStorage
+from cc_harness.project.service import TodoService
+from cc_harness.project.storage import StorageError
 
 
 # ---------------------------------------------------------------------------
-# sync helpers — 直接走 TodoStorage (避免 asyncio.run 与 event loop 冲突)
+# Service wrapper — 单次 async 调用 → sync(CLI 短生命周期,asyncio.run OK)
 # ---------------------------------------------------------------------------
 
 
-def _load_all_sync(cwd: Path) -> list[TodoTask]:
-    """sync 读 todo 列表(等价 TodoService.list 无过滤)。"""
-    from cc_harness.project.manifest import load_manifest
+def _list_via_service(cwd: Path) -> list[TodoTask]:
+    """通过 TodoService.list() 取 task 列表。
 
-    manifest = load_manifest(cwd)
-    if manifest is None:
-        return []
-    storage = TodoStorage(cwd, manifest)
-    return storage.load_all()
+    与直接走 TodoStorage 的区别(spec 规则:所有 CLI 操作经过 service):
+        - 一致的引用完整性校验钩子
+        - 一致的 subscribe / 事件流(为 Task 6 接入 REPL 预留)
+        - 与 cmd_todo 行为对齐(空 manifest 行为、错误传递)
+    """
+    manifest = load_manifest_or_exit(cwd)
+    svc = TodoService(project_root=cwd, manifest=manifest)
+    return asyncio.run(svc.list(include_done=True))
 
 
-def _get_sync(cwd: Path, task_id: str) -> TodoTask:
-    """sync 取单个 task,TaskNotFound 由 caller 兜底。"""
-    tasks = _load_all_sync(cwd)
-    for t in tasks:
-        if t.id == task_id:
-            return t
-    raise TaskNotFound(f"task {task_id!r} not found")
+def _get_via_service(cwd: Path, task_id: str) -> TodoTask:
+    """通过 TodoService.get() 取单个 task。TaskNotFound 由 caller 兜底。"""
+    manifest = load_manifest_or_exit(cwd)
+    svc = TodoService(project_root=cwd, manifest=manifest)
+    return asyncio.run(svc.get(task_id))
 
 
 # ---------------------------------------------------------------------------
@@ -119,7 +121,7 @@ def cmd_resume(args: Namespace, cwd: Path) -> int:
         cwd: 项目根目录。
 
     Returns:
-        exit code:0 OK / 1 业务错。
+        exit code:0 OK / 1 业务错(缺 manifest / 任务错)/ 2 系统错。
     """
     console = Console()
 
@@ -136,12 +138,12 @@ def cmd_resume(args: Namespace, cwd: Path) -> int:
     try:
         # --resume-id <id> 优先
         if args.resume_id:
-            task = _get_sync(cwd, args.resume_id)
+            task = _get_via_service(cwd, args.resume_id)
             print_text(console, _format_resume_summary(task))
             return 0
 
         # --resume(无 id)→ 选最新 in_progress
-        tasks = _load_all_sync(cwd)
+        tasks = _list_via_service(cwd)
         selected = select_resume_task(tasks)
         if selected is None:
             print_text(
@@ -156,9 +158,13 @@ def cmd_resume(args: Namespace, cwd: Path) -> int:
             + _format_resume_summary(selected),
         )
         return 0
-    except TaskNotFound as e:
+    except TodoError as e:
+        # 缺 manifest、TaskNotFound、InvalidFieldError 等都走这里(exit 1)
         print_error(console, f"{type(e).__name__}: {e}")
         return 1
+    except (OSError, StorageError) as e:
+        print_error(console, f"system error: {type(e).__name__}: {e}")
+        return 2
 
 
 __all__ = ["cmd_resume", "select_resume_task"]

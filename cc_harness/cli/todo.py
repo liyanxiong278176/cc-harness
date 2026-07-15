@@ -35,6 +35,7 @@ from cc_harness.cli._shared import (
 )
 from cc_harness.project.exceptions import TodoError
 from cc_harness.project.service import TodoService
+from cc_harness.project.storage import StorageError
 
 # ---------------------------------------------------------------------------
 # Helpers — TodoService factory
@@ -542,8 +543,11 @@ def cmd_todo(args: Namespace, cwd: Path) -> int:
     except TodoError as e:
         print_error(Console(), f"[{subcommand}] ✗ {type(e).__name__}: {e}")
         return 1
-    except OSError as e:
-        print_error(Console(), f"[{subcommand}] system error: {e}")
+    except (OSError, StorageError, RuntimeError) as e:
+        # StorageError:yaml 损坏 / I/O 错
+        # OSError:文件操作失败
+        # RuntimeError:其他运行时异常(防止 unhandled escape)
+        print_error(Console(), f"[{subcommand}] system error: {type(e).__name__}: {e}")
         return 2
     return rc
 
