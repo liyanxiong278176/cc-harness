@@ -18,6 +18,7 @@ import json
 import re
 import time
 from pathlib import Path
+from typing import TYPE_CHECKING
 from rich.console import Console
 from cc_harness.render import (
     print_thought, print_action, print_observation, print_result,
@@ -30,6 +31,9 @@ from cc_harness.l5 import L5Engine
 from cc_harness.tools import confirm_tool, run_command, RUN_COMMAND_SPEC
 from cc_harness.tokens import TokenCounter, TurnTokenStats, UsageRecord
 from cc_harness.config import ContextConfig
+
+if TYPE_CHECKING:
+    from cc_harness.project.models import TodoTask
 
 _VALID_MODES = ("coding", "plan", "design", "chat")
 
@@ -62,6 +66,7 @@ async def run_turn(
     memory_layer: dict | None = None,
     offload_deps: dict | None = None,
     qa_context: dict | None = None,
+    resume_task: "TodoTask | None" = None,
 ) -> TurnTokenStats:
     """Run one user turn in the given mode.
 
@@ -98,6 +103,13 @@ async def run_turn(
     设了之后系统段会渲染 qa_intro 段(必须答规则 + 简洁风格),并把 q_type 注入
     模板 `{qa_category}`。None = 不渲染(向后兼容,test_agent.py 不受影响)。
 
+    `resume_task`(Task 6)可选续干任务:``TodoTask``实例。非 None 时,在
+    `_refresh_system_prompt` 末尾 append 一个 `<resume_task>...</resume_task>`
+    块(用 append 不 rebuild,与 Q3 persona / Q4 canvas 同样的模式),每次 turn
+    重写 system prompt 时自动刷新。condition:`mode == "coding" and resume_task
+    is not None`,plan/design 模式不渲染。None = kill-switch(向后兼容,
+    test_agent.py 不受影响)。
+
     Mutates `messages` in place. Async so the repl can call it from its
     persistent event loop without `asyncio.run` overhead.
     """
@@ -117,9 +129,10 @@ async def run_turn(
             _refresh_system_prompt(
                 messages, cwd, mode,
                 extra_ctx={"qa_category": qa_context["q_type"]},
+                resume_task=resume_task,
             )
         else:
-            _refresh_system_prompt(messages, cwd, mode)
+            _refresh_system_prompt(messages, cwd, mode, resume_task=resume_task)
 
     # --- Q3 Task7: 分层记忆 pre-turn 注入 ---
     # memory_layer = {"recall": async callable(query) -> RecallResult}
@@ -570,11 +583,18 @@ def _pending_to_openai_tc(p) -> dict:
 
 
 def _refresh_system_prompt(messages: list[dict], cwd: str, mode: str,
-                           extra_ctx: dict | None = None) -> None:
+                           extra_ctx: dict | None = None,
+                           resume_task: "TodoTask | None" = None) -> None:
     """Insert or update the system prompt at messages[0] for the current mode.
 
     `extra_ctx` (Phase 1 Q1 uplift) is merged into the composer ctx so callers
     can gate qa-aware sections (e.g. qa_intro needs ctx["qa_category"]).
+
+    `resume_task` (Task 6) when set + mode=='coding' + system message exists →
+    append a `<resume_task>...</resume_task>` block to the system prompt for
+    LLM context. Idempotent: prior blocks are stripped before re-appending so
+    re-calling does not duplicate. Pattern matches Q3 persona / Q4 canvas
+    (append, not rebuild) so other sections are not clobbered.
     """
     from cc_harness.prompts import build_system_prompt
     if extra_ctx:
@@ -587,6 +607,45 @@ def _refresh_system_prompt(messages: list[dict], cwd: str, mode: str,
         messages[0]["content"] = prompt
     else:
         messages.insert(0, {"role": "system", "content": prompt})
+
+    # --- Task 6: append resume_task block (idempotent, append-only) ---
+    if (
+        mode == "coding"
+        and resume_task is not None
+        and messages
+        and messages[0].get("role") == "system"
+    ):
+        old = messages[0]["content"]
+        # Strip prior <resume_task>...</resume_task> block if present
+        # (anchored to end of string to avoid removing in-line occurrences
+        # of the literal text in user content)
+        old = re.sub(
+            r"\n\n<resume_task>.*?</resume_task>\s*$",
+            "",
+            old,
+            flags=re.DOTALL,
+        )
+        ac_lines = (
+            "\n".join(f"- {c}" for c in resume_task.acceptance_criteria)
+            if resume_task.acceptance_criteria
+            else "(none)"
+        )
+        sessions_repr = (
+            list(resume_task.active_sessions)
+            if resume_task.active_sessions
+            else []
+        )
+        messages[0]["content"] = old + (
+            f"\n\n<resume_task>\n"
+            f"id:    {resume_task.id}\n"
+            f"title: {resume_task.title}\n"
+            f"status:{resume_task.status}\n"
+            f"priority:{resume_task.priority or 'none'}\n"
+            f"active_sessions: {sessions_repr}\n\n"
+            f"## Acceptance Criteria\n"
+            f"{ac_lines}\n"
+            f"</resume_task>"
+        )
 
 
 def _save_design_output(

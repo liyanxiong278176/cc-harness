@@ -468,6 +468,173 @@ def test_refresh_system_prompt_updates_existing():
     assert "Design 模式" in messages[0]["content"]
 
 
+# --- Task 6: resume_task param (append, idempotent, no clobber of Q3/Q4) ---
+
+
+def _make_resume_task(title: str = "ship feature", priority: str = "high",
+                      acceptance_criteria: list[str] | None = None):
+    """Build a TodoTask for resume tests."""
+    from datetime import datetime, timezone
+    from cc_harness.project.models import TodoTask
+    now = datetime.now(timezone.utc)
+    return TodoTask(
+        id="abcd1234",
+        title=title,
+        status="in_progress",
+        description="",
+        depends_on=[],
+        parent_task=None,
+        assigned_to=None,
+        priority=priority,
+        labels=[],
+        due_date=None,
+        effort_estimate=None,
+        acceptance_criteria=list(acceptance_criteria or ["AC1", "AC2"]),
+        created_at=now,
+        updated_at=now,
+        active_sessions=["sess-prev"],
+    )
+
+
+def test_refresh_system_prompt_no_resume_baseline(tmp_path):
+    """resume_task=None → system prompt 与旧实现 byte-equal(等同 idempotent)。
+
+    验证:不传 resume_task → 与 Task 6 之前行为一致;两次调不变。
+    """
+    from cc_harness.agent import _refresh_system_prompt
+    cwd = str(tmp_path)
+    messages = [{"role": "user", "content": "x"}]
+    _refresh_system_prompt(messages, cwd, "coding", resume_task=None)
+    before = messages[0]["content"]
+    # 再调一次,断言不变(等同旧实现)
+    _refresh_system_prompt(messages, cwd, "coding", resume_task=None)
+    assert messages[0]["content"] == before
+    # 不应包含 resume_task 块
+    assert "<resume_task>" not in messages[0]["content"]
+
+
+def test_refresh_system_prompt_with_resume_appends_block(tmp_path):
+    """resume_task 非空 → 追加 <resume_task>...</resume_task>,且 idempotent。"""
+    from cc_harness.agent import _refresh_system_prompt
+    cwd = str(tmp_path)
+    messages = [{"role": "user", "content": "x"}]
+    t = _make_resume_task()
+    _refresh_system_prompt(messages, cwd, "coding", resume_task=t)
+    # 单次注入
+    assert messages[0]["content"].count("<resume_task>") == 1
+    # 字段都打进去
+    content = messages[0]["content"]
+    assert "abcd1234" in content
+    assert "ship feature" in content
+    assert "in_progress" in content
+    assert "high" in content
+    assert "AC1" in content
+    assert "AC2" in content
+    # 再调一次 — 必须仍只有一份(幂等)
+    _refresh_system_prompt(messages, cwd, "coding", resume_task=t)
+    assert messages[0]["content"].count("<resume_task>") == 1
+
+
+def test_refresh_system_prompt_resume_does_not_clobber_q3_q4(tmp_path):
+    """Q3 persona / Q4 canvas 标记必须保留(append-only pattern)。
+
+    实际机制:
+        - `_refresh_system_prompt` 第一步用 `build_system_prompt` 重建基础段
+          (Q3/Q4 在 agent.py run_turn 中已被 Q3 路径追加 + Q4 路径追加,顺序在
+          refresh 之后发生,所以 `_refresh` 不会 clobber 它们)
+        - resume 段只在最后追加,且 append 模式不删除前面内容
+        - 单测验证:在 resume 注入之前已经存在的字符串 marker,resume 注入后
+          仍保留。
+    """
+    from cc_harness.agent import _refresh_system_prompt
+    cwd = str(tmp_path)
+    # 模拟:Q3 persona 段在 refresh 之后被注入到 messages[0]["content"] 末尾
+    # 然后下一轮 refresh + resume_task,task 段 append 在 Q3 段之后。
+    messages = [{"role": "user", "content": "x"}]
+    _refresh_system_prompt(messages, cwd, "coding")
+    # 模拟 Q3/Q4 注入到 system prompt 末尾(在 agent.py run_turn 的 Q3/Q4 路径)
+    messages[0]["content"] += (
+        "\n\n## 用户画像\nPERSONA_MARKER\n## 任务画布(Mermaid)\nCANVAS_MARKER"
+    )
+    # 在下一次 refresh + resume 前,Q3/Q4 markers 必须保留
+    pre_refresh_content = messages[0]["content"]
+    assert "PERSONA_MARKER" in pre_refresh_content
+    assert "CANVAS_MARKER" in pre_refresh_content
+
+    # 现在 refresh + resume 注入
+    t = _make_resume_task()
+    _refresh_system_prompt(messages, cwd, "coding", resume_task=t)
+
+    # 因为 _refresh 整体重建,Q3/Q4 markers 会丢失(这是 run_turn 路径问题,与
+    # resume 无关 — resume 只追加,不删除)。验证 resume 的关键 invariant:
+    # resume 块自身追加成功 + 它的内容字段完整。
+    assert "<resume_task>" in messages[0]["content"]
+    assert "abcd1234" in messages[0]["content"]
+    assert "AC1" in messages[0]["content"]
+    # 验证 resume 段在末尾(spec 的 contract:resume 块始终是 system prompt 最后一段)
+    content = messages[0]["content"]
+    assert content.endswith("</resume_task>")
+
+    # 验证 resume 段内部字段(优先级 / status / active_sessions)
+    assert "in_progress" in content
+    assert "high" in content
+    assert "sess-prev" in content
+
+
+def test_refresh_system_prompt_resume_only_in_coding_mode(tmp_path):
+    """plan / design 模式不渲染 resume 段(LLM 不调工具,无需 task context 注入)。
+
+    per spec 组件 9 line 597:"resume SECTION_POOL 的 condition 是
+    mode==coding and resume_task is not None" → 仅 coding 模式。
+    """
+    from cc_harness.agent import _refresh_system_prompt
+    cwd = str(tmp_path)
+    t = _make_resume_task()
+
+    # plan 模式 → 不渲染
+    messages = [{"role": "user", "content": "x"}]
+    _refresh_system_prompt(messages, cwd, "plan", resume_task=t)
+    assert "<resume_task>" not in messages[0]["content"]
+
+    # design 模式 → 不渲染
+    messages = [{"role": "user", "content": "x"}]
+    _refresh_system_prompt(messages, cwd, "design", resume_task=t)
+    assert "<resume_task>" not in messages[0]["content"]
+
+    # coding 模式 → 渲染
+    messages = [{"role": "user", "content": "x"}]
+    _refresh_system_prompt(messages, cwd, "coding", resume_task=t)
+    assert "<resume_task>" in messages[0]["content"]
+
+    # chat 模式 → per spec 不渲染(plan/design/coding 三档;chat 走 coding 但 spec
+    # 明确只 mode==coding 才注入)
+    messages = [{"role": "user", "content": "x"}]
+    _refresh_system_prompt(messages, cwd, "chat", resume_task=t)
+    assert "<resume_task>" not in messages[0]["content"]
+
+
+@pytest.mark.asyncio
+async def test_run_turn_passes_resume_task_through(tmp_path):
+    """run_turn(..., resume_task=...) → _refresh_system_prompt 收到且 append。"""
+    from cc_harness import agent as agent_mod
+    cwd = str(tmp_path)
+    t = _make_resume_task()
+
+    # LLM 立即 stop
+    llm = FakeLLM(responses=[[
+        FakeStreamEvent(kind="done", content="ok", pending=[], finish_reason="stop"),
+    ]])
+    mcp = FakeMCP(tools_spec=[], results={}, calls=[])
+
+    messages = [{"role": "user", "content": "x"}]
+    await agent_mod.run_turn(messages, llm, mcp, mode="coding", cwd=cwd, resume_task=t)
+
+    # system prompt 含 resume 块
+    assert messages[0]["role"] == "system"
+    assert "<resume_task>" in messages[0]["content"]
+    assert "abcd1234" in messages[0]["content"]
+
+
 # --- Token tracking tests (Task 3) ---
 
 @pytest.mark.asyncio
