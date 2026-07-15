@@ -15,6 +15,8 @@
 """
 from __future__ import annotations
 
+import csv
+import io
 import json
 import sys
 import time
@@ -132,6 +134,7 @@ class JsonOrText:
         *,
         title: str,
         columns: list[tuple[str, str]],
+        fmt: str = "table",
     ) -> None:
         """渲染行列表。
 
@@ -142,6 +145,8 @@ class JsonOrText:
                 - key 在 rows 为 dataclass 时,通过 getattr 取值。
                 - 在 rows 为 dict 时,通过 key 取值。
                 - header 是列标题。
+            fmt: 输出格式 — "table" (rich.Table 或 plain) 或 "csv"。
+                json 模式总是输出 JSON,无视 fmt。
         """
         if self.json_mode:
             payload = [
@@ -149,6 +154,19 @@ class JsonOrText:
             ]
             sys.stdout.write(json.dumps(payload, default=str, ensure_ascii=False))
             sys.stdout.write("\n")
+            sys.stdout.flush()
+            return
+
+        # CSV — 列头 + 行
+        if fmt == "csv":
+            buf = io.StringIO()
+            writer = csv.writer(buf)
+            writer.writerow([header for _, header in columns])
+            for row in rows:
+                writer.writerow([
+                    _format_cell(_extract(row, key)) for key, _ in columns
+                ])
+            sys.stdout.write(buf.getvalue())
             sys.stdout.flush()
             return
 
@@ -171,14 +189,14 @@ class JsonOrText:
             sys.stdout.write("  ".join(cells) + "\n")
 
     def print_dict(self, payload: dict) -> None:
-        """渲染单对象。JSON mode → json.dumps,else → key=value 行。"""
+        """渲染单对象(JSON 模式直接 dump,否则走 key=value)。"""
+        # 保留为公共 API 但仅在 JSON 模式有意义;非 JSON 直接退化为 print_text。
         if self.json_mode:
             sys.stdout.write(json.dumps(payload, default=str, ensure_ascii=False))
             sys.stdout.write("\n")
             sys.stdout.flush()
             return
-        for k, v in payload.items():
-            sys.stdout.write(f"{k}: {v}\n")
+        self.print_text("\n".join(f"{k}: {v}" for k, v in payload.items()))
 
     def print_text(self, text: str) -> None:
         """渲染原始文本(不参与 json 决策 — 极简旁路,统一入口)。"""

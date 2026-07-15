@@ -77,8 +77,26 @@ async def _list(svc: TodoService, args: Namespace, console: Console) -> int:
     truncated = len(tasks) > limit
     shown = tasks[:limit]
 
-    # JSON mode 强制全量 dump(便于 jq 处理),不限 limit
+    # header 含总量(不受 limit 影响)
+    all_tasks = await svc.list(include_done=include_done)
+    counts: dict[str, int] = {}
+    for t in all_tasks:
+        counts[t.status] = counts.get(t.status, 0) + 1
+    total_n = len(all_tasks)
+    shown_n = len(shown)
+    header = (
+        f"[todo_list] {total_n} tasks "
+        f"({counts.get('done', 0)} done / "
+        f"{counts.get('in_progress', 0)} in_progress / "
+        f"{counts.get('pending', 0)} pending)"
+    )
+
+    sink = JsonOrText(console, args)
+    fmt = getattr(args, "format", "table") or "table"
+
     if args.json:
+        # --json 也尊重 --limit(spec 7):用 shown 而非 tasks
+        # 旧版"全量 dump"违反用户对 --limit 的直觉
         out_data = [
             {
                 "id": t.id,
@@ -92,42 +110,63 @@ async def _list(svc: TodoService, args: Namespace, console: Console) -> int:
                 "updated_at": t.updated_at.isoformat(),
                 "created_at": t.created_at.isoformat(),
             }
-            for t in tasks
+            for t in shown
         ]
         sys.stdout.write(json.dumps(out_data, ensure_ascii=False, default=str) + "\n")
         sys.stdout.flush()
         return 0
 
-    # header 含总量(不受 limit 影响)
-    all_tasks = await svc.list(include_done=include_done)
-    counts: dict[str, int] = {}
-    for t in all_tasks:
-        counts[t.status] = counts.get(t.status, 0) + 1
-    header = (
-        f"[todo_list] {len(all_tasks)} tasks "
-        f"({counts.get('done', 0)} done / "
-        f"{counts.get('in_progress', 0)} in_progress / "
-        f"{counts.get('pending', 0)} pending)"
-    )
-
-    sink = JsonOrText(console, args)  # json 已经被上方早退,这里仅 tty/text
+    # 打印 header(走 plain text — 不在表格中)
     sink.print_text(header + "\n")
 
-    body_lines = []
-    for t in shown:
-        icon = {
-            "done": "✓", "in_progress": "⠋", "pending": "○",
-            "blocked": "!", "cancelled": "✗",
-        }.get(t.status, "?")
-        prio_str = f"[{t.priority}] " if t.priority else ""
-        body_lines.append(
-            f"{icon} {t.id}  {t.title}  {prio_str}[{t.status}]"
+    # 渲染主体
+    if fmt == "csv":
+        # CSV:列头 + 行,不含 header
+        sink.print_table(
+            shown,
+            title="",
+            columns=[
+                ("id", "id"),
+                ("title", "title"),
+                ("status", "status"),
+                ("priority", "priority"),
+            ],
+            fmt="csv",
         )
-    suffix = (
-        f"\n(+{len(tasks) - limit} more, narrow with --status=X or --limit=N)"
-        if truncated else ""
-    )
-    sink.print_text("\n".join(body_lines) + suffix + "\n")
+    elif sink.is_tty:
+        # TTY 走 Rich Table
+        sink.print_table(
+            shown,
+            title="todo_list",
+            columns=[
+                ("id", "id"),
+                ("title", "title"),
+                ("status", "status"),
+                ("priority", "priority"),
+            ],
+            fmt="table",
+        )
+    else:
+        # 纯文本降级:保留原有的 icon/格式
+        body_lines = []
+        for t in shown:
+            icon = {
+                "done": "✓", "in_progress": "⠋", "pending": "○",
+                "blocked": "!", "cancelled": "✗",
+            }.get(t.status, "?")
+            prio_str = f"[{t.priority}] " if t.priority else ""
+            body_lines.append(
+                f"{icon} {t.id}  {t.title}  {prio_str}[{t.status}]"
+            )
+        sink.print_text("\n".join(body_lines) + "\n")
+
+    if truncated:
+        sink.print_text(
+            f"\n(+{len(tasks) - limit} more, narrow with --status=X or --limit=N)\n"
+        )
+    elif shown_n == 0:
+        # 已经在 header 表达 0 tasks,无需再写一行
+        pass
     return 0
 
 
