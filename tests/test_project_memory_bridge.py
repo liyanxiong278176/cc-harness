@@ -12,8 +12,6 @@ from dataclasses import replace
 from datetime import datetime, timezone
 from unittest.mock import AsyncMock
 
-import pytest
-
 from cc_harness.project.memory_bridge import on_task_completion
 from cc_harness.project.models import Manifest, TodoTask
 

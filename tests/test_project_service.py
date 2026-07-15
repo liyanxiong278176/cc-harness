@@ -185,7 +185,7 @@ async def test_list_all(svc: TodoService) -> None:
 
 
 async def test_list_filter_by_status(svc: TodoService) -> None:
-    a = await svc.create(title="a")
+    await svc.create(title="a")
     b = await svc.create(title="b")
     await svc.update(b.id, status="in_progress")
     in_prog = await svc.list(status="in_progress")
@@ -195,7 +195,7 @@ async def test_list_filter_by_status(svc: TodoService) -> None:
 async def test_list_filter_by_parent(svc: TodoService) -> None:
     a = await svc.create(title="parent")
     b = await svc.create(title="child", parent_task=a.id)
-    c = await svc.create(title="other")
+    await svc.create(title="other")
     children = await svc.list(parent_task=a.id)
     assert {t.id for t in children} == {b.id}
 
@@ -342,7 +342,7 @@ async def test_delete_done_with_force_succeeds(svc: TodoService) -> None:
 async def test_delete_with_dependents_without_force_raises(svc: TodoService) -> None:
     """force=False:有 dependents 拒绝删除。"""
     a = await svc.create(title="a")
-    b = await svc.create(title="b", depends_on=[a.id])
+    await svc.create(title="b", depends_on=[a.id])
     with pytest.raises(InvalidFieldError, match="has dependents"):
         await svc.delete(a.id)
 
@@ -350,7 +350,7 @@ async def test_delete_with_dependents_without_force_raises(svc: TodoService) -> 
 async def test_delete_force_with_dependents_creates_dangling(svc: TodoService) -> None:
     """force=True:删除后 dependents 的 depends_on 留 dangling → validate 报 missing_dependency。"""
     a = await svc.create(title="a")
-    b = await svc.create(title="b", depends_on=[a.id])
+    await svc.create(title="b", depends_on=[a.id])
     await svc.delete(a.id, force=True)
     issues = await svc.validate()
     assert any(i.rule_id == "missing_dependency" for i in issues)
@@ -447,14 +447,14 @@ async def test_validate_empty_returns_no_issues(svc: TodoService) -> None:
 
 async def test_validate_clean_returns_no_issues(svc: TodoService) -> None:
     a = await svc.create(title="a")
-    b = await svc.create(title="b", depends_on=[a.id])
+    await svc.create(title="b", depends_on=[a.id])
     issues = await svc.validate()
     assert issues == []
 
 
 async def test_validate_finds_missing_dependency(svc: TodoService) -> None:
     """外部直接构造 dangling(模拟 force-delete 之后)— 这里通过外部 yaml 操作模拟。"""
-    a = await svc.create(title="a")
+    await svc.create(title="a")
     # 强制让 b 引用已删除 task(通过内部绕过 Service.create 直接写 yaml)
     import yaml
     yaml_path = svc.project_root / ".cc-harness" / "todos" / "todos.yaml"
@@ -525,7 +525,10 @@ async def test_subscribe_fires_on_delete(svc: TodoService) -> None:
 
 async def test_unsubscribe_stops_callbacks(svc: TodoService) -> None:
     events: list[str] = []
-    cb = lambda t, e: events.append(e.kind)
+
+    def cb(t: TodoTask, e: TodoEvent) -> None:
+        events.append(e.kind)
+
     svc.subscribe(cb)
     await svc.create(title="x")
     svc.unsubscribe(cb)
@@ -536,7 +539,10 @@ async def test_unsubscribe_stops_callbacks(svc: TodoService) -> None:
 
 async def test_unsubscribe_nonexistent_callback_is_noop(svc: TodoService) -> None:
     """unsubscribe 一个从未 subscribe 过的 callback → swallow(覆盖 ValueError 分支)。"""
-    cb = lambda t, e: None
+
+    def cb(t: TodoTask, e: TodoEvent) -> None:
+        return None
+
     # 不应抛
     svc.unsubscribe(cb)
 
