@@ -27,7 +27,7 @@ from typing import Iterable
 
 import yaml
 
-from cc_harness.project.models import Manifest, TodoTask
+from cc_harness.project.models import Manifest, TodoTask, ValidationIssue
 
 log = logging.getLogger(__name__)
 
@@ -247,6 +247,66 @@ class TodoStorage:
                 "(spec: never silently prune; run `todo validate` to investigate)",
                 md_path,
             )
+
+    # ------------------------------------------------------------------ #
+    # 公共 — md/yaml 一致性校验(供 Service.validate 调用)
+    # ------------------------------------------------------------------ #
+
+    def check_md_consistency(
+        self, by_id: dict[str, TodoTask],
+    ) -> list[ValidationIssue]:
+        """校验磁盘 md 文件与 yaml 主索引的一致性(组件 4 — Task 3 review I-1 补)。
+
+        两条规则(均为 warning,不阻断):
+            - orphan_md:md 文件存在但 yaml by_id 不含该 id
+            - missing_md:yaml by_id 含该 id 但磁盘 <id>.md 不存在
+
+        Args:
+            by_id: 当前 yaml 主索引的 task 字典(从 Service.validate 传入)。
+
+        Returns:
+            issue 列表(可能空)。
+        """
+        issues: list[ValidationIssue] = []
+
+        # 1) orphan_md:磁盘 md 不在 by_id
+        if self.todos_dir.is_dir():
+            for md_path in self.todos_dir.glob("*.md"):
+                stem = md_path.stem
+                # 排除隐藏 / 非 8 hex 文件名(目录中其他文件)
+                if stem.startswith("."):
+                    continue
+                if stem in by_id:
+                    continue
+                issues.append(
+                    ValidationIssue(
+                        task_id=None,
+                        severity="warning",
+                        rule_id="orphan_md",
+                        message=(
+                            f"orphan md file: {md_path.name} exists on disk "
+                            f"but is not referenced by any task in yaml"
+                        ),
+                    )
+                )
+
+        # 2) missing_md:yaml 引用但磁盘 md 不存在
+        for task in by_id.values():
+            md_path = self._md_path(task.id)
+            if not md_path.is_file():
+                issues.append(
+                    ValidationIssue(
+                        task_id=task.id,
+                        severity="warning",
+                        rule_id="missing_md",
+                        message=(
+                            f"task {task.id} referenced in yaml but md file "
+                            f"missing on disk ({md_path.name})"
+                        ),
+                    )
+                )
+
+        return issues
 
     def _prune_active_sessions(self, task: TodoTask) -> TodoTask:
         """active_sessions 长度 > 50 → 截断为最近 50 条。"""

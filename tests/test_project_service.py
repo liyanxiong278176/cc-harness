@@ -526,6 +526,47 @@ async def test_validate_finds_cycle(svc: TodoService) -> None:
     assert any(i.rule_id == "cycle" for i in issues)
 
 
+async def test_validate_finds_missing_md(svc: TodoService, proj: Path) -> None:
+    """Task 3 review I-1:Service.validate() 检查 md/yaml 一致性。
+
+    yaml 引用 task 但磁盘 md 缺失 → missing_md (warning)。
+    """
+    t = await svc.create(title="with md")
+    md_path = proj / ".cc-harness" / "todos" / f"{t.id}.md"
+    assert md_path.is_file()
+    # 手动删 md
+    md_path.unlink()
+
+    issues = await svc.validate()
+    matching = [i for i in issues if i.rule_id == "missing_md"]
+    assert len(matching) == 1
+    assert matching[0].severity == "warning"
+    assert matching[0].task_id == t.id
+
+
+async def test_validate_finds_orphan_md(svc: TodoService, proj: Path) -> None:
+    """Task 3 review I-1:磁盘 md 存在但 yaml 不引用 → orphan_md (warning)。"""
+    todos_dir = proj / ".cc-harness" / "todos"
+    (todos_dir / "ghost1234.md").write_text(
+        "---\nid: ghost1234\n---\n\norphan body\n", encoding="utf-8"
+    )
+
+    issues = await svc.validate()
+    matching = [i for i in issues if i.rule_id == "orphan_md"]
+    assert len(matching) == 1
+    assert matching[0].severity == "warning"
+    assert matching[0].task_id is None  # 全局 issue
+
+
+async def test_validate_clean_returns_no_md_issues(svc: TodoService) -> None:
+    """正常状态:disk md == yaml 引用 → validate() 不报 md issues。"""
+    await svc.create(title="a")
+    await svc.create(title="b")
+    issues = await svc.validate()
+    md_issues = [i for i in issues if i.rule_id in ("orphan_md", "missing_md")]
+    assert md_issues == []
+
+
 # ---------------------------------------------------------------------------
 # subscribe / unsubscribe
 # ---------------------------------------------------------------------------

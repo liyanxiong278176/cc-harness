@@ -512,3 +512,74 @@ async def test_adelete_task_md_removes_file(tmp_path):
     await s.adelete_task_md("abc12345")
 
     assert not md_path.exists()
+
+
+# ---------------------------------------------------------------------------
+# check_md_consistency(Task 3 review I-1 补)
+# ---------------------------------------------------------------------------
+
+
+def test_check_md_consistency_clean_returns_no_issues(tmp_path):
+    """disk md == yaml 引用 → 空 issues。"""
+    s = _make_storage(tmp_path)
+    task = _make_task(description="ok")
+    s.save_all([task])
+    issues = s.check_md_consistency({task.id: task})
+    assert issues == []
+
+
+def test_check_md_consistency_missing_md_emits_warning(tmp_path):
+    """yaml 引用但磁盘 md 缺失 → missing_md (warning)。"""
+    s = _make_storage(tmp_path)
+    task = _make_task(description="x")
+    s.save_all([task])
+    # 手动删 md
+    (s.todos_dir / f"{task.id}.md").unlink()
+    issues = s.check_md_consistency({task.id: task})
+    matching = [i for i in issues if i.rule_id == "missing_md"]
+    assert len(matching) == 1
+    issue = matching[0]
+    assert issue.severity == "warning"
+    assert issue.task_id == task.id
+    assert task.id in issue.message
+
+
+def test_check_md_consistency_orphan_md_emits_warning(tmp_path):
+    """磁盘 md 存在但 yaml 不引用 → orphan_md (warning)。"""
+    s = _make_storage(tmp_path)
+    # 制造孤儿 md
+    (s.todos_dir / "ghost1234.md").write_text(
+        "---\nid: ghost1234\n---\n\norphan\n", encoding="utf-8"
+    )
+    issues = s.check_md_consistency({})  # by_id 空
+    matching = [i for i in issues if i.rule_id == "orphan_md"]
+    assert len(matching) == 1
+    issue = matching[0]
+    assert issue.severity == "warning"
+    assert issue.task_id is None  # 全局级 issue
+    assert "ghost1234" in issue.message
+
+
+def test_check_md_consistency_emits_both_when_both_broken(tmp_path):
+    """同时存在 orphan + missing → 两类 issue 都报。"""
+    s = _make_storage(tmp_path)
+    task = _make_task(description="y")
+    s.save_all([task])
+    # 删 task 的 md → missing
+    (s.todos_dir / f"{task.id}.md").unlink()
+    # 加 ghost md → orphan
+    (s.todos_dir / "ghost1234.md").write_text(
+        "---\nid: ghost1234\n---\n\norphan\n", encoding="utf-8"
+    )
+    issues = s.check_md_consistency({task.id: task})
+    rule_ids = {i.rule_id for i in issues}
+    assert "missing_md" in rule_ids
+    assert "orphan_md" in rule_ids
+
+
+def test_check_md_consistency_ignores_hidden_and_yaml(tmp_path):
+    """隐藏文件 / yaml 不视为 orphan。"""
+    s = _make_storage(tmp_path)
+    (s.todos_dir / ".hidden.md").write_text("---\n", encoding="utf-8")
+    issues = s.check_md_consistency({})
+    assert not any(i.rule_id == "orphan_md" for i in issues)

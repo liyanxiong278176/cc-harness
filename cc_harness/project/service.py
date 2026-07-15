@@ -170,6 +170,9 @@ class TodoService:
         # 2) 全表环检测
         issues.extend(check_no_cycle(tasks))
 
+        # 3) md/yaml 一致性(orphan + missing)
+        issues.extend(self._storage.check_md_consistency(by_id))
+
         return issues
 
     # ------------------------------------------------------------------ #
@@ -332,15 +335,15 @@ class TodoService:
 
         # 3) parent_task 引用(允许 None 表示清空)
         new_parent = fields.get("parent_task")
-        if new_parent is not None and new_parent != task_id:
+        if new_parent is not None:
+            if new_parent == task_id:
+                raise InvalidFieldError(
+                    f"task {task_id!r} cannot be its own parent"
+                )
             if new_parent not in by_id:
                 raise TaskNotFound(
                     f"parent_task references non-existent task {new_parent!r}"
                 )
-        if new_parent == task_id:
-            raise InvalidFieldError(
-                f"task {task_id!r} cannot be its own parent"
-            )
 
         # 4) priority 校验
         if "priority" in fields and fields["priority"] is not None:
