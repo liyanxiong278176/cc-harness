@@ -142,8 +142,8 @@ async def _get(svc: TodoService, args: Namespace, console: Console) -> int:
         print_error(console, f"{type(e).__name__}: {e}")
         return 1
 
-    if getattr(args, "description_only", False):
-        # 只输出 description 体,无装饰
+    if getattr(args, "raw", False):
+        # 只输出 description 体,无 frontmatter/装饰
         sys.stdout.write((task.description or "") + "\n")
         sys.stdout.flush()
         return 0
@@ -285,6 +285,17 @@ async def _update(svc: TodoService, args: Namespace, console: Console) -> int:
             else:
                 fields[k] = v
 
+    # --append-acceptance-criteria:在现有列表尾部追加(不去重,保留 user 输入顺序)
+    append_ac = getattr(args, "append_acceptance_criteria", None) or []
+    if append_ac:
+        try:
+            current = await svc.get(task_id)
+        except TodoError as e:
+            print_error(console, f"{type(e).__name__}: {e}")
+            return 1
+        merged = list(current.acceptance_criteria) + list(append_ac)
+        fields["acceptance_criteria"] = merged
+
     # clear_* 显式 None 化(可空字段)
     clearable_simple = ("parent_task", "assigned_to", "priority", "due_date",
                         "effort_estimate")
@@ -343,6 +354,11 @@ async def _delete(svc: TodoService, args: Namespace, console: Console) -> int:
         print_error(console, f"{type(e).__name__}: {e}")
         return 1
     suffix = " (force=True, dangling references left)" if force else ""
+    if args.json:
+        payload = {"id": task_id, "deleted": True, "force": force}
+        sys.stdout.write(json.dumps(payload, ensure_ascii=False) + "\n")
+        sys.stdout.flush()
+        return 0
     print_text(console, f"[todo_delete] ✓ deleted task {task_id}{suffix}")
     return 0
 

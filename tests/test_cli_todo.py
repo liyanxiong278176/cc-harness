@@ -45,7 +45,7 @@ def svc_args(proj: Path):
             "format": "table", "sort": "status", "limit": 20,
         },
         "get": {
-            "task_id": None, "description_only": False,
+            "task_id": None, "raw": False,
         },
         "create": {
             "title": None, "description": None, "depends_on": None,
@@ -59,6 +59,7 @@ def svc_args(proj: Path):
             "assigned_to": None, "priority": None, "label": None,
             "due_date": None, "effort_estimate": None,
             "acceptance_criteria": None,
+            "append_acceptance_criteria": None,
             # clear_* 标志
             "clear_parent_task": False, "clear_assigned_to": False,
             "clear_priority": False, "clear_due_date": False,
@@ -279,7 +280,8 @@ def test_get_json(proj, svc_args, capsys):
     assert parsed["id"] == tid
 
 
-def test_get_description_only(proj, svc_args, capsys):
+def test_get_raw_output_only_body(proj, svc_args, capsys):
+    """--raw → 只输出 task body(description),无 frontmatter / metadata。"""
     cmd_todo(
         svc_args("create", title="desc_test", description="the body"),
         proj,
@@ -288,13 +290,13 @@ def test_get_description_only(proj, svc_args, capsys):
     import yaml as _y
     data = _y.safe_load(yaml_path.read_text(encoding="utf-8"))
     tid = data["tasks"][0]["id"]
-    args = svc_args("get", task_id=tid, description_only=True)
+    args = svc_args("get", task_id=tid, raw=True)
     rc = cmd_todo(args, proj)
     out = capsys.readouterr().out
     assert rc == 0
     assert "the body" in out
     # 不应含 status/depends_on 等元数据行
-    assert "[todo_get]" not in out  # description-only 模式无 marker
+    assert "[todo_get]" not in out  # raw 模式无 marker
 
 
 # ---------------------------------------------------------------------------

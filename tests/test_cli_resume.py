@@ -55,6 +55,7 @@ def svc_args(subcommand: str, **kwargs) -> Namespace:
             "assigned_to": None, "priority": None, "label": None,
             "due_date": None, "effort_estimate": None,
             "acceptance_criteria": None,
+            "append_acceptance_criteria": None,
             "clear_parent_task": False, "clear_assigned_to": False,
             "clear_priority": False, "clear_due_date": False,
             "clear_effort_estimate": False,
