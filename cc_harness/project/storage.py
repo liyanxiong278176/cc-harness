@@ -148,6 +148,20 @@ class TodoStorage:
         tmp.write_text(content, encoding="utf-8")
         os.replace(tmp, md_path)
 
+    def delete_task_md(self, task_id: str) -> None:
+        """删除 per-task md 文件(若存在)。不存在 → no-op(idempotent)。
+
+        由 service.delete() 在 asave_all 之前调用,保持 yaml ↔ disk 一致
+        (spec 组件 5 line 345:删除 task 时同步删 yaml 行 + md 文件)。
+        """
+        md_path = self._md_path(task_id)
+        if md_path.exists():
+            md_path.unlink()
+
+    async def adelete_task_md(self, task_id: str) -> None:
+        """async 版 delete_task_md(占位实现 — 当前 storage 是 sync 的)。"""
+        self.delete_task_md(task_id)
+
     # ------------------------------------------------------------------ #
     # 内部 — md merge
     # ------------------------------------------------------------------ #

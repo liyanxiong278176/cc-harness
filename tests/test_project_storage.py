@@ -472,3 +472,43 @@ def test_render_md_chinese_description():
     t = _make_task(description="中文描述 测试")
     out = _render_md(t)
     assert "中文描述 测试" in out
+
+
+# ---------------------------------------------------------------------------
+# delete_task_md(spec 组件 5 line 345 — delete 同步删 yaml 行 + md 文件)
+# ---------------------------------------------------------------------------
+
+
+def test_delete_task_md_removes_file(tmp_path):
+    """delete_task_md 存在 → 删除。"""
+    s = _make_storage(tmp_path)
+    task = _make_task(description="x")
+    s.save_all([task])
+    md_path = tmp_path / "proj" / ".cc-harness" / "todos" / "abc12345.md"
+    assert md_path.is_file()
+
+    s.delete_task_md("abc12345")
+
+    assert not md_path.exists()
+
+
+def test_delete_task_md_missing_is_noop(tmp_path):
+    """delete_task_md 文件不存在 → 不抛(idempotent)。"""
+    s = _make_storage(tmp_path)
+    # 不 save,直接删 — 不应抛
+    s.delete_task_md("ghost1234")
+    assert not (tmp_path / "proj" / ".cc-harness" / "todos" / "ghost1234.md").exists()
+
+
+@pytest.mark.asyncio
+async def test_adelete_task_md_removes_file(tmp_path):
+    """async 版本与 sync 行为一致。"""
+    s = _make_storage(tmp_path)
+    task = _make_task(description="x")
+    await s.asave_all([task])
+    md_path = tmp_path / "proj" / ".cc-harness" / "todos" / "abc12345.md"
+    assert md_path.is_file()
+
+    await s.adelete_task_md("abc12345")
+
+    assert not md_path.exists()
