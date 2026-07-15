@@ -237,9 +237,8 @@ class TodoService:
         # 构造 task
         now = datetime.now(timezone.utc)
         new_id = uuid.uuid4().hex[:8]
-        sessions: list[str] = []
-        if session_id is not None and session_id not in sessions:
-            sessions.append(session_id)
+        # 新建 task 的 active_sessions:session_id 透传,无则空列表
+        sessions: list[str] = [session_id] if session_id is not None else []
 
         task = TodoTask(
             id=new_id,
@@ -419,6 +418,8 @@ class TodoService:
 
         # 持久化(直接过滤)
         remaining = [t for t in tasks if t.id != task_id]
+        # spec 组件 5 line 345:删 yaml 行同时删 md 文件,避免 disk orphan
+        await self._storage.adelete_task_md(task_id)
         await self._storage.asave_all(remaining)
 
         self._emit(task, TodoEvent(kind="deleted"))

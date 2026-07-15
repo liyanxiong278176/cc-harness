@@ -361,6 +361,45 @@ async def test_delete_not_found_raises(svc: TodoService) -> None:
         await svc.delete("ghost1234")
 
 
+async def test_delete_removes_md_file(svc: TodoService, proj: Path) -> None:
+    """spec 组件 5 line 345:delete task 时同步删 yaml 行 + md 文件。"""
+    t = await svc.create(title="with md", description="body")
+    md_path = proj / ".cc-harness" / "todos" / f"{t.id}.md"
+    assert md_path.is_file(), "md file should be created by save_all"
+
+    await svc.delete(t.id, force=True)
+
+    assert not md_path.exists(), "md file should be removed on delete"
+
+
+async def test_delete_no_force_on_done_removes_nothing(
+    svc: TodoService, proj: Path,
+) -> None:
+    """force=False 拒绝路径:raise 发生在触碰 md 之前(防止半状态)。"""
+    t = await svc.create(title="x")
+    await svc.update(t.id, status="in_progress")
+    await svc.update(t.id, status="done")
+    md_path = proj / ".cc-harness" / "todos" / f"{t.id}.md"
+
+    with pytest.raises(InvalidFieldError):
+        await svc.delete(t.id)  # no force
+
+    # md 文件应仍存在(拒绝路径未触动 md)
+    assert md_path.is_file()
+
+
+async def test_delete_md_idempotent_on_missing(svc: TodoService) -> None:
+    """delete 一个 md 已被人为删掉的 task 不应崩。"""
+    t = await svc.create(title="x")
+    # 手动删 md(模拟外部清理)
+    md_path = svc.project_root / ".cc-harness" / "todos" / f"{t.id}.md"
+    md_path.unlink()
+
+    # force=True 路径应正常删除 yaml 行,不动 md(no-op)
+    await svc.delete(t.id, force=True)
+    assert not md_path.exists()
+
+
 # ---------------------------------------------------------------------------
 # resolve
 # ---------------------------------------------------------------------------
