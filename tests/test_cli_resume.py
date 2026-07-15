@@ -190,3 +190,108 @@ def test_cmd_resume_no_flags_acts_as_no_resume(proj, capsys):
     out = capsys.readouterr().out
     assert rc == 0
     assert "no resume" in out.lower() or "skip" in out.lower()
+
+
+# ---------------------------------------------------------------------------
+# Spec gap fix tests
+# ---------------------------------------------------------------------------
+
+
+def test_resume_missing_manifest_exits_1(tmp_path, capsys):
+    """无 manifest(未 init)→ cmd_resume 退 1,stderr 含 init 提示。
+
+    load_manifest_or_exit 走 sys.exit(1),在 cmd_resume 内被 sys.excepthook / 顶层
+    重新 raise SystemExit;本测试验证整体退 1。
+    """
+    # 注意:tmp_path 是空的,没有 .cc-harness
+    args = Namespace(resume=True, resume_id="any", no_resume=False)
+    with pytest.raises(SystemExit) as ei:
+        cmd_resume(args, tmp_path)
+    assert ei.value.code == 1
+    err = capsys.readouterr().err
+    assert "cc-harness init" in err or "No .cc-harness" in err
+
+
+def test_resume_via_todo_service_not_storage(proj, capsys, monkeypatch):
+    """cmd_resume 走 TodoService.list / get,不再直接用 TodoStorage。"""
+    from cc_harness.cli import resume as resume_mod
+    from cc_harness.project.service import TodoService
+
+    # 记录实际被调用的方法
+    list_called = []
+    get_called = []
+
+    real_list = TodoService.list
+    real_get = TodoService.get
+
+    async def spy_list(self, **kw):
+        list_called.append(kw)
+        return await real_list(self, **kw)
+
+    async def spy_get(self, task_id):
+        get_called.append(task_id)
+        return await real_get(self, task_id)
+
+    monkeypatch.setattr(TodoService, "list", spy_list)
+    monkeypatch.setattr(TodoService, "get", spy_get)
+
+    cmd_todo(svc_args("create", title="via_svc"), proj)
+    import yaml as _y
+    yaml_path = proj / ".cc-harness" / "todos" / "todos.yaml"
+    data = _y.safe_load(yaml_path.read_text(encoding="utf-8"))
+    tid = data["tasks"][0]["id"]
+
+    args = Namespace(resume=True, resume_id=tid, no_resume=False)
+    rc = cmd_resume(args, proj)
+    assert rc == 0
+    # verify TodoService.get was used (not TodoStorage)
+    assert tid in get_called
+    # resume.py module should not import TodoStorage anymore
+    assert not hasattr(resume_mod, "TodoStorage") or "TodoStorage" not in dir(resume_mod)
+    # also verify list path: --resume (no id)
+    args2 = Namespace(resume=True, resume_id=None, no_resume=False)
+    rc2 = cmd_resume(args2, proj)
+    assert rc2 == 0
+    # list should have been called at least once
+    assert len(list_called) >= 1
+
+
+def test_resume_id_via_service_not_storage(proj, capsys, monkeypatch):
+    """--resume-id 路径也走 TodoService.get(非 TodoStorage.load_all 后过滤)。"""
+    from cc_harness.project.service import TodoService
+
+    cmd_todo(svc_args("create", title="get_via_svc"), proj)
+    import yaml as _y
+    yaml_path = proj / ".cc-harness" / "todos" / "todos.yaml"
+    data = _y.safe_load(yaml_path.read_text(encoding="utf-8"))
+    tid = data["tasks"][0]["id"]
+
+    get_called = []
+    real_get = TodoService.get
+
+    async def spy_get(self, task_id):
+        get_called.append(task_id)
+        return await real_get(self, task_id)
+
+    monkeypatch.setattr(TodoService, "get", spy_get)
+    args = Namespace(resume=True, resume_id=tid, no_resume=False)
+    rc = cmd_resume(args, proj)
+    assert rc == 0
+    assert tid in get_called
+
+
+def test_resume_todo_error_exits_1(proj, capsys, monkeypatch):
+    """TodoError 业务错(非 TaskNotFound)也走 exit 1。"""
+    from cc_harness.cli import resume as resume_mod
+    from cc_harness.project.exceptions import InvalidFieldError
+
+    def boom_get(cwd, task_id):
+        raise InvalidFieldError("test error")
+
+    monkeypatch.setattr(resume_mod, "_get_via_service", boom_get)
+    args = Namespace(resume=True, resume_id="any", no_resume=False)
+    rc = cmd_resume(args, proj)
+    err = capsys.readouterr().err
+    assert rc == 1
+    assert "InvalidFieldError" in err
+    assert "test error" in err

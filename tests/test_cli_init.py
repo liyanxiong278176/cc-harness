@@ -251,3 +251,112 @@ def test_init_interactive_existing_merge_overwrites(tmp_path, capsys, monkeypatc
     assert rc == 0
     m = load_manifest(tmp_path)
     assert m.name == "renamed"
+
+
+# ---------------------------------------------------------------------------
+# Spec gap fix tests
+# ---------------------------------------------------------------------------
+
+
+def test_init_resume_mode_auto_applied(tmp_path, capsys, monkeypatch):
+    """--resume-mode auto 透传到 manifest,不是默认 ask。"""
+    monkeypatch.chdir(tmp_path)
+    args = Namespace(
+        no_prompt=True,
+        name="r",
+        resume_mode="auto",
+        no_live=False,
+        force_reinit=False,
+    )
+    rc = cmd_init(args, tmp_path)
+    assert rc == 0
+    m = load_manifest(tmp_path)
+    assert m.resume_mode == "auto"
+
+
+def test_init_resume_mode_manual_applied(tmp_path, capsys, monkeypatch):
+    """--resume-mode manual 透传到 manifest。"""
+    monkeypatch.chdir(tmp_path)
+    args = Namespace(
+        no_prompt=True,
+        name="r",
+        resume_mode="manual",
+        no_live=True,
+        force_reinit=False,
+    )
+    rc = cmd_init(args, tmp_path)
+    assert rc == 0
+    m = load_manifest(tmp_path)
+    assert m.resume_mode == "manual"
+    assert m.live.position == "off"
+
+
+def test_init_no_live_disables_live(tmp_path, capsys, monkeypatch):
+    """--no-live → manifest.live.position == 'off'。"""
+    monkeypatch.chdir(tmp_path)
+    args = Namespace(
+        no_prompt=True,
+        name="nl",
+        resume_mode="ask",
+        no_live=True,
+        force_reinit=False,
+    )
+    rc = cmd_init(args, tmp_path)
+    assert rc == 0
+    m = load_manifest(tmp_path)
+    assert m.live.position == "off"
+
+
+def test_init_default_live_is_top(tmp_path, capsys, monkeypatch):
+    """不传 --no-live → live.position == 'top'(默认)。"""
+    monkeypatch.chdir(tmp_path)
+    args = Namespace(
+        no_prompt=True,
+        name="dflt",
+        resume_mode="ask",
+        no_live=False,
+        force_reinit=False,
+    )
+    rc = cmd_init(args, tmp_path)
+    assert rc == 0
+    m = load_manifest(tmp_path)
+    assert m.live.position == "top"
+
+
+def test_init_noninteractive_resume_mode_param(tmp_path):
+    """init_noninteractive 接受 resume_mode / live_enabled 参数。"""
+    m = init_noninteractive(
+        tmp_path, name="p",
+        resume_mode="auto", live_enabled=False, write_gitignore=True,
+    )
+    assert m.resume_mode == "auto"
+    assert m.live.position == "off"
+
+
+def test_init_interactive_no_gitignore_when_user_says_no(tmp_path, monkeypatch):
+    """交互模式回答 'no' 给 .gitignore 提示 → 即便 git 探测命中也不写 .gitignore。"""
+    # mock git 探测为"在 git repo 中"
+    with patch("subprocess.run") as mock_run:
+        mock_run.return_value = MagicMock(returncode=0, stdout="true", stderr="")
+        with patch("cc_harness.cli.init.Prompt.ask") as mock_ask:
+            mock_ask.side_effect = [
+                "nogitignore_proj",  # name
+                "ask",               # resume_mode
+                "yes",               # live
+                "no",                # gitignore = no
+            ]
+            init_interactive(tmp_path)
+    # git 探测命中(返回 0),但用户说 no → 不写 .gitignore
+    assert not (tmp_path / ".gitignore").exists()
+    # 仍然有 manifest
+    assert (tmp_path / ".cc-harness" / "project.yaml").is_file()
+
+
+def test_init_git_probe_only_checks_returncode(tmp_path):
+    """git 探测只看 returncode==0(放宽)— 任何 stdout 都行。"""
+    with patch("subprocess.run") as mock_run:
+        # 模拟空 stdout 但 returncode=0(某些 git 子命令 / sparse repo)
+        mock_run.return_value = MagicMock(returncode=0, stdout="", stderr="")
+        init_noninteractive(tmp_path, name="x")
+    # 即使 stdout 为空,只要 returncode=0 就算 in git repo → 写 .gitignore
+    assert (tmp_path / ".gitignore").is_file()

@@ -17,7 +17,6 @@ spec 组件 8 七子命令;`cmd_todo(args, cwd) -> int` 单 dispatcher,按
 from __future__ import annotations
 
 import asyncio
-import json
 import sys
 from argparse import Namespace
 from datetime import datetime
@@ -28,6 +27,7 @@ from rich.console import Console
 
 from cc_harness.cli._shared import (
     JsonOrText,
+    _json_dumps,
     cli_session_id,
     load_manifest_or_exit,
     print_error,
@@ -113,12 +113,14 @@ async def _list(svc: TodoService, args: Namespace, console: Console) -> int:
             }
             for t in shown
         ]
-        sys.stdout.write(json.dumps(out_data, ensure_ascii=False, default=str) + "\n")
+        sys.stdout.write(_json_dumps(out_data) + "\n")
         sys.stdout.flush()
         return 0
 
     # 打印 header(走 plain text — 不在表格中)
-    sink.print_text(header + "\n")
+    # CSV 模式跳过 header(CSV 无注释标准,且 jq-friendly)
+    if fmt != "csv":
+        sink.print_text(header + "\n")
 
     # 渲染主体
     if fmt == "csv":
@@ -162,9 +164,11 @@ async def _list(svc: TodoService, args: Namespace, console: Console) -> int:
         sink.print_text("\n".join(body_lines) + "\n")
 
     if truncated:
-        sink.print_text(
-            f"\n(+{len(tasks) - limit} more, narrow with --status=X or --limit=N)\n"
-        )
+        # CSV 模式不写 truncated 提示(避免污染 CSV 输出)
+        if fmt != "csv":
+            sink.print_text(
+                f"\n(+{len(tasks) - limit} more, narrow with --status=X or --limit=N)\n"
+            )
     elif shown_n == 0:
         # 已经在 header 表达 0 tasks,无需再写一行
         pass
@@ -206,7 +210,7 @@ async def _get(svc: TodoService, args: Namespace, console: Console) -> int:
         "description": task.description,
     }
     if args.json:
-        sys.stdout.write(json.dumps(payload, ensure_ascii=False, default=str) + "\n")
+        sys.stdout.write(_json_dumps(payload) + "\n")
         sys.stdout.flush()
         return 0
     # 人类可读
@@ -289,7 +293,7 @@ async def _create(svc: TodoService, args: Namespace, console: Console) -> int:
         "priority": task.priority,
     }
     if args.json:
-        sys.stdout.write(json.dumps(payload, ensure_ascii=False) + "\n")
+        sys.stdout.write(_json_dumps(payload) + "\n")
         sys.stdout.flush()
         return 0
     print_text(console, f"[todo_create] ✓ created task {task.id}")
@@ -373,7 +377,7 @@ async def _update(svc: TodoService, args: Namespace, console: Console) -> int:
 
     payload = {"id": updated.id, "status": updated.status}
     if args.json:
-        sys.stdout.write(json.dumps(payload, ensure_ascii=False) + "\n")
+        sys.stdout.write(_json_dumps(payload) + "\n")
         sys.stdout.flush()
         return 0
     print_text(console, f"[todo_update] ✓ updated task {updated.id}")
@@ -396,7 +400,7 @@ async def _delete(svc: TodoService, args: Namespace, console: Console) -> int:
     suffix = " (force=True, dangling references left)" if force else ""
     if args.json:
         payload = {"id": task_id, "deleted": True, "force": force}
-        sys.stdout.write(json.dumps(payload, ensure_ascii=False) + "\n")
+        sys.stdout.write(_json_dumps(payload) + "\n")
         sys.stdout.flush()
         return 0
     print_text(console, f"[todo_delete] ✓ deleted task {task_id}{suffix}")
@@ -426,7 +430,7 @@ async def _resolve(svc: TodoService, args: Namespace, console: Console) -> int:
             }
             for i, t in enumerate(chain)
         ]
-        sys.stdout.write(json.dumps(out, ensure_ascii=False) + "\n")
+        sys.stdout.write(_json_dumps(out) + "\n")
         sys.stdout.flush()
         return 0
 
@@ -478,7 +482,7 @@ async def _validate(svc: TodoService, args: Namespace, console: Console) -> int:
             }
             for i in issues
         ]
-        sys.stdout.write(json.dumps(out, ensure_ascii=False) + "\n")
+        sys.stdout.write(_json_dumps(out) + "\n")
         sys.stdout.flush()
         # 业务错(任意 error) → exit 1
         return 0 if not any(i.severity == "error" for i in issues) else 1

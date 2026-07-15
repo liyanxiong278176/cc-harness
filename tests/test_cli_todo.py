@@ -502,3 +502,177 @@ def test_validate_strict_promotes_warnings_to_error_exit(proj, svc_args, capsys)
     err = capsys.readouterr().err
     assert rc == 1
     assert "missing_md" in err or "Error" in err
+
+
+# ---------------------------------------------------------------------------
+# Spec gap fix tests
+# ---------------------------------------------------------------------------
+
+
+def test_update_append_acceptance_criteria(proj, svc_args, capsys):
+    """--append-acceptance-criteria → 在现有列表尾部追加,不替换。"""
+    tid = _create_and_get_id(
+        svc_args("create", title="ac", acceptance_criteria=["a1", "a2"]),
+        proj,
+    )
+    args = svc_args(
+        "update", task_id=tid,
+        append_acceptance_criteria=["b1", "b2"],
+    )
+    rc = cmd_todo(args, proj)
+    assert rc == 0
+
+    # 验证 yaml 中的 acceptance_criteria
+    import yaml as _y
+    yaml_path = proj / ".cc-harness" / "todos" / "todos.yaml"
+    data = _y.safe_load(yaml_path.read_text(encoding="utf-8"))
+    entry = next(t for t in data["tasks"] if t["id"] == tid)
+    assert entry["acceptance_criteria"] == ["a1", "a2", "b1", "b2"]
+
+
+def test_update_append_acceptance_criteria_with_existing(proj, svc_args, capsys):
+    """已经替换过(--acceptance-criteria)再 --append-acceptance-criteria → 累加。"""
+    tid = _create_and_get_id(
+        svc_args("create", title="ac", acceptance_criteria=["a1"]),
+        proj,
+    )
+    # 先替换
+    cmd_todo(
+        svc_args("update", task_id=tid, acceptance_criteria=["x"]),
+        proj,
+    )
+    # 再追加
+    args = svc_args(
+        "update", task_id=tid,
+        append_acceptance_criteria=["y", "z"],
+    )
+    rc = cmd_todo(args, proj)
+    assert rc == 0
+
+    import yaml as _y
+    yaml_path = proj / ".cc-harness" / "todos" / "todos.yaml"
+    data = _y.safe_load(yaml_path.read_text(encoding="utf-8"))
+    entry = next(t for t in data["tasks"] if t["id"] == tid)
+    assert entry["acceptance_criteria"] == ["x", "y", "z"]
+
+
+def test_delete_json_output(proj, svc_args, capsys):
+    """--json → delete 输出 JSON 而非纯文本。"""
+    tid = _create_and_get_id(svc_args("create", title="del_j"), proj)
+    capsys.readouterr()  # 清空 create 的输出
+    args = svc_args("delete", task_id=tid, json=True)
+    rc = cmd_todo(args, proj)
+    assert rc == 0
+    out = capsys.readouterr().out
+    parsed = json.loads(out.strip())
+    assert parsed["id"] == tid
+    assert parsed["deleted"] is True
+    assert parsed["force"] is False
+
+
+def test_delete_json_force(proj, svc_args, capsys):
+    """--json + --force → JSON 含 force=True。"""
+    a_id = _create_and_get_id(svc_args("create", title="p"), proj)
+    cmd_todo(svc_args("create", title="c", depends_on=[a_id]), proj)
+    capsys.readouterr()  # 清空 create 输出
+    args = svc_args("delete", task_id=a_id, force=True, json=True)
+    rc = cmd_todo(args, proj)
+    assert rc == 0
+    out = capsys.readouterr().out
+    parsed = json.loads(out.strip())
+    assert parsed["force"] is True
+
+
+def test_list_json_respects_limit(proj, svc_args, capsys):
+    """--json 输出也受 --limit 限制(不再全量 dump)。"""
+    for i in range(5):
+        cmd_todo(svc_args("create", title=f"t{i}"), proj)
+    capsys.readouterr()
+    args = svc_args(
+        "list", status=None, parent=None, no_done=False,
+        format="table", sort="status", limit=2, json=True,
+    )
+    rc = cmd_todo(args, proj)
+    assert rc == 0
+    out = capsys.readouterr().out
+    parsed = json.loads(out.strip())
+    assert isinstance(parsed, list)
+    assert len(parsed) == 2  # 受 --limit 限制
+
+
+def test_list_format_csv(proj, svc_args, capsys):
+    """--format csv → CSV 字符串(列头 + 行)。"""
+    cmd_todo(svc_args("create", title="csv_test"), proj)
+    capsys.readouterr()
+    args = svc_args(
+        "list", status=None, parent=None, no_done=False,
+        format="csv", sort="status", limit=20,
+    )
+    rc = cmd_todo(args, proj)
+    assert rc == 0
+    out = capsys.readouterr().out
+    # CSV:第一行是列头
+    lines = out.strip().splitlines()
+    assert lines[0] == "id,title,status,priority"
+    assert len(lines) >= 2
+    # 第二行包含 "csv_test"
+    assert "csv_test" in lines[1]
+
+
+def test_list_renders_rich_table_in_tty(proj, svc_args, capsys, monkeypatch):
+    """TTY 模式下 _list 走 Rich Table(JsonOrText.print_table 路径)。"""
+    cmd_todo(svc_args("create", title="tty_test"), proj)
+    capsys.readouterr()
+
+    # mock JsonOrText.is_tty 模拟 TTY
+    from cc_harness.cli import _shared
+    real_init = _shared.JsonOrText.__init__
+
+    def patched_init(self, console, args):
+        real_init(self, console, args)
+        self.is_tty = True
+
+    monkeypatch.setattr(_shared.JsonOrText, "__init__", patched_init)
+    args = svc_args(
+        "list", status=None, parent=None, no_done=False,
+        format="table", sort="status", limit=20,
+    )
+    rc = cmd_todo(args, proj)
+    assert rc == 0
+    # Rich Table 渲染到 console,不一定进 capsys 的 out
+    # 主要验证不报错、退出码为 0
+
+
+def test_cmd_todo_system_error_exit_2(proj, svc_args, capsys, monkeypatch):
+    """系统错(OSError / StorageError / RuntimeError)→ exit 2。"""
+    from cc_harness.cli import todo as todo_mod
+
+    async def boom(svc, args, console):
+        raise OSError("disk full")
+
+    monkeypatch.setitem(todo_mod._HANDLERS, "list", boom)
+    args = svc_args("list", status=None, parent=None, no_done=False,
+                    format="table", sort="status", limit=20)
+    rc = cmd_todo(args, proj)
+    err = capsys.readouterr().err
+    assert rc == 2
+    assert "system error" in err
+    assert "disk full" in err
+
+
+def test_cmd_todo_storage_error_exit_2(proj, svc_args, capsys, monkeypatch):
+    """StorageError(yaml 损坏等)→ exit 2。"""
+    from cc_harness.cli import todo as todo_mod
+
+    async def boom(svc, args, console):
+        from cc_harness.project.storage import StorageError
+        raise StorageError("yaml parse failed")
+
+    monkeypatch.setitem(todo_mod._HANDLERS, "list", boom)
+    args = svc_args("list", status=None, parent=None, no_done=False,
+                    format="table", sort="status", limit=20)
+    rc = cmd_todo(args, proj)
+    err = capsys.readouterr().err
+    assert rc == 2
+    assert "system error" in err
+    assert "yaml parse failed" in err

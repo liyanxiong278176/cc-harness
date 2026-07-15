@@ -103,13 +103,24 @@ def print_error(console: Console, text: str) -> None:
 # ---------------------------------------------------------------------------
 
 
+def _json_dumps(payload: Any) -> str:
+    """统一 JSON dump 风格(ensure_ascii=False + default=str)。
+
+    所有 CLI 出口的 JSON 都走这个 helper,保持 1 处风格控制:
+    - 中文 / emoji 不转义
+    - datetime 等非原生类型走 str()
+    - 不缩进(CLI 输出是单行可被 jq 处理)
+    """
+    return json.dumps(payload, ensure_ascii=False, default=str)
+
+
 class JsonOrText:
     """TTY/JSON/纯文本渲染器。
 
     用法:
         sink = JsonOrText(console, args)          # args.json 控制
         sink.print_table(tasks, columns=...)      # tty → rich Table,else plain
-        sink.print_dict({"foo": 1})               # json → dict dump,else plain
+        sink.print_text("...")                    # 原始文本(json 模式走 _json_dumps)
 
     决策链:
         args.json=True              → 全部走 JSON(stdout)
@@ -152,8 +163,7 @@ class JsonOrText:
             payload = [
                 {c[0]: _extract(row, c[0]) for c in columns} for row in rows
             ]
-            sys.stdout.write(json.dumps(payload, default=str, ensure_ascii=False))
-            sys.stdout.write("\n")
+            sys.stdout.write(_json_dumps(payload) + "\n")
             sys.stdout.flush()
             return
 
@@ -188,20 +198,10 @@ class JsonOrText:
             cells = [_format_cell(_extract(row, c[0])) for c, _ in columns]
             sys.stdout.write("  ".join(cells) + "\n")
 
-    def print_dict(self, payload: dict) -> None:
-        """渲染单对象(JSON 模式直接 dump,否则走 key=value)。"""
-        # 保留为公共 API 但仅在 JSON 模式有意义;非 JSON 直接退化为 print_text。
-        if self.json_mode:
-            sys.stdout.write(json.dumps(payload, default=str, ensure_ascii=False))
-            sys.stdout.write("\n")
-            sys.stdout.flush()
-            return
-        self.print_text("\n".join(f"{k}: {v}" for k, v in payload.items()))
-
     def print_text(self, text: str) -> None:
         """渲染原始文本(不参与 json 决策 — 极简旁路,统一入口)。"""
         if self.json_mode:
-            sys.stdout.write(json.dumps({"text": text}, ensure_ascii=False) + "\n")
+            sys.stdout.write(_json_dumps({"text": text}) + "\n")
             return
         sys.stdout.write(text)
         if not text.endswith("\n"):
