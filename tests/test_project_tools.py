@@ -18,12 +18,7 @@ from pathlib import Path
 import pytest
 
 from cc_harness.mcp_client import ToolResult
-from cc_harness.project.exceptions import (
-    DependencyCycleError,
-    InvalidFieldError,
-    TaskNotFound,
-    TodoError,
-)
+from cc_harness.project.exceptions import TaskNotFound
 from cc_harness.project.models import Manifest
 from cc_harness.project.service import TodoService
 from cc_harness.project.tools import (
@@ -299,6 +294,7 @@ async def test_list_handler_status_filter(deps):
     await deps["service"].update(b.id, status="in_progress")
     result = await todo_list_handler({"status": "pending"}, **deps)
     assert result.is_error is False
+    assert "1 tasks" in result.llm_text  # header 计数与已过滤列表一致
     assert a.id in result.llm_text  # pending 出现
     assert b.id not in result.llm_text  # in_progress 被过滤
 
@@ -316,7 +312,7 @@ async def test_list_handler_exclude_done(deps):
 
 async def test_list_handler_status_priority_sort(deps):
     """默认 sort='status' → in_progress 排在 pending 之前。"""
-    p = await deps["service"].create(title="pending_one")
+    await deps["service"].create(title="pending_one")
     ip = await deps["service"].create(title="inprog_one")
     await deps["service"].update(ip.id, status="in_progress")
     # 手动把 updated_at 调一下,让 pending 更新更早(确保不靠 updated_at)
@@ -546,6 +542,7 @@ async def test_resolve_handler_excludes_done(deps):
     assert result.is_error is False
     assert b.id in result.llm_text
     assert a.id not in result.llm_text  # done 被排除
+    assert "no unresolved upstream (done tasks excluded)" in result.llm_text
 
 
 # ---------------------------------------------------------------------------

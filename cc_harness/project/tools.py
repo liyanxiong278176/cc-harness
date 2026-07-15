@@ -350,13 +350,13 @@ async def todo_list_handler(
     truncated = len(tasks) > limit
     shown = tasks[:limit]
 
-    # 头部计数
-    all_for_count = await service.list(include_done=include_done)
+    # 头部计数复用已按 status/parent/include_done 过滤的列表,避免二次读盘,
+    # 也确保 header 与实际返回范围一致。
     by_status: dict[str, int] = {}
-    for t in all_for_count:
+    for t in tasks:
         by_status[t.status] = by_status.get(t.status, 0) + 1
     header = (
-        f"[todo_list] {len(all_for_count)} tasks "
+        f"[todo_list] {len(tasks)} tasks "
         f"({by_status.get('done', 0)} done / "
         f"{by_status.get('in_progress', 0)} in_progress / "
         f"{by_status.get('pending', 0)} pending)"
@@ -512,7 +512,7 @@ async def todo_resolve_handler(
 ) -> ToolResult:
     """todo_resolve:BFS 上游依赖链 + 层级缩进(spec line 472-477)。
 
-    返回列表顺序:深度递增(最深 dep 先,然后 target);每行带 depth 标记。
+    返回列表顺序:target 在前,随后按 BFS 深度递增列出依赖;每行带 depth 标记。
     """
     del cwd, session_id
     task_id = args.get("task_id")
@@ -527,6 +527,8 @@ async def todo_resolve_handler(
     except TodoError as e:
         return _err("todo_resolve", e)
 
+    # Service.resolve 的契约是 target-first BFS,与 spec 示例的 dependency-first
+    # 展示顺序不同。这里保留 Service 顺序,让目标上下文稳定出现在第一行。
     # 算每个 node 的 BFS depth(以 task_id 为 0,传递 dep 按 dep_of_target 推进)
     # 直接复用 resolve 返回顺序(target + 上游),深度 = index 顺序内推;
     # 简化:list[0]=target depth=0, 其后 dep 标注相对深度。
@@ -540,7 +542,11 @@ async def todo_resolve_handler(
     # Ready 判断:链中所有非 target 都 done
     upstream = chain[1:]
     if not upstream:
-        ready_line = "Ready to work: no upstream."
+        ready_line = (
+            "Ready to work: no upstream."
+            if include_done
+            else "Ready to work: no unresolved upstream (done tasks excluded)."
+        )
     elif all(t.status == "done" for t in upstream):
         ready_line = "Ready to work: all upstream done."
     else:
