@@ -1,0 +1,16 @@
+project_id: 7f3a-tasks-a91d
+name: cc-harness-with-tasks
+todos_path: .cc-harness/todos
+created_at: 2026-07-14T10:00:00Z
+schema_version: 1
+resume_mode: ask
+memory:
+  db_path: logs/memory.db
+  integration:
+    completion_capture: false
+live:
+  position: top
+  max_height: 10
+  spinner_style: dots
+  show_progress_bar: true
+  fold_done: 5

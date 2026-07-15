@@ -1,0 +1,3 @@
+project_id: bad-invalid-0001
+name: cc-harness-invalid
+# 故意缺 todos_path 和 created_at,测 fail-closed 错误恢复

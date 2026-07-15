@@ -1,0 +1,114 @@
+tasks:
+  - id: abc12345
+    title: 完成 hello.py
+    status: done
+    description: 实现一个简单的 hello world 输出脚本。
+    depends_on: []
+    parent_task: null
+    assigned_to: user
+    priority: medium
+    labels:
+      - smoke
+    due_date: null
+    effort_estimate: 0.5
+    acceptance_criteria:
+      - 脚本能直接运行
+      - 输出符合预期
+    created_at: 2026-07-14T10:00:00+00:00
+    updated_at: 2026-07-14T10:30:00+00:00
+    active_sessions:
+      - sess-A
+  - id: def67890
+    title: 设计新 API
+    status: done
+    description: 设计 TodoService 的对外 API。
+    depends_on:
+      - abc12345
+    parent_task: null
+    assigned_to: user
+    priority: high
+    labels:
+      - design
+    due_date: null
+    effort_estimate: 2.0
+    acceptance_criteria:
+      - API 签名确定
+    created_at: 2026-07-14T10:30:00+00:00
+    updated_at: 2026-07-14T11:00:00+00:00
+    active_sessions:
+      - sess-A
+  - id: jkl01234
+    title: 实现 todo 持久化
+    status: in_progress
+    description: 落 yaml + md 双文件格式。
+    depends_on:
+      - def67890
+    parent_task: null
+    assigned_to: user
+    priority: high
+    labels:
+      - core
+    due_date: null
+    effort_estimate: 4.0
+    acceptance_criteria:
+      - yaml 主索引
+      - md frontmatter
+      - active_sessions 自动 prune
+    created_at: 2026-07-14T11:00:00+00:00
+    updated_at: 2026-07-14T12:00:00+00:00
+    active_sessions:
+      - sess-A
+      - sess-B
+  - id: mno56789
+    title: 添加单元测试
+    status: pending
+    description: 给 status guard 和 dependency check 加 100% 覆盖测试。
+    depends_on:
+      - jkl01234
+    parent_task: null
+    assigned_to: user
+    priority: medium
+    labels:
+      - test
+    due_date: null
+    effort_estimate: 3.0
+    acceptance_criteria:
+      - 状态守卫规则表全覆盖
+      - 环检测全覆盖
+    created_at: 2026-07-14T11:30:00+00:00
+    updated_at: 2026-07-14T11:30:00+00:00
+    active_sessions: []
+  - id: pqr11111
+    title: 集成 Locomo eval
+    status: pending
+    description: 把 TodoService 接入 eval 流水线。
+    depends_on:
+      - mno56789
+    parent_task: null
+    assigned_to: user
+    priority: low
+    labels:
+      - eval
+    due_date: null
+    effort_estimate: 6.0
+    acceptance_criteria: []
+    created_at: 2026-07-14T12:00:00+00:00
+    updated_at: 2026-07-14T12:00:00+00:00
+    active_sessions: []
+  - id: stu22222
+    title: 写文档
+    status: pending
+    description: README + Quickstart 文档。
+    depends_on:
+      - pqr11111
+    parent_task: null
+    assigned_to: user
+    priority: low
+    labels:
+      - docs
+    due_date: null
+    effort_estimate: 1.5
+    acceptance_criteria: []
+    created_at: 2026-07-14T12:30:00+00:00
+    updated_at: 2026-07-14T12:30:00+00:00
+    active_sessions: []
