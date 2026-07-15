@@ -16,6 +16,7 @@ import asyncio
 import hashlib
 import os
 import time
+import uuid as _uuid
 from dataclasses import dataclass, field
 from pathlib import Path
 from openai import AsyncOpenAI
@@ -59,6 +60,13 @@ class ReplState:
     # Q3 Task8: session 标识 + mem_deps(pipeline/recall/store/persona_path/scenarios_dir)
     session_id: str = ""
     mem_deps: dict | None = None
+    # Task 6 (Plan A): project module state — manifest, TodoService, Live, resume
+    project_root: Path | None = None
+    manifest: object | None = None
+    todo_service: object | None = None
+    todo_extras: list = field(default_factory=list)
+    live_panel: object | None = None
+    resume_task: object | None = None
 
 
 async def _read_user(prompt: str) -> str:
@@ -135,10 +143,12 @@ async def run_repl(
         )
 
     console = Console()
+    # Task 6 / spec 组件 9 开放问题 8:session_id 加 hex 后缀保证唯一(避免同一秒
+    # 内多个 REPL 共享 session_id 导致 active_sessions 串台)。
     state = ReplState(
         mode=default_mode,
         context_config=context_config or ContextConfig(),
-        session_id=f"repl-{int(time.time())}",
+        session_id=f"repl-{int(time.time())}-{_uuid.uuid4().hex[:8]}",
     )
 
     # Q3 Task8: 加载分层记忆 config(kill-switches:layered_inject/capture_enabled/pipeline_enabled)
@@ -198,6 +208,94 @@ async def run_repl(
     except Exception as e:
         print_warn(console, f"memory 初始化异常: {e}; 不接入记忆工具")
         state.memory_extras = []
+
+    # --- Task 6 / spec 组件 9:6 处接线(Plan A) ---
+    # 0) 统一锚点 — 所有下游 service / storage / policy 都用 state.project_root
+    state.project_root = Path(cwd).resolve()
+
+    # 1) 启动检测 manifest + 自动 init(用户零摩擦,无需先 `cc-harness init`)
+    from cc_harness.project.manifest import load_manifest as _load_manifest
+    from cc_harness.cli.init import init_noninteractive as _init_ni
+    try:
+        _manifest = _load_manifest(state.project_root)
+    except Exception as e:
+        print_warn(console, f"manifest 加载异常: {e}; 按无 manifest 处理(自动 init)")
+        _manifest = None
+    if _manifest is None:
+        print_info(console, "No .cc-harness/project.yaml found. Auto-initializing...")
+        try:
+            _manifest = _init_ni(
+                state.project_root, name=state.project_root.name or "myapp",
+            )
+            print_info(
+                console,
+                "✓ Created .cc-harness/project.yaml "
+                "(run `cc-harness init` to customize)",
+            )
+        except Exception as e:
+            print_warn(console, f"auto init 失败: {e}; todo tools 跳过注入")
+            _manifest = None
+    state.manifest = _manifest
+
+    # 2) 加载 TodoService + Live(若 manifest 失败 → 跳过 Live)
+    if state.manifest is not None:
+        try:
+            from cc_harness.project.service import TodoService as _TSvc
+            from cc_harness.project.live import TodoLivePanel as _TLP
+            _mem_svc = None
+            if state.mem_deps and isinstance(state.mem_deps, dict):
+                _mem_svc = state.mem_deps.get("service")
+            state.todo_service = _TSvc(
+                project_root=state.project_root,
+                manifest=state.manifest,
+                memory_service=_mem_svc,
+            )
+            # Live panel — manifest.live.position='off' 时不启动 Live
+            if getattr(state.manifest.live, "position", "top") != "off":
+                state.live_panel = _TLP(console, state.todo_service, state.manifest)
+                try:
+                    state.live_panel.start()
+                except Exception as e:
+                    print_warn(console, f"live panel 启动失败: {e}; 继续不显示 Live")
+                    state.live_panel = None
+        except Exception as e:
+            print_warn(console, f"todo service 加载失败: {e}; todo tools 跳过")
+            state.todo_service = None
+
+    # 3) 注入 todo tools(拼接时 None-safe)
+    if state.todo_service is not None:
+        try:
+            from cc_harness.project.extras import inject_todo_tools as _itt
+            state.todo_extras = _itt(
+                state.todo_service,
+                session_id=state.session_id,
+                cwd=str(state.project_root),
+            )
+        except Exception as e:
+            print_warn(console, f"todo tools 注入失败: {e}; 跳过 7 个 todo tools")
+            state.todo_extras = []
+
+    # 4) Resume 询问(只在 turns==0 时触发;auto 静默,ask 询问,manual 不主动)
+    if (
+        state.manifest is not None
+        and state.todo_service is not None
+        and state.session_stats.turns == 0
+    ):
+        try:
+            _tasks = await state.todo_service.list(include_done=True)
+            _resume_mode = getattr(state.manifest, "resume_mode", "ask")
+            if _resume_mode == "ask":
+                from cc_harness.cli.resume import select_resume_task as _srt
+                _candidate = _srt(_tasks)
+                if _candidate is not None:
+                    state.resume_task = await _maybe_ask_resume(
+                        console, _candidate, _tasks,
+                    )
+            elif _resume_mode == "auto":
+                from cc_harness.cli.resume import select_resume_task as _srt
+                state.resume_task = _srt(_tasks)
+        except Exception as e:
+            print_warn(console, f"resume 检测失败: {e}; 不 attach")
 
     try:
         while True:
@@ -266,6 +364,9 @@ async def run_repl(
                 if state.mem_deps and mem_cfg.offload_enabled
                 else None
             )
+            # Task 6: extra_native_specs 必须 None-safe(memory_extras + todo_extras)
+            _all_extras = list(state.memory_extras or []) + list(state.todo_extras or [])
+            extra_native_specs = _all_extras or None
             turn_stats = await run_turn(
                 state.messages, llm, mcp,
                 max_iter=max_iter,
@@ -275,10 +376,11 @@ async def run_repl(
                 token_counter=state.token_counter,
                 policy=policy,
                 l5=l5,
-                extra_native_specs=state.memory_extras or None,  # Plan2: 记忆工具(chat/coding)
+                extra_native_specs=extra_native_specs,            # Task 6: memory + todo
                 context_config=state.context_config,             # Plan3: 压缩配置
                 memory_layer=memory_layer,                        # Q3 Task8: 分层注入
                 offload_deps=offload_deps,                        # Q4 Task7: 短期符号化卸载
+                resume_task=state.resume_task,                    # Task 6: 续干任务
             )
             state.session_stats.add(turn_stats)
 
@@ -293,10 +395,22 @@ async def run_repl(
             # Q3 Task8: after-turn hook — L0 capture + L1 pipeline(every-N)+ L2 scenario + L3 persona
             await _after_turn_memory(state, mem_cfg)
 
+            # Task 6: after-turn hook — A 阶段占位(verify hook 留 B 阶段)
+            try:
+                await _after_turn_todo(state, state.todo_service)
+            except Exception as e:
+                print_warn(console, f"todo after-turn hook failed: {e}")
+
             # After the turn, show what actually changed on disk — so the user
             # can see real file state without F5-ing their file manager.
             _print_disk_changes(console, cwd, since=turn_start)
     finally:
+        # Task 6: 退出前 stop live panel(避免 dangling Rich Live 影响 terminal)
+        if getattr(state, "live_panel", None) is not None:
+            try:
+                await state.live_panel.stop() if asyncio.iscoroutine(state.live_panel.stop()) else state.live_panel.stop()
+            except Exception as e:
+                print_warn(console, f"live panel stop failed: {e}")
         # 主循环退出(正常 exit / EOF / Ctrl-C / 异常)→ shutdown 会话级 executor。
         # async,非 atexit;sandbox 时 kill 容器 + shutdown_owned_server,best-effort。
         await shutdown_session_executor()
@@ -349,6 +463,74 @@ async def _after_turn_memory(state: ReplState, mem_cfg) -> None:
             )
         except Exception as e:
             print_warn(Console(), f"memory persona failed: {e}")
+
+
+async def _after_turn_todo(state: ReplState, todo_service) -> None:
+    """Task 6 after-turn hook(spec 组件 9 step 5)。
+
+    A 阶段占位 — 不做实际工作,只是接口预留。
+    B 阶段填 verify hook(task 状态自动验证、acceptance criteria 进展等)。
+
+    fail-soft:任何异常 swallow,不阻塞主循环。
+    """
+    if todo_service is None:
+        return
+    # A 阶段 no-op;B 阶段扩展:
+    # - 解析 LLM 回答中提到的 task ids → 自动校验状态
+    # - 校验 active_sessions 是否过期(session_id 已被 task 引用)
+    return
+
+
+async def _maybe_ask_resume(console: Console, candidate, tasks) -> object | None:
+    """Resume 询问 — 返回用户选的 task,或 None。
+
+    spec 组件 9 step 4(ask mode):
+        turn==0 + 1 个 in_progress → 打印候选 + 询问 y/n/pick
+        用户答 'y' → 选 candidate
+        用户答 'n' → None
+        用户答 'pick' → 列出所有 in_progress 让用户选 id
+
+    Notes:
+        - 使用本模块 _read_user(可被测试 monkeypatch),不走 builtins.input
+        - 空输入 → 选 candidate(默认 y)
+        - EOFError / KeyboardInterrupt → None(用户取消)
+    """
+    console.print(
+        f"\n[resume] 检测到 in_progress task: {candidate.id} - {candidate.title}",
+        markup=False,
+    )
+    n_in_progress = sum(1 for t in tasks if t.status == "in_progress")
+    if n_in_progress > 1:
+        console.print(
+            f"  (另有 {n_in_progress - 1} 个 in_progress task,输入 'pick' 选择其他)",
+            markup=False,
+        )
+
+    try:
+        answer = (await _read_user("resume? [Y/n/pick]: ")).strip().lower()
+    except (EOFError, KeyboardInterrupt):
+        return None
+
+    if answer in ("", "y", "yes"):
+        return candidate
+    if answer in ("n", "no"):
+        return None
+    if answer == "pick":
+        in_progress = [t for t in tasks if t.status == "in_progress"]
+        console.print("可选 in_progress task:", markup=False)
+        for t in in_progress:
+            console.print(f"  {t.id}  {t.title}", markup=False)
+        try:
+            raw_id = (await _read_user("输入 task id: ")).strip()
+        except (EOFError, KeyboardInterrupt):
+            return None
+        for t in in_progress:
+            if t.id == raw_id:
+                return t
+        console.print(f"未知 id: {raw_id!r},跳过 resume", markup=False)
+        return None
+    # 其它输入按 n 处理
+    return None
 
 
 # --- Disk change summary (printed after each LLM turn) ---
