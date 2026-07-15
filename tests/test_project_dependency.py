@@ -198,3 +198,18 @@ def test_dep_check_with_missing_new_dep() -> None:
     """new_depends_on 含不存在的 task id → 跳过(False 分支),不抛。"""
     a = _task("aaa")
     dep_check("aaa", ["ghost"], {"aaa": a})  # OK, no exception
+
+
+def test_dependency_cycle_error_inherits_todo_error() -> None:
+    """Task 3 起 DependencyCycleError 必须继承 TodoError,纳入统一异常层级。"""
+    from cc_harness.project.exceptions import TodoError
+
+    assert issubclass(DependencyCycleError, TodoError)
+
+
+def test_manifest_error_inherits_todo_error() -> None:
+    """Task 3 起 ManifestError 必须继承 TodoError(通过 cc_harness.project.manifest 导入路径)。"""
+    from cc_harness.project.exceptions import TodoError
+    from cc_harness.project.manifest import ManifestError
+
+    assert issubclass(ManifestError, TodoError)

@@ -11,6 +11,7 @@ from __future__ import annotations
 
 from dataclasses import replace
 
+from cc_harness.project.exceptions import DependencyCycleError as _DependencyCycleError
 from cc_harness.project.models import TodoTask, ValidationIssue
 
 
@@ -171,13 +172,16 @@ def dep_check(
 
 
 # ---------------------------------------------------------------------------
-# 异常(spec 异常体系 line 286 — TodoError 在 B 阶段统一引入;
-# A 阶段直接继承 Exception,匹配 Task 1 异常模式)
+# 异常(Task 3 起继承 TodoError,纳入统一异常层级;
+# 通过 alias 保留 `dependency.DependencyCycleError` 的导入路径稳定 — Task 2 测试不变)
 # ---------------------------------------------------------------------------
 
 
-class DependencyCycleError(Exception):
-    """子图环检测发现潜在依赖环时抛出(组件 4)。"""
+class DependencyCycleError(_DependencyCycleError):
+    """子图环检测发现潜在依赖环时抛出(组件 4)。
+
+    Task 3 起继承 `TodoError`。
+    """
 
 
 # ---------------------------------------------------------------------------

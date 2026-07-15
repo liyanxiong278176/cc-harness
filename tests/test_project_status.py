@@ -101,3 +101,28 @@ def test_status_guard_error_message_non_done_includes_illegal_phrase() -> None:
     """非 done 状态的非法转移消息应说明是 illegal transition(区别于 done terminal)。"""
     with pytest.raises(StatusGuardError, match="illegal status transition"):
         status_guard(_task("pending"), "garbage")
+
+
+def test_status_guard_unknown_current_status_raises() -> None:
+    """Task 2 review followup:当前 status 不在表里(损坏 yaml)→ StatusGuardError 而非 KeyError。"""
+    task = _task("pending")
+    # 直接构造非法当前 status(模拟外部编辑损坏 yaml)
+    object.__setattr__(task, "status", "corrupted_state")
+    with pytest.raises(StatusGuardError, match="unknown current status"):
+        status_guard(task, "done")
+
+
+def test_status_guard_same_state_transitions_accepted_for_all_states() -> None:
+    """Task 2 review followup:4 个非终态的同状态转移(idempotent)全部合法。
+
+    plan lines 357-359 只列了 pending→pending / in_progress→in_progress。
+    实现接受全部 4 个非终态;done 是终态,done→done 抛(见 test_status_guard_done_terminal_message)。
+    """
+    for s in ("pending", "in_progress", "blocked", "cancelled"):
+        status_guard(_task(s), s)  # 不抛
+
+
+def test_status_guard_inherits_todo_error() -> None:
+    """Task 3 起 StatusGuardError 必须继承 TodoError,纳入统一异常层级。"""
+    from cc_harness.project.exceptions import TodoError
+    assert issubclass(StatusGuardError, TodoError)

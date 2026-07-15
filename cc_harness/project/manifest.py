@@ -17,6 +17,7 @@ from pathlib import Path
 
 import yaml
 
+from cc_harness.project.exceptions import ManifestError as _ManifestError
 from cc_harness.project.models import (
     LiveConfig,
     Manifest,
@@ -35,11 +36,11 @@ _VALID_RESUME_MODES = ("ask", "auto", "manual")
 _VALID_LIVE_POSITIONS = ("top", "bottom", "off")
 
 
-class ManifestError(Exception):
-    """Manifest 加载/校验失败(组件 2 异常体系)。
+class ManifestError(_ManifestError):
+    """Manifest 加载/校验失败(组件 1)。
 
-    CLAUDE.md 约定:`ManifestError` 不嵌套在共同 base 下,直接继承 Exception,
-    与 cc_harness 现有异常模式一致(`ConfigError(Exception)` / `EmbeddingError(Exception)`)。
+    Task 3 起继承 `TodoError`,纳入统一异常层级;
+    通过重新继承 + 同名 alias 保留 `manifest.ManifestError` 的导入路径稳定。
     """
 
 
