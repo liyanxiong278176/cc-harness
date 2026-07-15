@@ -535,6 +535,36 @@ def test_refresh_system_prompt_with_resume_appends_block(tmp_path):
     assert messages[0]["content"].count("<resume_task>") == 1
 
 
+def test_refresh_system_prompt_replaces_general_trailing_resume_block(
+    tmp_path, monkeypatch,
+):
+    """尾部旧 resume block 可带属性、仅一个换行,仍应被替换而非重复。"""
+    from cc_harness.agent import _refresh_system_prompt
+    from cc_harness import prompts
+
+    monkeypatch.setattr(
+        prompts,
+        "build_system_prompt",
+        lambda cwd, mode: (
+            "BASE\n<resume_task data-source='legacy'>OLD</resume_task>\n"
+        ),
+    )
+    messages = [{"role": "user", "content": "x"}]
+
+    _refresh_system_prompt(
+        messages,
+        str(tmp_path),
+        "coding",
+        resume_task=_make_resume_task(),
+    )
+
+    content = messages[0]["content"]
+    assert content.count("<resume_task") == 1
+    assert "data-source='legacy'" not in content
+    assert "OLD" not in content
+    assert content.endswith("</resume_task>")
+
+
 def test_refresh_system_prompt_resume_does_not_clobber_q3_q4(tmp_path):
     """Q3 persona / Q4 canvas 标记必须保留(append-only pattern)。
 

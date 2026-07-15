@@ -620,7 +620,7 @@ def _refresh_system_prompt(messages: list[dict], cwd: str, mode: str,
         # (anchored to end of string to avoid removing in-line occurrences
         # of the literal text in user content)
         old = re.sub(
-            r"\n\n<resume_task>.*?</resume_task>\s*$",
+            r"\s*<resume_task\b[^>]*>.*?</resume_task>\s*\Z",
             "",
             old,
             flags=re.DOTALL,
