@@ -76,15 +76,15 @@ def test_todo_task_full_fields():
 
 
 def test_todo_task_field_count():
-    """T15 = 11 user + 3 auto + 1 system = 15 dataclass fields(加 1 是 active_sessions 本身 = 15?见下)。
+    """T15 = 11 user + 3 auto + 1 system,另有 1 个不持久化的内部辅助字段。
 
-    实际 dataclass 字段:
+    持久化字段:
       user-controllable(11): title / status / description / depends_on / parent_task /
                              assigned_to / priority / labels / due_date / effort_estimate /
                              acceptance_criteria
       auto-gen(3):           id / created_at / updated_at
       system(1):             active_sessions
-    总计 15。
+    内部辅助(1):             truncated_note
     """
     fields = {f for f in TodoTask.__dataclass_fields__.keys()}
     expected = {
@@ -96,9 +96,11 @@ def test_todo_task_field_count():
         "id", "created_at", "updated_at",
         # T15
         "active_sessions",
+        # 内部辅助(不持久化)
+        "truncated_note",
     }
     assert fields == expected
-    assert len(fields) == 15
+    assert len(fields) == 16
 
 
 def test_todo_task_yaml_dict_roundtrip():
@@ -123,6 +125,7 @@ def test_todo_task_yaml_dict_roundtrip():
         active_sessions=["s"],
     )
     d = t.to_yaml_dict()
+    assert "truncated_note" not in d
     t2 = TodoTask.from_yaml_dict(d)
     assert t2.id == t.id
     assert t2.title == t.title

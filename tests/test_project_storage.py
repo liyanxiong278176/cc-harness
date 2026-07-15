@@ -323,6 +323,9 @@ def test_active_sessions_prune_at_50(tmp_path, caplog):
     assert loaded[0].active_sessions[-1] == "session-059"
     assert any("truncated" in r.message for r in caplog.records)
 
+    md_path = s.todos_dir / "abc12345.md"
+    assert "# earlier 10 sessions truncated at" in md_path.read_text(encoding="utf-8")
+
 
 def test_active_sessions_under_50_unchanged(tmp_path):
     s = _make_storage(tmp_path)

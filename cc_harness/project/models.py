@@ -1,7 +1,8 @@
 """Sub-project A 数据类(组件 1 + 组件 2)。
 
 字段计数约定(全文统一):
-    TodoTask 共 15 字段 = 11 用户可控(T11)+ 3 自动生成(T14)+ 1 系统(T15)。
+    TodoTask 有 15 个持久化字段 = 11 用户可控(T11)+ 3 自动生成(T14)+ 1 系统(T15)。
+    truncated_note 是内部辅助字段,不计入 T15,不序列化到 yaml。
 """
 from __future__ import annotations
 
@@ -45,13 +46,13 @@ RuleId = Literal[
 
 
 # ---------------------------------------------------------------------------
-# TodoTask — T15 完整字段(11 user + 3 auto + 1 system)
+# TodoTask — T15 持久化字段(11 user + 3 auto + 1 system) + 内部辅助字段
 # ---------------------------------------------------------------------------
 
 
 @dataclass
 class TodoTask:
-    """单个 Todo 任务。T15 字段 = 11 user + 3 auto + 1 system。
+    """单个 Todo 任务。T15 持久化字段 = 11 user + 3 auto + 1 system。
 
     T11 用户可控字段:
         title / status / description / depends_on / parent_task / assigned_to /
@@ -84,6 +85,9 @@ class TodoTask:
 
     # --- T15 系统 ---
     active_sessions: list[str] = field(default_factory=list)
+
+    # --- 内部辅助状态(不计入 T15,不序列化到 yaml) ---
+    truncated_note: str | None = None
 
     # ------------------------------------------------------------------ #
     # 校验 / helper(纯逻辑,不放服务层)

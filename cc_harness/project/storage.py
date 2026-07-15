@@ -102,7 +102,7 @@ class TodoStorage:
     def save_all(self, tasks: Iterable[TodoTask]) -> None:
         """写 yaml 主索引 + 每个 task 的 md 文件。"""
         tasks = list(tasks)
-        # active_sessions prune
+        # active_sessions prune;返回值携带 md-only truncated_note 给后续 _render_md
         pruned_tasks = [self._prune_active_sessions(t) for t in tasks]
 
         # 1) 写 todos.yaml(原子)
@@ -246,10 +246,10 @@ class TodoStorage:
             "(earlier %d sessions dropped)",
             task.id, len(sessions), _ACTIVE_SESSIONS_MAX, truncated_n,
         )
-        # 在 task 描述里追加注释(spec 组件 5 约束 5)
+        # 构造写入 md body 末尾的注释(spec 组件 5 约束 5)
         note = f"# earlier {truncated_n} sessions truncated at {datetime.now().isoformat()}"
         # 实际截断:仅保留最近 50;注释通过 _render_md 写入 md 末尾(不污染 yaml)
-        return _replace(task, active_sessions=kept, _truncated_note=note)
+        return _replace(task, active_sessions=kept, truncated_note=note)
 
     # ------------------------------------------------------------------ #
     # 内部 — 路径 + 目录
@@ -277,12 +277,10 @@ class StorageError(Exception):
 
 
 def _replace(task: TodoTask, **changes) -> TodoTask:
-    """dataclass 不可变更新(支持 _truncated_note 这种临时字段占位)。"""
+    """dataclass 不可变更新。"""
     from dataclasses import replace
-    # 忽略非 TodoTask 字段(如 _truncated_note)
-    valid_fields = {f for f in TodoTask.__dataclass_fields__}
-    clean = {k: v for k, v in changes.items() if k in valid_fields}
-    return replace(task, **clean)
+
+    return replace(task, **changes)
 
 
 def _yaml_equal(a, b) -> bool:
@@ -361,4 +359,5 @@ def _render_md(task: TodoTask) -> str:
         default_flow_style=False, indent=2,
     ).rstrip("\n")
 
-    return f"---\n{fm_text}\n---\n\n{desc}\n"
+    note = f"\n\n{task.truncated_note}" if task.truncated_note is not None else ""
+    return f"---\n{fm_text}\n---\n\n{desc}{note}\n"
