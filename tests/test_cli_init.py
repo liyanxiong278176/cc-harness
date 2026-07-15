@@ -7,7 +7,6 @@ covers a smaller subset via mocking rich.prompt.Prompt.ask.
 from __future__ import annotations
 
 from argparse import Namespace
-from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 import pytest

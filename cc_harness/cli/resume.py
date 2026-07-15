@@ -14,20 +14,17 @@
 """
 from __future__ import annotations
 
-import asyncio
 from argparse import Namespace
 from pathlib import Path
 
 from rich.console import Console
 
 from cc_harness.cli._shared import (
-    load_manifest_or_exit,
     print_error,
     print_text,
 )
 from cc_harness.project.exceptions import TaskNotFound
 from cc_harness.project.models import TodoTask
-from cc_harness.project.service import TodoService
 from cc_harness.project.storage import TodoStorage
 
 

@@ -19,7 +19,6 @@
 from __future__ import annotations
 
 import logging
-import os
 import subprocess
 import sys
 import uuid
@@ -30,7 +29,6 @@ from pathlib import Path
 from rich.console import Console
 from rich.prompt import Prompt
 
-from cc_harness.cli._shared import load_manifest_or_exit  # noqa: F401(预留 main 接入)
 from cc_harness.cli._shared import print_error, print_text
 from cc_harness.project.manifest import load_manifest, save_manifest
 from cc_harness.project.models import LiveConfig, Manifest, MemoryConfig, MemoryIntegrationConfig

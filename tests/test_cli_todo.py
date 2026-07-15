@@ -17,7 +17,6 @@ from pathlib import Path
 
 import pytest
 
-from cc_harness.cli._shared import cli_session_id
 from cc_harness.cli.init import init_noninteractive
 from cc_harness.cli.todo import cmd_todo
 
@@ -206,7 +205,6 @@ def test_list_no_done(proj, svc_args, capsys):
         format="table", sort="status", limit=20,
     )
     rc = cmd_todo(args2, proj)
-    out = capsys.readouterr().out
     assert rc == 0
 
 
@@ -218,6 +216,7 @@ def test_list_json_output(proj, svc_args, capsys):
                     no_done=False, format="table",
                     sort="status", limit=20, json=True)
     rc = cmd_todo(args, proj)
+    assert rc == 0
     out = capsys.readouterr().out
     parsed = json.loads(out.strip())
     assert isinstance(parsed, list)

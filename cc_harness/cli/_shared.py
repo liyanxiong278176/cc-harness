@@ -77,10 +77,10 @@ def cli_session_id() -> str:
 def print_text(console: Console, text: str) -> None:
     """打印普通输出(stdout)。TTY 走 rich,否则 plain text。
 
-    简化设计:`console.print` 在非 tty 下自动降级为无 markup 文本,
-    与直接 `print` 行为一致。统一入口便于测试断言 capsys.readouterr().out。
+    关键:`[xxx]` 在 Rich 是 markup(颜色/样式),但 CLI 输出里
+    `[todo_create]` 这种 literal bracket 标记必须保留 → 用 `markup=False`。
     """
-    console.print(text)
+    console.print(text, markup=False, highlight=False)
 
 
 def print_error(console: Console, text: str) -> None:

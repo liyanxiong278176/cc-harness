@@ -20,7 +20,7 @@ import asyncio
 import json
 import sys
 from argparse import Namespace
-from datetime import datetime, timezone
+from datetime import datetime
 from pathlib import Path
 from typing import Any
 
@@ -307,7 +307,7 @@ async def _update(svc: TodoService, args: Namespace, console: Console) -> int:
         try:
             fields["effort_estimate"] = float(fields["effort_estimate"])
         except (TypeError, ValueError):
-            print_error(console, f"InvalidFieldError: effort_estimate not a number")
+            print_error(console, "InvalidFieldError: effort_estimate not a number")
             return 1
 
     if not fields:

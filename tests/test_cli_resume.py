@@ -15,9 +15,7 @@ CLI 行为:
 """
 from __future__ import annotations
 
-import asyncio
 from argparse import Namespace
-from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import pytest
@@ -26,7 +24,6 @@ from cc_harness.cli._shared import cli_session_id  # noqa: F401
 from cc_harness.cli.init import init_noninteractive
 from cc_harness.cli.resume import cmd_resume, select_resume_task
 from cc_harness.cli.todo import cmd_todo
-from cc_harness.project.service import TodoService
 
 
 # ---------------------------------------------------------------------------
