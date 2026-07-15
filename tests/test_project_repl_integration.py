@@ -11,13 +11,11 @@
 """
 from __future__ import annotations
 
-import asyncio
 from datetime import datetime, timezone
 from pathlib import Path
 from unittest.mock import AsyncMock
 
 import pytest
-from rich.console import Console
 
 from cc_harness.project.models import Manifest, TodoTask
 
@@ -167,7 +165,7 @@ async def test_run_repl_auto_init(tmp_path, monkeypatch):
 async def test_run_repl_loads_todo_service(tmp_path, monkeypatch):
     """run_repl 后 state.todo_service 是 TodoService 实例。"""
     from cc_harness import repl as repl_mod
-    from cc_harness.repl import run_repl, ReplState
+    from cc_harness.repl import run_repl
 
     proj = _seed_manifest(tmp_path)
     # 消息 → 触发 run_turn 至少一次,extras 才会被 capture
@@ -303,7 +301,7 @@ async def test_run_repl_extra_native_specs_none_safe_when_no_memory(tmp_path, mo
 async def test_run_repl_session_id_new_format(tmp_path, monkeypatch):
     """state.session_id 匹配 `repl-{int_ts}-{hex[:8]}`。"""
     from cc_harness import repl as repl_mod
-    from cc_harness.repl import run_repl, ReplState
+    from cc_harness.repl import run_repl
 
     proj = _seed_manifest(tmp_path)
     monkeypatch.setattr(repl_mod, "_read_user", _fake_inputs(["hi", "exit"]))

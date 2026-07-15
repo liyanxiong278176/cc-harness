@@ -29,6 +29,7 @@ Captures the Rich Console output and asserts:
   - Tool call results ARE shown in 观察 (this is the new design)
   - Order: 思考 -> 行动 -> 观察 -> 思考 -> ... -> 结果
 """
+# ruff: noqa: E402
 import asyncio
 import io
 import sys
@@ -160,7 +161,7 @@ n_thought = plain.count("思考:")
 n_action = plain.count("行动:")
 n_observation = plain.count("观察:")
 n_result = plain.count("结果:")
-print(f"\nLabel counts:", file=sys.stderr)
+print("\nLabel counts:", file=sys.stderr)
 print(f"  思考:  {n_thought}  (expected: 2, for iter 1 and iter 2; final is under 结果:)", file=sys.stderr)
 print(f"  行动:  {n_action}  (expected: 2, list_dir + read_file)", file=sys.stderr)
 print(f"  观察:  {n_observation}  (expected: 2, the two tool results)", file=sys.stderr)
@@ -175,13 +176,13 @@ print(f"\n'综合分析' count: {final_text_count} (expected: 1, no duplication)
 # indented under "观察:", so we check for the first line of each result.
 list_dir_result_count = plain.count("  main.py")
 read_file_result_count = plain.count("  #!/usr/bin/env python")
-print(f"\nTool result presence (new design shows them in 观察):", file=sys.stderr)
+print("\nTool result presence (new design shows them in 观察):", file=sys.stderr)
 print(f"  '  main.py' (list_dir first line): {list_dir_result_count} (expected: >= 1)", file=sys.stderr)
 print(f"  '  #!/usr/bin/env python' (read_file first line): {read_file_result_count} (expected: >= 1)", file=sys.stderr)
 
 # Line layout
 lines = plain.splitlines()
-print(f"\nFull layout (line by line):", file=sys.stderr)
+print("\nFull layout (line by line):", file=sys.stderr)
 for i, line in enumerate(lines):
     print(f"  [{i:2d}] {line!r}", file=sys.stderr)
 
@@ -205,7 +206,7 @@ positions = [
     ("结果:",            i_result),
     ("final text",       i_final),
 ]
-print(f"\nOrder (must be strictly increasing):", file=sys.stderr)
+print("\nOrder (must be strictly increasing):", file=sys.stderr)
 prev = -1
 order_ok = True
 for name, pos in positions:
@@ -234,7 +235,7 @@ assert order_ok, "4-phase order is wrong"
 # Critical: 结果: must be followed by the final text (not preceded by a duplicate 思考:)
 assert i_result < i_final, "结果: header should be followed by the final text"
 
-print(f"\nFinal messages list:", file=sys.stderr)
+print("\nFinal messages list:", file=sys.stderr)
 for i, m in enumerate(messages):
     role = m["role"]
     content = (m.get("content") or "")[:60]
@@ -243,8 +244,8 @@ for i, m in enumerate(messages):
         extra = f" tool_calls={[(tc['function']['name'], tc['id']) for tc in m['tool_calls']]}"
     print(f"  [{i}] {role:10s} | {content!r}{extra}", file=sys.stderr)
 
-print(f"\n✅ ALL ASSERTIONS PASSED", file=sys.stderr)
+print("\n✅ ALL ASSERTIONS PASSED", file=sys.stderr)
 print(f"   - {n_thought} 思考: blocks, {n_action} 行动: blocks, {n_observation} 观察: blocks, {n_result} 结果: block", file=sys.stderr)
-print(f"   - Full LLM text in each 思考 (no truncation)", file=sys.stderr)
-print(f"   - Tool results now shown in 观察 (per new 4-phase design)", file=sys.stderr)
-print(f"   - No color, no duplication, ReAct order correct", file=sys.stderr)
+print("   - Full LLM text in each 思考 (no truncation)", file=sys.stderr)
+print("   - Tool results now shown in 观察 (per new 4-phase design)", file=sys.stderr)
+print("   - No color, no duplication, ReAct order correct", file=sys.stderr)

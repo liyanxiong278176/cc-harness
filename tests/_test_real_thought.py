@@ -5,6 +5,7 @@ sends a real query, and runs agent.run_turn. Captures Rich Console output to
 verify the new no-color, no-tool-result, ReAct-labeled layout works against
 a real LLM.
 """
+# ruff: noqa: E402
 import asyncio
 import io
 import sys
@@ -48,7 +49,7 @@ async def main() -> None:
     mcp = MCPClient({"fake": fake_cfg})
     await mcp.start()
     tools = mcp.list_tools()
-    print(f"[mcp] started; tools loaded:", file=sys.stderr)
+    print("[mcp] started; tools loaded:", file=sys.stderr)
     for t in tools:
         print(f"  - {t['function']['name']}: {t['function']['description']}", file=sys.stderr)
 
@@ -83,7 +84,7 @@ async def main() -> None:
     # ---- analyze ----
     ansi_present = "\x1b[" in out
 
-    print(f"\n[analysis]", file=sys.stderr)
+    print("\n[analysis]", file=sys.stderr)
     print(f"  ANSI escape codes present : {ansi_present} (expected: False)", file=sys.stderr)
     print(f"  '行动:' occurrences       : {out.count('行动:')}", file=sys.stderr)
     print(f"  '结果:' occurrences       : {out.count('结果:')}", file=sys.stderr)
@@ -107,7 +108,7 @@ async def main() -> None:
     # Result text 'done' from fake_mcp_server should not leak (the result for 'echo' is just the input string)
     assert "done" not in out, "fake_mcp_server's 'slow' tool result 'done' leaked into output"
 
-    print(f"\n✅ Real LLM ran through the new plain-text ReAct layout cleanly", file=sys.stderr)
+    print("\n✅ Real LLM ran through the new plain-text ReAct layout cleanly", file=sys.stderr)
     print(f"   {n_action} tool calls, {n_result} final delimiter, no colors, no leaked results", file=sys.stderr)
 
 

@@ -194,6 +194,6 @@ async def test_start_surfaces_failure_reason_for_empty_str_exception(capsys):
     # (type name + repr). Critically, it must NOT be the old empty form.
     assert "server ghost failed to start" in out
     # The reason portion after the final ": " is non-empty.
-    line = next(l for l in out.splitlines() if "ghost failed to start" in l)
+    line = next(line for line in out.splitlines() if "ghost failed to start" in line)
     after = line.split("failed to start:", 1)[1]
     assert after.strip() != "", "failure reason must not be empty"

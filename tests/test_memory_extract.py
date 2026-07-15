@@ -1,11 +1,9 @@
 """Phase 3 Q1 uplift: extract_dates/entities/keywords 单测。"""
-import pytest
 
 from cc_harness.memory.extract import (
     extract_dates,
     extract_entities,
     extract_keywords,
-    _EN_STOPWORDS,
 )
 from cc_harness.memory.capture import _US
 

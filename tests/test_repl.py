@@ -3,6 +3,8 @@
 Covers: _prompt_for, _handle_slash, ReplState, and the integration of
 run_repl with mocked input + FakeLLM.
 """
+from pathlib import Path
+
 import pytest
 from cc_harness.repl import (
     ReplState,
@@ -216,7 +218,6 @@ async def test_run_repl_passes_design_dir(monkeypatch):
 
         # Capture the design_dir passed to run_turn by patching it
         captured: dict = {}
-        original_run_turn = agent_mod.run_turn
 
         async def spy_run_turn(messages, llm, mcp, **kwargs):
             captured.update(kwargs)
@@ -431,9 +432,6 @@ def test_collect_disk_changes_nonexistent_cwd_returns_empty(tmp_path):
 
 
 # --- Test helpers ---
-
-from pathlib import Path
-from typing import Any
 
 
 def _fake_read_user(inputs):

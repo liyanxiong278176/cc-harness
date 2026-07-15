@@ -9,8 +9,6 @@
 - memory_recall_handler 用 hybrid(已有 test_memory_recall_retry 不破)
 """
 from __future__ import annotations
-import asyncio
-import os
 import pytest
 
 

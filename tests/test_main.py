@@ -179,6 +179,7 @@ def test_main_resume_dispatches_to_cli(monkeypatch):
 
     def _spy_resume(args, cwd):
         called["resume"] = True
+        assert args.resume is True
         return 0
 
     monkeypatch.setattr("cc_harness.cli.resume.cmd_resume", _spy_resume)
@@ -218,8 +219,53 @@ def test_main_legacy_resume_flag(monkeypatch):
     assert called["repl"] is False
 
 
+def test_main_cli_dispatch_uses_current_working_directory(
+    tmp_path, monkeypatch,
+):
+    """CLI 子命令必须作用于调用者 cwd,不能固定写进 harness 源码目录。"""
+    cases = [
+        (["main.py", "init", "--name", "smoke", "--no-prompt"], "cc_harness.cli.init.cmd_init"),
+        (["main.py", "todo", "list"], "cc_harness.cli.todo.cmd_todo"),
+        (["main.py", "resume"], "cc_harness.cli.resume.cmd_resume"),
+    ]
+    monkeypatch.chdir(tmp_path)
+
+    for argv, target in cases:
+        main_mod = _load_main_module()
+        called = {}
+
+        def _spy(args, cwd):
+            called["cwd"] = Path(cwd)
+            return 0
+
+        monkeypatch.setattr(target, _spy)
+        with patch.object(sys, "argv", argv):
+            with pytest.raises(SystemExit) as exc:
+                main_mod.main()
+        assert exc.value.code == 0
+        assert called["cwd"] == tmp_path
+
+
+def test_main_repl_uses_current_working_directory(tmp_path, monkeypatch):
+    """REPL 的项目 cwd 来自启动目录;配置文件仍从 harness 安装目录加载。"""
+    main_mod = _load_main_module()
+    called = {"cwd": None}
+    _stub_dependencies(monkeypatch, main_mod, called)
+
+    async def _capture_repl(*args, **kwargs):
+        called["cwd"] = Path(kwargs["cwd"])
+
+    monkeypatch.setattr(main_mod, "run_repl", _capture_repl)
+    monkeypatch.chdir(tmp_path)
+
+    with patch.object(sys, "argv", ["main.py"]):
+        main_mod.main()
+
+    assert called["cwd"] == tmp_path
+
+
 # ---------------------------------------------------------------------------
-# argparse 解析
+# Argparse parsing
 # ---------------------------------------------------------------------------
 
 

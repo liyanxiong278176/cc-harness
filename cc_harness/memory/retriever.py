@@ -1,6 +1,11 @@
 """Per-query top-k retrieval + injection-block formatting."""
 from __future__ import annotations
+
 import time
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from cc_harness.memory.store import Memory
 
 
 def _format_age(ts: float) -> str:

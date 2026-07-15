@@ -7,7 +7,6 @@
 """
 from __future__ import annotations
 
-import asyncio
 from datetime import datetime, timezone
 from io import StringIO
 from unittest.mock import AsyncMock, patch
@@ -260,7 +259,7 @@ async def test_live_panel_does_not_break_read_user(svc):
     try:
         # 模拟 _read_user 返回 'exit'
         with patch("cc_harness.repl._read_user",
-                   new=AsyncMock(return_value="exit")) as mocked:
+                   new=AsyncMock(return_value="exit")):
             from cc_harness.repl import _read_user as live_read
             result = await live_read("anything>")
             assert result == "exit"

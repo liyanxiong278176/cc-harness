@@ -123,17 +123,20 @@ def _parse_args() -> argparse.Namespace:
 def main() -> None:
     args = _parse_args()
     console = Console()
+    working_dir = Path.cwd()
 
     # --- Task 6 / spec 组件 8:CLI sub-command 分派 ---
     if args.command == "init":
         from cc_harness.cli.init import cmd_init
-        sys.exit(cmd_init(args, PROJECT_ROOT))
+        sys.exit(cmd_init(args, working_dir))
     if args.command == "todo":
         from cc_harness.cli.todo import cmd_todo
-        sys.exit(cmd_todo(args, PROJECT_ROOT))
+        sys.exit(cmd_todo(args, working_dir))
     if args.command == "resume":
         from cc_harness.cli.resume import cmd_resume
-        sys.exit(cmd_resume(args, PROJECT_ROOT))
+        # Bare `resume` sub-command is the explicit opt-in equivalent of legacy --resume.
+        args.resume = True
+        sys.exit(cmd_resume(args, working_dir))
 
     # legacy `--resume` / `--resume-id` / `--no-resume`(无 sub-command)→ 走 CLI
     if getattr(args, "resume", False) or getattr(args, "resume_id_legacy", None) or getattr(args, "no_resume_legacy", False):
@@ -143,7 +146,7 @@ def main() -> None:
             args.resume_id = getattr(args, "resume_id_legacy", None)
         if not hasattr(args, "no_resume") or not args.no_resume:
             args.no_resume = getattr(args, "no_resume_legacy", False)
-        sys.exit(cmd_resume(args, PROJECT_ROOT))
+        sys.exit(cmd_resume(args, working_dir))
 
     boot_start = time.monotonic()
     try:
@@ -202,7 +205,7 @@ def main() -> None:
 
             await run_repl(
                 llm, mcp,
-                cwd=str(PROJECT_ROOT),
+                cwd=str(working_dir),
                 default_mode=args.mode,
                 design_dir=args.design_dir,
                 context_config=load_context_config(),

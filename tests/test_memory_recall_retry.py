@@ -7,14 +7,9 @@
 - env MAX_RECALL_RETRIES=0 时退化为旧行为(1 次)
 - 错误路径(EmbeddingError) 不重试
 """
-import os
 import pytest
 
-from cc_harness.memory.tools import (
-    _rewrite_query,
-    memory_recall_handler,
-    _format_recall_results,
-)
+from cc_harness.memory.tools import _rewrite_query
 
 
 # --- _rewrite_query ---

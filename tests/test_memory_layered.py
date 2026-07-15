@@ -35,7 +35,8 @@ async def test_store_migrate_old_db(tmp_path):
 @pytest.mark.asyncio
 async def test_store_conversation_table(tmp_path):
     from cc_harness.memory.store import MemoryStore
-    s = MemoryStore(db_path=tmp_path/"c.db", embedding_dim=4); await s.init_schema()
+    s = MemoryStore(db_path=tmp_path/"c.db", embedding_dim=4)
+    await s.init_schema()
     await s.add_conversation("sess1", 0, "user", "hi", time.time())
     cur = await s._db.execute("SELECT role,content FROM conversation WHERE session_id=?", ("sess1",))
     assert (await cur.fetchone()) == ("user", "hi")
@@ -68,7 +69,8 @@ def test_load_memory_config_kill_switch(tmp_path):
 async def test_capture_records_and_idempotent(tmp_path):
     from cc_harness.memory.store import MemoryStore
     from cc_harness.memory.capture import capture
-    s = MemoryStore(db_path=tmp_path/"cap.db", embedding_dim=4); await s.init_schema()
+    s = MemoryStore(db_path=tmp_path/"cap.db", embedding_dim=4)
+    await s.init_schema()
     msgs = [{"role":"user","content":"hi"},{"role":"assistant","content":"yo"},{"role":"system","content":"sys"}]
     await capture(s, "sess1", msgs, turn_idx=3)
     await capture(s, "sess1", msgs, turn_idx=3)  # 幂等重录不翻倍
@@ -83,7 +85,8 @@ async def test_capture_populates_extract_columns(tmp_path):
     """Phase 3: capture 同步抽 dates/entities/keywords 存到独立列。"""
     from cc_harness.memory.store import MemoryStore
     from cc_harness.memory.capture import capture
-    s = MemoryStore(db_path=tmp_path/"capex.db", embedding_dim=4); await s.init_schema()
+    s = MemoryStore(db_path=tmp_path/"capex.db", embedding_dim=4)
+    await s.init_schema()
     msgs = [
         {"role": "user", "content": "When did Caroline go to LGBTQ support on 7 May 2023?"},
         {"role": "assistant", "content": "She went last year."},
@@ -170,7 +173,8 @@ async def test_service_save_with_session(tmp_path):
     from cc_harness.memory.store import MemoryStore
     from cc_harness.memory.service import MemoryService
     from cc_harness.memory.decider import Decision, DecisionResult
-    s = MemoryStore(db_path=tmp_path/"sv.db", embedding_dim=4); await s.init_schema()
+    s = MemoryStore(db_path=tmp_path/"sv.db", embedding_dim=4)
+    await s.init_schema()
     class FakeEmb:
         async def embed(self, t): return [0.1]*4
     class FakeDec:
@@ -190,7 +194,8 @@ async def test_pipeline_every_n_and_ratio(tmp_path):
     from cc_harness.memory.decider import Decision, DecisionResult
     from tests.test_agent import FakeLLM, FakeStreamEvent
     from cc_harness.tokens import TokenCounter
-    s = MemoryStore(db_path=tmp_path/"pl.db", embedding_dim=4); await s.init_schema()
+    s = MemoryStore(db_path=tmp_path/"pl.db", embedding_dim=4)
+    await s.init_schema()
     class FakeEmb:
         async def embed(self, t): return [0.1]*4
     class FakeDec:
@@ -217,10 +222,12 @@ async def test_cluster_scenarios_writes_md(tmp_path):
     """同 session L1 达 min_atoms → 聚类写 scenario md(含 atom_id 溯源)。"""
     from cc_harness.memory.store import MemoryStore
     from cc_harness.memory.scenario import cluster_scenarios
-    s = MemoryStore(db_path=tmp_path/"sc.db", embedding_dim=4); await s.init_schema()
+    s = MemoryStore(db_path=tmp_path/"sc.db", embedding_dim=4)
+    await s.init_schema()
     for i in range(8):
         await s.add(f"fact{i}", [0.1*i]*4, "pipeline", session_id="sess1")
-    scen_dir = tmp_path / "scenarios"; scen_dir.mkdir()
+    scen_dir = tmp_path / "scenarios"
+    scen_dir.mkdir()
     class FakeEmb:
         async def embed(self, t): return [0.1]*4
     out = await cluster_scenarios(s, FakeEmb(), "sess1", scen_dir, min_atoms=8, llm=None)
@@ -237,10 +244,12 @@ async def test_cluster_scenarios_below_min_atoms(tmp_path):
     """不足 min_atoms → 返 [](不触发聚类)。"""
     from cc_harness.memory.store import MemoryStore
     from cc_harness.memory.scenario import cluster_scenarios
-    s = MemoryStore(db_path=tmp_path/"sc2.db", embedding_dim=4); await s.init_schema()
+    s = MemoryStore(db_path=tmp_path/"sc2.db", embedding_dim=4)
+    await s.init_schema()
     for i in range(3):
         await s.add(f"fact{i}", [0.1*i]*4, "pipeline", session_id="sess2")
-    scen_dir = tmp_path / "scenarios2"; scen_dir.mkdir()
+    scen_dir = tmp_path / "scenarios2"
+    scen_dir.mkdir()
     class FakeEmb:
         async def embed(self, t): return [0.1]*4
     out = await cluster_scenarios(s, FakeEmb(), "sess2", scen_dir, min_atoms=8, llm=None)
@@ -254,7 +263,8 @@ async def test_generate_persona_writes_md(tmp_path):
     """L1 总数达 trigger_every_n → 生成 persona md。"""
     from cc_harness.memory.store import MemoryStore
     from cc_harness.memory.persona import generate_persona
-    s = MemoryStore(db_path=tmp_path/"pe.db", embedding_dim=4); await s.init_schema()
+    s = MemoryStore(db_path=tmp_path/"pe.db", embedding_dim=4)
+    await s.init_schema()
     for i in range(3):
         await s.add(f"用户喜欢{i}", [0.1]*4, "pipeline", session_id="sess1")
     persona_path = tmp_path / "persona.md"
@@ -271,7 +281,8 @@ async def test_generate_persona_below_trigger(tmp_path):
     """L1 不足 trigger_every_n → 返 None,不写 md。"""
     from cc_harness.memory.store import MemoryStore
     from cc_harness.memory.persona import generate_persona
-    s = MemoryStore(db_path=tmp_path/"pe2.db", embedding_dim=4); await s.init_schema()
+    s = MemoryStore(db_path=tmp_path/"pe2.db", embedding_dim=4)
+    await s.init_schema()
     await s.add("一条", [0.1]*4, "pipeline", session_id="sess1")  # 1 < 3
     persona_path = tmp_path / "persona.md"
     out = await generate_persona(s, llm=None, persona_path=persona_path, trigger_every_n=3)
@@ -301,15 +312,20 @@ async def test_drill_down_traceability(tmp_path):
     """溯源 Persona→Scenario→Atom→Conversation 全链。"""
     from cc_harness.memory.store import MemoryStore
     from cc_harness.memory.recall import read_persona, read_top_scenarios
-    s = MemoryStore(db_path=tmp_path / "dr.db", embedding_dim=4); await s.init_schema()
+    s = MemoryStore(db_path=tmp_path / "dr.db", embedding_dim=4)
+    await s.init_schema()
     mid = (await s.add("用户喜欢猫", [0.1] * 4, "pipeline", session_id="sess1")).id
     await s.add_conversation("sess1", 0, "user", "我养了只猫", 1.0)
-    scen_dir = tmp_path / "scen"; scen_dir.mkdir()
+    scen_dir = tmp_path / "scen"
+    scen_dir.mkdir()
     (scen_dir / "sess1-1.md").write_text(f"summary: 养宠\natom_ids:\n- {mid}", encoding="utf-8")
     (tmp_path / "persona.md").write_text("# 画像\n爱宠物", encoding="utf-8")
-    pe = read_persona(tmp_path / "persona.md"); assert pe and "宠物" in pe.summary
-    scs = read_top_scenarios(scen_dir, 5); assert mid in scs[0].atom_ids
-    mem = await s.get(mid); assert mem and mem.session_id == "sess1"
+    pe = read_persona(tmp_path / "persona.md")
+    assert pe and "宠物" in pe.summary
+    scs = read_top_scenarios(scen_dir, 5)
+    assert mid in scs[0].atom_ids
+    mem = await s.get(mid)
+    assert mem and mem.session_id == "sess1"
     cur = await s._db.execute("SELECT content FROM conversation WHERE session_id=?", ("sess1",))
     assert "猫" in (await cur.fetchone())[0]
     await s.close()
