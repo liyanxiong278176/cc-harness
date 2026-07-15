@@ -18,7 +18,6 @@
 """
 from __future__ import annotations
 
-import logging
 import subprocess
 import sys
 import uuid
@@ -33,8 +32,6 @@ from cc_harness.cli._shared import print_error, print_text
 from cc_harness.project.manifest import load_manifest, save_manifest
 from cc_harness.project.models import LiveConfig, Manifest, MemoryConfig, MemoryIntegrationConfig
 
-log = logging.getLogger(__name__)
-
 
 # ---------------------------------------------------------------------------
 # git 探测
@@ -47,7 +44,7 @@ def _is_in_git_repo(cwd: Path) -> bool:
     """探测 cwd 是否在 git 工作树里。
 
     Returns:
-        True 仅当 `git rev-parse --is-inside-work-tree` 返回 0(stdout='true')。
+        True 仅当 `git rev-parse --is-inside-work-tree` 返回 0。
         其他情况(非 0 / git 缺失 / 超时 / 任何 exception)→ False。
         不抛任何异常。
     """
@@ -61,7 +58,7 @@ def _is_in_git_repo(cwd: Path) -> bool:
         )
     except (FileNotFoundError, subprocess.TimeoutExpired, OSError):
         return False
-    return result.returncode == 0 and result.stdout.strip() == "true"
+    return result.returncode == 0
 
 
 def _write_gitignore(cwd: Path) -> Path:
@@ -101,7 +98,12 @@ def _write_gitignore(cwd: Path) -> Path:
 # ---------------------------------------------------------------------------
 
 
-def _write_project_skeleton(cwd: Path, manifest: Manifest) -> None:
+def _write_project_skeleton(
+    cwd: Path,
+    manifest: Manifest,
+    *,
+    write_gitignore: bool = True,
+) -> None:
     """物理创建/写入 .cc-harness 目录 + project.yaml + todos/{yaml,.gitkeep}。
 
     顺序:
@@ -109,7 +111,7 @@ def _write_project_skeleton(cwd: Path, manifest: Manifest) -> None:
         2) write project.yaml(原子:.tmp + os.replace)
         3) write todos/todos.yaml = `tasks: []\n`
         4) write todos/.gitkeep = empty
-        5) git 探测 → 命中则追加 .gitignore
+        5) git 探测 → 命中 + write_gitignore=True 则追加 .gitignore
     """
     cc_dir = cwd / ".cc-harness"
     cc_dir.mkdir(parents=True, exist_ok=True)
@@ -124,12 +126,23 @@ def _write_project_skeleton(cwd: Path, manifest: Manifest) -> None:
     gitkeep = todos_dir / ".gitkeep"
     gitkeep.write_text("", encoding="utf-8")
 
-    if _is_in_git_repo(cwd):
+    if write_gitignore and _is_in_git_repo(cwd):
         _write_gitignore(cwd)
 
 
-def _make_default_manifest(name: str) -> Manifest:
-    """构造全默认值的 Manifest(name 由 caller 提供)。"""
+def _make_default_manifest(
+    name: str,
+    *,
+    resume_mode: str = "ask",
+    live_enabled: bool = True,
+) -> Manifest:
+    """构造全默认值的 Manifest(name 由 caller 提供)。
+
+    Args:
+        name: project name。
+        resume_mode: 透传 Manifest.resume_mode(ask/auto/manual)。
+        live_enabled: True → live.position='top';False → live.position='off'。
+    """
     return Manifest(
         project_id=uuid.uuid4().hex[:12],
         name=name,
@@ -140,9 +153,9 @@ def _make_default_manifest(name: str) -> Manifest:
             db_path=None,
             integration=MemoryIntegrationConfig(completion_capture=False),
         ),
-        resume_mode="ask",
+        resume_mode=resume_mode,  # type: ignore[arg-type]
         live=LiveConfig(
-            position="top",
+            position="top" if live_enabled else "off",
             max_height=10,
             spinner_style="dots",
             show_progress_bar=True,
@@ -156,20 +169,32 @@ def _make_default_manifest(name: str) -> Manifest:
 # ---------------------------------------------------------------------------
 
 
-def init_noninteractive(cwd: Path, *, name: str) -> Manifest:
+def init_noninteractive(
+    cwd: Path,
+    *,
+    name: str,
+    resume_mode: str = "ask",
+    live_enabled: bool = True,
+    write_gitignore: bool = True,
+) -> Manifest:
     """非交互式 init(cwd 必须不存在 manifest 或 caller 已决定覆盖)。
 
     Args:
         cwd: 项目根目录。
         name: Manifest.name。
+        resume_mode: 透传 Manifest.resume_mode(ask/auto/manual)。
+        live_enabled: True → live.position='top';False → live.position='off'。
+        write_gitignore: git 探测命中时是否写 .gitignore(用户显式拒绝时设 False)。
 
     Returns:
         写入并返回的 Manifest。
     """
     if not name:
         raise ValueError("name is required for init_noninteractive")
-    m = _make_default_manifest(name)
-    _write_project_skeleton(cwd, m)
+    m = _make_default_manifest(
+        name, resume_mode=resume_mode, live_enabled=live_enabled,
+    )
+    _write_project_skeleton(cwd, m, write_gitignore=write_gitignore)
     return m
 
 
@@ -179,7 +204,6 @@ def init_noninteractive(cwd: Path, *, name: str) -> Manifest:
 
 
 _VALID_RESUME_MODES = ("ask", "auto", "manual")
-_VALID_LIVE_POSITIONS = ("top", "bottom", "off")
 
 
 def init_interactive(cwd: Path) -> Manifest:
@@ -211,40 +235,21 @@ def init_interactive(cwd: Path) -> Manifest:
     )
     live_choice = Prompt.ask(
         "Enable live todo panel?", choices=["yes", "no"], default="yes")
-    # gitignore 探测由 _write_project_skeleton 自动做(cwd 是 git repo?),此处只确认意图
-    Prompt.ask(
+    # 用户回答决定是否写 .gitignore(spec line 715: gitignore opt-in)
+    gitignore_choice = Prompt.ask(
         "Add .gitignore entries? (recommended in git repos)",
         choices=["yes", "no"],
         default="yes",
     )
 
-    live_position = "top" if live_choice == "yes" else "off"
+    live_enabled = live_choice == "yes"
+    write_gitignore = gitignore_choice == "yes"
 
-    m = _make_default_manifest(name)
-    m = Manifest(
-        project_id=m.project_id,
-        name=m.name,
-        todos_path=m.todos_path,
-        created_at=m.created_at,
-        schema_version=m.schema_version,
-        memory=m.memory,
-        resume_mode=resume_mode,  # type: ignore[arg-type]
-        live=LiveConfig(
-            position=live_position,  # type: ignore[arg-type]
-            max_height=m.live.max_height,
-            spinner_style=m.live.spinner_style,
-            show_progress_bar=m.live.show_progress_bar,
-            fold_done=m.live.fold_done,
-        ),
+    m = _make_default_manifest(
+        name, resume_mode=resume_mode, live_enabled=live_enabled,
     )
-    _write_project_skeleton(cwd, m)
+    _write_project_skeleton(cwd, m, write_gitignore=write_gitignore)
     return m
-
-
-def _interactive_write(cwd: Path, manifest: Manifest) -> Manifest:
-    """init_interactive 写盘路径:抽出来便于测试 mock。"""
-    _write_project_skeleton(cwd, manifest)
-    return manifest
 
 
 # ---------------------------------------------------------------------------
@@ -279,8 +284,13 @@ def cmd_init(args: Namespace, cwd: Path) -> int:
             )
             return 1
         name = args.name or cwd.name or "myapp"
+        resume_mode = args.resume_mode or "ask"
+        live_enabled = not bool(getattr(args, "no_live", False))
         try:
-            m = init_noninteractive(cwd, name=name)
+            m = init_noninteractive(
+                cwd, name=name, resume_mode=resume_mode,
+                live_enabled=live_enabled,
+            )
         except OSError as e:
             print_error(console, f"failed to write project files: {e}")
             return 2
