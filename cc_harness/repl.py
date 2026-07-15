@@ -396,10 +396,7 @@ async def run_repl(
             await _after_turn_memory(state, mem_cfg)
 
             # Task 6: after-turn hook — A 阶段占位(verify hook 留 B 阶段)
-            try:
-                await _after_turn_todo(state, state.todo_service)
-            except Exception as e:
-                print_warn(console, f"todo after-turn hook failed: {e}")
+            await _after_turn_todo(state, state.todo_service)
 
             # After the turn, show what actually changed on disk — so the user
             # can see real file state without F5-ing their file manager.
@@ -470,8 +467,6 @@ async def _after_turn_todo(state: ReplState, todo_service) -> None:
 
     A 阶段占位 — 不做实际工作,只是接口预留。
     B 阶段填 verify hook(task 状态自动验证、acceptance criteria 进展等)。
-
-    fail-soft:任何异常 swallow,不阻塞主循环。
     """
     if todo_service is None:
         return

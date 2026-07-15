@@ -81,7 +81,7 @@ class TodoLivePanel:
         self.manifest = manifest
         self._live: Live | None = None
         self._tasks: list[TodoTask] = []
-        self._unsubscribe = None  # type: ignore[assignment]
+        self._unsubscribe = None
         self._started = False
 
     # --------------------------------------------------------------- #
@@ -96,26 +96,21 @@ class TodoLivePanel:
         """
         if self._started:
             return
-        # 初次加载任务(可能阻塞 IO,但 service.list 是 async;同步初值给个空 list,
-        # Live 第一帧先空 + 后续 _on_change 自动 refresh)。
+        # 初次加载任务。async REPL 中调度到当前 loop;同步调用方用 asyncio.run。
         try:
-            loop = asyncio.get_event_loop()
-            if loop.is_running():
-                # run_repl 已经在 loop 里 — 直接调度 task
-                loop.create_task(self._initial_load())
-            else:
-                self._tasks = asyncio.run(self.service.list(include_done=True))
+            loop = asyncio.get_running_loop()
         except RuntimeError:
-            # 无 running loop / 无 policy loop — fallback 同步跑
             try:
                 self._tasks = asyncio.run(self.service.list(include_done=True))
             except Exception as e:  # noqa: BLE001
-                log.warning("TodoLivePanel initial load failed: %e", e)
+                log.warning("TodoLivePanel initial load failed: %s", e)
                 self._tasks = []
-        # subscribe(注意:可能 subscribe 在 _initial_load 完成前先到 — 此时 task list
+        else:
+            loop.create_task(self._reload_and_refresh())
+        # subscribe(注意:可能 subscribe 在异步初次加载完成前先到 — 此时 task list
         # 已是 service 当前状态,event 触发后会重新 list)。
         self.service.subscribe(self._on_change)
-        self._unsubscribe = lambda: self.service.unsubscribe(self._on_change)
+        self._unsubscribe = self.service.unsubscribe
 
         # Live 上下文(Live 默认 refresh_per_second=4,够用)
         self._live = Live(
@@ -138,7 +133,7 @@ class TodoLivePanel:
             log.warning("TodoLivePanel stop failed: %e", e)
         try:
             if self._unsubscribe is not None:
-                self._unsubscribe()
+                self._unsubscribe(self._on_change)
         except Exception as e:  # noqa: BLE001
             log.warning("TodoLivePanel unsubscribe failed: %e", e)
         self._started = False
@@ -149,14 +144,6 @@ class TodoLivePanel:
 
     def __exit__(self, exc_type, exc, tb) -> None:
         self.stop()
-
-    async def _initial_load(self) -> None:
-        """首次异步加载 tasks(在 running loop 里用)。完成后 refresh Live。"""
-        try:
-            self._tasks = await self.service.list(include_done=True)
-            self._refresh()
-        except Exception as e:  # noqa: BLE001
-            log.warning("TodoLivePanel _initial_load failed: %e", e)
 
     # --------------------------------------------------------------- #
     # 订阅回调
@@ -173,17 +160,15 @@ class TodoLivePanel:
         # 让下一帧自动用最新 _tasks(如果并发更新 _tasks 可能短暂不一致,
         # 但 4Hz 足够 250ms 内自愈)。真正的并发安全留给 B 阶段加锁。
         try:
-            loop = asyncio.get_event_loop()
-            if loop.is_running():
-                loop.create_task(self._reload_and_refresh())
-            else:
-                self._tasks = asyncio.run(self.service.list(include_done=True))
-                self._refresh()
+            loop = asyncio.get_running_loop()
         except RuntimeError:
             try:
                 self._tasks = asyncio.run(self.service.list(include_done=True))
-            except Exception:
-                pass
+                self._refresh()
+            except Exception as e:  # noqa: BLE001
+                log.warning("TodoLivePanel synchronous reload failed: %s", e)
+        else:
+            loop.create_task(self._reload_and_refresh())
 
     async def _reload_and_refresh(self) -> None:
         """异步重载 tasks + refresh Live。"""
