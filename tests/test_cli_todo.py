@@ -11,11 +11,16 @@ Coverage:
 """
 from __future__ import annotations
 
+import io
 import json
+import sys
 from argparse import Namespace
 from pathlib import Path
 
 import pytest
+from rich.console import Console
+
+from cc_harness.cli._shared import JsonOrText
 
 from cc_harness.cli.init import init_noninteractive
 from cc_harness.cli.todo import cmd_todo
@@ -617,6 +622,69 @@ def test_list_format_csv(proj, svc_args, capsys):
     assert len(lines) >= 2
     # 第二行包含 "csv_test"
     assert "csv_test" in lines[1]
+
+
+def test_json_or_text_forced_tty_renders_rich_table(monkeypatch):
+    """显式 TTY stream + force_terminal Console 覆盖 Rich Table 分支。"""
+
+    class TtyBuffer(io.StringIO):
+        def isatty(self) -> bool:
+            return True
+
+    buf = TtyBuffer()
+    monkeypatch.setattr(sys, "stdout", buf)
+    sink = JsonOrText(
+        Console(file=buf, force_terminal=True, width=80),
+        Namespace(json=False),
+    )
+
+    sink.print_table(
+        [{"id": "abc12345", "labels": ["x", "y"], "active": True}],
+        title="TTY Todos",
+        columns=[("id", "ID"), ("labels", "Labels"), ("active", "Active")],
+    )
+
+    output = buf.getvalue()
+    assert sink.is_tty is True
+    assert "TTY Todos" in output
+    assert "abc12345" in output
+    assert "x,y" in output
+    assert "true" in output
+
+
+def test_json_or_text_json_table_writes_structured_stdout(capsys):
+    """JSON table 模式写 stdout,不经过 Rich Console。"""
+    sink = JsonOrText(Console(), Namespace(json=True))
+
+    sink.print_table(
+        [{"id": "abc12345", "title": "任务"}],
+        title="ignored",
+        columns=[("id", "ID"), ("title", "Title")],
+    )
+
+    assert json.loads(capsys.readouterr().out) == [
+        {"id": "abc12345", "title": "任务"}
+    ]
+
+
+def test_json_or_text_plain_table_and_text_modes(capsys):
+    """非 TTY table 与 plain/JSON text 三条输出旁路均可直接消费。"""
+    plain = JsonOrText(Console(), Namespace(json=False))
+
+    plain.print_table(
+        [{"id": "abc12345", "priority": None}],
+        title="Plain Todos",
+        columns=[("id", "ID"), ("priority", "Priority")],
+    )
+    plain.print_text("tail")
+
+    output = capsys.readouterr().out
+    assert "=== Plain Todos ===" in output
+    assert "abc12345  (none)" in output
+    assert output.endswith("tail\n")
+
+    JsonOrText(Console(), Namespace(json=True)).print_text("json tail")
+    assert json.loads(capsys.readouterr().out) == {"text": "json tail"}
 
 
 def test_list_renders_rich_table_in_tty(proj, svc_args, capsys, monkeypatch):

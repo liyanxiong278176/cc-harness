@@ -187,7 +187,7 @@ class JsonOrText:
             for _, header in columns:
                 table.add_column(header)
             for row in rows:
-                table.add_row(*(_format_cell(_extract(row, c[0])) for c, _ in columns))
+                table.add_row(*(_format_cell(_extract(row, key)) for key, _ in columns))
             self.console.print(table)
             return
 
@@ -195,7 +195,7 @@ class JsonOrText:
         if title:
             sys.stdout.write(f"=== {title} ===\n")
         for row in rows:
-            cells = [_format_cell(_extract(row, c[0])) for c, _ in columns]
+            cells = [_format_cell(_extract(row, key)) for key, _ in columns]
             sys.stdout.write("  ".join(cells) + "\n")
 
     def print_text(self, text: str) -> None:
