@@ -174,37 +174,37 @@ async def test_toposort_default_group_all(deps, svc):
 
 
 async def test_toposort_group_ready(deps, svc):
-    """group=ready → 只 ready(pending 且 deps 全 done)。"""
+    """group=ready → 只渲染 ready 分组。"""
     sid = deps["session_id"]
     t1 = await _create(svc, "T1", status="pending", session_id=sid)
     await _create(svc, "T2", status="in_progress", session_id=sid)
 
     result = await todo_toposort_handler({"group": "ready"}, **deps)
     assert result.is_error is False
-    # ready 段含 T1 (T1 是 pending 且无 deps → ready)
-    assert t1.id in result.llm_text
-    # in_progress 的 T2 在 llm_text 中可能因为 topo_order 含它,但不在 "Ready (N)" 段里
-    # 至少 in_progress 标题存在说明渲染了全表(因为渲染始终含 in_progress 段)
-    # 关键断言: ready 段存在且至少 T1 出现
+    assert "过滤 = ready" in result.llm_text
     assert "Ready" in result.llm_text
+    assert t1.id in result.llm_text
+    for section in ("In progress", "Blocked", "Done"):
+        assert section not in result.llm_text
 
 
 async def test_toposort_group_in_progress(deps, svc):
-    """group=in_progress → 只 in_progress。"""
+    """group=in_progress → 只渲染 in_progress 分组。"""
     sid = deps["session_id"]
     await _create(svc, "T1", status="pending", session_id=sid)
     t2 = await _create(svc, "T2", status="in_progress", session_id=sid)
 
     result = await todo_toposort_handler({"group": "in_progress"}, **deps)
     assert result.is_error is False
-    # in_progress 段含 T2
+    assert "过滤 = in_progress" in result.llm_text
     assert "In progress" in result.llm_text
     assert t2.id in result.llm_text
+    for section in ("Ready", "Blocked", "Done"):
+        assert section not in result.llm_text
 
 
 async def test_toposort_group_blocked(deps, svc):
-    """group=blocked → 只 blocked(注: blocked status 当前不是 Service.create 默认选项,
-    但 spec 仍允许 LLM 查询这个 group,空组也 OK)。
+    """group=blocked → 只渲染 blocked 分组(空组也 OK)。
 
     Service 不直接接受 status='blocked',需先创建 pending 再 update。
     """
@@ -219,9 +219,11 @@ async def test_toposort_group_blocked(deps, svc):
 
     result = await todo_toposort_handler({"group": "blocked"}, **deps)
     assert result.is_error is False
-    # Blocked 段出现
+    assert "过滤 = blocked" in result.llm_text
     assert "Blocked" in result.llm_text
     assert t1.id in result.llm_text
+    for section in ("Ready", "In progress", "Done"):
+        assert section not in result.llm_text
 
 
 # ---------------------------------------------------------------------------
@@ -254,8 +256,19 @@ async def test_toposort_cycle_returns_error(deps, svc):
     assert result.is_error is True
     # llm_text 含环路径(两个真实 task id 都出现 — 服务生成 8 字符短码)
     assert t1.id in result.llm_text and t2.id in result.llm_text
-    # display_text 含 topo 摘要
-    assert "topo" in result.display_text
+    # display_text 不再带 topo: 前缀
+    assert "topo:" not in result.display_text
+
+
+def test_toposort_cycle_includes_fix_hint():
+    """环错误应给出用 todo_update 修复依赖边的指引。"""
+    llm_text = _render_toposort(
+        order=None,
+        filtered=[],
+        by_id={},
+        topo_error="dependency cycle detected: T1 -> T2 -> T1",
+    )
+    assert "建议" in llm_text or "todo_update" in llm_text
 
 
 # ---------------------------------------------------------------------------
@@ -335,6 +348,22 @@ def test_toposort_render_truncation_at_50_direct():
     assert "T000" in output
     assert "T049" in output
     assert "T059" not in output  # 第 60 个(0-indexed 59)应被截
+
+
+def test_toposort_done_section_truncated_at_50():
+    """60 个 done task 时 Done 段只列前 50 个并标注剩余数量。"""
+    tasks = {
+        f"T{i:03d}": _make_task(id_=f"T{i:03d}", status="done")
+        for i in range(60)
+    }
+    order = list(tasks)
+
+    output = _render_toposort(order, list(tasks.values()), tasks, topo_error=None)
+
+    assert "Done (60):" in output
+    assert "+10 more" in output
+    assert "T049" in output
+    assert "T059" not in output
 
 
 # ---------------------------------------------------------------------------

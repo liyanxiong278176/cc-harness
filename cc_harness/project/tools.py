@@ -687,7 +687,13 @@ async def todo_toposort_handler(
         return _err("todo_toposort", e)
 
     by_id = {t.id: t for t in tasks_list}
-    group = args.get("group", "all")
+    requested_group = args.get("group", "all")
+    group = (
+        requested_group
+        if isinstance(requested_group, str)
+        and requested_group in {"all", "ready", "in_progress", "blocked"}
+        else "all"
+    )
 
     if group == "ready":
         filtered = get_ready_tasks(by_id)
@@ -705,12 +711,12 @@ async def todo_toposort_handler(
         order = None
         topo_error = str(e)
 
-    llm_text = _render_toposort(order, filtered, by_id, topo_error)
+    llm_text = _render_toposort(order, filtered, by_id, topo_error, group=group)
 
     if topo_error:
         return ToolResult(
             is_error=True,
-            display_text=f"topo: {topo_error}",
+            display_text=topo_error,
             llm_text=llm_text,
         )
     return ToolResult(
@@ -725,6 +731,7 @@ def _render_toposort(
     filtered: list[TodoTask],
     by_id: dict[str, TodoTask],
     topo_error: str | None,
+    group: str = "all",
 ) -> str:
     """渲染 DAG 拓扑视图给 LLM 看。
 
@@ -734,9 +741,10 @@ def _render_toposort(
 
     Args:
         order: topo_sort 输出的拓扑序;有环时为 None。
-        filtered: 按 group 过滤后的 task 列表(当前未直接用于渲染 — 渲染展示全表分组)。
+        filtered: 按 group 过滤后的 task 列表;非 all 时仅渲染对应分组。
         by_id: 全表 task 字典(handler 内部构造)。
         topo_error: 环错误信息;有环时非 None。
+        group: 当前视图分组;all 渲染全表,其余值只渲染对应分组。
 
     Returns:
         渲染好的 LLM 可见字符串。
@@ -751,7 +759,10 @@ def _render_toposort(
         )
 
     if topo_error:
-        topo_line = f"⚠ {topo_error}\n"
+        topo_line = (
+            f"⚠ {topo_error}\n"
+            "  → 建议用 todo_update 修正 depends_on,移除或重排环路径中的依赖边\n"
+        )
     elif order:
         # 截断模式:全表 id 列表可能很长,显示前 MAX + 提示
         if truncated:
@@ -763,15 +774,24 @@ def _render_toposort(
         topo_line = ""
 
     # Ready
-    ready_tasks = get_ready_tasks(by_id)
-    ready_section = f"Ready ({len(ready_tasks)}):\n"
-    for t in ready_tasks[:MAX_RENDER_TASKS]:
-        prio = f" (priority: {t.priority})" if t.priority else ""
-        ready_section += f"  - {t.id} [pending]{prio} \"{t.title}\"\n"
+    ready_tasks = filtered if group == "ready" else get_ready_tasks(by_id)
+    ready_section = (
+        f"Ready ({len(ready_tasks)}):\n"
+        + "".join(
+            f"  - {t.id} [pending]"
+            f"{f' (priority: {t.priority})' if t.priority else ''}"
+            f' "{t.title}"\n'
+            for t in ready_tasks[:MAX_RENDER_TASKS]
+        )
+    )
 
     # In progress(显示 deps 状态 checkmark)
-    ip_tasks = [t for t in by_id.values() if t.status == "in_progress"]
-    ip_section = f"In progress ({len(ip_tasks)}):\n"
+    ip_tasks = (
+        filtered
+        if group == "in_progress"
+        else [t for t in by_id.values() if t.status == "in_progress"]
+    )
+    ip_lines = []
     for t in ip_tasks[:MAX_RENDER_TASKS]:
         prio = f" (priority: {t.priority})" if t.priority else ""
         deps_str = ""
@@ -784,11 +804,16 @@ def _render_toposort(
                 else:
                     deps_parts.append(f"{d} ?")
             deps_str = f" (deps: {', '.join(deps_parts)})"
-        ip_section += f"  - {t.id} [in_progress]{prio} \"{t.title}\"{deps_str}\n"
+        ip_lines.append(f'  - {t.id} [in_progress]{prio} "{t.title}"{deps_str}\n')
+    ip_section = f"In progress ({len(ip_tasks)}):\n" + "".join(ip_lines)
 
     # Blocked(显示 waiting on 哪些未 done 的 dep)
-    bl_tasks = [t for t in by_id.values() if t.status == "blocked"]
-    bl_section = f"Blocked ({len(bl_tasks)}):\n"
+    bl_tasks = (
+        filtered
+        if group == "blocked"
+        else [t for t in by_id.values() if t.status == "blocked"]
+    )
+    bl_lines = []
     for t in bl_tasks[:MAX_RENDER_TASKS]:
         prio = f" (priority: {t.priority})" if t.priority else ""
         waiting = ""
@@ -799,27 +824,43 @@ def _render_toposort(
             ]
             if not_done:
                 waiting = f" (waiting on {', '.join(not_done)})"
-        bl_section += f"  - {t.id} [blocked]{prio} \"{t.title}\"{waiting}\n"
+        bl_lines.append(f'  - {t.id} [blocked]{prio} "{t.title}"{waiting}\n')
+    bl_section = f"Blocked ({len(bl_tasks)}):\n" + "".join(bl_lines)
 
     # Done(简略列 id)
     done_tasks = [t for t in by_id.values() if t.status == "done"]
-    done_section = ""
+    done_section = f"Done ({len(done_tasks)}):\n"
     if done_tasks:
-        ids = ", ".join(t.id for t in done_tasks)
-        done_section = f"Done ({len(done_tasks)}): {ids}\n"
+        ids_str = ", ".join(t.id for t in done_tasks[:MAX_RENDER_TASKS])
+        if len(done_tasks) > MAX_RENDER_TASKS:
+            n_more = len(done_tasks) - MAX_RENDER_TASKS
+            done_section = f"Done ({len(done_tasks)}): {ids_str} (+{n_more} more)\n"
+        else:
+            done_section = f"Done ({len(done_tasks)}): {ids_str}\n"
 
-    return (
-        head
-        + f"DAG 拓扑视图 ({total} tasks):\n"
-        + ("  " + topo_line if topo_line else "")
-        + "\n"
-        + ready_section
-        + "\n"
-        + ip_section
-        + "\n"
-        + bl_section
-        + "\n"
-        + done_section
+    if group == "all":
+        sections = [ready_section, ip_section, bl_section, done_section]
+        header = f"DAG 拓扑视图 ({total} tasks):\n"
+        filter_note = ""
+    else:
+        sections_by_group = {
+            "ready": ready_section,
+            "in_progress": ip_section,
+            "blocked": bl_section,
+        }
+        sections = [sections_by_group[group]] if group in sections_by_group else []
+        header = f"DAG 拓扑视图 ({total}, group={group}):\n"
+        filter_note = f"过滤 = {group}\n"
+
+    return "".join(
+        [
+            head,
+            header,
+            filter_note,
+            ("  " + topo_line if topo_line else ""),
+            "\n",
+            "\n".join(sections),
+        ]
     )
 
 
