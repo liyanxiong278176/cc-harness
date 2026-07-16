@@ -19,6 +19,7 @@ from cc_harness.project.tools import (
     TODO_GET_SPEC,
     TODO_LIST_SPEC,
     TODO_RESOLVE_SPEC,
+    TODO_TOPOSORT_SPEC,
     TODO_UPDATE_SPEC,
     TODO_VALIDATE_SPEC,
 )
@@ -51,10 +52,10 @@ def svc(proj: Path) -> TodoService:
 # ---------------------------------------------------------------------------
 
 
-def test_inject_returns_seven_entries(svc: TodoService):
+def test_inject_returns_eight_entries(svc: TodoService):
     extras = inject_todo_tools(svc, "test-session", "/tmp")
     assert isinstance(extras, list)
-    assert len(extras) == 7
+    assert len(extras) == 8
 
 
 def test_inject_entries_have_required_keys(svc: TodoService):
@@ -66,12 +67,13 @@ def test_inject_entries_have_required_keys(svc: TodoService):
         assert callable(entry["handler"])
 
 
-def test_inject_specs_are_the_seven_todo_tools(svc: TodoService):
+def test_inject_specs_are_the_eight_todo_tools(svc: TodoService):
     extras = inject_todo_tools(svc, "test-session", "/tmp")
     specs = [e["spec"] for e in extras]
     expected = [
         TODO_LIST_SPEC, TODO_GET_SPEC, TODO_CREATE_SPEC, TODO_UPDATE_SPEC,
         TODO_DELETE_SPEC, TODO_RESOLVE_SPEC, TODO_VALIDATE_SPEC,
+        TODO_TOPOSORT_SPEC,  # B 阶段 Task 3
     ]
     for exp in expected:
         assert exp in specs, f"missing spec: {exp['function']['name']}"
@@ -88,6 +90,7 @@ def test_inject_handlers_correspond_to_specs(svc: TodoService):
     assert by_name["todo_delete"] is not None
     assert by_name["todo_resolve"] is not None
     assert by_name["todo_validate"] is not None
+    assert by_name["todo_toposort"] is not None  # B 阶段 Task 3
 
 
 # ---------------------------------------------------------------------------

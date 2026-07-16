@@ -187,13 +187,13 @@ async def test_run_repl_loads_todo_service(tmp_path, monkeypatch):
 
     await run_repl(_NoopLLM(), _NoopMCP(), cwd=str(proj))
 
-    # 验证 todo_extras 被注入(7 个 todo tools)
+    # 验证 todo_extras 被注入(8 个 todo tools)
     extras = captured.get("extras") or []
-    assert len(extras) == 7
+    assert len(extras) == 8
     tool_names = {e["spec"]["function"]["name"] for e in extras}
     expected = {
         "todo_list", "todo_get", "todo_create", "todo_update",
-        "todo_delete", "todo_resolve", "todo_validate",
+        "todo_delete", "todo_resolve", "todo_validate", "todo_toposort",
     }
     assert tool_names == expected
 
@@ -221,9 +221,9 @@ async def test_run_repl_live_panel_starts(tmp_path, monkeypatch):
 
     await run_repl(_NoopLLM(), _NoopMCP(), cwd=str(proj))
 
-    # extras 含 7 个 todo tools → 说明 todo_service + extras 注入成功
+    # extras 含 8 个 todo tools → 说明 todo_service + extras 注入成功
     # (间接证明 Live panel 也在,因为只有 todo_service 创建后才会 inject_todo_tools)
-    assert any(e and len(e) == 7 for e in captured_extras)
+    assert any(e and len(e) == 8 for e in captured_extras)
 
 
 # ---------------------------------------------------------------------------
@@ -255,7 +255,7 @@ async def test_run_repl_extra_native_specs_includes_todo_tools(tmp_path, monkeyp
 
     extras = captured["extras"]
     assert extras is not None
-    assert len(extras) >= 7   # todo tools always present in coding mode
+    assert len(extras) >= 8   # todo tools always present in coding mode
 
 
 @pytest.mark.asyncio
@@ -287,9 +287,9 @@ async def test_run_repl_extra_native_specs_none_safe_when_no_memory(tmp_path, mo
     await run_repl(_NoopLLM(), _NoopMCP(), cwd=str(proj))
 
     extras = captured["extras"]
-    # 即便 memory 空,extras 仍含 todo 7 个;不存在 None 错。
+    # 即便 memory 空,extras 仍含 todo 8 个;不存在 None 错。
     assert extras is not None
-    assert len(extras) == 7
+    assert len(extras) == 8
 
 
 # ---------------------------------------------------------------------------

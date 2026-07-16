@@ -1,4 +1,4 @@
-"""Sub-project A:组装 7 个 todo agent tools 为 extra_native_specs。
+"""Sub-project A + B:组装 8 个 todo agent tools 为 extra_native_specs。
 
 Caller(repl.py / cli/_shared.py / runner)负责构造 TodoService 实例并提供
 session_id(REPL session id 或 CLI 一次性 id);本模块只负责把 spec+handler+deps
@@ -21,6 +21,7 @@ from cc_harness.project.tools import (
     TODO_GET_SPEC,
     TODO_LIST_SPEC,
     TODO_RESOLVE_SPEC,
+    TODO_TOPOSORT_SPEC,
     TODO_UPDATE_SPEC,
     TODO_VALIDATE_SPEC,
     todo_create_handler,
@@ -28,6 +29,7 @@ from cc_harness.project.tools import (
     todo_get_handler,
     todo_list_handler,
     todo_resolve_handler,
+    todo_toposort_handler,
     todo_update_handler,
     todo_validate_handler,
 )
@@ -36,7 +38,7 @@ from cc_harness.project.tools import (
 def inject_todo_tools(
     service: TodoService, session_id: str, cwd: str = "",
 ) -> list[dict]:
-    """Return `extra_native_specs` entries for all 7 todo tools.
+    """Return `extra_native_specs` entries for all 8 todo tools.
 
     Args:
         service: TodoService 实例(handler 通过 deps['service'] 访问)。
@@ -44,7 +46,7 @@ def inject_todo_tools(
         cwd: 当前工作目录(handler 当前未用;保留签名,未来 path 归一化用)。
 
     Returns:
-        list of ``{"spec": ..., "handler": ..., "deps": ...}``,长度固定为 7。
+        list of ``{"spec": ..., "handler": ..., "deps": ...}``,长度固定为 8。
     """
     deps: dict = {"service": service, "session_id": session_id, "cwd": cwd}
     return [
@@ -55,6 +57,7 @@ def inject_todo_tools(
         {"spec": TODO_DELETE_SPEC,   "handler": todo_delete_handler,   "deps": deps},
         {"spec": TODO_RESOLVE_SPEC,  "handler": todo_resolve_handler,  "deps": deps},
         {"spec": TODO_VALIDATE_SPEC, "handler": todo_validate_handler, "deps": deps},
+        {"spec": TODO_TOPOSORT_SPEC, "handler": todo_toposort_handler, "deps": deps},  # B 阶段 Task 3
     ]
 
 

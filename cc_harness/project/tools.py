@@ -1,6 +1,6 @@
-"""Sub-project A Agent tools(spec 组件 7)。
+"""Sub-project A Agent tools(spec 组件 7) + Sub-project B Task 3 第 8 个 tool。
 
-7 个 OpenAI function-calling 工具,handler 签名一致:
+8 个 OpenAI function-calling 工具,handler 签名一致:
 
     async def xxx_handler(args: dict, *, service, session_id, cwd) -> ToolResult
 
@@ -20,6 +20,11 @@ from datetime import datetime
 from typing import Any
 
 from cc_harness.mcp_client import ToolResult
+from cc_harness.project.dependency import (
+    DependencyCycleError,
+    get_ready_tasks,
+    topo_sort,
+)
 from cc_harness.project.exceptions import TodoError
 from cc_harness.project.models import TodoTask, ValidationIssue
 
@@ -50,8 +55,13 @@ _MAX_LIST_LIMIT = 100
 
 
 # ---------------------------------------------------------------------------
-# 7 个 SPEC dict(OpenAI function-calling format)
+# 8 个 SPEC dict(OpenAI function-calling format)
 # ---------------------------------------------------------------------------
+
+
+# 全部 SPEC 列表(供 inject_todo_tools / 测试用 — 单一来源真相)。
+# B 阶段 Task 3 起从 7 → 8 项。
+ALL_SPECS: list[dict[str, Any]] = []  # forward declaration,后续 append
 
 
 TODO_LIST_SPEC: dict[str, Any] = {
@@ -265,6 +275,49 @@ TODO_VALIDATE_SPEC: dict[str, Any] = {
         },
     },
 }
+
+
+# B 阶段 Task 3(组件 3):todo_toposort
+TODO_TOPOSORT_SPEC: dict[str, Any] = {
+    "type": "function",
+    "function": {
+        "name": "todo_toposort",
+        "description": (
+            "查看项目任务 DAG 的拓扑视图。"
+            "返回全表拓扑序 + 当前 ready/in_progress/blocked 分组。"
+            "用于 LLM 编排决策:'下一步做哪个?'。"
+            "注: ready 指 pending 且依赖全 done,由 get_ready_tasks 计算。"
+            "存在环时 is_error=True 并报告环路径,不抛异常。"
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "group": {
+                    "type": "string",
+                    "enum": ["all", "ready", "in_progress", "blocked"],
+                    "default": "all",
+                },
+            },
+            "required": [],
+        },
+    },
+}
+
+
+# 把所有 SPEC 装进 ALL_SPECS(单一来源真相)。
+# forward declaration 在文件头先声明空 list,这里一次性 populate,
+# 让 ALL_SPECS 永远等于 已声明的 SPEC 总和。
+ALL_SPECS.extend([
+    TODO_LIST_SPEC,
+    TODO_GET_SPEC,
+    TODO_CREATE_SPEC,
+    TODO_UPDATE_SPEC,
+    TODO_DELETE_SPEC,
+    TODO_RESOLVE_SPEC,
+    TODO_VALIDATE_SPEC,
+    TODO_TOPOSORT_SPEC,  # B 阶段 Task 3: 第 8 个 tool
+])
+assert len(ALL_SPECS) == 8, f"ALL_SPECS 应当有 8 项,实际 {len(ALL_SPECS)}"
 
 
 # ---------------------------------------------------------------------------
@@ -603,10 +656,180 @@ async def todo_validate_handler(
     return ToolResult.success(text)
 
 
+# ---------------------------------------------------------------------------
+# B 阶段 Task 3(组件 3):todo_toposort — DAG 拓扑视图给主 agent 决策用
+# ---------------------------------------------------------------------------
+
+# 截断阈值:超过此数则在输出顶端 prepend ⚠ 警告(防 context window 爆)。
+MAX_RENDER_TASKS = 50
+
+
+async def todo_toposort_handler(
+    args: dict, *, service, session_id: str, cwd: str,
+) -> ToolResult:
+    """todo_toposort:返回 DAG 拓扑视图。
+
+    Args:
+        args: `{"group": "all" | "ready" | "in_progress" | "blocked"}`(默认 "all")。
+        service: TodoService 实例。
+        session_id: 当前 session(handler 当前未使用,但保留签名)。
+        cwd: 当前工作目录(handler 当前未使用)。
+
+    Returns:
+        ToolResult:
+        - 正常:is_error=False, llm_text 含 topo order + ready/in_progress/blocked/done 分组。
+        - 有环:is_error=True, llm_text 含环路径(不抛异常)。
+    """
+    del cwd, session_id
+    try:
+        tasks_list = await service.list(include_done=True)
+    except TodoError as e:
+        return _err("todo_toposort", e)
+
+    by_id = {t.id: t for t in tasks_list}
+    group = args.get("group", "all")
+
+    if group == "ready":
+        filtered = get_ready_tasks(by_id)
+    elif group == "in_progress":
+        filtered = [t for t in tasks_list if t.status == "in_progress"]
+    elif group == "blocked":
+        filtered = [t for t in tasks_list if t.status == "blocked"]
+    else:  # "all" (default)
+        filtered = tasks_list
+
+    try:
+        order = topo_sort(by_id)
+        topo_error: str | None = None
+    except DependencyCycleError as e:
+        order = None
+        topo_error = str(e)
+
+    llm_text = _render_toposort(order, filtered, by_id, topo_error)
+
+    if topo_error:
+        return ToolResult(
+            is_error=True,
+            display_text=f"topo: {topo_error}",
+            llm_text=llm_text,
+        )
+    return ToolResult(
+        is_error=False,
+        display_text=f"topo: {len(order)} tasks",
+        llm_text=llm_text,
+    )
+
+
+def _render_toposort(
+    order: list[str] | None,
+    filtered: list[TodoTask],
+    by_id: dict[str, TodoTask],
+    topo_error: str | None,
+) -> str:
+    """渲染 DAG 拓扑视图给 LLM 看。
+
+    分组渲染:Topo order / Ready / In progress / Blocked / Done。
+    截断:`len(by_id) > MAX_RENDER_TASKS` 时 prepend ⚠ 行,且每个分组只展示前 50。
+    注:Done 段总是简略列 id(避免长清单刷屏)。
+
+    Args:
+        order: topo_sort 输出的拓扑序;有环时为 None。
+        filtered: 按 group 过滤后的 task 列表(当前未直接用于渲染 — 渲染展示全表分组)。
+        by_id: 全表 task 字典(handler 内部构造)。
+        topo_error: 环错误信息;有环时非 None。
+
+    Returns:
+        渲染好的 LLM 可见字符串。
+    """
+    total = len(by_id)
+    truncated = total > MAX_RENDER_TASKS
+
+    head = ""
+    if truncated:
+        head = (
+            f"⚠ 项目 task 数 {total} > {MAX_RENDER_TASKS}, 仅展示前 {MAX_RENDER_TASKS}\n"
+        )
+
+    if topo_error:
+        topo_line = f"⚠ {topo_error}\n"
+    elif order:
+        # 截断模式:全表 id 列表可能很长,显示前 MAX + 提示
+        if truncated:
+            ids_str = " → ".join(order[:MAX_RENDER_TASKS]) + " → ..."
+        else:
+            ids_str = " → ".join(order)
+        topo_line = f"Topo order: {ids_str}\n"
+    else:
+        topo_line = ""
+
+    # Ready
+    ready_tasks = get_ready_tasks(by_id)
+    ready_section = f"Ready ({len(ready_tasks)}):\n"
+    for t in ready_tasks[:MAX_RENDER_TASKS]:
+        prio = f" (priority: {t.priority})" if t.priority else ""
+        ready_section += f"  - {t.id} [pending]{prio} \"{t.title}\"\n"
+
+    # In progress(显示 deps 状态 checkmark)
+    ip_tasks = [t for t in by_id.values() if t.status == "in_progress"]
+    ip_section = f"In progress ({len(ip_tasks)}):\n"
+    for t in ip_tasks[:MAX_RENDER_TASKS]:
+        prio = f" (priority: {t.priority})" if t.priority else ""
+        deps_str = ""
+        if t.depends_on:
+            deps_parts: list[str] = []
+            for d in t.depends_on:
+                if d in by_id:
+                    mark = "✓" if by_id[d].status == "done" else "✗"
+                    deps_parts.append(f"{d} {mark}")
+                else:
+                    deps_parts.append(f"{d} ?")
+            deps_str = f" (deps: {', '.join(deps_parts)})"
+        ip_section += f"  - {t.id} [in_progress]{prio} \"{t.title}\"{deps_str}\n"
+
+    # Blocked(显示 waiting on 哪些未 done 的 dep)
+    bl_tasks = [t for t in by_id.values() if t.status == "blocked"]
+    bl_section = f"Blocked ({len(bl_tasks)}):\n"
+    for t in bl_tasks[:MAX_RENDER_TASKS]:
+        prio = f" (priority: {t.priority})" if t.priority else ""
+        waiting = ""
+        if t.depends_on:
+            not_done = [
+                d for d in t.depends_on
+                if d in by_id and by_id[d].status != "done"
+            ]
+            if not_done:
+                waiting = f" (waiting on {', '.join(not_done)})"
+        bl_section += f"  - {t.id} [blocked]{prio} \"{t.title}\"{waiting}\n"
+
+    # Done(简略列 id)
+    done_tasks = [t for t in by_id.values() if t.status == "done"]
+    done_section = ""
+    if done_tasks:
+        ids = ", ".join(t.id for t in done_tasks)
+        done_section = f"Done ({len(done_tasks)}): {ids}\n"
+
+    return (
+        head
+        + f"DAG 拓扑视图 ({total} tasks):\n"
+        + ("  " + topo_line if topo_line else "")
+        + "\n"
+        + ready_section
+        + "\n"
+        + ip_section
+        + "\n"
+        + bl_section
+        + "\n"
+        + done_section
+    )
+
+
 __all__ = [
     "TODO_LIST_SPEC", "TODO_GET_SPEC", "TODO_CREATE_SPEC", "TODO_UPDATE_SPEC",
     "TODO_DELETE_SPEC", "TODO_RESOLVE_SPEC", "TODO_VALIDATE_SPEC",
+    "TODO_TOPOSORT_SPEC",  # B 阶段 Task 3
+    "ALL_SPECS",
     "todo_list_handler", "todo_get_handler", "todo_create_handler",
     "todo_update_handler", "todo_delete_handler", "todo_resolve_handler",
     "todo_validate_handler",
+    "todo_toposort_handler",  # B 阶段 Task 3
 ]

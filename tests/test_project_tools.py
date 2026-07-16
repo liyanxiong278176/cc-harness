@@ -1,7 +1,7 @@
-"""tests/test_project_tools.py — 7 个 agent tool handler + spec shape。
+"""tests/test_project_tools.py — 8 个 agent tool handler + spec shape。
 
 覆盖矩阵:
-- 7 SPEC dict 结构(type/function.name/function.parameters)
+- 8 SPEC dict 结构(type/function.name/function.parameters)
 - handler 成功路径:返回 ToolResult(is_error=False), llm_text 含标记
 - handler 错误路径:返回 ToolResult(is_error=True), llm_text 含 type 名 + 描述
 - session_id 从 deps 透传到 Service.create(append active_sessions)
@@ -27,6 +27,7 @@ from cc_harness.project.tools import (
     TODO_GET_SPEC,
     TODO_LIST_SPEC,
     TODO_RESOLVE_SPEC,
+    TODO_TOPOSORT_SPEC,
     TODO_UPDATE_SPEC,
     TODO_VALIDATE_SPEC,
     todo_create_handler,
@@ -34,6 +35,7 @@ from cc_harness.project.tools import (
     todo_get_handler,
     todo_list_handler,
     todo_resolve_handler,
+    todo_toposort_handler,
     todo_update_handler,
     todo_validate_handler,
 )
@@ -42,12 +44,13 @@ from cc_harness.project.tools import (
 ALL_SPECS = [
     TODO_LIST_SPEC, TODO_GET_SPEC, TODO_CREATE_SPEC, TODO_UPDATE_SPEC,
     TODO_DELETE_SPEC, TODO_RESOLVE_SPEC, TODO_VALIDATE_SPEC,
+    TODO_TOPOSORT_SPEC,  # B 阶段 Task 3
 ]
 
 ALL_HANDLERS = [
     todo_list_handler, todo_get_handler, todo_create_handler,
     todo_update_handler, todo_delete_handler, todo_resolve_handler,
-    todo_validate_handler,
+    todo_validate_handler, todo_toposort_handler,  # B 阶段 Task 3
 ]
 
 
@@ -114,6 +117,7 @@ def test_specs_have_distinct_names():
     assert set(names) == {
         "todo_list", "todo_get", "todo_create", "todo_update",
         "todo_delete", "todo_resolve", "todo_validate",
+        "todo_toposort",  # B 阶段 Task 3
     }
 
 
