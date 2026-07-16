@@ -14,6 +14,7 @@ System prompt is refreshed at messages[0] on every turn to reflect the mode.
 from __future__ import annotations
 import asyncio
 import hashlib
+import logging
 import os
 import time
 import uuid as _uuid
@@ -30,6 +31,8 @@ from cc_harness.render import print_compaction_summary, print_info, print_result
 from cc_harness.tokens import TokenCounter, SessionTokenStats
 from cc_harness.tools import init_session_executor, shutdown_session_executor
 
+log = logging.getLogger(__name__)
+
 _VALID_MODES = ("coding", "plan", "design", "chat")
 
 # How far back to scan for disk changes after an LLM turn.
@@ -38,6 +41,10 @@ _DISK_CHANGE_WINDOW_S = 30
 _PREVIEW_MAX_BYTES = 500
 # Max number of changed files to print (most recent first).
 _MAX_CHANGES_SHOWN = 10
+# Task 4 (Plan B): verify hook hints 截断 — 单 task 最多写 3 条,
+# 全局最多 10 条(防 system prompt 爆炸)。
+MAX_HINTS_PER_TASK = 3
+MAX_HINTS_TOTAL = 10
 
 _HELP_TEXT = """\
 可用命令:
@@ -67,6 +74,10 @@ class ReplState:
     todo_extras: list = field(default_factory=list)
     live_panel: object | None = None
     resume_task: object | None = None
+    # Task 4 (Plan B): verify hook — todo_hints 给下轮 system prompt 注入,
+    # last_turn_text 是本轮 LLM 文本输出(给 verify 评 heuristic 用)。
+    todo_hints: list[str] = field(default_factory=list)
+    last_turn_text: str = ""
 
 
 async def _read_user(prompt: str) -> str:
@@ -384,6 +395,9 @@ async def run_repl(
             )
             state.session_stats.add(turn_stats)
 
+            # Task 4 (Plan B): 提取本轮 LLM 输出文本,给下轮 verify hook 用
+            state.last_turn_text = _extract_final_text(state.messages)
+
             # 打印 token 明细
             print_token_summary(console, "本轮", turn_stats)
             print_token_summary(console, f"累计 {state.session_stats.turns} 轮", state.session_stats)
@@ -463,17 +477,72 @@ async def _after_turn_memory(state: ReplState, mem_cfg) -> None:
 
 
 async def _after_turn_todo(state: ReplState, todo_service) -> None:
-    """Task 6 after-turn hook(spec 组件 9 step 5)。
+    """B 阶段 verify hook。每 turn 跑一次,不自动改 status。
 
-    A 阶段占位 — 不做实际工作,只是接口预留。
-    B 阶段填 verify hook(task 状态自动验证、acceptance criteria 进展等)。
+    扫所有 in_progress task,跑 run_verify,结果写到 state.todo_hints。
+    agent._refresh_system_prompt 读 hints 注入到 system prompt 末尾。
+
+    三层异常(全部 swallow + warn):
+    1. todo_service.list 抛 → 保留旧 hints(不重置)
+    2. 单 task run_verify 抛 → 跳过该 task,其他继续
+    3. 其他 Exception(impl 内部 bug)→ warn 后放弃本轮
     """
+    try:
+        await _after_turn_todo_impl(state, todo_service)
+    except Exception as e:
+        log.warning("verify hook: unexpected: %s", e)
+
+
+async def _after_turn_todo_impl(state, todo_service):
     if todo_service is None:
         return
-    # A 阶段 no-op;B 阶段扩展:
-    # - 解析 LLM 回答中提到的 task ids → 自动校验状态
-    # - 校验 active_sessions 是否过期(session_id 已被 task 引用)
-    return
+    try:
+        tasks_list = await todo_service.list(include_done=False)
+    except Exception as e:
+        log.warning("verify hook: todo_service.list failed: %s", e)
+        return  # 不清旧 hints
+
+    # Lazy import:run_verify 在 cc_harness.project,repl 顶层 import 阶段不要拽
+    # (避免 cc_harness 启动时把整个 project 链拉起来)。
+    from cc_harness.project.verify import run_verify as _run_verify
+
+    by_id = {t.id: t for t in tasks_list}
+    last_turn_text = getattr(state, "last_turn_text", "") or ""
+    hints: list[str] = []
+
+    for task in tasks_list:
+        if task.status != "in_progress":
+            continue
+        try:
+            result = _run_verify(task, by_id, last_turn_text)
+        except Exception as e:
+            log.warning("verify hook: run_verify failed for %s: %s", task.id, e)
+            continue  # 单 task 失败不影响其他
+
+        per_task: list[str] = []
+        if not result.passed:
+            for miss in result.missing_criteria:
+                per_task.append(f"task {task.id} criterion 未在最近一轮输出中体现: {miss}")
+        # hints 无条件采纳(包括 passed=True 的辅助信号,如"无产出"提示)
+        per_task.extend(result.hints)
+        hints.extend(per_task[:MAX_HINTS_PER_TASK])
+
+    state.todo_hints = hints[:MAX_HINTS_TOTAL]  # 覆盖 + 截断
+
+
+def _extract_final_text(messages: list[dict]) -> str:
+    """从 messages 末尾反向查找 role=assistant 且 content 是非空 str 的那条。
+
+    含 tool_calls(content=None)时回退到上一条纯文本 message。
+    无 assistant 或全 tool_calls → 返空串。
+    """
+    for msg in reversed(messages):
+        if msg.get("role") != "assistant":
+            continue
+        content = msg.get("content")
+        if isinstance(content, str) and content.strip():
+            return content
+    return ""
 
 
 async def _maybe_ask_resume(console: Console, candidate, tasks) -> object | None:
