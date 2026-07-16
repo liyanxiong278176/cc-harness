@@ -262,6 +262,17 @@ def test_run_verify_empty_criteria():
     assert result.hints == []
 
 
+def test_run_verify_empty_criteria_with_unready_deps_returns_passed():
+    """空 acceptance_criteria 应该无条件 passed=True,不依赖 deps 状态。"""
+    _, _, _, run_verify = _import_under_test()
+    dependency = _make_task("T1", "pending")
+    task = _make_task("T2", "in_progress", deps=["T1"], criteria=[])
+    result = run_verify(task, {"T1": dependency, "T2": task}, "whatever")
+    assert result.passed is True
+    assert result.missing_criteria == []
+    assert result.hints == []
+
+
 def test_run_verify_all_pass():
     """heuristic 全通过 + deps ready → passed=True"""
     _, _, _, run_verify = _import_under_test()
@@ -288,7 +299,7 @@ def test_run_verify_state_fail():
     """deps 未 ready → passed=False, hints 填 dep hint"""
     _, _, _, run_verify = _import_under_test()
     t1 = _make_task("T1", "pending")
-    t2 = _make_task("T2", "in_progress", deps=["T1"])
+    t2 = _make_task("T2", "in_progress", deps=["T1"], criteria=["any"])
     result = run_verify(t2, {"T1": t1, "T2": t2}, "any text")
     assert result.passed is False
     assert any("T1" in h for h in result.hints)

@@ -150,9 +150,10 @@ def run_verify(
 
     短路顺序:
         1. status != in_progress -> passed=True 全空(no-op)
-        2. last_turn_text 空 + 有 criteria -> passed=True + "无产出" hint(info, 不阻断)
-        3. heuristic 仅在 criteria 非空时跑(text 空时 heuristic_check 已给 fail)
-        4. state_check 总是跑(即便 criteria 空,也要看 deps)
+        2. acceptance_criteria 为空 -> passed=True 全空
+        3. last_turn_text 空 + 有 criteria -> passed=True + "无产出" hint(info, 不阻断)
+        4. heuristic 仅在 criteria 非空时跑(text 空时 heuristic_check 已给 fail)
+        5. state_check(仅 criteria 非空时跑)
 
     字段语义:
         - passed — heuristic_passed AND deps_ready
@@ -165,24 +166,27 @@ def run_verify(
             task_id=task.id, passed=True, missing_criteria=[], hints=[]
         )
 
+    # 2. 空 criteria -> 无条件通过,不检查 deps
+    if not task.acceptance_criteria:
+        return VerifyResult(
+            task_id=task.id, passed=True, missing_criteria=[], hints=[]
+        )
+
     hints: list[str] = []
 
-    # 2. last_turn_text 空 + 有 criteria -> info hint(不阻断)
+    # 3. last_turn_text 空 + 有 criteria -> info hint(不阻断)
     if not last_turn_text.strip() and task.acceptance_criteria:
         hints.append(f"task {task.id} 已 in_progress 但本轮无文本产出")
         return VerifyResult(
             task_id=task.id, passed=True, missing_criteria=[], hints=hints
         )
 
-    # 3. heuristic(criteria 非空且 text 非空才跑;空 text 已在上一步 return)
-    heuristic_passed = True
-    missing: list[str] = []
-    if task.acceptance_criteria:
-        heuristic_passed, missing = heuristic_check(
-            task.acceptance_criteria, last_turn_text
-        )
+    # 4. heuristic(criteria 非空且 text 非空才跑;空 text 已在上一步 return)
+    heuristic_passed, missing = heuristic_check(
+        task.acceptance_criteria, last_turn_text
+    )
 
-    # 4. state_check(总是跑,即便 criteria 空)
+    # 5. state_check(criteria 非空时才跑)
     deps_ready, dep_hint = state_check(task, all_tasks)
     if not deps_ready and dep_hint:
         hints.append(dep_hint)
