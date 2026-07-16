@@ -185,7 +185,74 @@ class DependencyCycleError(_DependencyCycleError):
 
 
 # ---------------------------------------------------------------------------
-# 占位(YAGNI):拓扑排序 B 阶段(组件 2)再实现。
-# 计划:用 Kahn 算法,输入 task 列表,返回拓扑序 list[id];失败(有环)抛 DependencyCycleError。
+# B 阶段实现(组件 1):Kahn 拓扑排序 + get_ready_tasks
 # ---------------------------------------------------------------------------
-# TODO: B 阶段实现 Kahn 拓扑排序。
+
+
+def topo_sort(tasks: dict[str, TodoTask]) -> list[str]:
+    """Kahn 算法。返回拓扑序 list[id];失败抛 DependencyCycleError。
+
+    Tiebreaker:字典序(deterministic,LLM 输出可重现)。
+    只跟踪存在于字典内的依赖边,缺失依赖由 check_references 报告。
+    空字典返回 []。
+    """
+    if not tasks:
+        return []
+
+    # 入度表 + 邻接表,仅跟踪字典内的边
+    indegree: dict[str, int] = {tid: 0 for tid in tasks}
+    graph: dict[str, list[str]] = {tid: [] for tid in tasks}
+
+    for tid, task in tasks.items():
+        for dep_id in task.depends_on:
+            if dep_id == tid:
+                # self-loop 视作环
+                raise DependencyCycleError(
+                    f"dependency cycle detected: {tid} -> {tid}"
+                )
+            if dep_id in tasks:
+                graph[dep_id].append(tid)
+                indegree[tid] += 1
+            # 缺失依赖由 check_references 报告,这里静默跳过
+
+    # Kahn BFS,字典序 tiebreaker
+    import heapq
+
+    heap: list[str] = sorted(tid for tid, deg in indegree.items() if deg == 0)
+    heapq.heapify(heap)
+    order: list[str] = []
+    while heap:
+        node = heapq.heappop(heap)
+        order.append(node)
+        for neighbor in graph[node]:
+            indegree[neighbor] -= 1
+            if indegree[neighbor] == 0:
+                heapq.heappush(heap, neighbor)
+
+    if len(order) != len(tasks):
+        # 有环:残留 indegree > 0 的节点
+        remaining = [tid for tid, deg in indegree.items() if deg > 0]
+        chain = " -> ".join(remaining + [remaining[0]]) if remaining else ""
+        raise DependencyCycleError(
+            f"dependency cycle detected: {chain}"
+        )
+    return order
+
+
+def get_ready_tasks(tasks: dict[str, TodoTask]) -> list[TodoTask]:
+    """返回所有 ready 的 task — 状态是 pending 且 depends_on 全 done。
+
+    'done' 视为已就绪;不存在于字典的依赖 id 视为不阻塞(由 validate 报告)。
+    """
+    ready: list[TodoTask] = []
+    for task in tasks.values():
+        if task.status != "pending":
+            continue
+        all_done = all(
+            tasks[dep_id].status == "done"
+            for dep_id in task.depends_on
+            if dep_id in tasks  # 缺失依赖不阻塞
+        )
+        if all_done:
+            ready.append(task)
+    return ready
