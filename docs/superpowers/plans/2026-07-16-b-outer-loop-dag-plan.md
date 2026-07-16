@@ -29,6 +29,31 @@ baseline: 1016 passed → now: X passed (delta +N)
 ```
 确保任何回归在 commit message 可见,review 时一眼能看出 A 阶段 1016 是否保住。
 
+## 测试 API 约定(全 plan 适用)
+
+`TodoService.create()` 签名(`cc_harness/project/service.py:182-196`):**只接受 keyword-only 参数**,无 `status` 字段。`status` 必须创建后通过 `update()` 设。
+
+**所有 B 阶段测试用 helper 函数(避免每个 test 都写两行)**:
+
+```python
+async def _create(svc, title, status="pending", criteria=None, deps=None, session_id="s"):
+    """Helper: 创建 task + (可选) update status + acceptance_criteria + depends_on。
+    
+    用法:await _create(svc, "T1", status="in_progress", criteria=["..."], deps=["T2"])
+    """
+    t = await svc.create(
+        title=title,
+        acceptance_criteria=criteria or [],
+        depends_on=deps or [],
+        session_id=session_id,
+    )
+    if status != "pending":  # pending 是默认,不必 update
+        t = await svc.update(t.id, {"status": status}, session_id=session_id)
+    return t
+```
+
+放在 `tests/test_project_tools.py` 顶部 + `tests/test_repl_b_hook.py` 顶部各一份(避免 cross-test 引用)。所有本 plan 测试代码里出现的 `svc.create({"title": ..., "status": ...}, ...)` 全部改用 `_create(svc, ..., status=...)`。
+
 ---
 
 ## File Structure(Plan B 涉及,5 文件改 + 2 文件新 + 4 测试文件)
@@ -47,13 +72,11 @@ baseline: 1016 passed → now: X passed (delta +N)
 |---|---|---|
 | `tests/test_project_dependency.py` | **改**:append `topo_sort` / `get_ready_tasks` 测试(保持 100% 覆盖) | 组件 1 |
 | `tests/test_project_verify.py` | **新**:`VerifyResult` + `heuristic_check` + `state_check` + `run_verify`(目标 100%) | 组件 2 |
-| `tests/test_project_tools.py` | **改**:append `todo_toposort` handler 测试(7 case) | 组件 3 |
+| `tests/test_project_tools.py` | **改**:append `todo_toposort` handler 测试(7 case)+ 改 `test_specs_have_distinct_names` 加 `"todo_toposort"` | 组件 3 |
 | `tests/test_repl_b_hook.py` | **新**:`_after_turn_todo` 集成 + `<todo_hints>` agent 注入 | 组件 4 |
 | `tests/_test_b_e2e.py` | **新**:`_` 前缀 gated,FakeLLM E2E + 1 真 LLM | 组件 4 |
 
-**fixtures**:
-- `tests/fixtures/dag_projects/.cc-harness/project.yaml`(1 个 manifest,内容简单)
-- `tests/fixtures/dag_projects/.cc-harness/todos/todos.yaml`(3 形态通过 test 函数参数化覆盖:无环链 / 菱形 / 含环)
+(无 fixtures 文件 — 所有测试用 pytest `tmp_path` fixture 自包含)
 
 ---
 
@@ -1135,10 +1158,10 @@ async def test_toposort_handler_empty_manifest(svc, deps):
 
 async def test_toposort_handler_default_group(svc, deps):
     """group 默认 all → 全表"""
-    # 创建 3 个 task
-    await svc.create({"title": "T1", "status": "pending"}, session_id=deps["session_id"])
-    await svc.create({"title": "T2", "status": "in_progress"}, session_id=deps["session_id"])
-    await svc.create({"title": "T3", "status": "done"}, session_id=deps["session_id"])
+    # 创建 3 个 task(用 helper)
+    await _create(svc, "T1", status="pending", session_id=deps["session_id"])
+    await _create(svc, "T2", status="in_progress", session_id=deps["session_id"])
+    await _create(svc, "T3", status="done", session_id=deps["session_id"])
 
     result = await todo_toposort_handler({}, **deps)
     assert result.is_error is False
@@ -1149,8 +1172,8 @@ async def test_toposort_handler_default_group(svc, deps):
 
 async def test_toposort_handler_ready_group(svc, deps):
     """group=ready → 只 ready"""
-    await svc.create({"title": "T1", "status": "pending"}, session_id=deps["session_id"])
-    await svc.create({"title": "T2", "status": "in_progress"}, session_id=deps["session_id"])
+    await _create(svc, "T1", status="pending", session_id=deps["session_id"])
+    await _create(svc, "T2", status="in_progress", session_id=deps["session_id"])
 
     result = await todo_toposort_handler({"group": "ready"}, **deps)
     assert result.is_error is False
@@ -1161,13 +1184,11 @@ async def test_toposort_handler_ready_group(svc, deps):
 
 async def test_toposort_handler_with_cycle(svc, deps):
     """有环 → is_error=True, llm_text 含环路径"""
-    t1 = await svc.create({"title": "T1", "status": "pending"}, session_id=deps["session_id"])
-    t2 = await svc.create(
-        {"title": "T2", "status": "pending", "depends_on": [t1.id]},
-        session_id=deps["session_id"],
-    )
+    sid = deps["session_id"]
+    t1 = await _create(svc, "T1", status="pending", session_id=sid)
+    t2 = await _create(svc, "T2", status="pending", deps=[t1.id], session_id=sid)
     # 强制造环:更新 T1 depends_on=[T2]
-    await svc.update(t1.id, {"depends_on": [t2.id]}, session_id=deps["session_id"])
+    await svc.update(t1.id, {"depends_on": [t2.id]}, session_id=sid)
 
     result = await todo_toposort_handler({}, **deps)
     assert result.is_error is True
@@ -1197,8 +1218,13 @@ async def test_toposort_handler_truncation_at_50(svc, deps):
     order = [f"T{i:03d}" for i in range(60)]
 
     output = _render_toposort(order, list(tasks.values()), tasks, topo_error=None)
-    assert "truncated" in output or "60" in output
-    assert "T049" in output or "T000" in output  # 至少前 50 个 id 出现
+    # 强断言: 截断警告必须出现, 60 任务标识必须出现
+    assert "truncated" in output.lower() or "⚠" in output
+    assert "60" in output
+    # 至少前 50 个 id 出现(后 10 个应该不出现)
+    assert "T000" in output
+    assert "T049" in output
+    assert "T059" not in output  # 第 60 个(0-indexed 59)应被截
 ```
 
 - [ ] **Step 2: 跑测试验失败**
@@ -1223,7 +1249,17 @@ from cc_harness.project.dependency import (
 )
 ```
 
-2. 在 `__all__` 之前 append 第 8 个 SPEC + handler + 渲染:
+2. **改 `ALL_SPECS` 列表(line 42)** append `TODO_TOPOSORT_SPEC`:
+
+```python
+ALL_SPECS = [
+    TODO_LIST_SPEC, TODO_GET_SPEC, TODO_CREATE_SPEC, TODO_UPDATE_SPEC,
+    TODO_DELETE_SPEC, TODO_RESOLVE_SPEC, TODO_VALIDATE_SPEC,
+    TODO_TOPOSORT_SPEC,  # B 阶段 Task 3
+]
+```
+
+3. 在 `__all__` 之前 append 第 8 个 SPEC + handler + 渲染:
 
 ```python
 # ---------------------------------------------------------------------------
@@ -1291,11 +1327,16 @@ async def todo_toposort_handler(
     llm_text = _render_toposort(order, filtered, by_id, topo_error)
 
     if topo_error:
-        return ToolResult.error(
-            display=f"topo: {topo_error}",
-            llm=llm_text,
+        return ToolResult(
+            is_error=True,
+            display_text=f"topo: {topo_error}",
+            llm_text=llm_text,
         )
-    return ToolResult.success(f"topo: {len(order)} tasks", llm=llm_text)
+    return ToolResult(
+        is_error=False,
+        display_text=f"topo: {len(order)} tasks",
+        llm_text=llm_text,
+    )
 
 
 def _render_toposort(
@@ -1366,7 +1407,7 @@ def _render_toposort(
 
     return (
         head
-        + f"DAG 拓扑视图 ({len(by_id)} tasks, group={'all' if order is None else 'all'}):\n"
+        + f"DAG 拓扑视图 ({len(by_id)} tasks):\n"
         + "  " + topo_line
         + "\n"
         + ready_section
@@ -1393,14 +1434,47 @@ __all__ = [
 ]
 ```
 
+4. **改 `cc_harness/project/extras.py`**(第 8 个 tool 注入到 LLM):
+
+文件头 `from cc_harness.project.tools import` 列表 append:
+
+```python
+    TODO_TOPOSORT_SPEC,
+    todo_toposort_handler,
+```
+
+`inject_todo_tools()` 函数返回 list append:
+
+```python
+        {"spec": TODO_RESOLVE_SPEC,  "handler": todo_resolve_handler,  "deps": deps},
+        {"spec": TODO_VALIDATE_SPEC, "handler": todo_validate_handler, "deps": deps},
+        {"spec": TODO_TOPOSORT_SPEC, "handler": todo_toposort_handler, "deps": deps},  # B 阶段
+    ]
+```
+
+文件头 docstring 改 "7" → "8",`Returns:` 段 "长度固定为 7" → "8"。
+
 - [ ] **Step 4: 跑测试验通过**
+
+**注意**:`test_specs_have_distinct_names`(`tests/test_project_tools.py:111-117`)hard-code 7 个 tool name,B 阶段必须改这个 set 加 `"todo_toposort"`:
+
+```python
+def test_specs_have_distinct_names():
+    names = [s["function"]["name"] for s in ALL_SPECS]
+    assert len(names) == len(set(names))
+    assert set(names) == {
+        "todo_list", "todo_get", "todo_create", "todo_update",
+        "todo_delete", "todo_resolve", "todo_validate",
+        "todo_toposort",  # B 阶段 Task 3
+    }
+```
 
 Run:
 ```bash
-.venv/Scripts/python.exe -m pytest tests/test_project_tools.py -v -k "toposort"
+.venv/Scripts/python.exe -m pytest tests/test_project_tools.py tests/test_project_extras.py -v -k "toposort or distinct_names"
 ```
 
-Expected: 7 passed
+Expected: 全部通过(tools.py 新 handler 测试 + extras.py 已有 inject_todo_tools 测试 + distinct_names 改后过)
 
 - [ ] **Step 5: 覆盖 + baseline + commit**
 
@@ -1413,7 +1487,7 @@ Run:
 Expected: 新 handler ≥85% 覆盖;1055 + 7 = 1062 passed
 
 ```bash
-git add cc_harness/project/tools.py tests/test_project_tools.py
+git add cc_harness/project/tools.py cc_harness/project/extras.py tests/test_project_tools.py
 git commit -m "feat(project): todo_toposort 第 8 个 agent tool
 
 B 阶段 Task 3: 组件 3 - 让主 agent 查 DAG 拓扑。
@@ -1422,6 +1496,7 @@ B 阶段 Task 3: 组件 3 - 让主 agent 查 DAG 拓扑。
 - DependencyCycleError 转 is_error=True + 报告环路径
 - 渲染包含 ready/in_progress/blocked/done 分组 + deps checkmark
 - 50+ task 输出截断
+- inject_todo_tools 第 8 项接入, LLM 可见
 
 baseline: 1055 passed → now: 1062 passed (delta +7)
 
@@ -1535,8 +1610,7 @@ async def test_after_turn_todo_empty_manifest(state):
 
 async def test_after_turn_todo_in_progress_with_missing_criterion(state, svc):
     """in_progress task 有 criterion 缺 → hints 含 missing"""
-    t = _make_task("T1", "in_progress", criteria=["实现 verify hook"])
-    await svc.create({"title": "T1", "status": "in_progress", "acceptance_criteria": ["实现 verify hook"]}, session_id="s")
+    await _create(svc, "T1", status="in_progress", criteria=["实现 verify hook"], session_id="s")
     state.last_turn_text = "本轮啥也没干"  # 不含"实现 verify"
 
     await _after_turn_todo(state, svc)
@@ -1547,17 +1621,18 @@ async def test_after_turn_todo_in_progress_with_missing_criterion(state, svc):
 async def test_after_turn_todo_overwrites_hints(state, svc):
     """每 turn 覆盖 hints(不累积)"""
     # Turn 1: 有 missing
-    await svc.create({"title": "T1", "status": "in_progress", "acceptance_criteria": ["X"]}, session_id="s")
+    await _create(svc, "T1", status="in_progress", criteria=["X"], session_id="s")
     state.last_turn_text = "no match"
     await _after_turn_todo(state, svc)
-    assert len(state.todo_hints) > 0
+    assert any("X" in h and "criterion" in h for h in state.todo_hints)
     turn1_hints = list(state.todo_hints)
 
     # Turn 2: text 包含 X → 不该有 missing hint
     state.last_turn_text = "X done"
     await _after_turn_todo(state, svc)
-    # 覆盖后, missing hint 应消失(其他类型 hint 可能仍在)
-    assert state.todo_hints != turn1_hints or not any("X" in h and "criterion" in h for h in state.todo_hints)
+    # 覆盖后, missing hint 应消失
+    assert not any("X" in h and "criterion" in h for h in state.todo_hints)
+    assert state.todo_hints != turn1_hints  # 真覆盖了
 
 
 # --- 异常处理 ---
@@ -1571,14 +1646,14 @@ async def test_after_turn_todo_service_list_failure_preserves_hints(state, svc, 
             await _after_turn_todo(state, svc)
     # 旧 hints 保留
     assert state.todo_hints == ["preexisting hint"]
-    # warn log
-    assert any("verify hook" in r.message for r in caplog.records)
+    # warn log: "verify hook" + 错误内容
+    assert any("verify hook" in r.message and "disk error" in r.message for r in caplog.records)
 
 
 async def test_after_turn_todo_single_task_failure_continues(state, svc, caplog):
     """单 task run_verify 抛 → 跳过该 task, 其他继续"""
-    await svc.create({"title": "T1", "status": "in_progress", "acceptance_criteria": ["ok"]}, session_id="s")
-    await svc.create({"title": "T2", "status": "in_progress", "acceptance_criteria": ["write test"]}, session_id="s")
+    await _create(svc, "T1", status="in_progress", criteria=["ok"], session_id="s")
+    await _create(svc, "T2", status="in_progress", criteria=["write test"], session_id="s")
     state.last_turn_text = "no match"
 
     # 让 run_verify 在 T1 上抛,T2 继续
@@ -1603,10 +1678,7 @@ async def test_after_turn_todo_single_task_failure_continues(state, svc, caplog)
 async def test_after_turn_todo_per_task_truncation_at_3(state, svc):
     """单 task 5 criterion 缺 → 最多 3 条"""
     crits = ["crit one", "crit two", "crit three", "crit four", "crit five"]
-    await svc.create({
-        "title": "T1", "status": "in_progress",
-        "acceptance_criteria": crits,
-    }, session_id="s")
+    await _create(svc, "T1", status="in_progress", criteria=crits, session_id="s")
     state.last_turn_text = "no match anything"
 
     await _after_turn_todo(state, svc)
@@ -1619,10 +1691,7 @@ async def test_after_turn_todo_total_truncation_at_10(state, svc):
     """3 in_progress task 各 5 criterion 缺 → 全局最多 10 条"""
     for i in range(3):
         crits = [f"task{i} crit{j}" for j in range(5)]
-        await svc.create({
-            "title": f"T{i}", "status": "in_progress",
-            "acceptance_criteria": crits,
-        }, session_id="s")
+        await _create(svc, f"T{i}", status="in_progress", criteria=crits, session_id="s")
     state.last_turn_text = "no match"
 
     await _after_turn_todo(state, svc)
@@ -1973,6 +2042,17 @@ def run_turn(
 
 `_refresh_system_prompt` 调用处(两处,line 132 与 135)加 `todo_hints=todo_hints` 透传。
 
+4. **`repl.py` `run_turn` 调用点也必须传 `todo_hints=state.todo_hints`**(line 370-384,resume_task=state.resume_task 旁边加一行,否则下轮 prompt 不注入):
+
+```python
+turn_stats = await run_turn(
+    state.messages, llm, mcp,
+    ...
+    resume_task=state.resume_task,                    # Task 6: 续干任务
+    todo_hints=list(state.todo_hints or []),          # B 阶段 Task 5: verify hints
+)
+```
+
 - [ ] **Step 4: 跑测试验通过**
 
 Run:
@@ -2033,11 +2113,7 @@ async def test_e2e_verify_hints_flow_into_next_turn_prompt(tmp_path, svc, manife
     from cc_harness.repl import ReplState, _after_turn_todo
 
     # 准备
-    await svc.create({
-        "title": "T1",
-        "status": "in_progress",
-        "acceptance_criteria": ["实现 verify hook"],
-    }, session_id="s")
+    await _create(svc, "T1", status="in_progress", criteria=["实现 verify hook"], session_id="s")
 
     state = ReplState()
     state.todo_service = svc
@@ -2148,10 +2224,10 @@ async def test_e2e_llm_uses_topo_sort_tool_response(svc, monkeypatch):
     """
     from cc_harness.project.tools import todo_toposort_handler
 
-    # 创建 3 task
-    await svc.create({"title": "T1", "status": "done"}, session_id="s")
-    await svc.create({"title": "T2", "status": "in_progress"}, session_id="s")
-    await svc.create({"title": "T3", "status": "pending"}, session_id="s")
+    # 创建 3 task(用 helper)
+    await _create(svc, "T1", status="done", session_id="s")
+    await _create(svc, "T2", status="in_progress", session_id="s")
+    await _create(svc, "T3", status="pending", session_id="s")
 
     # 模拟 LLM 调 tool
     result = await todo_toposort_handler(
@@ -2170,11 +2246,11 @@ async def test_e2e_verify_hints_influence_next_turn(svc):
     from cc_harness.repl import _after_turn_todo, ReplState
 
     # 准备: in_progress task + 缺 criterion
-    await svc.create({
-        "title": "ship feature X",
-        "status": "in_progress",
-        "acceptance_criteria": ["跑通 unit test", "更新 README"],
-    }, session_id="s")
+    await _create(
+        svc, "ship feature X", status="in_progress",
+        criteria=["跑通 unit test", "更新 README"],
+        session_id="s",
+    )
 
     state = ReplState()
     state.todo_service = svc
@@ -2204,27 +2280,37 @@ async def test_e2e_verify_hints_influence_next_turn(svc):
     reason="requires real LLM API key",
 )
 async def test_e2e_full_cycle_real_llm(svc):
-    """真 LLM: 创建一个 in_progress task → 让 LLM 知道 hints 缺 criterion →
-    LLM 在下一轮 turn 主动调用 todo_toposort 决策。
+    """真 LLM: 创建 in_progress task + 缺 criterion → _after_turn_todo 写 hints →
+    _refresh_system_prompt 注入 <todo_hints> 段 → 验证 system prompt 包含。
 
     注:本测试仅在有 OPENAI_API_KEY 时跑,默认跳过。
+    不调 LLM chat(避免 token 成本),只验证 system prompt 构造链路包含 hints 段。
     """
-    # 简化:只验证"LLM 收到 hints 后能调 todo_toposort tool"
     from cc_harness.repl import _after_turn_todo, ReplState
+    from cc_harness.agent import _refresh_system_prompt
 
-    await svc.create({
-        "title": "Build DAG topo",
-        "status": "in_progress",
-        "acceptance_criteria": ["实现 Kahn 算法"],
-    }, session_id="real-llm-sess")
+    await _create(
+        svc, "Build DAG topo", status="in_progress",
+        criteria=["实现 Kahn 算法"],
+        session_id="real-llm-sess",
+    )
 
     state = ReplState()
     state.todo_service = svc
-    state.last_turn_text = "starting"  # 无产物
+    state.last_turn_text = "starting"  # 无产物 → 触发 "无产出" hint
 
     await _after_turn_todo(state, svc)
-    # 至少有一个 hint 涉及 Kahn
-    assert any("Kahn" in h or "criterion" in h for h in state.todo_hints)
+    assert any("Kahn" in h or "无产出" in h for h in state.todo_hints)
+
+    # 真 LLM 调 run_turn 时, 这些 hints 会进 system prompt
+    messages = [{"role": "user", "content": "continue"}]
+    _refresh_system_prompt(
+        messages, "/tmp", "coding",
+        todo_hints=state.todo_hints,
+    )
+    content = messages[0]["content"]
+    assert "<todo_hints>" in content
+    assert "Kahn" in content or "无产出" in content
 ```
 
 - [ ] **Step 2: 跑 FakeLLM 部分(默认 pytest 收集)**
