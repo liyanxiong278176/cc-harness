@@ -130,11 +130,18 @@ def run_verify(
 ) -> VerifyResult:
     """组合 heuristic + state。
 
+    字段语义:
+        - passed — heuristic AND state 整体是否通过
+        - missing_criteria — heuristic 失败的 criterion(只在 heuristic 失败时填)
+        - hints — 辅助信号(state 失败 / 无产出),**无条件采纳**,调用方不要用 passed 过滤
+
     行为:
-        - status != in_progress → passed=True, no-op
-        - acceptance_criteria 为空 → passed=True
+        - status != in_progress → passed=True, 全空
+        - acceptance_criteria 为空 → passed=True, 全空
         - last_turn_text 为空 → passed=True, hints 追加"无产出"提示
-        - 否则跑 heuristic + state,任一失败 → passed=False
+        - heuristic fail → passed=False, missing_criteria 填未命中项
+        - state fail(deps 未 ready)→ passed=False, hints 填 dep hint
+        - heuristic fail + state fail → passed=False, 两边都填
     """
 ```
 
@@ -206,6 +213,34 @@ async def handle_todo_toposort(args, *, service, session_id):
 
 **`_render_toposort` 截断**:`len(tasks) > 50` 时截断并提示。
 
+**`_render_toposort` 输出 schema**(给 LLM 看,plan 阶段按此实现):
+
+```
+DAG 拓扑视图 (12 tasks, group=all):
+  Topo order: T1 → T2 → T3 → T5 → T4 → T6 → T7 → T8 → T9 → T10 → T11 → T12
+
+  Ready (2):
+    - T5 [pending] (priority: high) "verify hook 实现"
+    - T7 [pending] (priority: medium) "CLI 接入"
+
+  In progress (1):
+    - T3 [in_progress] (priority: high) "DAG 实现" (deps: T1 ✓, T2 ✓)
+
+  Blocked (1):
+    - T4 [blocked] (priority: medium) "测试覆盖" (waiting on T3)
+
+  Done (8): T1, T2, T6, T8, T9, T10, T11, T12
+```
+
+**截断模式**(tasks > 50):
+
+```
+⚠ 项目 task 数 75 > 50, 仅展示前 50
+DAG 拓扑视图 (75 tasks, group=all, truncated):
+  ...
+  (后续 25 task 请用 todo_list 分组查看)
+```
+
 **与 `todo_list` 不重叠**:`todo_list` 按 status filter,`todo_toposort` 提供拓扑序(新维度)。
 
 ### 组件 4:`_after_turn_todo` 接线
@@ -253,12 +288,13 @@ async def _after_turn_todo_impl(state, todo_service):
             log.warning("verify hook: run_verify failed for %s: %s", task.id, e)
             continue  # 单 task 失败不影响其他
 
+        per_task: list[str] = []
         if not result.passed:
-            per_task = []
             for miss in result.missing_criteria:
                 per_task.append(f"task {task.id} criterion 未在最近一轮输出中体现: {miss}")
-            per_task.extend(result.hints)
-            hints.extend(per_task[:MAX_HINTS_PER_TASK])
+        # hints 无条件采纳(包括 passed=True 的辅助信号,如"无产出"提示)
+        per_task.extend(result.hints)
+        hints.extend(per_task[:MAX_HINTS_PER_TASK])
 
     state.todo_hints = hints[:MAX_HINTS_TOTAL]  # 覆盖 + 截断
 ```
@@ -282,7 +318,9 @@ if todo_hints:
     prompt += "\n\n<todo_hints>\n" + "\n".join(todo_hints) + "\n</todo_hints>"
 ```
 
-注入位置:`messages[0]["content"]` 末尾 → 与 resume append 并列。
+注入位置:`_refresh_system_prompt` 构造的 system prompt 字符串末尾 → 与 resume append 并列(两者都是 append 到 `_refresh_system_prompt` 返回的 prompt 字符串,然后整段赋给 `messages[0]["content"]`)。
+
+**与 A spec SECTION_POOL 描述的一致性说明**:A spec line 552 文字描述 "Resume 注入走 SECTION_POOL,**不** append 到 messages",但 A 阶段 plan/落地实际用 `messages[0]["content"] += "..."` append 模式(见 A spec 落地 commit + `cc_harness/agent.py` 实际代码)。**B 阶段沿用 A 实际落地的 append 模式**,与 A spec 文字描述的 SECTION_POOL 不一致 —— 这条不一致是 A 阶段已存在的,B 不解决,后续若要统一 SECTION_POOL 模式另立 spec。**当前选择 append 模式的理由**:A 阶段 1016 测试 baseline 已锁 append,改 SECTION_POOL 风险高、收益低(YAGNI)。
 
 **`last_turn_text` 接线**:
 
@@ -399,8 +437,8 @@ Turn N+1 开始
 1. **`topo_sort` 返回 list[id] 后,tool handler 是否要在 llm_text 里同时输出 task title?**(当前设计:只渲染 ready/in_progress/blocked 分组的 task title + id;拓扑序只输出 id 列表。是否够清晰?)
 2. **`heuristic_check` 的 stopword 列表是否要中英文各扩到 30+?**(当前 10+10,YAGNI 起步;真误判多再扩)
 3. **`MAX_RENDER_TASKS = 50` 是否合理?**(基于"50 task 内 LLM 一次性消化";真有大项目 100+ task → 改参数或拆项目)
-4. **`<todo_hints>` 注入位置在 resume 段之后还是之前?**(当前设计:resume 之后。LLM 注意力偏末,但 resume 是身份信息,hints 是行动指引,放后面让 LLM "先记住我是谁,再看行动指引"——可能反了,需 plan 阶段验证)
-5. **`last_turn_text` 是否要在 messages 末尾的 assistant message 含 tool_calls 时 fallback 找上一条文本?**(当前设计:简单 fallback,但更"对"的实现是合并"工具结果段"作为 verify 目标——但这跟 L5 DLP "工具观察段不扫" 冲突,YAGNI)
+4. **`<todo_hints>` 注入位置在 resume 段之后还是之前?**(当前设计:resume 之后。LLM 注意力偏末,但 resume 是身份信息,hints 是行动指引,放后面让 LLM "先记住我是谁,再看行动指引"——可能反了。**plan 阶段必须跑一次受控实验对比 LLM 行为再定位置**,不允许 implementer 任意选)
+5. **`last_turn_text` 是否要在 messages 末尾的 assistant message 含 tool_calls 时 fallback 找上一条文本?**(当前设计:简单 fallback,但更"对"的实现是合并"工具结果段"作为 verify 目标——但这跟 L5 DLP "工具观察段不扫" 冲突,YAGNI。如未来 L5 政策放宽,fallback 升级路径已留:改 `_extract_final_text` 单点函数即可,无需重写 `_after_turn_todo`)
 
 ## Out of scope(明确不做)
 
@@ -449,6 +487,8 @@ Turn N+1 开始
 - `state.todo_hints` 默认空 → agent 不注入 → verify hook no-op(功能关闭)
 - `topo_sort` 占位没填 → `todo_toposort` 不可用,但不破坏其他 tool
 - `verify.py` 新文件 → 删除即可
+
+**commit message 规范**:每个 B 阶段 commit 末尾必须显式报告测试 baseline + delta:`baseline: 1016 passed → now: X passed (delta +N)`,确保任何回归在 commit message 可见,review 时一眼能看出 A 阶段 1016 是否保住。
 
 ## 后续 plan(本 B 完成后另立)
 
