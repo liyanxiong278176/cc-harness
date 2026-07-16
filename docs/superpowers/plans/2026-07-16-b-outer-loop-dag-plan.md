@@ -40,6 +40,11 @@ async def _create(svc, title, status="pending", criteria=None, deps=None, sessio
     """Helper: 创建 task + (可选) update status + acceptance_criteria + depends_on。
     
     用法:await _create(svc, "T1", status="in_progress", criteria=["..."], deps=["T2"])
+    
+    关键 API 细节:
+    - svc.create() 是 keyword-only, 无 status 字段 (status 默认 pending)
+    - svc.update(task_id, *, session_id, **fields) 也是 keyword-only,
+      fields 必须作为 kwargs 传入, 不能传 dict
     """
     t = await svc.create(
         title=title,
@@ -47,8 +52,23 @@ async def _create(svc, title, status="pending", criteria=None, deps=None, sessio
         depends_on=deps or [],
         session_id=session_id,
     )
-    if status != "pending":  # pending 是默认,不必 update
-        t = await svc.update(t.id, {"status": status}, session_id=session_id)
+    if status != "pending":  # pending 是默认, 不必 update
+        t = await svc.update(t.id, status=status, session_id=session_id)
+    return t
+```
+
+**完整代码块(必须原样复制到 test 文件顶部)**:
+
+```python
+async def _create(svc, title, status="pending", criteria=None, deps=None, session_id="s"):
+    t = await svc.create(
+        title=title,
+        acceptance_criteria=criteria or [],
+        depends_on=deps or [],
+        session_id=session_id,
+    )
+    if status != "pending":
+        t = await svc.update(t.id, status=status, session_id=session_id)
     return t
 ```
 
@@ -720,7 +740,7 @@ from __future__ import annotations
 
 import re
 
-from cc_harness.project.models import TodoTask, TaskStatus
+from cc_harness.project.models import TodoTask
 
 
 # 简陋版 stopword:YAGNI 起步,中英文各 10 个,误判多再扩
@@ -1123,6 +1143,22 @@ Co-Authored-By: Claude Fable 5 <noreply@anthropic.com>"
 
 ### Task 3.1: 失败测试 + `todo_toposort` spec + handler
 
+- [ ] **Step 0: 在 `tests/test_project_tools.py` 顶部加 helper**(关键,所有本 task 测试用它)
+
+```python
+# 顶部 append (在 import 之后, fixture 之前)
+async def _create(svc, title, status="pending", criteria=None, deps=None, session_id="s"):
+    t = await svc.create(
+        title=title,
+        acceptance_criteria=criteria or [],
+        depends_on=deps or [],
+        session_id=session_id,
+    )
+    if status != "pending":
+        t = await svc.update(t.id, status=status, session_id=session_id)
+    return t
+```
+
 - [ ] **Step 1: 在 `tests/test_project_tools.py` 末尾 append 测试**
 
 ```python
@@ -1196,11 +1232,31 @@ async def test_toposort_handler_with_cycle(svc, deps):
 
 
 async def test_toposort_handler_truncation_at_50(svc, deps):
-    """51+ task → 截断提示"""
-    # 简化:直接调 handler 内部函数测试截断逻辑
-    from cc_harness.project.tools import _render_toposort
+    """51+ task → handler 路径截断 + ⚠ 提示。
 
-    # 构造 60 个 task(用 stub by_id, 不写盘)
+    注意:这测试用 handler 真路径(不是直接调 _render_toposort),
+    验证 handler 在大 manifest 下是否:
+    1. is_error=False(无环)
+    2. llm_text 含 ⚠ truncated 标记
+    3. llm_text 含具体 task id(至少前 50 个)
+    """
+    # 真的写 60 个 task 到 svc
+    for i in range(60):
+        await _create(svc, f"Task {i:03d}", status="pending", session_id=deps["session_id"])
+
+    result = await todo_toposort_handler({}, **deps)
+    assert result.is_error is False  # 无环
+    # llm_text 含截断警告
+    assert "truncated" in result.llm_text.lower() or "⚠" in result.llm_text
+    # 含具体 task id(至少前 50 个, 后 10 个应被截)
+    assert "T000" in result.llm_text or "Task 000" in result.llm_text
+    # display_text 简洁(可选优化, 后续可加)
+    assert "60" in result.display_text or "topo" in result.display_text
+
+
+async def test_toposort_render_truncation_at_50_direct():
+    """直接调 _render_toposort 测试渲染逻辑(单元层)。"""
+    from cc_harness.project.tools import _render_toposort
     from datetime import datetime
     from cc_harness.project.models import TodoTask
     now = datetime.now()
@@ -1213,15 +1269,11 @@ async def test_toposort_handler_truncation_at_50(svc, deps):
             acceptance_criteria=[], created_at=now, updated_at=now,
         )
     tasks = {f"T{i:03d}": _make(i) for i in range(60)}
-
-    # topo order 全 60 个
     order = [f"T{i:03d}" for i in range(60)]
 
     output = _render_toposort(order, list(tasks.values()), tasks, topo_error=None)
-    # 强断言: 截断警告必须出现, 60 任务标识必须出现
     assert "truncated" in output.lower() or "⚠" in output
     assert "60" in output
-    # 至少前 50 个 id 出现(后 10 个应该不出现)
     assert "T000" in output
     assert "T049" in output
     assert "T059" not in output  # 第 60 个(0-indexed 59)应被截
@@ -1515,6 +1567,22 @@ Co-Authored-By: Claude Fable 5 <noreply@anthropic.com>"
 
 ### Task 4.1: 失败测试 + `_after_turn_todo` 最小实现
 
+- [ ] **Step 0: 在 `tests/test_repl_b_hook.py` 顶部加 helper**(关键,所有本 task 测试用它)
+
+```python
+# 文件 import 之后, 任何 fixture 之前
+async def _create(svc, title, status="pending", criteria=None, deps=None, session_id="s"):
+    t = await svc.create(
+        title=title,
+        acceptance_criteria=criteria or [],
+        depends_on=deps or [],
+        session_id=session_id,
+    )
+    if status != "pending":
+        t = await svc.update(t.id, status=status, session_id=session_id)
+    return t
+```
+
 - [ ] **Step 1: 创建 `tests/test_repl_b_hook.py`**
 
 ```python
@@ -1537,7 +1605,7 @@ from unittest.mock import patch
 import pytest
 
 from cc_harness.project.models import (
-    Manifest, TodoTask, TaskStatus,
+    Manifest, TodoTask,
 )
 from cc_harness.project.service import TodoService
 from cc_harness.repl import (
@@ -2169,6 +2237,22 @@ Co-Authored-By: Claude Fable 5 <noreply@anthropic.com>"
 ---
 
 ### Task 6.2: E2E FakeLLM + 1 真 LLM gated
+
+- [ ] **Step 0: 在 `tests/_test_b_e2e.py` 顶部加 helper**(关键,所有本 task 测试用它)
+
+```python
+# import 之后, fixture 之前
+async def _create(svc, title, status="pending", criteria=None, deps=None, session_id="s"):
+    t = await svc.create(
+        title=title,
+        acceptance_criteria=criteria or [],
+        depends_on=deps or [],
+        session_id=session_id,
+    )
+    if status != "pending":
+        t = await svc.update(t.id, status=status, session_id=session_id)
+    return t
+```
 
 - [ ] **Step 1: 创建 `tests/_test_b_e2e.py`**
 
