@@ -608,6 +608,12 @@ def _refresh_system_prompt(messages: list[dict], cwd: str, mode: str,
     注入位置:resume_task 段之后(append-only,与 resume_task 块并列,互不破坏)。
     Idempotent: 旧 `<todo_hints>` 块在 append 前先 strip 掉(anchored 到末尾,
     同 resume_task 的 idempotency 策略)。
+
+    C 阶段 Task 5:mode=='coding' + system message 存在 → 追加静态
+    `<todo_completion_gate>...</todo_completion_gate>` 块,告知 agent 标 done
+    前的校验规则(子任务聚合 + acceptance,force 绕 acceptance)。与 Task 3
+    的 tool 层完成门互补(预防告知 vs 强制兜底)。Idempotent:旧块 anchored 到
+    末尾 strip 后 re-append。plan/design 不注入(无 todo_update 语义)。
     """
     from cc_harness.prompts import build_system_prompt
     if extra_ctx:
@@ -685,6 +691,31 @@ def _refresh_system_prompt(messages: list[dict], cwd: str, mode: str,
             "\n\n<todo_hints>\n"
             + "\n".join(todo_hints)
             + "\n</todo_hints>"
+        )
+
+    # --- C 阶段 Task 5: append <todo_completion_gate> block (idempotent) ---
+    # 静态提示:告知 agent 标 task 为 done 前的校验规则(与 Task 3 的 tool 层
+    # 完成门互补 —— 这里是预防性告知,Task 3 是强制兜底)。与 <todo_hints> /
+    # <resume_task> 并列,同 idempotent 模式(re.sub strip 旧块 anchored to
+    # end + append 新块)。coding mode only(plan/design 无 todo_update)。
+    if mode == "coding" and messages and messages[0].get("role") == "system":
+        old = messages[0]["content"]
+        # Strip prior <todo_completion_gate>...</todo_completion_gate> block if
+        # present (anchored to end of string to avoid removing in-line
+        # occurrences of the literal text in user content).
+        old = re.sub(
+            r"\s*<todo_completion_gate\b[^>]*>.*?</todo_completion_gate>\s*\Z",
+            "",
+            old,
+            flags=re.DOTALL,
+        )
+        messages[0]["content"] = old + (
+            "\n\n<todo_completion_gate>\n"
+            "标 task 为 done(todo_update status=done)前,系统会校验:"
+            "① 所有直接子任务(parent_task)已 done;② acceptance_criteria 在最近输出中体现。\n"
+            "- 子任务聚合校验不可绕过(数据一致性)。\n"
+            "- acceptance 校验可用 todo_update(status=done, force=true) 绕过(仅在确认启发式误判时)。\n"
+            "</todo_completion_gate>"
         )
 
 
