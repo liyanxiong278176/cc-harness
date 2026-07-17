@@ -313,6 +313,12 @@ TODO_TOPOSORT_SPEC: dict[str, Any] = {
                     "enum": ["all", "ready", "in_progress", "blocked"],
                     "default": "all",
                 },
+                "view": {
+                    "type": "string",
+                    "enum": ["flat", "tree"],
+                    "default": "flat",
+                    "description": "flat=拓扑+分组;tree=HTN 缩进树(parent/child 嵌套)",
+                },
             },
             "required": [],
         },
@@ -790,6 +796,12 @@ async def todo_toposort_handler(
         and requested_group in {"all", "ready", "in_progress", "blocked"}
         else "all"
     )
+    requested_view = args.get("view", "flat")
+    view = (
+        requested_view
+        if isinstance(requested_view, str) and requested_view in {"flat", "tree"}
+        else "flat"
+    )
 
     if group == "ready":
         filtered = get_ready_tasks(by_id)
@@ -807,7 +819,9 @@ async def todo_toposort_handler(
         order = None
         topo_error = str(e)
 
-    llm_text = _render_toposort(order, filtered, by_id, topo_error, group=group)
+    llm_text = _render_toposort(
+        order, filtered, by_id, topo_error, group=group, view=view
+    )
 
     if topo_error:
         return ToolResult(
@@ -828,6 +842,7 @@ def _render_toposort(
     by_id: dict[str, TodoTask],
     topo_error: str | None,
     group: str = "all",
+    view: str = "flat",
 ) -> str:
     """渲染 DAG 拓扑视图给 LLM 看。
 
@@ -841,10 +856,14 @@ def _render_toposort(
         by_id: 全表 task 字典(handler 内部构造)。
         topo_error: 环错误信息;有环时非 None。
         group: 当前视图分组;all 渲染全表,其余值只渲染对应分组。
+        view: "flat"(默认,现状拓扑+分组)或 "tree"(HTN 缩进树)。
 
     Returns:
         渲染好的 LLM 可见字符串。
     """
+    if view == "tree":
+        return _render_tree(order, filtered, by_id, topo_error, group)
+
     total = len(by_id)
     truncated = total > MAX_RENDER_TASKS
 
@@ -958,6 +977,122 @@ def _render_toposort(
             "\n".join(sections),
         ]
     )
+
+
+def _render_tree(
+    order: list[str] | None,
+    filtered: list[TodoTask],
+    by_id: dict[str, TodoTask],
+    topo_error: str | None,
+    group: str,
+) -> str:
+    """HTN parent/child 缩进树视图(spec 组件 3, C Task 4)。
+
+    与 `_render_toposort` 的 flat 视图正交:
+    - group 决定 **task 集合**(filter);view=tree 只决定 **渲染方式**。
+    - filtered 掉 parent 的 child 静默升为顶层(无标注);只有 dangling_parent
+      (parent 不在 by_id)才标 `(orphan: parent not in view)` 注释(spec 开放问题 #4)。
+
+    顶层判定:`parent_task is None` 或 parent 不在 by_id(孤儿)。
+    DFS:children = `by_id.values()` 里 `parent_task == current.id` 的 task,
+        按 `order` 列表顺序排(topo 序,提供确定性)。缩进 +2/层。
+    visited set 防环(parent_task 环理论存在 — A 阶段 check_no_cycle 只查 depends_on):
+        遇已访问 node 截断 + 标 `⚠ cycle: {id}`,不无限递归。
+    截断:沿用 MAX_RENDER_TASKS=50。
+
+    Args:
+        order: topo_sort 输出的拓扑序;有环时为 None(只用 filtered 里的 task)。
+        filtered: 按 group 过滤后的 task 列表(决定哪些 task 进森林)。
+        by_id: 全表 task 字典。
+        topo_error: depends_on 环错误信息(显示在头部,与 parent_task 环无关)。
+        group: 当前分组(显示在头部)。
+
+    Returns:
+        HTN 树视图字符串,header 以 "HTN 树视图" 开头。
+    """
+    total = len(by_id)
+    truncated = total > MAX_RENDER_TASKS
+
+    # filtered 集合:决定哪些 task 进入森林(由 view=tree 之外的 group 控制)
+    filtered_ids = {t.id for t in filtered}
+
+    # children index:parent_id -> [child_id, ...] 按 topo order 排
+    # 仅含 filtered 中的 task(group 过滤后的森林)
+    children_map: dict[str, list[str]] = {}
+    # 遍历顺序:topo order 优先(提供确定性),fallback 用 by_id 插入序
+    if order:
+        iter_ids = [tid for tid in order if tid in filtered_ids]
+    else:
+        # 有环时 order=None,fallback 到 filtered 列表顺序
+        iter_ids = [t.id for t in filtered if t.id in filtered_ids]
+    for tid in iter_ids:
+        t = by_id[tid]
+        if t.parent_task and t.parent_task in by_id:
+            children_map.setdefault(t.parent_task, []).append(tid)
+
+    # 顶层:parent_task is None,或 parent 不在 by_id(孤儿),且自身在 filtered
+    top_ids = [
+        tid for tid in iter_ids
+        if not by_id[tid].parent_task or by_id[tid].parent_task not in by_id
+    ]
+
+    lines: list[str] = []
+    header = f"HTN 树视图 ({total} tasks):\n"
+    if group != "all":
+        header = f"HTN 树视图 ({total}, group={group}):\n"
+    lines.append(header.rstrip("\n"))
+
+    if topo_error:
+        lines.append(f"  ⚠ topo: {topo_error}")
+
+    if truncated:
+        lines.append(
+            f"  ⚠ 项目 task 数 {total} > {MAX_RENDER_TASKS}, 仅展示前 {MAX_RENDER_TASKS}"
+        )
+
+    if not iter_ids:
+        lines.append("  (no tasks)")
+        return "\n".join(lines) + "\n"
+
+    # DFS 渲染
+    visited: set[str] = set()
+    rendered_count = 0
+    # 标记出现在过滤集中但其 parent 被过滤掉的孤儿(可选标注)
+    orphan_ids = {
+        tid for tid in iter_ids
+        if by_id[tid].parent_task and by_id[tid].parent_task not in by_id
+    }
+
+    def _dfs(tid: str, depth: int) -> None:
+        nonlocal rendered_count
+        # 防环:已访问 → 标环截断该支,不无限递归
+        if tid in visited:
+            indent = "  " * depth
+            lines.append(f"{indent}⚠ cycle: {tid}")
+            return
+        if rendered_count >= MAX_RENDER_TASKS:
+            return
+        visited.add(tid)
+        rendered_count += 1
+        indent = "  " * depth
+        t = by_id[tid]
+        orphan_note = " (orphan: parent not in view)" if tid in orphan_ids else ""
+        prio = f" (priority: {t.priority})" if t.priority else ""
+        lines.append(
+            f'{indent}{t.id} [{t.status}]{prio} "{t.title}"{orphan_note}'
+        )
+        for child_id in children_map.get(tid, []):
+            _dfs(child_id, depth + 1)
+
+    for top_id in top_ids:
+        _dfs(top_id, 0)
+    # 兜底:parent_task 环(全部 task 互相是 parent,无顶层)时,
+    # 从任意未访问 task 起 DFS,visited 防环会标出环路径。
+    for tid in iter_ids:
+        if tid not in visited and rendered_count < MAX_RENDER_TASKS:
+            _dfs(tid, 0)
+
+    return "\n".join(lines) + "\n"
 
 
 __all__ = [
