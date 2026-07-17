@@ -16,17 +16,22 @@ handler 业务错都是开发者自用,所以两字段同内容即可。
 """
 from __future__ import annotations
 
+import logging
 from datetime import datetime
 from typing import Any
 
 from cc_harness.mcp_client import ToolResult
 from cc_harness.project.dependency import (
     DependencyCycleError,
+    children_all_done,
     get_ready_tasks,
     topo_sort,
 )
 from cc_harness.project.exceptions import TodoError
 from cc_harness.project.models import TodoTask, ValidationIssue
+from cc_harness.project.verify import run_verify
+
+log = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
 # 状态/排序常量
@@ -181,6 +186,9 @@ TODO_UPDATE_SPEC: dict[str, Any] = {
             "parent_task/assigned_to/priority/labels/due_date/effort_estimate/"
             "acceptance_criteria),未传字段不动。前置校验:status_guard;depends_on "
             "引用 + 子图环;parent_task 不能 self + 引用必须存在。"
+            "status=done 时触发完成门(子任务聚合 + acceptance_criteria 校验):"
+            "聚合不过列 pending 子任务(不可绕);acceptance 不过列 missing criteria"
+            "(可用 force=true 绕过)。"
         ),
         "parameters": {
             "type": "object",
@@ -203,6 +211,14 @@ TODO_UPDATE_SPEC: dict[str, Any] = {
                 "due_date": {"type": ["string", "null"]},
                 "effort_estimate": {"type": ["number", "null"]},
                 "acceptance_criteria": {"type": "array", "items": {"type": "string"}},
+                "force": {
+                    "type": "boolean",
+                    "default": False,
+                    "description": (
+                        "status=done 时绕过 acceptance 校验;"
+                        "子任务聚合校验不可绕(数据一致性)"
+                    ),
+                },
             },
             "required": ["task_id"],
         },
@@ -497,12 +513,75 @@ async def todo_create_handler(
     return ToolResult.success(text)
 
 
+async def _completion_gate(
+    service, task_id: str, force: bool, last_turn_text: str
+) -> ToolResult | None:
+    """完成门:返回 None=放行,ToolResult(is_error=True)= 拦截。
+
+    两道校验,任一不过收集到 errors:
+      1. 聚合:children_all_done(force 也不跳)
+      2. acceptance:criteria 非空 且 not force → run_verify
+    service.list / run_verify 内部异常 → fail-soft(放行,不阻断 update),warn log。
+    """
+    try:
+        all_tasks = await service.list(include_done=True)
+    except Exception as e:  # noqa: BLE001 — fail-soft 任何异常
+        log.warning("completion_gate: service.list failed: %s — fail-soft 放行", e)
+        return None
+    by_id = {t.id: t for t in all_tasks}
+    if task_id not in by_id:                # 交给 service.update 报 TaskNotFound
+        return None
+
+    task = by_id[task_id]
+    if task.status == "done":               # 已 done,重复设 done 不触发 gate
+        return None
+
+    errors: list[str] = []
+
+    # 1. 聚合(force 也不跳 — 数据一致性)
+    children_done, pending = children_all_done(by_id, task_id)
+    if not children_done:
+        errors.append(f"task {task_id} 有未完成子任务: {', '.join(pending)}")
+
+    # 2. acceptance(criteria 非空 且 not force)
+    if task.acceptance_criteria and not force:
+        try:
+            result = run_verify(task, by_id, last_turn_text)
+        except Exception as e:  # noqa: BLE001 — fail-soft
+            log.warning(
+                "completion_gate: run_verify failed: %s — fail-soft 跳过 acceptance", e,
+            )
+            result = None
+        if result is not None and not result.passed:
+            miss = "; ".join(result.missing_criteria)
+            errors.append(f"task {task_id} acceptance 未满足: {miss}")
+
+    if not errors:
+        return None
+
+    has_acceptance_err = any("acceptance" in e for e in errors)
+    has_children_err = any("子任务" in e for e in errors)
+    hint = ""
+    if has_acceptance_err and not has_children_err:
+        hint = "\n(可用 force=true 绕过 acceptance 校验;子任务聚合不可绕)"
+    elif has_acceptance_err and has_children_err:
+        hint = "\n(子任务聚合不可绕;补齐子任务后,acceptance 可用 force=true 绕过)"
+    return ToolResult(
+        is_error=True,
+        display_text=f"todo_update blocked: {len(errors)} check(s) failed",
+        llm_text="⚠ task 无法标完成:\n  - " + "\n  - ".join(errors) + hint,
+    )
+
+
 async def todo_update_handler(
     args: dict, *, service, session_id: str, cwd: str,
     last_turn_text: str = "",
 ) -> ToolResult:
-    """todo_update:任意 T11 字段 → Service.update。session_id 显式传。"""
-    del cwd, last_turn_text  # Task 3 将接入完成门 acceptance 校验
+    """todo_update:任意 T11 字段 → Service.update。session_id 显式传。
+
+    C 阶段:status=done 转换时触发完成门(聚合 + acceptance),force 可绕 acceptance。
+    """
+    del cwd  # 当前未用,保留签名
     task_id = args.get("task_id")
     if not task_id:
         return ToolResult.error(
@@ -527,6 +606,14 @@ async def todo_update_handler(
             fields["due_date"] = due
     if "effort_estimate" in args and args["effort_estimate"] is not None:
         fields["effort_estimate"] = args["effort_estimate"]
+
+    # --- C 阶段完成门:仅当本次要把 status 设为 done ---
+    force = bool(args.get("force", False))  # 仅 status=done 时有意义
+    if fields.get("status") == "done":
+        gate = await _completion_gate(service, task_id, force, last_turn_text)
+        if gate is not None:                # not None = 被拦,返回 error
+            return gate
+
     try:
         updated = await service.update(task_id, session_id=session_id, **fields)
     except TodoError as e:
