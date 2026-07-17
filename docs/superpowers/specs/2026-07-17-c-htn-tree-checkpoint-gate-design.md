@@ -42,7 +42,7 @@
 | `cc_harness/project/service.py` | A 已落 `list(parent_task=...)` / `update`(mark-done 路径,含 status_guard + `_on_completion`)/ `resolve`(**只读**依赖链查看器,非 mark-done) | **不动**(C 的完成门校验全在 tool 层,不污染 service 纯状态机) |
 | `cc_harness/project/tools.py` | A 落 7 tool(含 `todo_update_handler:497` / `todo_resolve_handler:563`);B 落第 8 个 `todo_toposort`(flat 视图 + group 过滤) | **改 2 处**:① `todo_update_handler` 加完成门(仅 status→done 转换触发)+ force 参数 ② `todo_toposort` 加 `view=flat\|tree` 参数 + tree 渲染。**`todo_resolve` 不动**(它是只读查看器,与完成门无关) |
 | `cc_harness/project/extras.py` | B 已落 `inject_todo_tools` 返回 8 entry,deps = `{service, session_id, cwd}` | **改 deps**:加 `last_turn_text` 字段(handler 跑 acceptance verify 要用) |
-| `cc_harness/agent.py` | dispatch:`h_kwargs = {"cwd": ..., **deps}` 统一 splat(`agent.py:247`)→ **deps 加 key,所有 8 个 handler 签名都要兼容**;B 已落 `<todo_hints>` 段注入 | 完成 handler 签名兼容(见开放问题 #1)+ `_refresh_system_prompt` 加 `<todo_resolve_gate>` 静态提示 |
+| `cc_harness/agent.py` | dispatch:`h_kwargs = {"cwd": ..., **deps}` 统一 splat(`agent.py:247`)→ **deps 加 key,所有 8 个 handler 签名都要兼容**;B 已落 `<todo_hints>` 段注入 | 完成 handler 签名兼容(见开放问题 #1)+ `_refresh_system_prompt` 加 `<todo_completion_gate>` 静态提示 |
 | `cc_harness/repl.py` | B 已落 `ReplState.last_turn_text` + `_extract_final_text` + run_turn 调用点传 `todo_hints` | **改 1 处**:`inject_todo_tools` 调用点传 `last_turn_text=state.last_turn_text` |
 | `tests/test_*` | A/B 已落 ~100 测试 | **新增** `test_c_integration.py` + `_test_c_e2e.py` + 各组件单元测试 |
 
@@ -268,11 +268,11 @@ deps = {"service": service, "session_id": session_id, "cwd": cwd,
 
 `_refresh_system_prompt` 的 coding mode 段(与 `<todo_hints>` 并列)追加静态提示:
 ```
-<todo_resolve_gate>
+<todo_completion_gate>
 标 task 为 done(todo_update status=done)前,系统会校验:① 所有直接子任务(parent_task)已 done;② acceptance_criteria 在最近输出中体现。
 - 子任务聚合校验不可绕过(数据一致性)。
 - acceptance 校验可用 todo_update(status=done, force=true) 绕过(仅在确认启发式误判时)。
-</todo_resolve_gate>
+</todo_completion_gate>
 ```
 
 ## 数据流
@@ -306,7 +306,7 @@ agent 调 todo_toposort(group=all, view=tree)
 turn N 结束:
   _after_turn_todo → run_verify(in_progress tasks) → 写 state.todo_hints(软提示)
 turn N+1 开始:
-  _refresh_system_prompt → 注入 <todo_hints>(B)+ <todo_resolve_gate>(C 静态提示)
+  _refresh_system_prompt → 注入 <todo_hints>(B)+ <todo_completion_gate>(C 静态提示)
 turn N+1 中:
   agent 调 todo_update(status=done) → C 完成门(聚合 + acceptance + force)
 ```
@@ -454,7 +454,7 @@ B 软提示 + C 软拦,两层互补。
 - `cc_harness/project/tools.py`(改 `todo_update_handler` + `_render_toposort` + `TODO_UPDATE_SPEC` + `TODO_TOPOSORT_SPEC` + 全 8 handler 签名兼容)
 - `cc_harness/project/extras.py`(deps 加 `last_turn_text`)
 - `cc_harness/repl.py`(调用点传 `last_turn_text`)
-- `cc_harness/agent.py`(`_refresh_system_prompt` 加 `<todo_resolve_gate>` 静态段)
+- `cc_harness/agent.py`(`_refresh_system_prompt` 加 `<todo_completion_gate>` 静态段)
 
 **迁移方案**:
 1. **依赖顺序**:1(children_all_done)+ 2(handler 签名兼容)→ 3+4(update 完成门 + deps)→ 5(tree 视图)→ 6(prompt)→ 7(集成)
@@ -465,7 +465,7 @@ B 软提示 + C 软拦,两层互补。
 **backout**:
 - `children_all_done` 删除 → update 完成门退化为只查 acceptance(或全跳)
 - `view=tree` 删除 → toposort 回 flat(默认值,零影响)
-- `<todo_resolve_gate>` prompt 段删除 → agent 不知道有门,但门仍在(tool 层)
+- `<todo_completion_gate>` prompt 段删除 → agent 不知道有门,但门仍在(tool 层)
 - deps 不传 last_turn_text → handler 默认空字符串,acceptance 校验走空文本路径(放行)
 - handler 签名回退(去掉 last_turn_text 形参)→ deps 也要同步去掉,否则 dispatch splat TypeError
 
