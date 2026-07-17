@@ -392,6 +392,7 @@ async def run_repl(
                 memory_layer=memory_layer,                        # Q3 Task8: 分层注入
                 offload_deps=offload_deps,                        # Q4 Task7: 短期符号化卸载
                 resume_task=state.resume_task,                    # Task 6: 续干任务
+                todo_hints=list(state.todo_hints or []),          # B 阶段 Task 5: verify hints
             )
             state.session_stats.add(turn_stats)
 

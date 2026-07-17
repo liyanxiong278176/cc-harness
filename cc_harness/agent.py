@@ -67,6 +67,7 @@ async def run_turn(
     offload_deps: dict | None = None,
     qa_context: dict | None = None,
     resume_task: "TodoTask | None" = None,
+    todo_hints: list[str] | None = None,  # B 阶段 Task 5: verify hook hints
 ) -> TurnTokenStats:
     """Run one user turn in the given mode.
 
@@ -130,9 +131,14 @@ async def run_turn(
                 messages, cwd, mode,
                 extra_ctx={"qa_category": qa_context["q_type"]},
                 resume_task=resume_task,
+                todo_hints=todo_hints,
             )
         else:
-            _refresh_system_prompt(messages, cwd, mode, resume_task=resume_task)
+            _refresh_system_prompt(
+                messages, cwd, mode,
+                resume_task=resume_task,
+                todo_hints=todo_hints,
+            )
 
     # --- Q3 Task7: 分层记忆 pre-turn 注入 ---
     # memory_layer = {"recall": async callable(query) -> RecallResult}
@@ -584,7 +590,8 @@ def _pending_to_openai_tc(p) -> dict:
 
 def _refresh_system_prompt(messages: list[dict], cwd: str, mode: str,
                            extra_ctx: dict | None = None,
-                           resume_task: "TodoTask | None" = None) -> None:
+                           resume_task: "TodoTask | None" = None,
+                           todo_hints: list[str] | None = None) -> None:
     """Insert or update the system prompt at messages[0] for the current mode.
 
     `extra_ctx` (Phase 1 Q1 uplift) is merged into the composer ctx so callers
@@ -595,6 +602,12 @@ def _refresh_system_prompt(messages: list[dict], cwd: str, mode: str,
     LLM context. Idempotent: prior blocks are stripped before re-appending so
     re-calling does not duplicate. Pattern matches Q3 persona / Q4 canvas
     (append, not rebuild) so other sections are not clobbered.
+
+    `todo_hints` (B 阶段 Task 5) 非空时 + mode=='coding' + system message 存在
+    → append 一个 `<todo_hints>...</todo_hints>` 块(每行一条 hint,空时跳过)。
+    注入位置:resume_task 段之后(append-only,与 resume_task 块并列,互不破坏)。
+    Idempotent: 旧 `<todo_hints>` 块在 append 前先 strip 掉(anchored 到末尾,
+    同 resume_task 的 idempotency 策略)。
     """
     from cc_harness.prompts import build_system_prompt
     if extra_ctx:
@@ -645,6 +658,33 @@ def _refresh_system_prompt(messages: list[dict], cwd: str, mode: str,
             f"## Acceptance Criteria\n"
             f"{ac_lines}\n"
             f"</resume_task>"
+        )
+
+    # --- B 阶段 Task 5: append todo_hints block (idempotent, append-only) ---
+    # 与 resume_task 段并列,在 resume 段之后再 append 一段 <todo_hints>...</todo_hints>
+    # 内容来自 repl._after_turn_todo 验证钩子写入的 state.todo_hints。
+    # 模式同 resume_task:re.sub strip 旧块(anchored to end)+ append 新块,
+    # 幂等。空 / None → 不注入段(向后兼容)。
+    if (
+        mode == "coding"
+        and todo_hints
+        and messages
+        and messages[0].get("role") == "system"
+    ):
+        old = messages[0]["content"]
+        # Strip prior <todo_hints>...</todo_hints> block if present (anchored
+        # to end of string to avoid removing in-line occurrences of the
+        # literal text in user content).
+        old = re.sub(
+            r"\s*<todo_hints\b[^>]*>.*?</todo_hints>\s*\Z",
+            "",
+            old,
+            flags=re.DOTALL,
+        )
+        messages[0]["content"] = old + (
+            "\n\n<todo_hints>\n"
+            + "\n".join(todo_hints)
+            + "\n</todo_hints>"
         )
 
 
