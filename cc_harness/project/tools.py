@@ -360,6 +360,7 @@ def _err(tool_name: str, e: TodoError) -> ToolResult:
 
 async def todo_list_handler(
     args: dict, *, service, session_id: str, cwd: str,
+    last_turn_text: str = "",
 ) -> ToolResult:
     """todo_list:列出 + 过滤 + 排序 + limit 截断。
 
@@ -367,7 +368,7 @@ async def todo_list_handler(
     其他值按字段时间戳 desc;'priority' 按 high > medium > low > critical > None。
     limit 封顶 _MAX_LIST_LIMIT(100)。
     """
-    del cwd  # 当前未用,保留签名
+    del cwd, last_turn_text  # 当前未用,保留签名
     status_filter = args.get("status")
     parent_filter = args.get("parent_task")
     include_done = args.get("include_done", True)
@@ -423,9 +424,10 @@ async def todo_list_handler(
 
 async def todo_get_handler(
     args: dict, *, service, session_id: str, cwd: str,
+    last_turn_text: str = "",
 ) -> ToolResult:
     """todo_get:返回 task 全字段详情 + 触发 task 的依赖关系。"""
-    del cwd, session_id
+    del cwd, session_id, last_turn_text
     task_id = args.get("task_id")
     if not task_id:
         return ToolResult.error(
@@ -459,9 +461,10 @@ async def todo_get_handler(
 
 async def todo_create_handler(
     args: dict, *, service, session_id: str, cwd: str,
+    last_turn_text: str = "",
 ) -> ToolResult:
     """todo_create:T11 全字段 → Service.create。"""
-    del cwd
+    del cwd, last_turn_text
     title = args.get("title")
     if not title:
         return ToolResult.error(
@@ -496,9 +499,10 @@ async def todo_create_handler(
 
 async def todo_update_handler(
     args: dict, *, service, session_id: str, cwd: str,
+    last_turn_text: str = "",
 ) -> ToolResult:
     """todo_update:任意 T11 字段 → Service.update。session_id 显式传。"""
-    del cwd
+    del cwd, last_turn_text  # Task 3 将接入完成门 acceptance 校验
     task_id = args.get("task_id")
     if not task_id:
         return ToolResult.error(
@@ -540,9 +544,10 @@ async def todo_update_handler(
 
 async def todo_delete_handler(
     args: dict, *, service, session_id: str, cwd: str,
+    last_turn_text: str = "",
 ) -> ToolResult:
     """todo_delete:force 透传;返回简化确认。"""
-    del cwd, session_id
+    del cwd, session_id, last_turn_text
     task_id = args.get("task_id")
     if not task_id:
         return ToolResult.error(
@@ -562,12 +567,13 @@ async def todo_delete_handler(
 
 async def todo_resolve_handler(
     args: dict, *, service, session_id: str, cwd: str,
+    last_turn_text: str = "",
 ) -> ToolResult:
     """todo_resolve:BFS 上游依赖链 + 层级缩进(spec line 472-477)。
 
     返回列表顺序:target 在前,随后按 BFS 深度递增列出依赖;每行带 depth 标记。
     """
-    del cwd, session_id
+    del cwd, session_id, last_turn_text
     task_id = args.get("task_id")
     if not task_id:
         return ToolResult.error(
@@ -611,9 +617,10 @@ async def todo_resolve_handler(
 
 async def todo_validate_handler(
     args: dict, *, service, session_id: str, cwd: str,
+    last_turn_text: str = "",
 ) -> ToolResult:
     """todo_validate:全表 issue 列表;strict=True 把 warning 提升为 error。"""
-    del cwd, session_id
+    del cwd, session_id, last_turn_text
     strict = bool(args.get("strict", False))
     try:
         issues = await service.validate()
@@ -666,6 +673,7 @@ MAX_RENDER_TASKS = 50
 
 async def todo_toposort_handler(
     args: dict, *, service, session_id: str, cwd: str,
+    last_turn_text: str = "",
 ) -> ToolResult:
     """todo_toposort:返回 DAG 拓扑视图。
 
@@ -674,13 +682,14 @@ async def todo_toposort_handler(
         service: TodoService 实例。
         session_id: 当前 session(handler 当前未使用,但保留签名)。
         cwd: 当前工作目录(handler 当前未使用)。
+        last_turn_text: 上一轮 LLM 文本(handler 当前未使用,保留签名)。
 
     Returns:
         ToolResult:
         - 正常:is_error=False, llm_text 含 topo order + ready/in_progress/blocked/done 分组。
         - 有环:is_error=True, llm_text 含环路径(不抛异常)。
     """
-    del cwd, session_id
+    del cwd, session_id, last_turn_text
     try:
         tasks_list = await service.list(include_done=True)
     except TodoError as e:

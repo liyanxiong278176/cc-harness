@@ -281,6 +281,7 @@ async def run_repl(
                 state.todo_service,
                 session_id=state.session_id,
                 cwd=str(state.project_root),
+                last_turn_text=state.last_turn_text,
             )
         except Exception as e:
             print_warn(console, f"todo tools 注入失败: {e}; 跳过 7 个 todo tools")
