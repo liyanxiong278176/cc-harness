@@ -256,3 +256,24 @@ def get_ready_tasks(tasks: dict[str, TodoTask]) -> list[TodoTask]:
         if all_done:
             ready.append(task)
     return ready
+
+
+def children_all_done(
+    tasks: dict[str, TodoTask], parent_id: str
+) -> tuple[bool, list[str]]:
+    """parent 的所有直接 children 是否全 done。
+
+    Returns:
+        (all_done, pending_child_ids)
+        - 无 children / parent 不在 dict → (True, [])
+        - children 引用缺失(不在 dict)→ 容错跳过,不阻塞
+        - pending_child_ids 按 task.id 字典序(确定性)
+    只看直接 children(一层);孙的聚合由孙自己的完成动作把关。
+    """
+    if parent_id not in tasks:
+        return (True, [])
+    pending = sorted(
+        t.id for t in tasks.values()
+        if t.parent_task == parent_id and t.status != "done"
+    )
+    return (len(pending) == 0, pending)
