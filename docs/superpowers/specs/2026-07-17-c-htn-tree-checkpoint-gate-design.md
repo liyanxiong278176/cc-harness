@@ -136,7 +136,7 @@ async def todo_update_handler(
     if not task_id:
         return ToolResult.error(display="task_id is required", llm="...")
 
-    fields = _extract_update_fields(args)   # 现有字段提取逻辑不变
+    fields = _extract_update_fields(args)   # 现状 inline 逻辑(tools.py:509-525);抽 helper 或保持 inline 由 plan 定
     force = bool(args.get("force", False))  # C 新增:仅 status=done 时有意义
 
     # --- C 阶段完成门:仅当本次要把 status 设为 done ---
@@ -324,6 +324,7 @@ B 软提示 + C 软拦,两层互补。
 | update status=done:空 acceptance | 跳 acceptance 校验,只查聚合 |
 | update status=done:无 children 的 task | 聚合 (True, []),直接放行到 acceptance 校验 |
 | update status=done:task 已是 done(重复设) | 放行,不触发 gate(幂等) |
+| update status=done:task 当前 pending(从未 in_progress,create 后直接标 done) | `run_verify` 对 non-in_progress 是 no-op(passed=true,B 契约),acceptance 静默通过;聚合仍查。典型 HTN flow(pending→in_progress→done)不踩,已知边界 |
 | update 其他字段(非 status=done) | **完全不触发 gate**(现状行为,force 参数被忽略) |
 | gate 内 `service.list` 抛 | fail-soft 放行(warn log)—— 与 run_verify 异常一致,绝不因内部错误卡死 update |
 | gate 内 `run_verify` 抛 | fail-soft 跳过 acceptance 校验(warn log),聚合校验仍跑 |
