@@ -113,7 +113,7 @@ SubAgent fan-out 完成 (N=3, 总耗时 45s, 总 tokens 12K)
 
 **为什么不默认 serial**(Claude Code 模式):fan-out 场景的核心价值就是并行,serial 失去 fan-out 收益。
 
-**为什么不默认独立 token budget**:D1 不假设"subagent 跑飞不能影响 parent"的强隔离场景(那是 D1.x / D2 付费 / SLA 场景)。Hard cap 留 D1.1 接 SessionTokenStats,subagent 真实消耗仍记入 `SubAgentResult.tokens_used` 供 parent 决策参考。
+**为什么不默认独立 token budget**:D1 不假设"subagent 跑飞不能影响 parent"的强隔离场景(那是 D1.x / D2 付费 / SLA 场景)。Hard cap 留 D1.1 接 SessionTokenStats,`SubAgentResult.tokens_used` 默认 0(parent 看到 0 走 TBD 分支不误判),D1.1 才真实记录。
 
 **D1.1 候选**:`run_in_background: true` 异步参数(parent 不阻塞,返回 task_id,后续 turn 轮询)。**D1 不做**,parent 阻塞够用。
 
@@ -552,7 +552,7 @@ def _extract_file_refs(text: str) -> list[str]:
         r"html|xml|svg|csv|sql|env|ini|cfg|conf|lock)"
         r"(?!\w)"
     )
-    return list(set(re.findall(pattern, text)))
+    return sorted(set(re.findall(pattern, text)))
 
 
 def get_default_runner(
@@ -821,7 +821,7 @@ async def run(
 `_render_subagent_summary` 接口:
 ```python
 def _render_subagent_summary(
-    results: list[SubAgentResult], parent_id: str, timeout: int,
+    results: list[SubAgentResult], parent_id: str,
 ) -> ToolResult:
     """N 个 subagent 结果合并成结构化摘要 ToolResult。"""
 ```
