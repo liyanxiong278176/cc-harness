@@ -132,6 +132,7 @@ class TurnTokenStats:
     api_reported: bool = False
     tool_call_log: list = field(default_factory=list)  # [{name, args, ok, result}], Plan1 收集
     compaction: Any = None  # Plan3: CompactionStats obj (context.py) or None
+    error: str | None = None  # D1 Task 4 fix:run_turn fatal error message(if any)
 
     @property
     def breakdown_subtotal(self) -> int:

@@ -68,6 +68,7 @@ async def run_turn(
     qa_context: dict | None = None,
     resume_task: "TodoTask | None" = None,
     todo_hints: list[str] | None = None,  # B 阶段 Task 5: verify hook hints
+    system_prompt: str | None = None,  # D1 Task 4 fix:subagent override
 ) -> TurnTokenStats:
     """Run one user turn in the given mode.
 
@@ -111,6 +112,13 @@ async def run_turn(
     is not None`,plan/design 模式不渲染。None = kill-switch(向后兼容,
     test_agent.py 不受影响)。
 
+    `system_prompt`(D1 Task 4 fix)可选显式 system prompt override:非 None 时,
+    跳过 `_refresh_system_prompt()`(不重建 system 段),直接把此字符串写入
+    `messages[0]["content"]`(若 `messages[0]` 是 system)或 insert 新 system
+    消息。**专为 subagent 用**(SubAgentRunner 构造独立 system prompt,不能
+    被主 agent 的 mode-aware rebuild 覆盖)。None = 走默认 _refresh 路径
+    (向后兼容,REPL/test_agent 无感)。
+
     Mutates `messages` in place. Async so the repl can call it from its
     persistent event loop without `asyncio.run` overhead.
     """
@@ -124,7 +132,15 @@ async def run_turn(
     last_compaction = None  # Plan3: CompactionStats from maybe_compact (or None)
     _last_node = None  # Q4 Task5: offload edge chain — node_id of last offloaded tool result
 
-    if cwd is not None:
+    # D1 Task 4 fix:system_prompt override 优先于 cwd-driven rebuild(专为
+    # subagent 用 — subagent 构造的独立 prompt 不能被主 agent 的 mode-aware
+    # refresh 覆盖)。非 None → 直接写入/插入 messages[0],跳过 _refresh。
+    if system_prompt is not None:
+        if messages and messages[0].get("role") == "system":
+            messages[0]["content"] = system_prompt
+        else:
+            messages.insert(0, {"role": "system", "content": system_prompt})
+    elif cwd is not None:
         # Phase 1 Q1 uplift: qa_context → render qa_intro section
         if qa_context and qa_context.get("q_type") is not None:
             _refresh_system_prompt(
@@ -381,7 +397,11 @@ async def run_turn(
             content, pending, finish_reason, iter_usage = await _stream_one_turn()
         except Exception as e:
             print_error(console, f"LLM stream failed: {e}")
-            return _stats()
+            # D1 Task 4 fix (Important #1):把 fatal 错误塞 stats.error,
+            # 让 SubAgentRunner.run() 检测到 → status="failed"。
+            _err_stats = _stats()
+            _err_stats.error = f"{type(e).__name__}: {e}"
+            return _err_stats
 
         if iter_usage is not None:
             iter_usages.append(iter_usage)
