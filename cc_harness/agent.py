@@ -34,6 +34,7 @@ from cc_harness.config import ContextConfig
 
 if TYPE_CHECKING:
     from cc_harness.project.models import TodoTask
+    from cc_harness.project.service import TodoService  # D1 Task 7:TodoService 类型注解
 
 _VALID_MODES = ("coding", "plan", "design", "chat")
 
@@ -93,6 +94,9 @@ async def run_turn(
     resume_task: "TodoTask | None" = None,
     todo_hints: list[str] | None = None,  # B 阶段 Task 5: verify hook hints
     system_prompt: str | None = None,  # D1 Task 4 fix:subagent override
+    todo_service: "TodoService | None" = None,  # D1 Task 7:TodoService 实例,非 None 时自动构造 SubAgentRunner + 注入 extras
+    session_id: str = "",  # D1 Task 7:handler 用作 active_sessions(显式,不靠 env var)
+    last_turn_text: str = "",  # D1 Task 7:C 阶段 todo_update 完成门 acceptance 校验用
 ) -> TurnTokenStats:
     """Run one user turn in the given mode.
 
@@ -142,6 +146,26 @@ async def run_turn(
     消息。**专为 subagent 用**(SubAgentRunner 构造独立 system prompt,不能
     被主 agent 的 mode-aware rebuild 覆盖)。None = 走默认 _refresh 路径
     (向后兼容,REPL/test_agent 无感)。
+
+    `todo_service`(D1 Task 7)TodoService 实例:非 None 时,run_turn 在构造
+    tool_specs **之前**自动:
+      1. 调 `get_default_runner(llm, mcp, todo_service, project_root=cwd,
+         max_iter=max_iter, policy=policy, l5=l5)` 构造 depth=0 SubAgentRunner
+         (共享 4 资源 — decision 6:llm / mcp / todo_service / policy,
+         加 l5 — D1 Task 4 fix)。
+      2. 调 `inject_todo_tools(todo_service, session_id, cwd=cwd,
+         last_turn_text=last_turn_text, dispatch_subagent_runner=runner)`
+         构造 9 个 todo entries(含 dispatch_subagent),runner 注入 deps。
+      3. 把 todo entries append 到 `extra_native_specs`(若 caller 已传
+         extra_native_specs,合并而非替换 — REPL 当前既传 memory_extras 又
+         将来传 todo_service 时不丢 memory_extras)。None = 跳过 auto-build
+         (向后兼容,旧 caller / test_agent.py 不受影响)。
+
+    `session_id`(D1 Task 7)handler 用作 active_sessions(显式,不靠 env var)。
+    与 `todo_service` 配对使用;todo_service 非 None 时建议传非空 session_id。
+
+    `last_turn_text`(D1 Task 7)C 阶段 todo_update 完成门 acceptance 校验用。
+    todo_service 非 None 时透传给 inject_todo_tools。
 
     Mutates `messages` in place. Async so the repl can call it from its
     persistent event loop without `asyncio.run` overhead.
@@ -258,6 +282,36 @@ async def run_turn(
     # it physically cannot emit tool_calls. In coding mode, expose both the
     # MCP tool set and the native tool registry (built-in + caller-injected).
     if mode in ("coding", "chat"):
+        # --- D1 Task 7: todo_service → 自动构造 SubAgentRunner + 注入 extras ---
+        # 共享 4 资源(decision 6: llm / mcp / todo_service / policy) + l5
+        # (D1 Task 4 fix);runner 注入 dispatch_subagent entry 的 deps dict。
+        # 合并而非替换 caller 的 extra_native_specs(REPL 既有 memory_extras
+        # 又传 todo_service 时不丢 memory_extras)。fail-soft: 构造异常时
+        # 跳过 auto-build,继续走默认路径,不崩主循环。
+        if todo_service is not None:
+            try:
+                from cc_harness.project.subagent import get_default_runner
+                from cc_harness.project.extras import inject_todo_tools
+                _runner = get_default_runner(
+                    llm, mcp, todo_service,
+                    project_root=str(project_root),
+                    max_iter=max_iter,
+                    policy=policy,
+                    l5=l5,
+                )
+                _todo_extras = inject_todo_tools(
+                    todo_service, session_id,
+                    cwd=str(project_root),
+                    last_turn_text=last_turn_text,
+                    dispatch_subagent_runner=_runner,
+                )
+                if extra_native_specs is None:
+                    extra_native_specs = _todo_extras
+                else:
+                    extra_native_specs = list(extra_native_specs) + _todo_extras
+            except Exception as _e:
+                print_warn(console, f"subagent runner 注入失败: {_e}; 跳过 dispatch_subagent")
+
         tool_specs = list(mcp.list_tools())
         for native in NATIVE_TOOLS.values():
             tool_specs.append(native["spec"])

@@ -7,6 +7,7 @@ Task 4 fix (review):run_turn(system_prompt/l5)+ handler 校验顺序 + SubAgentR
 """
 from __future__ import annotations
 
+import json
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import get_args
@@ -817,3 +818,58 @@ def test_inject_todo_tools_attaches_dispatch_subagent_runner(tmp_path):
         if e["spec"]["function"]["name"] == "dispatch_subagent"
     )
     assert dispatch_entry["deps"]["dispatch_subagent_runner"] is runner
+
+
+# ---------------------------------------------------------------------------
+# D1 Task 7:run_turn 构造 SubAgentRunner + 注入 dispatch_subagent_runner
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_run_turn_injects_dispatch_subagent_runner(tmp_path):
+    """run_turn 构造 SubAgentRunner 并注入到 extras 的 deps(关键 fix #1)。
+
+    通过 dispatch_subagent 真调通路径验证注入成功:tool message 应含
+    _render_subagent_summary 的"SubAgent fan-out"串(没注入 → "未注入"
+    错误;注入成功 → 渲染摘要)。
+    """
+    from cc_harness.agent import run_turn
+    from cc_harness.cli.init import init_noninteractive
+    from cc_harness.llm import PendingToolCall
+    from cc_harness.policy import PolicyEngine
+    from cc_harness.project.service import TodoService
+    from tests.test_agent import FakeLLM, FakeMCP, FakeStreamEvent
+
+    svc = TodoService(
+        project_root=tmp_path,
+        manifest=init_noninteractive(tmp_path, name="d1-rt", write_gitignore=False),
+    )
+    parent = await svc.create(title="p", session_id="s")
+
+    # FakeLLM 调 dispatch_subagent 触达注入路径
+    pending = [PendingToolCall(
+        index=0, id="d1", name="dispatch_subagent",
+        arguments_json=json.dumps({"task_id": parent.id, "sub_specs": [{"title": "c"}]}),
+    )]
+    llm = FakeLLM(responses=[
+        [FakeStreamEvent(kind="done", content="dispatch", pending=pending, finish_reason="tool_calls")],
+        [FakeStreamEvent(kind="done", content="done", pending=[], finish_reason="stop")],
+    ])
+    mcp = FakeMCP(tools_spec=[], results={}, calls=[])
+
+    messages = [{"role": "user", "content": "dispatch it"}]
+    await run_turn(
+        messages, llm, mcp,
+        cwd=str(tmp_path), max_iter=3,
+        policy=PolicyEngine(project_root=tmp_path, enabled=False),
+        todo_service=svc,
+        session_id="s",
+    )
+
+    # 验证:dispatch_subagent 已被调用,tool message 进了 messages(说明注入成功,不然会报"未注入")
+    tool_msgs = [m for m in messages if m.get("role") == "tool"]
+    assert tool_msgs, "agent should have produced a tool message"
+    assert "SubAgent fan-out" in tool_msgs[-1]["content"], (
+        f"tool message 应含 'SubAgent fan-out'(注入成功); got: "
+        f"{tool_msgs[-1]['content'][:300]}"
+    )
