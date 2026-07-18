@@ -3,9 +3,11 @@
 Task 2: _build_subagent_system_prompt + _render_subagent_summary。
 Task 3: SubAgentRunner 类 + get_default_runner + _subagent_err。
 Task 4: dispatch_subagent_handler + TODO_DISPATCH_SUBAGENT_SPEC。
+Task 4 fix (review):run_turn(system_prompt/l5)+ handler 校验顺序 + SubAgentRunner.run() 行为。
 """
 from __future__ import annotations
 
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import get_args
 
@@ -24,6 +26,12 @@ from cc_harness.project.subagent import (
     _subagent_err,
     get_default_runner,
 )
+
+
+# Reuse FakeMCP from test_agent (FakeLLM/FakeStreamEvent not needed in this file —
+# 我们用本地的 _RecordingLLM/_FailingLLM 等 dataclass)。
+from tests.test_agent import FakeMCP  # noqa: E402
+from cc_harness.mcp_client import ToolResult  # noqa: E402
 
 
 # ---------------------------------------------------------------------------
@@ -370,3 +378,410 @@ async def test_subagent_runner_timeout_validation(tmp_path):
         )
         assert r.is_error is True, f"timeout={bad_timeout} should be rejected"
         assert "timeout" in (r.display_text or "") + (r.llm_text or "")
+
+
+# ---------------------------------------------------------------------------
+# D1 Task 4 fix:handler int 转换安全(Important #2)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_subagent_runner_int_conversion_safe(tmp_path):
+    """Important #2:max_fan_out / timeout 非数字(str / None / 列表)→ 友好 error,
+    不让 ValueError/TypeError 冒泡 handler 而崩整轮。
+
+    之前:int(args.get("max_fan_out", 3)) 跑在 if not task_id 之前,
+    args={"task_id":"t","sub_specs":[{...}],"max_fan_out":"abc"} 会让
+    ValueError 未捕获 → handler raise → MCP dispatch 崩。修复后:
+    基础校验(task_id / sub_specs)先通过 → int 转换在 try/except 里。
+    """
+    from cc_harness.project.tools import dispatch_subagent_handler
+
+    svc = _make_service(tmp_path)
+    parent = await svc.create(title="p", session_id="s")
+    policy = PolicyEngine(project_root=Path(str(tmp_path)), enabled=False)
+    runner = SubAgentRunner(
+        llm=None, mcp=None, todo_service=svc, current_depth=0,
+        project_root=str(tmp_path), max_iter=5, policy=policy,
+    )
+    # "abc" / None / 列表都是 int() 抛 ValueError/TypeError 的情形
+    for bad in ["abc", None, [1, 2]]:
+        r = await dispatch_subagent_handler(
+            {"task_id": parent.id, "sub_specs": [{"title": "c"}],
+             "max_fan_out": bad},
+            service=svc, session_id="s", cwd=str(tmp_path),
+            dispatch_subagent_runner=runner,
+        )
+        assert r.is_error is True, f"max_fan_out={bad!r} should be rejected"
+        msg = (r.display_text or "") + (r.llm_text or "")
+        assert "类型错" in msg, f"expected 类型错 in error, got: {msg}"
+
+
+# ---------------------------------------------------------------------------
+# D1 Task 4 fix:SubAgentRunner.run() 实际行为测试(Critical #1/2 + Important #1/5)
+# 套用 tests/test_agent.py 的 FakeLLM/FakeMCP 模式,加 _RecordingLLM 记录入参。
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class _RecordingLLM:
+    """记录所有 chat() 调用收到的 messages(供 system_prompt 验证)。"""
+    responses: list
+    call_count: int = 0
+    received_messages: list[list[dict]] = field(default_factory=list)
+    model: str = "fake"
+
+    async def chat(self, messages, tools):
+        self.call_count += 1
+        # 浅拷贝记录(只存 messages 引用,后续被改也不重新 snapshot)
+        self.received_messages.append(list(messages))
+        idx = self.call_count - 1
+        for ev in self.responses[idx]:
+            yield ev
+
+
+@dataclass
+class _FailingLLM:
+    """chat() 直接 raise — 模拟 fatal provider error(auth fail / model not found)。"""
+    call_count: int = 0
+
+    async def chat(self, messages, tools):
+        self.call_count += 1
+        raise RuntimeError("simulated provider error")
+        yield  # 不可达,让 async generator 类型正确  # noqa: F401
+
+
+@dataclass
+class _SlowLLM:
+    """chat() 延迟 yield — 模拟 LLM 慢响应,触发外层 asyncio.wait_for timeout。"""
+    call_count: int = 0
+    delay_s: float = 2.0
+
+    async def chat(self, messages, tools):
+        self.call_count += 1
+        import asyncio as _aio
+        await _aio.sleep(self.delay_s)
+        from cc_harness.llm import StreamEvent
+        yield StreamEvent(kind="done", content="slow", pending=[], finish_reason="stop")
+
+
+@dataclass
+class _RaisingHandlerLLM:
+    """chat() 调一个会 raise 的 tool — 模拟 tool handler 抛异常路径。"""
+    tool_name: str
+    call_count: int = 0
+
+    async def chat(self, messages, tools):
+        from cc_harness.llm import PendingToolCall, StreamEvent
+        self.call_count += 1
+        if self.call_count == 1:
+            pending = [PendingToolCall(
+                index=0, id="c1", name=self.tool_name, arguments_json="{}",
+            )]
+            yield StreamEvent(
+                kind="done", content="", pending=pending, finish_reason="tool_calls",
+            )
+        else:
+            yield StreamEvent(
+                kind="done", content="ok", pending=[], finish_reason="stop",
+            )
+
+
+@pytest.mark.asyncio
+async def test_subagent_runner_accepts_l5_parameter(tmp_path):
+    """Critical #2 子项:SubAgentRunner.__init__ 接受 l5 参数 + get_default_runner 透传。"""
+    from cc_harness.l5 import KeyRegexLayer, L5Engine
+
+    l5 = L5Engine(layers=[KeyRegexLayer()], pii_active=False)
+    policy = PolicyEngine(project_root=Path(str(tmp_path)), enabled=False)
+    runner = SubAgentRunner(
+        llm=None, mcp=None, todo_service=None,
+        current_depth=0, project_root=str(tmp_path), max_iter=5,
+        policy=policy, l5=l5,
+    )
+    assert runner.l5 is l5
+
+    # get_default_runner 也接受 l5
+    runner2 = get_default_runner(
+        None, None, None,
+        project_root=str(tmp_path), max_iter=10, policy=policy, l5=l5,
+    )
+    assert runner2.l5 is l5
+
+
+@pytest.mark.asyncio
+async def test_subagent_runner_preserves_custom_system_prompt(tmp_path):
+    """Critical #1:FakeLLM 收到的 messages[0]["content"] 含 subagent 自定义 system prompt。
+
+    之前:SubAgentRunner.run() 构造的 system prompt 在 run_turn 内部被
+    `_refresh_system_prompt()` 覆盖(主 agent 的 mode-aware rebuild),
+    subagent 看到主 prompt。修复后:run_turn 接受 `system_prompt` override,
+    SubAgentRunner 透传,custom prompt 不被改写。
+    """
+    from cc_harness.llm import StreamEvent
+
+    svc = _make_service(tmp_path)
+    parent = await svc.create(title="p", session_id="s")
+    policy = PolicyEngine(project_root=Path(str(tmp_path)), enabled=False)
+
+    # marker 放在 title 里 — _build_subagent_system_prompt 把 title 注入 prompt
+    marker = "# My Custom Subagent Marker xyz123"
+    llm = _RecordingLLM(responses=[[
+        StreamEvent(kind="done", content="done", pending=[], finish_reason="stop"),
+    ]])
+    mcp = FakeMCP(tools_spec=[], results={}, calls=[])
+
+    runner = SubAgentRunner(
+        llm=llm, mcp=mcp, todo_service=svc,
+        current_depth=0, project_root=str(tmp_path), max_iter=5,
+        policy=policy,
+    )
+    await runner.run(
+        task_id=parent.id,
+        title=marker,
+        description="",
+        session_id="s",
+        timeout=10,
+    )
+
+    # LLM 应在 messages[0]["content"] 看到 subagent 自定义 prompt(含 marker)
+    assert llm.call_count >= 1
+    first_call_messages = llm.received_messages[0]
+    assert first_call_messages[0]["role"] == "system"
+    assert marker in first_call_messages[0]["content"], (
+        f"system prompt 应保留 subagent marker; got: "
+        f"{first_call_messages[0]['content'][:200]}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_subagent_runner_returns_failed_on_provider_error(tmp_path):
+    """Important #1:FakeLLM.chat() 抛 RuntimeError → SubAgentRunner.run() 返 status='failed'。
+
+    之前:run_turn 在 _stream_one_turn 捕获 Exception → 返回 _stats()(不 raise),
+    SubAgentRunner 看到 "normal exit" → status 兜底成 done / unknown,失去
+    "失败"语义。修复后:run_turn 把 fatal 错误塞 stats.error,
+    SubAgentRunner 检测到 → status="failed" + error 含异常类型。
+    """
+    from cc_harness.l5 import KeyRegexLayer, L5Engine
+
+    svc = _make_service(tmp_path)
+    parent = await svc.create(title="p", session_id="s")
+    policy = PolicyEngine(project_root=Path(str(tmp_path)), enabled=False)
+
+    llm = _FailingLLM()
+    mcp = FakeMCP(tools_spec=[], results={}, calls=[])
+
+    runner = SubAgentRunner(
+        llm=llm, mcp=mcp, todo_service=svc,
+        current_depth=0, project_root=str(tmp_path), max_iter=5,
+        policy=policy, l5=L5Engine(layers=[KeyRegexLayer()], pii_active=False),
+    )
+    result = await runner.run(
+        task_id=parent.id, title="t", session_id="s", timeout=10,
+    )
+    assert result.status == "failed", (
+        f"provider error 应返 status=failed, got {result.status}"
+    )
+    assert result.error is not None
+    assert "RuntimeError" in result.error, (
+        f"error 应含 'RuntimeError', got: {result.error}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_subagent_runner_returns_done_on_successful_run(tmp_path):
+    """Important #5:happy path — FakeLLM 正常完成 + sub-todo 已 mark done → status='done'。
+
+    验证 SubAgentRunner.run() 5 步流程能正确落到 "正常完成" 分支,并把
+    final_status 透传给 SubAgentResult.status。"""
+    from cc_harness.llm import StreamEvent
+
+    svc = _make_service(tmp_path)
+    parent = await svc.create(title="p", session_id="s")
+    policy = PolicyEngine(project_root=Path(str(tmp_path)), enabled=False)
+
+    llm = _RecordingLLM(responses=[[
+        StreamEvent(kind="done", content="all done", pending=[], finish_reason="stop"),
+    ]])
+    mcp = FakeMCP(tools_spec=[], results={}, calls=[])
+
+    # 预 mark sub-todo 为 done(runner 检查 final_t.status)
+    parent = await svc.update(parent.id, status="in_progress", session_id="s")
+    parent = await svc.update(parent.id, status="done", session_id="s")
+
+    runner = SubAgentRunner(
+        llm=llm, mcp=mcp, todo_service=svc,
+        current_depth=0, project_root=str(tmp_path), max_iter=5,
+        policy=policy,
+    )
+    result = await runner.run(
+        task_id=parent.id, title="t", session_id="s", timeout=10,
+    )
+    assert result.status == "done", f"expected done, got {result.status}"
+    assert "all done" in result.final_text
+    assert result.duration_s > 0
+
+
+@pytest.mark.asyncio
+async def test_subagent_runner_returns_incomplete_when_max_iter_reached(tmp_path):
+    """Important #5:max_iter 耗尽 + todo 未 done → status='incomplete'。
+
+    验证 SubAgentRunner.run() 第 4 步判 incomplete 分支:iter_used >= max_iter
+    且 final_status not in ('done','blocked')。"""
+    from cc_harness.llm import PendingToolCall, StreamEvent
+
+    svc = _make_service(tmp_path)
+    parent = await svc.create(title="p", session_id="s")
+    policy = PolicyEngine(project_root=Path(str(tmp_path)), enabled=False)
+
+    # 一个无害的 fs tool,让 LLM 不断调它耗尽 max_iter
+    fs_tool = {"type": "function", "function": {
+        "name": "mcp__fs__read", "description": "r", "parameters": {"type": "object"},
+    }}
+    pending = PendingToolCall(index=0, id="c1", name="mcp__fs__read", arguments_json="{}")
+    max_iter = 3
+    responses = []
+    for _ in range(max_iter + 5):  # 多备,保险
+        responses.append([
+            StreamEvent(kind="done", content="looping",
+                        pending=[pending], finish_reason="tool_calls"),
+        ])
+    llm = _RecordingLLM(responses=responses)
+    mcp = FakeMCP(
+        tools_spec=[fs_tool],
+        results={"mcp__fs__read": ToolResult.success("x")},
+        calls=[],
+    )
+
+    runner = SubAgentRunner(
+        llm=llm, mcp=mcp, todo_service=svc,
+        current_depth=0, project_root=str(tmp_path), max_iter=max_iter,
+        policy=policy,
+    )
+    # parent 留 in_progress(非 done/blocked) → 触发 incomplete
+    parent = await svc.update(parent.id, status="in_progress", session_id="s")
+    result = await runner.run(
+        task_id=parent.id, title="t", session_id="s", timeout=10,
+    )
+    assert result.status == "incomplete", (
+        f"expected incomplete, got {result.status}; error={result.error}"
+    )
+    assert "max_iter" in (result.error or "")
+
+
+@pytest.mark.asyncio
+async def test_subagent_runner_returns_timeout_when_exceeded(tmp_path):
+    """Important #5:run_turn 跑得比 timeout 久 → status='timeout'。"""
+    svc = _make_service(tmp_path)
+    parent = await svc.create(title="p", session_id="s")
+    policy = PolicyEngine(project_root=Path(str(tmp_path)), enabled=False)
+
+    llm = _SlowLLM(delay_s=3.0)
+    mcp = FakeMCP(tools_spec=[], results={}, calls=[])
+
+    runner = SubAgentRunner(
+        llm=llm, mcp=mcp, todo_service=svc,
+        current_depth=0, project_root=str(tmp_path), max_iter=5,
+        policy=policy,
+    )
+    result = await runner.run(
+        task_id=parent.id, title="t", session_id="s", timeout=1,
+    )
+    assert result.status == "timeout", f"expected timeout, got {result.status}"
+    assert "timeout" in (result.error or "").lower()
+
+
+@pytest.mark.asyncio
+async def test_subagent_runner_returns_failed_on_tool_error(tmp_path):
+    """Important #5:tool handler 抛异常 → run_turn 异常冒泡 → SubAgentRunner 捕 → status='failed'。
+
+    与 provider error 测试不同:这里 LLM 正常 stream,调一个会 raise 的 tool,
+    异常从 _dispatch 冒出 run_turn,被 SubAgentRunner 的 except Exception 捕获。
+    用 _BoomMCP 让 mcp.call_tool() raise(模拟 tool handler 抛异常路径)。
+    """
+    svc = _make_service(tmp_path)
+    parent = await svc.create(title="p", session_id="s")
+    policy = PolicyEngine(project_root=Path(str(tmp_path)), enabled=False)
+
+    boom_tool_spec = {
+        "type": "function", "function": {
+            "name": "boom_tool", "description": "raises",
+            "parameters": {"type": "object"},
+        },
+    }
+    llm = _RaisingHandlerLLM(tool_name="boom_tool")
+    mcp = _BoomMCP(
+        tools_spec=[boom_tool_spec],
+        raise_with=RuntimeError("Tool Error: boom"),
+    )
+    runner = SubAgentRunner(
+        llm=llm, mcp=mcp, todo_service=svc,
+        current_depth=0, project_root=str(tmp_path), max_iter=5,
+        policy=policy,
+    )
+    result = await runner.run(
+        task_id=parent.id, title="t", session_id="s", timeout=10,
+    )
+    assert result.status == "failed", f"expected failed, got {result.status}"
+    assert "Tool Error" in (result.error or ""), (
+        f"error 应含 'Tool Error', got: {result.error}"
+    )
+
+
+@dataclass
+class _BoomMCP:
+    """call_tool 直接 raise — 模拟 tool handler 异常路径。"""
+    tools_spec: list[dict]
+    raise_with: Exception
+    calls: list[tuple[str, dict]] = field(default_factory=list)
+
+    def list_tools(self) -> list[dict]:
+        return list(self.tools_spec)
+
+    async def call_tool(self, name: str, args: dict):
+        self.calls.append((name, args))
+        raise self.raise_with
+
+
+@pytest.mark.asyncio
+async def test_subagent_runner_inherits_l5_dlp(tmp_path):
+    """Critical #2:FakeLLM 输出含 AWS key → l5 脱敏后 final_text 含 [REDACTED:aws_access_key]。
+
+    之前:SubAgentRunner.run() 不传 l5 给 run_turn → subagent 思考/结果不经脱敏,
+    密钥直出(决策 6 违规)。修复后:l5 透传,run_turn._redact() 替换命中片段。
+    """
+    from cc_harness.l5 import KeyRegexLayer, L5Engine
+    from cc_harness.llm import StreamEvent
+
+    svc = _make_service(tmp_path)
+    parent = await svc.create(title="p", session_id="s")
+    policy = PolicyEngine(project_root=Path(str(tmp_path)), enabled=False)
+
+    secret = "AKIAIOSFODNN7EXAMPLE"  # AWS access key(16 字母数字)
+    llm = _RecordingLLM(responses=[[
+        StreamEvent(kind="done", content=f"here is the key: {secret}",
+                    pending=[], finish_reason="stop"),
+    ]])
+    mcp = FakeMCP(tools_spec=[], results={}, calls=[])
+
+    # 预 mark sub-todo 为 done,让 runner.run() 落到 "正常完成" 分支
+    parent = await svc.update(parent.id, status="in_progress", session_id="s")
+    parent = await svc.update(parent.id, status="done", session_id="s")
+
+    l5 = L5Engine(layers=[KeyRegexLayer()], pii_active=False)
+    runner = SubAgentRunner(
+        llm=llm, mcp=mcp, todo_service=svc,
+        current_depth=0, project_root=str(tmp_path), max_iter=5,
+        policy=policy, l5=l5,
+    )
+    result = await runner.run(
+        task_id=parent.id, title="t", session_id="s", timeout=10,
+    )
+    assert result.status == "done"
+    assert secret not in result.final_text, (
+        f"secret 不应出现在 final_text, got: {result.final_text}"
+    )
+    assert "[REDACTED:aws_access_key]" in result.final_text, (
+        f"final_text 应含 [REDACTED:aws_access_key], got: {result.final_text}"
+    )
