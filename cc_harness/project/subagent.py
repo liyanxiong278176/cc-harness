@@ -33,6 +33,7 @@ from cc_harness.project.tools import ToolResult
 log = logging.getLogger(__name__)
 
 if TYPE_CHECKING:  # 避免循环依赖:agent.run_turn 不在模块级 import(Task 4 再引)
+    from cc_harness.l5 import L5Engine
     from cc_harness.llm import LLMClient
     from cc_harness.mcp_client import MCPClient
     from cc_harness.policy import PolicyEngine
@@ -243,6 +244,7 @@ class SubAgentRunner:
         project_root: str = "",
         max_iter: int = 20,
         policy: PolicyEngine,
+        l5: "L5Engine | None" = None,  # D1 Task 4 fix:subagent 继承主 agent 的 L5 引擎
     ):
         self.llm = llm
         self.mcp = mcp
@@ -251,6 +253,7 @@ class SubAgentRunner:
         self.project_root = project_root
         self.max_iter = max_iter
         self.policy = policy
+        self.l5 = l5
 
     async def run(
         self,
@@ -274,7 +277,7 @@ class SubAgentRunner:
 
         status 取值:
           - "timeout":超过 timeout 秒
-          - "failed":subagent 内异常
+          - "failed":subagent 内异常(fatal provider error / tool handler 抛 / L5 不丢链)
           - "incomplete":max_iter 耗尽但 todo 未 done/blocked
           - "done" / "blocked" / "in_progress":todo 实际最终状态
         """
@@ -299,12 +302,14 @@ class SubAgentRunner:
         ]
 
         # 2. 注入 extras(deps 加 dispatch_subagent_runner=self 的下一层)
+        # D1 Task 4 fix:next_runner 透传 l5,保持脱敏链路(subagent 思考/结果同主 agent)。
         next_runner = SubAgentRunner(
             self.llm, self.mcp, self.todo_service,
             current_depth=self.current_depth + 1,
             project_root=self.project_root,
             max_iter=self.max_iter,
             policy=self.policy,
+            l5=self.l5,
         )
         extras = inject_todo_tools(
             self.todo_service, session_id, cwd=self.project_root,
@@ -318,14 +323,18 @@ class SubAgentRunner:
         ]
 
         # 3. 跑 subagent ReAct loop(超时由外层 asyncio.wait_for 控)
+        # D1 Task 4 fix:传 system_prompt 跳过 mode-aware rebuild(避免主 agent
+        # prompt 覆盖 subagent 独立 system);传 l5 继承脱敏(决策 6)。
         try:
-            await asyncio.wait_for(
+            stats = await asyncio.wait_for(
                 run_turn(
                     messages, self.llm, self.mcp,
                     cwd=self.project_root,
                     max_iter=self.max_iter,
                     extra_native_specs=extras,
                     policy=self.policy,
+                    l5=self.l5,
+                    system_prompt=system_prompt,
                 ),
                 timeout=timeout,
             )
@@ -342,20 +351,29 @@ class SubAgentRunner:
                 error=str(e)[:200],
                 duration_s=time.time() - start,
             )
-        else:
-            # 4. 检测 max_iter 耗尽(没 timeout/exception 的话)
-            try:
-                final_t = await self.todo_service.get(task_id)
-                final_status = final_t.status
-            except Exception:
-                final_status = "unknown"
-            iter_used = sum(1 for m in messages if m.get("role") == "assistant")
-            if iter_used >= self.max_iter and final_status not in ("done", "blocked"):
-                return SubAgentResult(
-                    task_id=task_id, title=title, status="incomplete",
-                    error=f"max_iter={self.max_iter} 耗尽, todo 未 done/blocked",
-                    duration_s=time.time() - start,
-                )
+
+        # D1 Task 4 fix (Important #1):run_turn 不再 raise fatal provider
+        # error,而是塞 stats.error。SubAgentRunner 检测到 → status="failed"。
+        if stats.error:
+            return SubAgentResult(
+                task_id=task_id, title=title, status="failed",
+                error=f"run_turn 错误: {stats.error}",
+                duration_s=time.time() - start,
+            )
+
+        # 4. 检测 max_iter 耗尽(没 timeout/exception/fatal 的话)
+        try:
+            final_t = await self.todo_service.get(task_id)
+            final_status = final_t.status
+        except Exception:
+            final_status = "unknown"
+        iter_used = sum(1 for m in messages if m.get("role") == "assistant")
+        if iter_used >= self.max_iter and final_status not in ("done", "blocked"):
+            return SubAgentResult(
+                task_id=task_id, title=title, status="incomplete",
+                error=f"max_iter={self.max_iter} 耗尽, todo 未 done/blocked",
+                duration_s=time.time() - start,
+            )
 
         # 5. 正常完成
         final_text = _extract_final_text(messages)[-500:]
@@ -370,12 +388,14 @@ class SubAgentRunner:
 def get_default_runner(
     llm, mcp, todo_service,
     *, project_root: str, max_iter: int, policy: PolicyEngine,
+    l5: "L5Engine | None" = None,  # D1 Task 4 fix:透传主 agent L5
 ) -> SubAgentRunner:
     """构造主 agent 调用的 runner(depth=0)。
 
     **不在模块级做单例缓存**(避免多 session 跨 llm/mcp/service/policy
     复用错实例 — 重要 fix #1)。调用方(agent.run_turn)在每次 dispatch 前
-    构造 1 个新实例;policy 由主 agent 透传(decision 6,共享 L4 闸门)。
+    构造 1 个新实例;policy 由主 agent 透传(decision 6,共享 L4 闸门);
+    l5 由主 agent 透传(D1 Task 4 fix,共享 L5 脱敏链路)。
     """
     return SubAgentRunner(
         llm, mcp, todo_service,
@@ -383,6 +403,7 @@ def get_default_runner(
         project_root=project_root,
         max_iter=max_iter,
         policy=policy,
+        l5=l5,
     )
 
 
