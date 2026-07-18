@@ -1,4 +1,7 @@
-"""Sub-project D1 Task 1: SubAgentResult + _extract_file_refs 底座。"""
+"""Sub-project D1 Task 1: SubAgentResult + _extract_file_refs 底座。
+
+Task 2: _build_subagent_system_prompt + _render_subagent_summary。
+"""
 from __future__ import annotations
 
 from typing import get_args
@@ -6,7 +9,9 @@ from typing import get_args
 from cc_harness.project.subagent import (
     SubAgentResult,
     SubAgentStatus,
+    _build_subagent_system_prompt,
     _extract_file_refs,
+    _render_subagent_summary,
 )
 
 
@@ -83,3 +88,60 @@ def test_extract_file_refs_bare_dotenv():
     assert _extract_file_refs("Copy .env to .env") == [".env"]
     # 与其它扩展名混排
     assert ".env" in _extract_file_refs("see .env and config.yaml")
+
+
+# ---------------------------------------------------------------------------
+# D1 Task 2:_build_subagent_system_prompt + _render_subagent_summary
+# ---------------------------------------------------------------------------
+
+
+def test_build_subagent_prompt_includes_task_metadata():
+    """System prompt 含 task_id / title / parent_id / acceptance_criteria / depth。"""
+    p = _build_subagent_system_prompt(
+        task_id="t1", title="test foo", description="run pytest",
+        criteria=["5/5 通过"], parent_id="p1", depth=1,
+    )
+    assert "t1" in p
+    assert "test foo" in p
+    assert "p1" in p
+    assert "5/5 通过" in p
+    assert "depth=1" in p
+
+
+def test_build_subagent_prompt_no_description_no_criteria():
+    """description / criteria 为空时跳过对应行(不留 '描述:' 空行 wart)。"""
+    p = _build_subagent_system_prompt(
+        task_id="t1", title="x", description="",
+        criteria=[], parent_id="p1", depth=0,
+    )
+    assert "描述:" not in p  # D1 Minor fix:不留视觉 wart
+    assert "acceptance_criteria:" not in p
+
+
+def test_render_summary_includes_done_state_hint():
+    """3 个 subagent 全 done → '父完成门: 全部 done'。"""
+    results = [
+        SubAgentResult(task_id="t1", title="a", status="done", final_text="x"),
+        SubAgentResult(task_id="t2", title="b", status="done", final_text="y"),
+        SubAgentResult(task_id="t3", title="c", status="done", final_text="z"),
+    ]
+    tr = _render_subagent_summary(results, parent_id="p1")
+    assert "全部 done" in tr.llm_text
+    assert "p1" in tr.llm_text
+    assert tr.is_error is False
+
+
+def test_render_summary_done_count_display():
+    """display_text 含 N done 统计;status_label 覆盖 done/timeout/failed/incomplete。"""
+    results = [
+        SubAgentResult(task_id="t1", title="a", status="done"),
+        SubAgentResult(task_id="t2", title="b", status="timeout", error="oops"),
+        SubAgentResult(task_id="t3", title="c", status="incomplete"),
+        SubAgentResult(task_id="t4", title="d", status="failed", error="x"),
+    ]
+    tr = _render_subagent_summary(results, parent_id="p1")
+    assert "1/4" in tr.display_text
+    assert "timeout" in tr.llm_text
+    assert "incomplete" in tr.llm_text
+    assert "failed" in tr.llm_text
+    assert "未 done" in tr.llm_text  # 父完成门 hint
