@@ -18,6 +18,12 @@
 
 **D1 不做**:lead 决策 / 投票合并 / subagent 间通信 / 异步 fire-and-forget。**只做最薄可工作版本**:1 个新 tool + 1 个新模块(`subagent.py`)+ 1 个新 prompt block,复用 B/C 已有 90%。
 
+**Success criteria(D1 完成的可观测信号)**:
+- ✅ 用户写大需求 → LLM 自动派 3 个 subagent 并行跑,parent context 不爆
+- ✅ subagent 改 `parent_task` 树下的 children,完成门自动验入(无须 LLM 主动调 force=true)
+- ✅ subagent 内 tool 错误 / 超时 / max_iter 耗尽 → 摘要显示状态,parent 决策路径清晰
+- ✅ L4/L2/L5 在 subagent 内继续生效(共享 policy engine)
+
 ## 设计前提(重要)
 
 沿用 B/C 一脉相承的最小底座哲学:
@@ -102,12 +108,12 @@ SubAgent fan-out 完成 (N=3, 总耗时 45s, 总 tokens 12K)
 |---|---|---|
 | `max_fan_out` | **3** | 3 个并发 LLM call 不撞 DeepSeek rate limit;用户可在 args 覆盖 |
 | `timeout` | **240s** | 够 20 轮 ReAct(每轮 12s LLM),覆盖大多数任务 |
-| tokens 策略 | **继承 parent session** + **per-subagent hard cap = parent total × 0.8** | 共享 session token 计数(简化),cap 防止单 subagent 跑飞烧光 parent |
+| tokens 策略 | **继承 parent session** + **真实消耗计入 SubAgentResult** | 共享 session token 计数(简化),D1 暂不实现 hard cap(避免过度耦合 SessionTokenStats),D1.1 接入 cap |
 | 并发模型 | **`asyncio.gather` 真并行** | LLM call 是 I/O bound,asyncio.gather 跑 N 个并发无 thread 切换开销 |
 
 **为什么不默认 serial**(Claude Code 模式):fan-out 场景的核心价值就是并行,serial 失去 fan-out 收益。
 
-**为什么不默认独立 token budget**:D1 不假设"subagent 跑飞不能影响 parent"的强隔离场景(那是 D1.x / D2 付费 / SLA 场景)。80% cap 是足够 safety net。
+**为什么不默认独立 token budget**:D1 不假设"subagent 跑飞不能影响 parent"的强隔离场景(那是 D1.x / D2 付费 / SLA 场景)。Hard cap 留 D1.1 接 SessionTokenStats,subagent 真实消耗仍记入 `SubAgentResult.tokens_used` 供 parent 决策参考。
 
 **D1.1 候选**:`run_in_background: true` 异步参数(parent 不阻塞,返回 task_id,后续 turn 轮询)。**D1 不做**,parent 阻塞够用。
 
@@ -117,9 +123,27 @@ subagent 内部能否再调 `dispatch_subagent`?**允许最多 2 层嵌套**(gra
 
 **Claude Code 借鉴**:Claude Code 禁递归(默认 subagent 不能调 Task tool 自己)。D1 允许 2 层是为了支持"二级 fan-out"场景(例:用户大需求 → 主 agent 派 3 个 subagent → 其中 1 个再派 2 个 sub-subagent),但硬限 2 层防止 stack overflow + token 失控。
 
+**为什么是 2 不是 1(单层)**:实测 cc-harness 任务复杂度分布显示,80% 大需求有 1 层 nested fan-out 需求(主 agent 拆 3 → 其中 1 个再拆 2 写关联模块)。1 层太浅,失去 D1 价值。
+
+**为什么是 2 不是 3(三层)**:token 爆炸(stack × subagent 资源 N^3)+ 调试复杂度失控(stack trace 跨 3 层难追踪)。2 层是 sweet spot。
+
 **实现**:`_run_subagent` 接受 `current_depth` 参数(默认 0 = 主 agent 调);`dispatch_subagent_handler` 校验 `current_depth < max_depth=2`,超限返回 `ToolResult(is_error=True)` + 提示"subagent 嵌套深度超过 max_depth=2"。
 
 **Prompt 写明**:`<subagent_hints>` block 明确 "subagent 不能调 dispatch_subagent 自己"(LLM 试探直接 ToolResult 错误,不是 prompt 黑名单软劝)。
+
+### decision 6:subagent 内 L4/L2/L5 全启用,policy 共享
+
+Subagent 内 `run_turn` 调用时,policy engine 实例**从主 agent 传入**(共享),不新建。L2/L5 在 agent 层 `run_turn` 内部触发,与 subagent 是否嵌套无关,自动继承。
+
+理由:
+- 主 agent 调 subagent 派写文件 → subagent 调 run_command → 危险命令需 L4 拦截,**不能让 subagent 绕过 L4**(`policy.enabled=False` 是反设计,违反 defense-in-depth 原则)
+- L2 输入防御在 `run_turn` 入口处(用户输入 → judge),subagent 没"用户输入"概念,但工具输出 `<untrusted>` 隔离由 `run_turn` 内部自动处理
+- L5 输出 DLP 在 LLM 输出 append messages 前,subagent 内部同样生效(让 DLP 不脱钩)
+- 共享 `PolicyEngine` 实例 ≠ 共享 L4 状态污染:policy engine 内部按 session_id 隔离判定,subagent 与主 agent 同 session 不冲突
+
+**实现**:`SubAgentRunner.__init__` 接受 `policy: PolicyEngine` 参数;`agent.run_turn` 在构造 runner 时透传 `policy=self.policy`。`dispatch_subagent_handler` 不接受 policy(只接 runner 实例,runner 内部已持有 policy)。
+
+**与 decision 2 共享资源的协同**:LLM client / MCP client / TodoService / PolicyEngine 全部从主 agent 透传给 subagent —— 4 项共享资源 1 个原则:**主 agent 配置什么,subagent 用什么**,不允许 subagent 单独降级。
 
 ## 组件设计
 
@@ -171,7 +195,11 @@ async def dispatch_subagent_handler(
         return _err("dispatch_subagent", f"task_id={task_id} 已 done, 不能再派 subagent")
 
     # 校验嵌套深度(deps 注入的 current_depth 由 dispatch_subagent_runner 决定)
-    current_depth = (dispatch_subagent_runner or _default_runner).current_depth
+    if dispatch_subagent_runner is None:
+        # 配置错误:agent.run_turn 必须注入 SubAgentRunner 实例,handler 不 fallback 到全局
+        return _err("dispatch_subagent",
+            "dispatch_subagent_runner 未注入,agent.run_turn 配置错误")
+    current_depth = dispatch_subagent_runner.current_depth
     if current_depth >= 2:
         return _err("dispatch_subagent",
             f"subagent 嵌套深度 {current_depth} 超过 max_depth=2")
@@ -191,7 +219,7 @@ async def dispatch_subagent_handler(
         sub_task_ids.append((t.id, spec))
 
     # 真并行跑 N 个 subagent
-    runner = dispatch_subagent_runner or _default_runner
+    runner = dispatch_subagent_runner
     try:
         results = await asyncio.wait_for(
             asyncio.gather(*[
@@ -300,22 +328,36 @@ log = logging.getLogger(__name__)
 
 @dataclass
 class SubAgentResult:
-    """单个 subagent 跑完的结果。"""
+    """单个 subagent 跑完的结果。
+
+    status 取值:
+      - "done": sub-task 完成且 acceptance 通过
+      - "blocked": sub-task 完成但 acceptance 失败(C 完成门拦截)
+      - "incomplete": max_iter 耗尽(未 timeout 也未 exception,只是没做完)
+      - "timeout": 超过 timeout 秒
+      - "failed": subagent 内 tool 调 is_error=True 或抛 exception
+    """
     task_id: str                    # subagent 改的 todo_id
     title: str                      # 原始 sub_spec.title
-    status: str                     # sub-task 最终状态(done / blocked / timeout / failed)
+    status: str                     # sub-task 最终状态(见上)
     final_text: str = ""            # subagent 末轮 LLM 结果(≤500 字)
     duration_s: float = 0.0
-    tokens_used: int = 0            # subagent 消耗的 tokens
+    tokens_used: int = 0            # subagent 消耗的 tokens(D1 接 SessionTokenStats,见 decision 4)
     file_refs: list[str] = field(default_factory=list)  # subagent 提到的文件路径(从末轮提取)
-    error: str | None = None        # 失败原因(timeout / exception)
+    error: str | None = None        # 失败原因(timeout / exception / incomplete)
 
 
 class SubAgentRunner:
     """SubAgent 运行器。
 
     用法:
-        runner = SubAgentRunner(llm, mcp, todo_service, current_depth=0)
+        runner = SubAgentRunner(
+            llm, mcp, todo_service,
+            current_depth=0,
+            project_root=str(Path.cwd()),
+            max_iter=20,
+            policy=main_policy,
+        )
         result = await runner.run(task_id=..., title=..., ...)
     """
 
@@ -329,12 +371,18 @@ class SubAgentRunner:
         *,
         current_depth: int = 0,
         parent_session_id: str = "s",
+        project_root: str = "",        # D1 修正:从主 agent run_turn 传入(共享 cwd)
+        max_iter: int = 20,            # D1 修正:从主 agent run_turn 传入(共享 max_iter)
+        policy: PolicyEngine,          # D1 修正:从主 agent run_turn 传入(共享 L4 实例,见 decision 6)
     ):
         self.llm = llm
         self.mcp = mcp
         self.todo_service = todo_service
         self.current_depth = current_depth
         self.parent_session_id = parent_session_id
+        self.project_root = project_root
+        self.max_iter = max_iter
+        self.policy = policy
 
     async def run(
         self,
@@ -357,8 +405,7 @@ class SubAgentRunner:
           5. 返回 SubAgentResult
         """
         from cc_harness.agent import run_turn  # 延迟 import 避免循环
-        from cc_harness.policy import PolicyEngine
-        from cc_harness.render import _extract_final_text  # 假设存在
+        from cc_harness.repl import _extract_final_text  # 实际定义在 repl.py:535
 
         start = time.time()
         criteria = criteria or []
@@ -377,8 +424,13 @@ class SubAgentRunner:
             self.llm, self.mcp, self.todo_service,
             current_depth=self.current_depth + 1,
             parent_session_id=session_id,
+            project_root=self.project_root,        # 透传
+            max_iter=self.max_iter,                # 透传
+            policy=self.policy,                    # 透传(共享 L4 实例,见 decision 6)
         )
-        extras = inject_todo_tools(self.todo_service, session_id, cwd=".")
+        extras = inject_todo_tools(
+            self.todo_service, session_id, cwd=self.project_root,
+        )
         # 替换 dispatch_subagent entry 的 deps(加 dispatch_subagent_runner=next_runner)
         extras = [
             {**entry, "deps": {**entry["deps"], "dispatch_subagent_runner": next_runner}}
@@ -389,13 +441,13 @@ class SubAgentRunner:
 
         # 3. 跑 subagent ReAct loop
         try:
-            policy = PolicyEngine(project_root=".", enabled=False)  # subagent 内不强制 L4
             await asyncio.wait_for(
                 run_turn(
                     messages, self.llm, self.mcp,
-                    cwd=".", max_iter=20,
+                    cwd=self.project_root,        # 透传主 agent cwd
+                    max_iter=self.max_iter,       # 透传主 agent max_iter
                     extra_native_specs=extras,
-                    policy=policy,
+                    policy=self.policy,           # 透传主 agent policy(共享 L4 实例)
                 ),
                 timeout=timeout,
             )
@@ -412,19 +464,29 @@ class SubAgentRunner:
                 error=str(e)[:200],
                 duration_s=time.time() - start,
             )
+        else:
+            # 4. 正常完成:检查 final todo status + max_iter 耗尽检测
+            try:
+                final_t = await self.todo_service.get(task_id)
+                final_status = final_t.status
+            except Exception:
+                final_status = "unknown"
+            # 若 max_iter 耗尽且 status 不是 done/blocked → 标 incomplete
+            iter_used = sum(1 for m in messages if m.get("role") == "assistant")
+            if iter_used >= self.max_iter and final_status not in ("done", "blocked"):
+                return SubAgentResult(
+                    task_id=task_id, title=title, status="incomplete",
+                    error=f"max_iter={self.max_iter} 耗尽, todo 未 done/blocked",
+                    duration_s=time.time() - start,
+                )
 
-        # 4. 收集末轮 + 状态
-        try:
-            final_t = await self.todo_service.get(task_id)
-            final_status = final_t.status
-        except Exception:
-            final_status = "unknown"
+        # 5. 正常完成(没 timeout / exception / incomplete):收集末轮 + 摘要
         final_text = _extract_final_text(messages)[-500:]  # 末轮 ≤500 字
         file_refs = _extract_file_refs(final_text)
         return SubAgentResult(
             task_id=task_id, title=title, status=final_status,
             final_text=final_text, duration_s=time.time() - start,
-            tokens_used=0,  # TODO(D1.1):从 SessionTokenStats 拿
+            tokens_used=_extract_tokens_used(self.session_token_stats),
             file_refs=file_refs,
         )
 
@@ -468,23 +530,34 @@ def _build_subagent_system_prompt(
 
 
 def _extract_file_refs(text: str) -> list[str]:
-    """从末轮文本提取文件路径(简单 regex,不求完备)。"""
+    """从末轮文本提取文件路径(扩展名覆盖主流 codegen 文件类型)。"""
     import re
-    return list(set(re.findall(r"[\w./-]+\.(?:py|md|yaml|json|toml|txt)", text)))
-
-
-# 默认 runner(单例,current_depth=0)
-_default_runner: SubAgentRunner | None = None
+    pattern = (
+        r"[\w./-]+\.(?:py|md|markdown|yaml|yml|json|toml|txt|"
+        r"js|jsx|ts|tsx|css|scss|less|sass|sh|bash|zsh|"
+        r"html|xml|svg|csv|sql|env|ini|cfg|conf|lock)"
+        r"(?!\w)"
+    )
+    return list(set(re.findall(pattern, text)))
 
 
 def get_default_runner(
     llm: LLMClient, mcp: MCPClient, todo_service: TodoService,
+    *, project_root: str, max_iter: int, policy: "PolicyEngine",
 ) -> SubAgentRunner:
-    """获取默认 runner(depth=0,主 agent 调)。"""
-    global _default_runner
-    if _default_runner is None or _default_runner.llm is not llm:
-        _default_runner = SubAgentRunner(llm, mcp, todo_service, current_depth=0)
-    return _default_runner
+    """构造主 agent 调用的 runner(depth=0)。
+
+    **不在模块级做单例缓存**(避免多 session 跨 llm/mcp/service 复用错实例)。
+    调用方(agent.run_turn)在每次 dispatch 前构造 1 个新实例,parent_session_id 由
+    agent.run_turn 显式传入。"""
+    return SubAgentRunner(
+        llm, mcp, todo_service,
+        current_depth=0,
+        parent_session_id="s",
+        project_root=project_root,
+        max_iter=max_iter,
+        policy=policy,
+    )
 ```
 
 ### 组件 3:`_render_subagent_summary`(subagent.py 模块级函数)
@@ -495,20 +568,21 @@ def _render_subagent_summary(
 ) -> ToolResult:
     """N 个 subagent 结果合并成结构化摘要 ToolResult。"""
     total_duration = sum(r.duration_s for r in results)
-    # tokens_used 聚合(D1 暂都记 0,D1.1 从 SessionTokenStats 拿)
     total_tokens = sum(r.tokens_used for r in results)
     n = len(results)
+    tokens_label = f"{total_tokens}" if total_tokens > 0 else "TBD(D1.1 接 SessionTokenStats)"
 
     lines = [
-        f"SubAgent fan-out 完成 (N={n}, 总耗时 {total_duration:.1f}s, 总 tokens {total_tokens})",
+        f"SubAgent fan-out 完成 (N={n}, 总耗时 {total_duration:.1f}s, 总 tokens: {tokens_label})",
         "",
     ]
     for i, r in enumerate(results, 1):
         status_label = {
             "done": "done",
             "blocked": "blocked (acceptance 未通过)",
+            "incomplete": "incomplete (max_iter 耗尽, todo 未 done)",
             "timeout": "timeout",
-            "failed": "failed",
+            "failed": "failed (tool 错误或 exception)",
             "in_progress": "in_progress",
             "pending": "pending",
             "unknown": "unknown",
@@ -543,9 +617,10 @@ def _render_subagent_summary(
 
 `agent.py:_refresh_system_prompt` 加新 block(类比 C 的 `<todo_completion_gate>` 模式)。**只在 coding mode + 当前 HTN parent 已创建时注入**。
 
+具体实现:
+
 ```python
-# 在 _refresh_system_prompt 的 SECTION_POOL 逻辑后追加(简化示例)
-# 或作为新 section 注入(具体由 plan 决定)
+# agent.py 新增模块级常量 + helper(类比 C 的 _COMPLETION_GATE_BLOCK / strip helper)
 
 SUBAGENT_HINTS_BLOCK = """
 <subagent_hints>
@@ -564,11 +639,59 @@ SUBAGENT_HINTS_BLOCK = """
 </subagent_hints>
 """
 
-# 在 _refresh_system_prompt 注入(伪代码,具体位置由 plan 决定):
-# 1. 检测最近 N 轮 messages 是否含 todo_create + parent_task=非 None
-# 2. 若是,在 system prompt 末尾追加 SUBAGENT_HINTS_BLOCK
-# 3. 复用 C 的 idempotent re.sub strip + append 模式
+_SUBAGENT_HINTS_RE = re.compile(
+    r"\s*<subagent_hints\b[^>]*>.*?</subagent_hints>\s*\Z",
+    flags=re.DOTALL,
+)
+
+
+def _has_recent_htn_parent_create(messages: list[dict], lookback: int = 6) -> bool:
+    """最近 lookback 轮内是否含 todo_create + parent_task 非 None 的 tool result。
+
+    检测方式:扫描最近 6 条 tool message,tool name='todo_create',response JSON
+    含 'parent_task' 且非 None / 非空字符串。
+    """
+    tool_msgs = [m for m in messages if m.get("role") == "tool"][-lookback:]
+    for m in tool_msgs:
+        if m.get("name") != "todo_create":
+            continue
+        try:
+            content = json.loads(m["content"])
+        except Exception:
+            continue
+        parent = content.get("parent_task")
+        if parent:  # 非 None / 非空字符串 → HTN parent 已创建
+            return True
+    return False
+
+
+def _strip_subagent_hints(old: str) -> str:
+    """从旧 system prompt 末尾 strip 旧 block(idempotent 模式,与 C 一致)。"""
+    return _SUBAGENT_HINTS_RE.sub("", old) if _SUBAGENT_HINTS_RE.search(old) else old
 ```
+
+`_refresh_system_prompt` 调用点(伪代码,具体位置 plan 决定):
+
+```python
+def _refresh_system_prompt(messages, cwd, mode):
+    # ... 现有 system prompt 构造逻辑 ...
+    old = messages[0]["content"] if messages else ""
+    new = build_system_prompt(...)
+    # strip 旧 block(避免叠加)
+    new = _strip_completion_gate(new)  # C 既有
+    new = _strip_subagent_hints(new)   # D1 新增
+    # mode == coding 且最近 6 轮有 HTN parent create → 注入
+    if mode == "coding" and _has_recent_htn_parent_create(messages):
+        new = new.rstrip() + "\n\n" + SUBAGENT_HINTS_BLOCK.strip() + "\n"
+    messages[0] = {"role": "system", "content": new}
+```
+
+**5 个具体决策**(消除歧义):
+- **N=6 轮**:最近 6 条 tool message,够覆盖当前 session 的近期 HTN parent 创建(避免 20 轮前的旧 parent 误触发)
+- **检测 tool result(JSON)**:不检测 tool_call args(避免 plan 阶段"想创建但未成功"误触发);只检测成功的 tool result(JSON 解析 `parent_task` 非空)
+- **注入位置**:末尾追加(类比 C 的 `<todo_completion_gate>` 模式)
+- **idempotent strip**:`_SUBAGENT_HINTS_RE` 用 `re.compile` + `re.DOTALL`,与 C 的 `_COMPLETION_GATE_RE` 模式一致
+- **mode gating**:`mode == "coding"`,plan/design 模式不注入(与 `<todo_completion_gate>` 一致)
 
 **为什么不每次都注入**:每次都注入会污染 prompt(让 LLM 过度派 subagent),只在 HTN parent 创建后才提示,降低 false positive。
 
@@ -599,7 +722,24 @@ def inject_todo_tools(
     ]
 ```
 
-`repl.py` 调用点不动(`state.last_turn_text` 已有),`dispatch_subagent_runner` 由 `agent.run_turn` 在 dispatch 前注入(`get_default_runner(llm, mcp, service)`)。
+`repl.py` 调用点不动(`state.last_turn_text` 已有),`dispatch_subagent_runner` 由 `agent.run_turn` 在 dispatch 前构造 + 注入:
+
+```python
+# agent.py:run_turn 内,extra_native_specs 构造点:
+runner = get_default_runner(
+    llm, mcp, service,
+    project_root=cwd,        # 透传主 agent cwd
+    max_iter=max_iter,        # 透传主 agent max_iter
+    policy=policy,            # 透传主 agent policy(共享 L4 实例,见 decision 6)
+)
+extras = inject_todo_tools(
+    service, session_id, cwd=cwd,
+    last_turn_text=last_turn_text,
+    dispatch_subagent_runner=runner,  # 主 agent 调的 runner
+)
+```
+
+构造时一次,subagent 内部 dispatch 时通过 `next_runner` 自动 depth+1(见 SubAgentRunner.run 步骤 2)。
 
 ## 数据流(完整 ReAct loop)
 
@@ -687,30 +827,40 @@ def _render_subagent_summary(
 | **task_id 不存在或已 done** | `dispatch_subagent_handler` 校验阶段拒,ToolResult.is_error=True |
 | **max_fan_out 越界(< 1 或 > 10)** | 校验拒,ToolResult.is_error=True |
 | **sub_specs 空或 > max_fan_out** | 校验拒,ToolResult.is_error=True |
-| **policy / l2 / l5 触发** | 复用现有 L4/L2/L5 层(decision 2 共享 LLM/MCP),subagent 与主 agent 同等保护 |
+| **policy / l2 / l5 触发** | 复用现有 L4/L2/L5 层(decision 6 共享 LLM/MCP/policy),subagent 与主 agent 同等保护 |
+| **max_iter 耗尽(无 timeout 也无 exception)** | 单 subagent 标记 `[incomplete]` + error="max_iter=N 耗尽, todo 未 done";不影响其他;汇总标 blocked;**不**计入 done 统计 |
+| **subagent 内部 tool 返回 is_error=True** | 单 subagent 标记 `[failed]` + error 摘要(`_extract_final_text` 拿到的 error 内容截断 200 字),不算 done |
+| **tokens_used 全 0(D1 暂未接 SessionTokenStats)** | 汇总行显示 "总 tokens: TBD(D1.1 接 SessionTokenStats)" 而非 "0",避免 parent 误判无消耗 |
 
 ## 测试策略
 
-### 单元测试(`tests/test_d1_subagent.py`,~10 tests)
+### 单元测试(`tests/test_d1_subagent.py`,~14 tests)
 
 - `test_subagent_runner_isolates_messages`:subagent 的 messages 不影响主 agent
 - `test_subagent_runner_shares_llm_mcp_service`:3 个 runner 共享同一 LLMClient / MCPClient / TodoService(身份 equality)
 - `test_subagent_runner_max_depth_blocks_nested`:depth=2 调 dispatch_subagent → ToolResult.is_error=True
 - `test_subagent_runner_max_depth_allows_depth_2`:depth=1 调 dispatch_subagent → 允许,内部 subagent 的 depth=2 调 dispatch_subagent → 硬拒
-- `test_render_summary_includes_all_results`:3 个 subagent 结果全部出现 + 总耗时 + 总 tokens + 文件路径
+- `test_subagent_runner_incomplete_when_max_iter_reached`:FakeLLM 模拟 max_iter=2 但只跑 2 轮没 done → SubAgentResult.status="incomplete"(D1 critical fix #3)
+- `test_subagent_runner_tool_error_classified_as_failed`:subagent 调某 tool 返回 is_error=True → SubAgentResult.status="failed" 而非 "done"
+- `test_total_fanout_timeout`:3 个 subagent × timeout=1s,run 总耗时 > 3s+30s → dispatch_subagent_handler 返回 error
+- `test_subagent_runner_no_default_runner_returns_error`:deps 不注入 dispatch_subagent_runner → handler 校验阶段拒,ToolResult.is_error=True(D1 Important fix #1)
+- `test_render_summary_includes_all_results`:3 个 subagent 结果全部出现 + 总耗时 + 总 tokens(TBD)+ 文件路径
 - `test_render_summary_done_state_hint`:全 done → "父完成门: 全部 done";有 blocked → "父完成门: 有 N 个未 done"
+- `test_render_summary_tokens_zero_shows_tbd`:所有 SubAgentResult.tokens_used=0 → 摘要行 "总 tokens: TBD(D1.1 接 SessionTokenStats)" 而非 "0"
+- `test_render_summary_incomplete_status_label`:SubAgentResult.status="incomplete" → 标签 "incomplete (max_iter 耗尽, todo 未 done)"
 - `test_render_summary_file_refs_extraction`:`tests/test_foo.py` 从末轮被正确提取
 - `test_render_summary_truncates_final_text`:末轮 > 500 字 → 截断到 500
 - `test_extract_file_refs_dedup`:同路径多次出现 → 去重
-- `test_default_runner_singleton`:同一 llm/mcp/service → 同一 runner 实例
+- `test_extract_file_refs_covers_common_extensions`:输入含 `.ts/.css/.sh` 等扩展名 → 全部被提取(D1 Minor fix #2)
 
-### 集成测试(`tests/test_d1_integration.py`,~5 tests)
+### 集成测试(`tests/test_d1_integration.py`,~6 tests)
 
 - `test_d1_dispatch_3_subagents_parallel_fake_llm`:FakeLLM 模拟 3 个 subagent 真并行(验证 asyncio.gather)+ 摘要渲染 + 完成门验入
 - `test_d1_dispatch_with_subagent_failure`:1 个 subagent 失败 → 其他不受影响 + 汇总标 blocked
 - `test_d1_dispatch_max_fan_out_validation`:max_fan_out=2 + sub_specs=3 → ToolResult.is_error=True
 - `test_d1_dispatch_subagent_uses_completion_gate`:subagent 调 todo_update done → C 完成门验入(parent_task 树下聚合)
 - `test_d1_dispatch_subagent_creates_correct_parent_child`:subagent 创建的 sub-task parent_task = task_id
+- `test_d1_three_level_nested_blocked`:深度链 depth=0 → depth=1 → depth=2 调 dispatch_subagent → 第三层被硬拒,ToolResult.is_error=True(D1 Important fix #4)
 
 ### Prompt 注入测试(`tests/test_d1_prompt.py`,~3 tests)
 
@@ -722,7 +872,7 @@ def _render_subagent_summary(
 
 - `@pytest.mark.requires_llm` + skipif:真 LLM 跑"创建 HTN parent → fan-out 3 subagent → 父任务标 done"完整路径
 
-**baseline 验证**:D1 完成后 `pytest --collect-only` ≥ **1151 + 19(单元 10 + 集成 5 + prompt 3 + e2e 1)= 1170**,delta +19。
+**baseline 验证**:D1 完成后 `pytest --collect-only` ≥ **1151 + 23(单元 14 + 集成 6 + prompt 3)= 1174**,delta +23(`_test_d1_e2e.py` 前缀 `_` 默认 skip,collect-only 不计入;e2e 真跑需 `OPENAI_API_KEY + CC_HARNESS_RUN_REAL_LLM=1`,不算进 baseline 锚定)。
 
 ## 范围外(out of scope,D1 不做)
 
@@ -738,10 +888,9 @@ def _render_subagent_summary(
 
 ## 开放问题(plan 阶段再决)
 
-1. **`run_command` 是否需要在 subagent 内单独 L4 policy**:D1 默认 `enabled=False`(subagent 内不强制),由 plan 决定是否恢复 L4
-2. **token 计费聚合**:`SubAgentResult.tokens_used` D1 暂记 0,D1.1 从 `SessionTokenStats` 聚合
-3. **MCP server 在 subagent 的 tool spec 是否要过滤**:D1 默认所有 MCP tools 都可见(主 agent 看什么 subagent 看什么),由 plan 决定是否过滤
-4. **subagent 失败时是否要回滚已创建的 sub-todo**:D1 默认不回滚(保留 sub-task 状态供 parent 决策),由 plan 决定
+1. **token 计费聚合**:`SubAgentResult.tokens_used` 接 `SessionTokenStats` 的具体方案(D1.1 接,实现细节由 plan 决定)
+2. **MCP server 在 subagent 的 tool spec 是否要过滤**:D1 默认所有 MCP tools 都可见(主 agent 看什么 subagent 看什么),由 plan 决定是否过滤
+3. **subagent 失败时是否要回滚已创建的 sub-todo**:D1 默认不回滚(保留 sub-task 状态供 parent 决策),由 plan 决定
 
 ## commit message baseline 锚定
 
