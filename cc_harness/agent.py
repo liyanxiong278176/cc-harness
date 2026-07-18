@@ -37,6 +37,30 @@ if TYPE_CHECKING:
 
 _VALID_MODES = ("coding", "plan", "design", "chat")
 
+SUBAGENT_HINTS_BLOCK = """
+<subagent_hints>
+你最近创建了 HTN parent task(有 children 的父任务)。如果有多个独立子任务可并行完成,考虑用 `dispatch_subagent` tool fan-out 派 subagent 并行跑:
+- 调 `dispatch_subagent(task_id=<parent_id>, sub_specs=[{title, criteria}, ...])`
+- 派发数 N = len(sub_specs)(根据你的 todo 列表动态传),不是默认派 3 个
+- subagent 共享 TodoService, 完成门自动验入(改 children 状态)
+- N 个 subagent 真并行(默认上限 3 个;实际派发数 = sub_specs 长度,根据你的 todo 列表动态传 N,需要更多可覆盖 max_fan_out 到 ≤10)
+- 完成后回填摘要(标题 + 状态 + 末轮结果 + 文件路径)
+
+不要 fan-out:
+- 1 个任务(没必要)
+- 强依赖串行的任务(应改用 depends_on)
+- 嵌套 > 2 层(硬拒)
+
+完成 fan-out 后, 父任务可在 children 全 done 后标 done (聚合由 C 完成门把关)。
+</subagent_hints>
+"""
+
+_SUBAGENT_HINTS_RE = re.compile(
+    r"\s*<subagent_hints\b[^>]*>.*?</subagent_hints>\s*\Z",
+    flags=re.DOTALL,
+)
+
+
 # --- Native (non-MCP) tool registry ---
 # Tools registered here are exposed to the LLM alongside MCP tools, but
 # dispatched directly inside the agent (no protocol round-trip, no extra
@@ -737,6 +761,33 @@ def _refresh_system_prompt(messages: list[dict], cwd: str, mode: str,
             "- acceptance 校验可用 todo_update(status=done, force=true) 绕过(仅在确认启发式误判时)。\n"
             "</todo_completion_gate>"
         )
+
+    # D1: <subagent_hints> 注入(coding mode + HTN parent 已创建)
+    new = _strip_subagent_hints(messages[0]["content"])
+    if mode == "coding" and _has_recent_htn_parent_create(messages):
+        new = new.rstrip() + "\n\n" + SUBAGENT_HINTS_BLOCK.strip() + "\n"
+    messages[0]["content"] = new
+
+
+def _has_recent_htn_parent_create(messages: list[dict], lookback: int = 6) -> bool:
+    """最近 lookback 轮内是否含 todo_create + parent_task 非 None 的 tool result。"""
+    tool_msgs = [m for m in messages if m.get("role") == "tool"][-lookback:]
+    for m in tool_msgs:
+        if m.get("name") != "todo_create":
+            continue
+        try:
+            content = json.loads(m["content"])
+        except Exception:
+            continue
+        parent = content.get("parent_task")
+        if parent:  # 非 None / 非空字符串
+            return True
+    return False
+
+
+def _strip_subagent_hints(old: str) -> str:
+    """从旧 system prompt 末尾 strip 旧 block(idempotent,类比 C)。"""
+    return _SUBAGENT_HINTS_RE.sub("", old) if _SUBAGENT_HINTS_RE.search(old) else old
 
 
 def _save_design_output(
