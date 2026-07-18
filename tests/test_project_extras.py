@@ -53,9 +53,10 @@ def svc(proj: Path) -> TodoService:
 
 
 def test_inject_returns_eight_entries(svc: TodoService):
+    """D1 Task 5:inject_todo_tools 返回 9 个 entry(8 原 todo + dispatch_subagent)。"""
     extras = inject_todo_tools(svc, "test-session", "/tmp")
     assert isinstance(extras, list)
-    assert len(extras) == 8
+    assert len(extras) == 9
 
 
 def test_inject_entries_have_required_keys(svc: TodoService):

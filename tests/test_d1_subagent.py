@@ -785,3 +785,35 @@ async def test_subagent_runner_inherits_l5_dlp(tmp_path):
     assert "[REDACTED:aws_access_key]" in result.final_text, (
         f"final_text 应含 [REDACTED:aws_access_key], got: {result.final_text}"
     )
+
+
+# ---------------------------------------------------------------------------
+# D1 Task 5:inject_todo_tools 的 deps 含 dispatch_subagent_runner
+# ---------------------------------------------------------------------------
+
+
+def test_inject_todo_tools_attaches_dispatch_subagent_runner(tmp_path):
+    """inject_todo_tools 的 deps 含 dispatch_subagent_runner 字段(可能为 None)。
+
+    9 个 todo entry 全部带同一 runner 引用(主 agent 共享)。
+    """
+    from cc_harness.project.extras import inject_todo_tools
+
+    svc = _make_service(tmp_path)
+    runner = SubAgentRunner(
+        llm=None, mcp=None, todo_service=svc,
+        current_depth=0, project_root=str(tmp_path), max_iter=10,
+        policy=PolicyEngine(project_root=tmp_path, enabled=False),
+    )
+    extras = inject_todo_tools(
+        svc, "s", cwd=str(tmp_path), dispatch_subagent_runner=runner,
+    )
+    assert len(extras) == 9  # 8 个原 todo + dispatch_subagent
+    for entry in extras:
+        assert "dispatch_subagent_runner" in entry["deps"]
+    # dispatch_subagent entry 的 deps.runner 应 == runner
+    dispatch_entry = next(
+        e for e in extras
+        if e["spec"]["function"]["name"] == "dispatch_subagent"
+    )
+    assert dispatch_entry["deps"]["dispatch_subagent_runner"] is runner

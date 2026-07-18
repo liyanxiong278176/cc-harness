@@ -385,10 +385,10 @@ def test_all_specs_include_toposort():
 
 
 def test_inject_todo_tools_returns_8(svc):
-    """inject_todo_tools 返回 8 个 entry(7 原有 + todo_toposort)。"""
+    """inject_todo_tools 返回 9 个 entry(D1 Task 5:8 原 todo + dispatch_subagent)。"""
     extras = inject_todo_tools(svc, "test-session", "/tmp")
     assert isinstance(extras, list)
-    assert len(extras) == 8
+    assert len(extras) == 9
 
 
 def test_inject_todo_tools_includes_toposort(svc):

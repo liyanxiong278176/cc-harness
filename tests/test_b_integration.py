@@ -127,9 +127,9 @@ async def test_b_e2e_llm_uses_topo_sort(tmp_path: Path):
         spec["function"]["name"]
         for spec in tool_specs_seen[0]
     }
-    # FakeLLM sees all eight todo specs; run_command remains the ninth built-in.
+    # FakeLLM sees all 9 todo specs (D1 Task 5); run_command remains the 10th built-in.
     assert len(prompts) == 2
-    assert len(todo_names) == 8
+    assert len(todo_names) == 9
     assert todo_names <= observed_names
     assert observed_names - todo_names == {"run_command"}
     assert len(messages) == 5

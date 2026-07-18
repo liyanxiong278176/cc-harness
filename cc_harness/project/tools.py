@@ -432,6 +432,7 @@ def _err(tool_name: str, e: TodoError) -> ToolResult:
 async def todo_list_handler(
     args: dict, *, service, session_id: str, cwd: str,
     last_turn_text: str = "",
+    dispatch_subagent_runner=None,  # D1 Task 5:deps 共享参数(handler 当前未用,保留签名兼容)
 ) -> ToolResult:
     """todo_list:列出 + 过滤 + 排序 + limit 截断。
 
@@ -496,6 +497,7 @@ async def todo_list_handler(
 async def todo_get_handler(
     args: dict, *, service, session_id: str, cwd: str,
     last_turn_text: str = "",
+    dispatch_subagent_runner=None,  # D1 Task 5:deps 共享参数(handler 当前未用,保留签名兼容)
 ) -> ToolResult:
     """todo_get:返回 task 全字段详情 + 触发 task 的依赖关系。"""
     del cwd, session_id, last_turn_text
@@ -533,6 +535,7 @@ async def todo_get_handler(
 async def todo_create_handler(
     args: dict, *, service, session_id: str, cwd: str,
     last_turn_text: str = "",
+    dispatch_subagent_runner=None,  # D1 Task 5:deps 共享参数(handler 当前未用,保留签名兼容)
 ) -> ToolResult:
     """todo_create:T11 全字段 → Service.create。"""
     del cwd, last_turn_text
@@ -631,6 +634,7 @@ async def _completion_gate(
 async def todo_update_handler(
     args: dict, *, service, session_id: str, cwd: str,
     last_turn_text: str = "",
+    dispatch_subagent_runner=None,  # D1 Task 5:deps 共享参数(handler 当前未用,保留签名兼容)
 ) -> ToolResult:
     """todo_update:任意 T11 字段 → Service.update。session_id 显式传。
 
@@ -687,6 +691,7 @@ async def todo_update_handler(
 async def todo_delete_handler(
     args: dict, *, service, session_id: str, cwd: str,
     last_turn_text: str = "",
+    dispatch_subagent_runner=None,  # D1 Task 5:deps 共享参数(handler 当前未用,保留签名兼容)
 ) -> ToolResult:
     """todo_delete:force 透传;返回简化确认。"""
     del cwd, session_id, last_turn_text
@@ -710,6 +715,7 @@ async def todo_delete_handler(
 async def todo_resolve_handler(
     args: dict, *, service, session_id: str, cwd: str,
     last_turn_text: str = "",
+    dispatch_subagent_runner=None,  # D1 Task 5:deps 共享参数(handler 当前未用,保留签名兼容)
 ) -> ToolResult:
     """todo_resolve:BFS 上游依赖链 + 层级缩进(spec line 472-477)。
 
@@ -760,6 +766,7 @@ async def todo_resolve_handler(
 async def todo_validate_handler(
     args: dict, *, service, session_id: str, cwd: str,
     last_turn_text: str = "",
+    dispatch_subagent_runner=None,  # D1 Task 5:deps 共享参数(handler 当前未用,保留签名兼容)
 ) -> ToolResult:
     """todo_validate:全表 issue 列表;strict=True 把 warning 提升为 error。"""
     del cwd, session_id, last_turn_text
@@ -816,6 +823,7 @@ MAX_RENDER_TASKS = 50
 async def todo_toposort_handler(
     args: dict, *, service, session_id: str, cwd: str,
     last_turn_text: str = "",
+    dispatch_subagent_runner=None,  # D1 Task 5:deps 共享参数(handler 当前未用,保留签名兼容)
 ) -> ToolResult:
     """todo_toposort:返回 DAG 拓扑视图。
 

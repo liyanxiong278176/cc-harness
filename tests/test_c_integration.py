@@ -202,8 +202,8 @@ async def test_c_deps_last_turn_text_wired(tmp_path: Path):
     svc = _make_service(tmp_path)
     extras = inject_todo_tools(svc, "s", cwd=".", last_turn_text="placeholder")
 
-    # (a) every extras entry's deps carries last_turn_text
-    assert len(extras) == 8
+    # (a) every extras entry's deps carries last_turn_text(D1 Task 5:9 个 entry)
+    assert len(extras) == 9
     for entry in extras:
         assert entry["deps"]["last_turn_text"] == "placeholder"
 

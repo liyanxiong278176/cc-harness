@@ -15,7 +15,8 @@ def _make_service(tmp_path):
 async def test_inject_todo_tools_passes_last_turn_text(tmp_path):
     svc = _make_service(tmp_path)
     extras = inject_todo_tools(svc, "s", cwd=".", last_turn_text="hello")
-    assert len(extras) == 8
+    # D1 Task 5:9 个 entry(8 原 todo + dispatch_subagent)
+    assert len(extras) == 9
     for e in extras:
         assert e["deps"]["last_turn_text"] == "hello"
 
