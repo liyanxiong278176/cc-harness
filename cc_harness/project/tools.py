@@ -333,7 +333,8 @@ TODO_DISPATCH_SUBAGENT_SPEC: dict[str, Any] = {
     "function": {
         "name": "dispatch_subagent",
         "description": (
-            "Fan-out 派 N 个独立 subagent 跑并行子任务(派发数 = len(sub_specs),"
+            "Fan-out 派 N 个独立 subagent 跑并行子任务"
+            "(派发数 N = len(sub_specs),"
             "由 LLM 根据 todo 列表动态决定)。"
             "subagent 与主 agent 共享 TodoService,完成门天然验入。"
             "完成后回填摘要(标题 + todo_id + 状态 + 末轮结果 + 文件路径)。"
@@ -360,7 +361,7 @@ TODO_DISPATCH_SUBAGENT_SPEC: dict[str, Any] = {
                 },
                 "max_fan_out": {
                     "type": "integer", "default": 3, "minimum": 1, "maximum": 10,
-                    "description": "并发 subagent 上限(默认 3,不是默认派发数);实际派发数 = len(sub_specs)",
+                    "description": "并发 subagent 上限(默认 3,不是默认派发数);实际派发数 N = len(sub_specs)",
                 },
                 "timeout": {
                     "type": "integer", "default": 240, "minimum": 1, "maximum": 3600,
@@ -1184,15 +1185,22 @@ async def dispatch_subagent_handler(
 
     task_id = args.get("task_id")
     sub_specs = args.get("sub_specs") or []
-    max_fan_out = int(args.get("max_fan_out", 3))
-    timeout = int(args.get("timeout", 240))
 
-    # 1. 参数校验
+    # 1. 参数校验(基础存在性优先,int 转换后置 — D1 Task 4 fix Important #2:
+    #    max_fan_out="abc" 之类非 str 错误若前置 → ValueError 未捕获,handler 崩
+    #    而非返回结构化 ToolResult)
     if not task_id:
         return _subagent_err("dispatch_subagent", "task_id is required")
     if not sub_specs:
         return _subagent_err(
             "dispatch_subagent", "sub_specs is required (non-empty list)"
+        )
+    try:
+        max_fan_out = int(args.get("max_fan_out", 3))
+        timeout = int(args.get("timeout", 240))
+    except (ValueError, TypeError) as e:
+        return _subagent_err(
+            "dispatch_subagent", f"max_fan_out/timeout 类型错: {e}"
         )
     if not (1 <= len(sub_specs) <= max_fan_out):
         return _subagent_err(
