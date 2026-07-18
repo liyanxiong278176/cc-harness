@@ -1,11 +1,13 @@
 """Sub-project D1 Task 1: SubAgentResult + _extract_file_refs 底座。
 
 Task 2: _build_subagent_system_prompt + _render_subagent_summary。
+Task 3: SubAgentRunner 类 + get_default_runner + _subagent_err。
 """
 from __future__ import annotations
 
 from typing import get_args
 
+from cc_harness.policy import PolicyEngine
 from cc_harness.project.subagent import (
     SubAgentResult,
     SubAgentStatus,
@@ -145,3 +147,67 @@ def test_render_summary_done_count_display():
     assert "incomplete" in tr.llm_text
     assert "failed" in tr.llm_text
     assert "未 done" in tr.llm_text  # 父完成门 hint
+
+
+# ---------------------------------------------------------------------------
+# D1 Task 3: SubAgentRunner 类 + get_default_runner + _subagent_err
+# ---------------------------------------------------------------------------
+
+from cc_harness.project.subagent import (  # noqa: E402  排在 import-block 末尾因 step-1 失败预期 ImportError
+    SubAgentRunner,
+    _subagent_err,
+    get_default_runner,
+)
+from pathlib import Path  # noqa: E402  PolicyEngine 严格要求 Path 输入(string 会 AttributeError)
+
+
+def test_subagent_err_returns_tool_result():
+    """_subagent_err 是 dispatch_subagent 专用 helper(避免与 tools.py:_err 重名)。"""
+    tr = _subagent_err("dispatch_subagent", "boom")
+    assert tr.is_error is True
+    assert "dispatch_subagent" in (tr.display_text or "") + (tr.llm_text or "")
+    assert "boom" in (tr.display_text or "") + (tr.llm_text or "")
+
+
+def test_subagent_runner_init_stores_args():
+    """__init__ 存 llm / mcp / service / depth / project_root / max_iter / policy。"""
+    # 不实际跑 ReAct,只验 init 不抛
+    runner = SubAgentRunner(
+        llm=None, mcp=None, todo_service=None,  # 类型暂 None,只验 init
+        current_depth=1,
+        project_root="/tmp", max_iter=10,
+        policy=PolicyEngine(project_root=Path("/tmp"), enabled=False),
+    )
+    assert runner.current_depth == 1
+    assert runner.project_root == "/tmp"
+    assert runner.max_iter == 10
+    assert runner.policy is not None
+
+
+def test_get_default_runner_constructs_depth_zero(tmp_path):
+    """get_default_runner 构造 depth=0,project_root / max_iter / policy 透传。"""
+    policy = PolicyEngine(project_root=tmp_path, enabled=False)
+    runner = get_default_runner(
+        llm=None, mcp=None, todo_service=None,
+        project_root=str(tmp_path), max_iter=15, policy=policy,
+    )
+    assert isinstance(runner, SubAgentRunner)
+    assert runner.current_depth == 0
+    assert runner.project_root == str(tmp_path)
+    assert runner.max_iter == 15
+    assert runner.policy is policy
+
+
+def test_subagent_runner_max_depth_constant():
+    """MAX_DEPTH = 2(decision 5 + spec line 378)。"""
+    assert SubAgentRunner.MAX_DEPTH == 2
+
+
+def test_get_default_runner_no_module_singleton():
+    """重要 fix #1:模块级不缓存单例(避免多 session 跨 llm 复用错实例)。
+    连续 2 次调用应返回不同实例。
+    """
+    policy = PolicyEngine(project_root=Path("."), enabled=False)
+    r1 = get_default_runner(None, None, None, project_root=".", max_iter=10, policy=policy)
+    r2 = get_default_runner(None, None, None, project_root=".", max_iter=10, policy=policy)
+    assert r1 is not r2

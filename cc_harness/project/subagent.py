@@ -1,4 +1,5 @@
-"""SubAgent fan-out 结果数据层 (D1 Task 1) + 提示/摘要层 (D1 Task 2)。
+"""SubAgent fan-out 结果数据层 (D1 Task 1) + 提示/摘要层 (D1 Task 2)
++ 运行器底座 (D1 Task 3)。
 
 定义 SubAgentResult dataclass(单个 subagent 跑完的结果,8 种 status 值)
 和 _extract_file_refs(从末轮文本提取文件路径)。
@@ -9,15 +10,31 @@ Task 2 新增:
 - _render_subagent_summary:N 个 SubAgentResult 合并成结构化 ToolResult
   (display_text 给用户、llm_text 给 LLM、is_error 反映子任务聚合)。
 
-SubAgentRunner 将在 Task 3-4 落地。
+Task 3 新增:
+- SubAgentRunner 类骨架(__init__ 存 llm/mcp/service/depth/root/max_iter/policy;
+  `run()` 方法在 Task 4 实现)。
+- get_default_runner 工厂(depth=0,无模块级单例缓存 — 重要 fix #1)。
+- _subagent_err 本地 helper(避免与 tools.py:_err 重名 + TodoError 签名混淆)。
+
+决策 6:SubAgentRunner 接收主 agent 透传的 policy(共享 L4 闸门,
+不允许 subagent 单独降级)。MAX_DEPTH = 2 硬限(decision 5)。
 """
 from __future__ import annotations
 
+import logging
 import re
 from dataclasses import dataclass, field
-from typing import Literal
+from typing import TYPE_CHECKING, Literal
 
 from cc_harness.project.tools import ToolResult
+
+if TYPE_CHECKING:  # 避免循环依赖:agent.run_turn 不在模块级 import(Task 4 再引)
+    from cc_harness.llm import LLMClient
+    from cc_harness.mcp_client import MCPClient
+    from cc_harness.policy import PolicyEngine
+    from cc_harness.project.service import TodoService
+
+log = logging.getLogger(__name__)
 
 
 # spec decision 5:8 个合法 status 值(Literal 做静态约束)
@@ -183,3 +200,78 @@ def _render_subagent_summary(
         display_text=f"dispatch_subagent: {n} subagents, {sum(1 for r in results if r.status=='done')}/{n} done",
         llm_text="\n".join(lines),
     )
+
+
+# ---------------------------------------------------------------------------
+# D1 Task 3:SubAgentRunner 类骨架 + get_default_runner 工厂 + _subagent_err helper
+# ---------------------------------------------------------------------------
+
+
+def _subagent_err(tool_name: str, msg: str) -> ToolResult:
+    """dispatch_subagent 专用 error 构造器(避免与 tools.py:_err 重名 + 签名混淆)。
+
+    tools.py 已有的 _err(tool_name, e: TodoError) 第二个参数必须是 TodoError 实例,
+    dispatch_subagent 的错误不是 TodoError 语义,本地 helper 构造。
+    """
+    return ToolResult.error(display=msg, llm=f"[{tool_name}] {msg}")
+
+
+class SubAgentRunner:
+    """SubAgent 运行器(decision 6:共享 LLM / MCP / Service / Policy)。
+
+    用法:
+        runner = SubAgentRunner(llm, mcp, todo_service, current_depth=0,
+                                 project_root=cwd, max_iter=max_iter, policy=policy)
+        result = await runner.run(task_id=..., title=..., ...)
+
+    Task 3 仅落 `__init__`(`run()` 在 Task 4 实现);存 6 个字段 + 1 个深度上限
+    class const `MAX_DEPTH = 2`(decision 5)。不做模块级单例:每次构造 1 个新
+    实例避免跨 session 复用错 LLM / MCP / Service / Policy。
+    """
+
+    # decision 5 / spec line 378:max subagent nesting depth = 2
+    MAX_DEPTH = 2
+
+    def __init__(
+        self,
+        llm: "LLMClient",
+        mcp: "MCPClient",
+        todo_service: "TodoService",
+        *,
+        current_depth: int = 0,
+        project_root: str = "",
+        max_iter: int = 20,
+        policy: "PolicyEngine",
+    ):
+        self.llm = llm
+        self.mcp = mcp
+        self.todo_service = todo_service
+        self.current_depth = current_depth
+        self.project_root = project_root
+        self.max_iter = max_iter
+        self.policy = policy
+
+
+def get_default_runner(
+    llm, mcp, todo_service,
+    *, project_root: str, max_iter: int, policy: "PolicyEngine",
+) -> SubAgentRunner:
+    """构造主 agent 调用的 runner(depth=0)。
+
+    **不在模块级做单例缓存**(避免多 session 跨 llm/mcp/service/policy
+    复用错实例 — 重要 fix #1)。调用方(agent.run_turn)在每次 dispatch 前
+    构造 1 个新实例;policy 由主 agent 透传(decision 6,共享 L4 闸门)。
+    """
+    return SubAgentRunner(
+        llm, mcp, todo_service,
+        current_depth=0,
+        project_root=project_root,
+        max_iter=max_iter,
+        policy=policy,
+    )
+
+
+# _DEFAULT_RUNNER 单例禁留:历史 D1 plan 阶段提过"主 agent 派发前全局兜底
+# 单例",已被 Important fix #1 撤掉(单例会让多 session 跨 llm / mcp / service
+# 复用错实例,并冻结 policy 使 L4 共享失效)。需要显式构造时调
+# get_default_runner(每次返回新实例)。
