@@ -21,7 +21,6 @@ Task 3 新增:
 """
 from __future__ import annotations
 
-import logging
 import re
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Literal
@@ -33,8 +32,6 @@ if TYPE_CHECKING:  # 避免循环依赖:agent.run_turn 不在模块级 import(Ta
     from cc_harness.mcp_client import MCPClient
     from cc_harness.policy import PolicyEngine
     from cc_harness.project.service import TodoService
-
-log = logging.getLogger(__name__)
 
 
 # spec decision 5:8 个合法 status 值(Literal 做静态约束)
@@ -217,16 +214,15 @@ def _subagent_err(tool_name: str, msg: str) -> ToolResult:
 
 
 class SubAgentRunner:
-    """SubAgent 运行器(decision 6:共享 LLM / MCP / Service / Policy)。
+    """SubAgent 运行器骨架(decision 6:共享 LLM/MCP/Service/Policy)。
 
-    用法:
+    当前实现:`__init__` 存 7 字段 + `MAX_DEPTH = 2` 常量。
+    完整 `run()` 在 Task 4 落地。
+
+    用法 (Task 4 后):
         runner = SubAgentRunner(llm, mcp, todo_service, current_depth=0,
                                  project_root=cwd, max_iter=max_iter, policy=policy)
         result = await runner.run(task_id=..., title=..., ...)
-
-    Task 3 仅落 `__init__`(`run()` 在 Task 4 实现);存 6 个字段 + 1 个深度上限
-    class const `MAX_DEPTH = 2`(decision 5)。不做模块级单例:每次构造 1 个新
-    实例避免跨 session 复用错 LLM / MCP / Service / Policy。
     """
 
     # decision 5 / spec line 378:max subagent nesting depth = 2
@@ -241,7 +237,7 @@ class SubAgentRunner:
         current_depth: int = 0,
         project_root: str = "",
         max_iter: int = 20,
-        policy: "PolicyEngine",
+        policy: PolicyEngine,
     ):
         self.llm = llm
         self.mcp = mcp
@@ -254,7 +250,7 @@ class SubAgentRunner:
 
 def get_default_runner(
     llm, mcp, todo_service,
-    *, project_root: str, max_iter: int, policy: "PolicyEngine",
+    *, project_root: str, max_iter: int, policy: PolicyEngine,
 ) -> SubAgentRunner:
     """构造主 agent 调用的 runner(depth=0)。
 

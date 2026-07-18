@@ -5,15 +5,19 @@ Task 3: SubAgentRunner 类 + get_default_runner + _subagent_err。
 """
 from __future__ import annotations
 
+from pathlib import Path
 from typing import get_args
 
 from cc_harness.policy import PolicyEngine
 from cc_harness.project.subagent import (
     SubAgentResult,
+    SubAgentRunner,
     SubAgentStatus,
     _build_subagent_system_prompt,
     _extract_file_refs,
     _render_subagent_summary,
+    _subagent_err,
+    get_default_runner,
 )
 
 
@@ -153,13 +157,6 @@ def test_render_summary_done_count_display():
 # D1 Task 3: SubAgentRunner 类 + get_default_runner + _subagent_err
 # ---------------------------------------------------------------------------
 
-from cc_harness.project.subagent import (  # noqa: E402  排在 import-block 末尾因 step-1 失败预期 ImportError
-    SubAgentRunner,
-    _subagent_err,
-    get_default_runner,
-)
-from pathlib import Path  # noqa: E402  PolicyEngine 严格要求 Path 输入(string 会 AttributeError)
-
 
 def test_subagent_err_returns_tool_result():
     """_subagent_err 是 dispatch_subagent 专用 helper(避免与 tools.py:_err 重名)。"""
@@ -170,28 +167,40 @@ def test_subagent_err_returns_tool_result():
 
 
 def test_subagent_runner_init_stores_args():
-    """__init__ 存 llm / mcp / service / depth / project_root / max_iter / policy。"""
-    # 不实际跑 ReAct,只验 init 不抛
+    """__init__ 存全部 7 个字段(llm/mcp/service/depth/project_root/max_iter/policy)。"""
+    sentinel_llm = object()
+    sentinel_mcp = object()
+    sentinel_svc = object()
+    sentinel_policy = PolicyEngine(project_root=Path.cwd(), enabled=False)
     runner = SubAgentRunner(
-        llm=None, mcp=None, todo_service=None,  # 类型暂 None,只验 init
-        current_depth=1,
-        project_root="/tmp", max_iter=10,
-        policy=PolicyEngine(project_root=Path("/tmp"), enabled=False),
+        llm=sentinel_llm, mcp=sentinel_mcp, todo_service=sentinel_svc,
+        current_depth=2,
+        project_root="/foo", max_iter=10,
+        policy=sentinel_policy,
     )
-    assert runner.current_depth == 1
-    assert runner.project_root == "/tmp"
+    assert runner.llm is sentinel_llm
+    assert runner.mcp is sentinel_mcp
+    assert runner.todo_service is sentinel_svc
+    assert runner.current_depth == 2
+    assert runner.project_root == "/foo"
     assert runner.max_iter == 10
-    assert runner.policy is not None
+    assert runner.policy is sentinel_policy
 
 
 def test_get_default_runner_constructs_depth_zero(tmp_path):
     """get_default_runner 构造 depth=0,project_root / max_iter / policy 透传。"""
+    sentinel_llm = object()
+    sentinel_mcp = object()
+    sentinel_svc = object()
     policy = PolicyEngine(project_root=tmp_path, enabled=False)
     runner = get_default_runner(
-        llm=None, mcp=None, todo_service=None,
+        llm=sentinel_llm, mcp=sentinel_mcp, todo_service=sentinel_svc,
         project_root=str(tmp_path), max_iter=15, policy=policy,
     )
     assert isinstance(runner, SubAgentRunner)
+    assert runner.llm is sentinel_llm
+    assert runner.mcp is sentinel_mcp
+    assert runner.todo_service is sentinel_svc
     assert runner.current_depth == 0
     assert runner.project_root == str(tmp_path)
     assert runner.max_iter == 15
