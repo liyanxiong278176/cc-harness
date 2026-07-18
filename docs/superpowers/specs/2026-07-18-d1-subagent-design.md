@@ -19,8 +19,8 @@
 **D1 不做**:lead 决策 / 投票合并 / subagent 间通信 / 异步 fire-and-forget。**只做最薄可工作版本**:1 个新 tool + 1 个新模块(`subagent.py`)+ 1 个新 prompt block,复用 B/C 已有 90%。
 
 **Success criteria(D1 完成的可观测信号)**:
-- ✅ 用户写大需求 → LLM 自动派 3 个 subagent 并行跑,parent context 不爆
-- ✅ subagent 改 `parent_task` 树下的 children,完成门自动验入(无须 LLM 主动调 force=true)
+- ✅ 用户写大需求 → LLM 派 N 个 subagent 并行跑(N 取决于 todo 数量,可被 max_fan_out=3 默认上限限制,需更多可 args 覆盖到 ≤10),parent context 不爆
+- ✅ subagent 改 `parent_task` 树下的 children,完成门只查 children_all_done 聚合(sub-todo 不带 acceptance_criteria,见 dispatch_subagent_handler 注释)
 - ✅ subagent 内 tool 错误 / 超时 / max_iter 耗尽 → 摘要显示状态,parent 决策路径清晰
 - ✅ L4/L2/L5 在 subagent 内继续生效(共享 policy engine)
 
