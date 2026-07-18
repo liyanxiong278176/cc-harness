@@ -2,13 +2,18 @@
 
 Task 2: _build_subagent_system_prompt + _render_subagent_summary。
 Task 3: SubAgentRunner 类 + get_default_runner + _subagent_err。
+Task 4: dispatch_subagent_handler + TODO_DISPATCH_SUBAGENT_SPEC。
 """
 from __future__ import annotations
 
 from pathlib import Path
 from typing import get_args
 
+import pytest
+
+from cc_harness.cli.init import init_noninteractive
 from cc_harness.policy import PolicyEngine
+from cc_harness.project.service import TodoService
 from cc_harness.project.subagent import (
     SubAgentResult,
     SubAgentRunner,
@@ -19,6 +24,39 @@ from cc_harness.project.subagent import (
     _subagent_err,
     get_default_runner,
 )
+
+
+# ---------------------------------------------------------------------------
+# Task 4 测试用 helper:_make_service + _create(套用 test_b_integration 模式)
+# ---------------------------------------------------------------------------
+
+
+def _make_service(tmp_path: Path) -> TodoService:
+    """构造 TodoService(非交互 init)。"""
+    manifest = init_noninteractive(
+        tmp_path,
+        name="d1-subagent",
+        write_gitignore=False,
+    )
+    return TodoService(project_root=tmp_path, manifest=manifest)
+
+
+async def _create(svc, title, status="pending", criteria=None, session_id="s"):
+    """快捷建 task + 可选设 status。
+
+    status 转移需合法:pending → in_progress → done(直接 pending → done 非法)。
+    """
+    t = await svc.create(
+        title=title,
+        acceptance_criteria=criteria or [],
+        session_id=session_id,
+    )
+    if status == "done":
+        t = await svc.update(t.id, status="in_progress", session_id=session_id)
+        t = await svc.update(t.id, status="done", session_id=session_id)
+    elif status != "pending":
+        t = await svc.update(t.id, status=status, session_id=session_id)
+    return t
 
 
 def test_subagent_result_defaults():
@@ -220,3 +258,115 @@ def test_get_default_runner_no_module_singleton():
     r1 = get_default_runner(None, None, None, project_root=".", max_iter=10, policy=policy)
     r2 = get_default_runner(None, None, None, project_root=".", max_iter=10, policy=policy)
     assert r1 is not r2
+
+
+# ---------------------------------------------------------------------------
+# D1 Task 4:dispatch_subagent_handler 校验 + sub-todo 构造
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_subagent_runner_subagent_no_default_runner_returns_error(tmp_path):
+    """重要 fix #1:handler 校验 deps 没注入 → ToolResult.is_error=True。"""
+    from cc_harness.project.tools import dispatch_subagent_handler
+
+    svc = _make_service(tmp_path)
+    parent = await svc.create(title="p", session_id="s")
+    r = await dispatch_subagent_handler(
+        {"task_id": parent.id, "sub_specs": [{"title": "c"}]},
+        service=svc, session_id="s", cwd=str(tmp_path),
+        dispatch_subagent_runner=None,
+    )
+    assert r.is_error is True
+    assert "未注入" in (r.display_text or "") + (r.llm_text or "")
+
+
+@pytest.mark.asyncio
+async def test_subagent_runner_subagent_creates_subtodo_without_criteria(tmp_path):
+    """重要 fix:sub-todo 不带 acceptance_criteria(避免 subagent 空 last_turn_text 误判)。"""
+    from cc_harness.project.tools import dispatch_subagent_handler
+
+    svc = _make_service(tmp_path)
+    parent = await svc.create(title="p", session_id="s")
+    policy = PolicyEngine(project_root=Path(str(tmp_path)), enabled=False)
+    runner = SubAgentRunner(
+        llm=None, mcp=None, todo_service=svc,
+        current_depth=0, project_root=str(tmp_path), max_iter=5, policy=policy,
+    )
+    # 故意传 criteria 给 handler,但 sub-todo 应被清空(D1 重要 fix)
+    await dispatch_subagent_handler(
+        {"task_id": parent.id, "sub_specs": [
+            {"title": "c1", "criteria": ["5/5 通过"]},
+        ]},
+        service=svc, session_id="s", cwd=str(tmp_path),
+        dispatch_subagent_runner=runner,
+    )
+    # sub-todo 应已创建,criteria 故意空(避免 completion_gate 空 last_turn_text 误判)
+    children = await svc.list(parent_task=parent.id)
+    assert len(children) == 1
+    assert children[0].acceptance_criteria == []  # D1 重要 fix
+    assert children[0].title == "c1"
+
+
+@pytest.mark.asyncio
+async def test_subagent_runner_max_fan_out_validation(tmp_path):
+    """len(sub_specs) > max_fan_out → ToolResult.is_error。"""
+    from cc_harness.project.tools import dispatch_subagent_handler
+
+    svc = _make_service(tmp_path)
+    parent = await svc.create(title="p", session_id="s")
+    policy = PolicyEngine(project_root=Path(str(tmp_path)), enabled=False)
+    runner = SubAgentRunner(
+        llm=None, mcp=None, todo_service=svc, current_depth=0,
+        project_root=str(tmp_path), max_iter=5, policy=policy,
+    )
+    r = await dispatch_subagent_handler(
+        {"task_id": parent.id, "sub_specs": [{"title": "c1"}, {"title": "c2"}, {"title": "c3"}], "max_fan_out": 2},
+        service=svc, session_id="s", cwd=str(tmp_path),
+        dispatch_subagent_runner=runner,
+    )
+    assert r.is_error is True
+    assert "max_fan_out" in (r.display_text or "") + (r.llm_text or "")
+
+
+@pytest.mark.asyncio
+async def test_subagent_runner_parent_already_done(tmp_path):
+    """parent 已 done → ToolResult.is_error(不能再派 subagent)。"""
+    from cc_harness.project.tools import dispatch_subagent_handler
+
+    svc = _make_service(tmp_path)
+    parent = await _create(svc, "p", status="done", session_id="s")
+    policy = PolicyEngine(project_root=Path(str(tmp_path)), enabled=False)
+    runner = SubAgentRunner(
+        llm=None, mcp=None, todo_service=svc, current_depth=0,
+        project_root=str(tmp_path), max_iter=5, policy=policy,
+    )
+    r = await dispatch_subagent_handler(
+        {"task_id": parent.id, "sub_specs": [{"title": "c"}]},
+        service=svc, session_id="s", cwd=str(tmp_path),
+        dispatch_subagent_runner=runner,
+    )
+    assert r.is_error is True
+    assert "已 done" in (r.display_text or "") + (r.llm_text or "")
+
+
+@pytest.mark.asyncio
+async def test_subagent_runner_timeout_validation(tmp_path):
+    """timeout ≤ 0 或 > 3600 → ToolResult.is_error。"""
+    from cc_harness.project.tools import dispatch_subagent_handler
+
+    svc = _make_service(tmp_path)
+    parent = await svc.create(title="p", session_id="s")
+    policy = PolicyEngine(project_root=Path(str(tmp_path)), enabled=False)
+    runner = SubAgentRunner(
+        llm=None, mcp=None, todo_service=svc, current_depth=0,
+        project_root=str(tmp_path), max_iter=5, policy=policy,
+    )
+    for bad_timeout in [0, -1, 3601]:
+        r = await dispatch_subagent_handler(
+            {"task_id": parent.id, "sub_specs": [{"title": "c"}], "timeout": bad_timeout},
+            service=svc, session_id="s", cwd=str(tmp_path),
+            dispatch_subagent_runner=runner,
+        )
+        assert r.is_error is True, f"timeout={bad_timeout} should be rejected"
+        assert "timeout" in (r.display_text or "") + (r.llm_text or "")

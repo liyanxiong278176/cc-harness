@@ -16,6 +16,7 @@ handler 业务错都是开发者自用,所以两字段同内容即可。
 """
 from __future__ import annotations
 
+import asyncio
 import logging
 from datetime import datetime
 from typing import Any
@@ -326,6 +327,52 @@ TODO_TOPOSORT_SPEC: dict[str, Any] = {
 }
 
 
+# D1 阶段 Task 4:dispatch_subagent(第 9 个 todo tool)
+TODO_DISPATCH_SUBAGENT_SPEC: dict[str, Any] = {
+    "type": "function",
+    "function": {
+        "name": "dispatch_subagent",
+        "description": (
+            "Fan-out 派 N 个独立 subagent 跑并行子任务(派发数 = len(sub_specs),"
+            "由 LLM 根据 todo 列表动态决定)。"
+            "subagent 与主 agent 共享 TodoService,完成门天然验入。"
+            "完成后回填摘要(标题 + todo_id + 状态 + 末轮结果 + 文件路径)。"
+            "max_fan_out 默认上限 3(不是默认派发数);timeout 默认 240s,可在 args 覆盖。"
+            "嵌套最多 2 层(depth 0=主 agent,1=第一层,2=第二层)。"
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "task_id": {"type": "string", "description": "Parent task ID"},
+                "sub_specs": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "title": {"type": "string"},
+                            "criteria": {"type": "array", "items": {"type": "string"}},
+                            "description": {"type": "string"},
+                        },
+                        "required": ["title"],
+                    },
+                    "description": "每个 sub-task 描述(title 必填,criteria/description 可选)",
+                    "minItems": 1,
+                },
+                "max_fan_out": {
+                    "type": "integer", "default": 3, "minimum": 1, "maximum": 10,
+                    "description": "并发 subagent 上限(默认 3,不是默认派发数);实际派发数 = len(sub_specs)",
+                },
+                "timeout": {
+                    "type": "integer", "default": 240, "minimum": 1, "maximum": 3600,
+                    "description": "每个 subagent 超时(秒)",
+                },
+            },
+            "required": ["task_id", "sub_specs"],
+        },
+    },
+}
+
+
 # 把所有 SPEC 装进 ALL_SPECS(单一来源真相)。
 # forward declaration 在文件头先声明空 list,这里一次性 populate,
 # 让 ALL_SPECS 永远等于 已声明的 SPEC 总和。
@@ -338,8 +385,9 @@ ALL_SPECS.extend([
     TODO_RESOLVE_SPEC,
     TODO_VALIDATE_SPEC,
     TODO_TOPOSORT_SPEC,  # B 阶段 Task 3: 第 8 个 tool
+    TODO_DISPATCH_SUBAGENT_SPEC,  # D1 阶段 Task 4: 第 9 个 tool
 ])
-assert len(ALL_SPECS) == 8, f"ALL_SPECS 应当有 8 项,实际 {len(ALL_SPECS)}"
+assert len(ALL_SPECS) == 9, f"ALL_SPECS 应当有 9 项,实际 {len(ALL_SPECS)}"
 
 
 # ---------------------------------------------------------------------------
@@ -1095,13 +1143,154 @@ def _render_tree(
     return "\n".join(lines) + "\n"
 
 
+# ---------------------------------------------------------------------------
+# D1 阶段 Task 4(组件 1):dispatch_subagent handler
+# ---------------------------------------------------------------------------
+
+
+async def dispatch_subagent_handler(
+    args: dict, *, service, session_id: str, cwd: str,
+    last_turn_text: str = "",
+    dispatch_subagent_runner=None,
+):
+    """dispatch_subagent 第 9 个 todo tool。
+
+    校验 → 创建 N 个 sub-todo(故意 acceptance_criteria=[]) → asyncio.gather 真并行
+    → _render_subagent_summary 合并。完整实现见 spec 组件 1。
+
+    Args:
+        args: LLM 调工具传入的参数(task_id + sub_specs + max_fan_out + timeout)。
+        service: TodoService 实例(handler 通过 deps['service'] 访问)。
+        session_id: 当前 session(handler 用来标 sub-todo session_id)。
+        cwd: 当前工作目录(handler 当前未用,保留签名)。
+        last_turn_text: 上一轮 LLM 文本(handler 当前未用,保留签名)。
+        dispatch_subagent_runner: SubAgentRunner 实例(inject_todo_tools 由
+            deps['dispatch_subagent_runner'] 注入;**不可为 None** —
+            重要 fix #1)。
+
+    Returns:
+        ToolResult:
+        - 校验失败 → is_error=True + 提示("未注入" / "已 done" /
+          "max_fan_out 超出" / "timeout 越界")。
+        - 正常 → _render_subagent_summary 合并结果(仍 is_error=False)。
+    """
+    from cc_harness.project.subagent import (
+        SubAgentRunner,
+        _render_subagent_summary,
+        _subagent_err,
+    )
+
+    del cwd, last_turn_text
+
+    task_id = args.get("task_id")
+    sub_specs = args.get("sub_specs") or []
+    max_fan_out = int(args.get("max_fan_out", 3))
+    timeout = int(args.get("timeout", 240))
+
+    # 1. 参数校验
+    if not task_id:
+        return _subagent_err("dispatch_subagent", "task_id is required")
+    if not sub_specs:
+        return _subagent_err(
+            "dispatch_subagent", "sub_specs is required (non-empty list)"
+        )
+    if not (1 <= len(sub_specs) <= max_fan_out):
+        return _subagent_err(
+            "dispatch_subagent",
+            f"sub_specs 长度 {len(sub_specs)} 超出 max_fan_out={max_fan_out}",
+        )
+    if not (1 <= max_fan_out <= 10):
+        return _subagent_err(
+            "dispatch_subagent", "max_fan_out 必须在 [1, 10]"
+        )
+    if not (1 <= timeout <= 3600):
+        return _subagent_err(
+            "dispatch_subagent", f"timeout={timeout} 必须在 [1, 3600]"
+        )
+
+    # 2. parent 存在性 + 状态校验
+    try:
+        parent = await service.get(task_id)
+    except Exception as e:
+        return _subagent_err(
+            "dispatch_subagent", f"task_id={task_id} 不存在: {e}"
+        )
+    if parent.status == "done":
+        return _subagent_err(
+            "dispatch_subagent",
+            f"task_id={task_id} 已 done, 不能再派 subagent",
+        )
+
+    # 3. runner 注入校验 + 嵌套深度(decision 5:MAX_DEPTH=2)
+    if dispatch_subagent_runner is None:
+        return _subagent_err(
+            "dispatch_subagent",
+            "dispatch_subagent_runner 未注入,agent.run_turn 配置错误",
+        )
+    current_depth = dispatch_subagent_runner.current_depth
+    if current_depth >= SubAgentRunner.MAX_DEPTH:
+        return _subagent_err(
+            "dispatch_subagent",
+            f"subagent 嵌套深度 {current_depth} 超过 max_depth=2",
+        )
+
+    # 4. 创建 N 个 sub-todo(故意 acceptance_criteria=[],
+    #    避免 subagent 末轮空 last_turn_text 误判 acceptance 失败)
+    sub_task_ids: list[tuple[str, dict]] = []
+    for spec in sub_specs:
+        try:
+            t = await service.create(
+                title=spec.get("title", "(untitled)"),
+                acceptance_criteria=[],  # D1 重要 fix
+                parent_task=task_id,
+                session_id=session_id,
+            )
+        except Exception as e:
+            return _subagent_err(
+                "dispatch_subagent", f"创建 sub-task 失败: {e}"
+            )
+        sub_task_ids.append((t.id, spec))
+
+    # 5. 真并行跑 N 个 subagent
+    runner = dispatch_subagent_runner
+    try:
+        results = await asyncio.wait_for(
+            asyncio.gather(*[
+                runner.run(
+                    task_id=tid,
+                    title=spec.get("title", ""),
+                    description=spec.get("description") or "",
+                    criteria=spec.get("criteria", []),
+                    parent_id=task_id,
+                    session_id=session_id,
+                    timeout=timeout,
+                )
+                for tid, spec in sub_task_ids
+            ]),
+            timeout=timeout * len(sub_specs) + 30,
+        )
+    except asyncio.TimeoutError:
+        return _subagent_err(
+            "dispatch_subagent",
+            f"subagent fan-out 总耗时超过 {timeout * len(sub_specs) + 30}s",
+        )
+    except Exception as e:
+        return _subagent_err(
+            "dispatch_subagent", f"subagent runner 异常: {e}"
+        )
+
+    return _render_subagent_summary(results, parent_id=task_id)
+
+
 __all__ = [
     "TODO_LIST_SPEC", "TODO_GET_SPEC", "TODO_CREATE_SPEC", "TODO_UPDATE_SPEC",
     "TODO_DELETE_SPEC", "TODO_RESOLVE_SPEC", "TODO_VALIDATE_SPEC",
     "TODO_TOPOSORT_SPEC",  # B 阶段 Task 3
+    "TODO_DISPATCH_SUBAGENT_SPEC",  # D1 阶段 Task 4
     "ALL_SPECS",
     "todo_list_handler", "todo_get_handler", "todo_create_handler",
     "todo_update_handler", "todo_delete_handler", "todo_resolve_handler",
     "todo_validate_handler",
     "todo_toposort_handler",  # B 阶段 Task 3
+    "dispatch_subagent_handler",  # D1 阶段 Task 4
 ]

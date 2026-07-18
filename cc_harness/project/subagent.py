@@ -21,11 +21,16 @@ Task 3 新增:
 """
 from __future__ import annotations
 
+import asyncio
+import logging
 import re
+import time
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Literal
 
 from cc_harness.project.tools import ToolResult
+
+log = logging.getLogger(__name__)
 
 if TYPE_CHECKING:  # 避免循环依赖:agent.run_turn 不在模块级 import(Task 4 再引)
     from cc_harness.llm import LLMClient
@@ -246,6 +251,120 @@ class SubAgentRunner:
         self.project_root = project_root
         self.max_iter = max_iter
         self.policy = policy
+
+    async def run(
+        self,
+        *,
+        task_id: str,
+        title: str,
+        description: str = "",
+        criteria: list[str] | None = None,
+        parent_id: str = "",
+        session_id: str = "s",
+        timeout: int = 240,
+    ) -> SubAgentResult:
+        """跑 1 个 subagent,返回结果摘要。
+
+        5 步实现:
+          1. 构造独立 messages(system + user 任务)
+          2. 注入 extras(dispatch_subagent 的 deps 加 current_depth+1 runner)
+          3. 调 run_turn + asyncio.wait_for timeout
+          4. 收集末轮 LLM 输出 + status(判 incomplete if max_iter 耗尽)
+          5. 返回 SubAgentResult(tokens_used 默认 0,decision 4)
+
+        status 取值:
+          - "timeout":超过 timeout 秒
+          - "failed":subagent 内异常
+          - "incomplete":max_iter 耗尽但 todo 未 done/blocked
+          - "done" / "blocked" / "in_progress":todo 实际最终状态
+        """
+        # 延迟 import:subagent.py 是 agent.py 的下游,避免循环
+        from cc_harness.agent import run_turn
+        from cc_harness.project.extras import inject_todo_tools
+        from cc_harness.repl import _extract_final_text
+
+        start = time.time()
+        criteria = criteria or []
+
+        # 1. 独立 messages
+        system_prompt = _build_subagent_system_prompt(
+            task_id, title, description, criteria, parent_id, self.current_depth,
+        )
+        messages: list[dict] = [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": (
+                f"完成任务: {title}\n\n描述: {description}" if description
+                else f"完成任务: {title}"
+            )},
+        ]
+
+        # 2. 注入 extras(deps 加 dispatch_subagent_runner=self 的下一层)
+        next_runner = SubAgentRunner(
+            self.llm, self.mcp, self.todo_service,
+            current_depth=self.current_depth + 1,
+            project_root=self.project_root,
+            max_iter=self.max_iter,
+            policy=self.policy,
+        )
+        extras = inject_todo_tools(
+            self.todo_service, session_id, cwd=self.project_root,
+            last_turn_text="",  # sub-todo 不带 criteria,完成门不查 acceptance
+        )
+        extras = [
+            {**entry, "deps": {**entry["deps"], "dispatch_subagent_runner": next_runner}}
+            if entry["spec"]["function"]["name"] == "dispatch_subagent"
+            else entry
+            for entry in extras
+        ]
+
+        # 3. 跑 subagent ReAct loop(超时由外层 asyncio.wait_for 控)
+        try:
+            await asyncio.wait_for(
+                run_turn(
+                    messages, self.llm, self.mcp,
+                    cwd=self.project_root,
+                    max_iter=self.max_iter,
+                    extra_native_specs=extras,
+                    policy=self.policy,
+                ),
+                timeout=timeout,
+            )
+        except asyncio.TimeoutError:
+            return SubAgentResult(
+                task_id=task_id, title=title, status="timeout",
+                error=f"subagent 超过 {timeout}s timeout",
+                duration_s=time.time() - start,
+            )
+        except Exception as e:
+            log.exception("subagent run failed: %s", e)
+            return SubAgentResult(
+                task_id=task_id, title=title, status="failed",
+                error=str(e)[:200],
+                duration_s=time.time() - start,
+            )
+        else:
+            # 4. 检测 max_iter 耗尽(没 timeout/exception 的话)
+            try:
+                final_t = await self.todo_service.get(task_id)
+                final_status = final_t.status
+            except Exception:
+                final_status = "unknown"
+            iter_used = sum(1 for m in messages if m.get("role") == "assistant")
+            if iter_used >= self.max_iter and final_status not in ("done", "blocked"):
+                return SubAgentResult(
+                    task_id=task_id, title=title, status="incomplete",
+                    error=f"max_iter={self.max_iter} 耗尽, todo 未 done/blocked",
+                    duration_s=time.time() - start,
+                )
+
+        # 5. 正常完成
+        final_text = _extract_final_text(messages)[-500:]
+        file_refs = _extract_file_refs(final_text)
+        return SubAgentResult(
+            task_id=task_id, title=title, status=final_status,
+            final_text=final_text, duration_s=time.time() - start,
+            file_refs=file_refs,
+        )
 
 
 def get_default_runner(
