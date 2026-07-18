@@ -1,6 +1,6 @@
 # 其一·长程任务 — Sub-project D1:SubAgent 单层 fan-out 设计
 
-> **范围**:cc-harness AI 工程目标"其一·长程任务" 5 红 + 3 黄中的 **D 子集(SubAgent 单层)** —— 给主 agent 加 `dispatch_subagent` tool,让主 agent 能 fan-out 派 N 个独立 subagent ReAct loop 跑并行子任务,结果以摘要形式回填主 agent。复用 B 的 `get_ready_tasks` 做 fan-out 校验,复用 C 的 `todo_update` 完成门 + `children_all_done` 聚合做 subagent 结果验入,复用 C 的 `parent_task` 树天然映射 subagent 任务分解。
+> **范围**:cc-harness AI 工程目标"其一·长程任务" 5 红 + 3 黄中的 **D 子集(SubAgent 单层)** —— 给主 agent 加 `dispatch_subagent` tool,让主 agent 能 fan-out 派 N 个独立 subagent ReAct loop 跑并行子任务(**派发数 N = LLM 传的 `len(sub_specs)`,根据 todo 列表动态决定**;`max_fan_out=3` 默认是上限,不是派发数),结果以摘要形式回填主 agent。复用 C 的 `todo_update` 完成门 + `children_all_done` 聚合做 subagent 结果验入,复用 C 的 `parent_task` 树天然映射 subagent 任务分解。
 >
 > **不做**(明确 out of scope):
 > - **Agent Team(D2)**:lead 调度 + 多 agent 协同 + 投票合并 —— D2 后续 sub-project
@@ -106,7 +106,7 @@ SubAgent fan-out 完成 (N=3, 总耗时 45s, 总 tokens 12K)
 
 | 维度 | 默认值 | 理由 |
 |---|---|---|
-| `max_fan_out` | **3** | 3 个并发 LLM call 不撞 DeepSeek rate limit;用户可在 args 覆盖 |
+| `max_fan_out` | **3(上限,不是默认派发数)** | LLM 不显式传时,默认上限 3(3 个并发 LLM call 不撞 DeepSeek rate limit);**实际派发数 = `len(sub_specs)`**(LLM 根据 todo 数量动态决定,想派 5 个就传 5 个 sub_specs 并设 max_fan_out=5,≤10) |
 | `timeout` | **240s** | 够 20 轮 ReAct(每轮 12s LLM),覆盖大多数任务 |
 | tokens 策略 | **继承 parent session** + **D1 tokens_used 字段保持 0** | D1 不接 SessionTokenStats(避免过度耦合),`SubAgentResult.tokens_used` 默认 0,parent 看到 0 走 TBD 分支不误判;D1.1 接 SessionTokenStats 后才真正记录 |
 | 并发模型 | **`asyncio.gather` 真并行** | LLM call 是 I/O bound,asyncio.gather 跑 N 个并发无 thread 切换开销 |
@@ -173,7 +173,7 @@ async def dispatch_subagent_handler(
       task_id (str, required):parent task ID(必须存在 + status≠done)
       sub_specs (list[dict], required):每个含 title, criteria, description
         例: [{"title": "test for foo/parser", "criteria": ["5/5 通过"]}, ...]
-      max_fan_out (int, default=3):并发 subagent 数上限(1-10)
+      max_fan_out (int, default=3, 上限不是派发数):并发 subagent 数上限(1-10);**实际派发数 = len(sub_specs)**,LLM 根据 todo 列表长度动态决定,超过 max_fan_out 报错
       timeout (int, default=240):每个 subagent 超时(秒, [1, 3600])
 
     Returns:ToolResult(摘要渲染:见 decision 3)
@@ -271,7 +271,7 @@ TODO_DISPATCH_SUBAGENT_SPEC = {
             "Fan-out 派 N 个独立 subagent 跑并行子任务。"
             "subagent 与主 agent 共享 TodoService,完成门天然验入。"
             "完成后回填摘要(标题 + todo_id + 状态 + 末轮结果 + 文件路径)。"
-            "max_fan_out 默认 3,timeout 默认 240s,可在 args 覆盖。"
+            "max_fan_out 默认上限 3(不是默认派发数),实际派发数 = len(sub_specs);timeout 默认 240s,可在 args 覆盖。"
             "嵌套最多 2 层(depth 0=主 agent 调,1=第一层 subagent 调,2=第二层)。"
         ),
         "parameters": {
@@ -300,7 +300,7 @@ TODO_DISPATCH_SUBAGENT_SPEC = {
                     "default": 3,
                     "minimum": 1,
                     "maximum": 10,
-                    "description": "并发 subagent 上限",
+                    "description": "并发 subagent 上限(默认 3,不是默认派发数);实际派发数 = len(sub_specs),LLM 根据 todo 列表动态决定",
                 },
                 "timeout": {
                     "type": "integer",
@@ -639,7 +639,7 @@ SUBAGENT_HINTS_BLOCK = """
 你最近创建了 HTN parent task(有 children 的父任务)。如果有多个独立子任务可并行完成,考虑用 `dispatch_subagent` tool fan-out 派 subagent 并行跑:
 - 调 `dispatch_subagent(task_id=<parent_id>, sub_specs=[{title, criteria}, ...])`
 - subagent 共享 TodoService, 完成门自动验入(改 children 状态)
-- N 个 subagent 真并行(默认 3 个, 可覆盖 max_fan_out)
+- N 个 subagent 真并行(默认上限 3 个;**实际派发数 = sub_specs 长度**,根据你的 todo 列表动态传 N,需要更多可覆盖 max_fan_out 到 ≤10)
 - 完成后回填摘要(标题 + 状态 + 末轮结果 + 文件路径)
 
 不要 fan-out:
@@ -773,9 +773,9 @@ Parent agent.run_turn() iter 2
   ↓
 dispatch_subagent_handler:
   ├─ 校验 parent_t 存在 + status≠done + current_depth=0 < 2
-  ├─ 校验 len(sub_specs)=3 ≤ max_fan_out=3
+  ├─ 校验 len(sub_specs)=3 ≤ max_fan_out=3(本例 N=3 不超上限;若 LLM 想派 5 个,传 max_fan_out=5)
   ├─ 为每个 sub_spec 调 service.create(parent_task=parent_t) → t_a, t_b, t_c
-  ├─ runner.run(task_id=t_a, ...) × 3 asyncio.gather 并发
+  ├─ runner.run(task_id=t_a, ...) × N=3 asyncio.gather 并发
   │   ├─ subagent_1 (depth=1):新 messages + system prompt + extras → run_turn
   │   │   ├─ subagent_1 调 todo_update(t_a, status=in_progress)
   │   │   ├─ subagent_1 调 run_command 写 test_parser.py + 跑 pytest
