@@ -163,23 +163,32 @@ async def test_run_repl_auto_init(tmp_path, monkeypatch):
 
 @pytest.mark.asyncio
 async def test_run_repl_loads_todo_service(tmp_path, monkeypatch):
-    """run_repl 后 state.todo_service 是 TodoService 实例。"""
+    """run_repl 后 state.todo_service 是 TodoService 实例,并透传到 run_turn。
+
+    D1 final:REPL 不再预 inject todo_extras(D1 Task 5 死代码,因
+    dispatch_subagent_runner 在预 build 时为 None → handler 返 is_error)。
+    改为把 `todo_service / session_id / last_turn_text` 透传给 `run_turn`,
+    由 agent.run_turn 在 dispatch 前自动调 `inject_todo_tools(...)` 注入 9 个
+    todo entries(含 dispatch_subagent + 共享 SubAgentRunner)。
+    本 test 验证契约:todoservice 实例 + 3 个 kwarg 都透传到 run_turn。
+    """
     from cc_harness import repl as repl_mod
     from cc_harness.repl import run_repl
+    from cc_harness.project.service import TodoService
 
     proj = _seed_manifest(tmp_path)
-    # 消息 → 触发 run_turn 至少一次,extras 才会被 capture
     monkeypatch.setattr(repl_mod, "_read_user", _fake_inputs(["hi", "exit"]))
     monkeypatch.setattr(repl_mod, "init_session_executor", lambda c, r: None)
     monkeypatch.setattr(repl_mod, "shutdown_session_executor", AsyncMock())
 
-    # 通过 patch run_turn 直接捕获 state(因 state 是 run_repl 内部变量)
+    # 通过 patch run_turn 直接捕获 kwargs(因 state 是 run_repl 内部变量)
     captured = {}
 
     async def _spy_run_turn(messages, llm, mcp, **kwargs):
-        # 第一次调用时,capture state — 但 state 是局部变量,只能通过 session_id
-        # 来验证 todo_extras 注入(走 run_turn 的 extra_native_specs)
-        captured["extras"] = kwargs.get("extra_native_specs")
+        captured["todo_service"] = kwargs.get("todo_service")
+        captured["session_id"] = kwargs.get("session_id")
+        captured["last_turn_text"] = kwargs.get("last_turn_text")
+        captured["extra_native_specs"] = kwargs.get("extra_native_specs")
         from cc_harness.tokens import TurnTokenStats
         return TurnTokenStats()
 
@@ -187,35 +196,46 @@ async def test_run_repl_loads_todo_service(tmp_path, monkeypatch):
 
     await run_repl(_NoopLLM(), _NoopMCP(), cwd=str(proj))
 
-    # 验证 todo_extras 被注入(D1 Task 5:9 个 todo tools)
-    extras = captured.get("extras") or []
-    assert len(extras) == 9
-    tool_names = {e["spec"]["function"]["name"] for e in extras}
-    # D1 Task 5:9 个 todo tools(8 原 todo + dispatch_subagent)
-    expected = {
-        "todo_list", "todo_get", "todo_create", "todo_update",
-        "todo_delete", "todo_resolve", "todo_validate", "todo_toposort",
-        "dispatch_subagent",
-    }
-    assert tool_names == expected
+    # D1 final:REPL 透传 todo_service 实例(由 run_turn 内部自动 inject 9 个 todo tools)
+    assert captured.get("todo_service") is not None
+    assert isinstance(captured["todo_service"], TodoService)
+    # session_id 非空 str(D1 Task 7:handler 用作 active_sessions,显式不靠 env var)
+    assert isinstance(captured["session_id"], str)
+    assert captured["session_id"] != ""
+    # last_turn_text 透传(C 阶段 todo_update 完成门 acceptance 校验用)
+    assert isinstance(captured["last_turn_text"], str)
+    # REPL 不再预 inject todo_extras(死代码路径);extras 仅含 memory(可能 None)。
+    # todo extras 由 run_turn 内部 inject_todo_tools() 追加。
+    assert (captured["extra_native_specs"] is None
+            or len(captured["extra_native_specs"]) == 0
+            or all(e["spec"]["function"]["name"] not in (
+                "todo_list", "todo_get", "todo_create", "todo_update",
+                "todo_delete", "todo_resolve", "todo_validate",
+                "todo_toposort", "dispatch_subagent",
+            ) for e in captured["extra_native_specs"]))
 
 
 @pytest.mark.asyncio
 async def test_run_repl_live_panel_starts(tmp_path, monkeypatch):
-    """run_repl 启动 → live_panel 非 None 且已 started。"""
+    """run_repl 启动 → live_panel 非 None,且 TodoService 已构造(传给 run_turn)。
+
+    D1 final:从"spy extras == 9"改为"spy todo_service is not None"。
+    todo_service 是 live_panel 启动的前置(只有 TodoService 创建后 live_panel 才 attach)。
+    """
     from cc_harness import repl as repl_mod
     from cc_harness.repl import run_repl
+    from cc_harness.project.service import TodoService
 
     proj = _seed_manifest(tmp_path)
     monkeypatch.setattr(repl_mod, "_read_user", _fake_inputs(["hi", "exit"]))
     monkeypatch.setattr(repl_mod, "init_session_executor", lambda c, r: None)
     monkeypatch.setattr(repl_mod, "shutdown_session_executor", AsyncMock())
 
-    # Spy:捕获 run_turn 时 extras
-    captured_extras = []
+    # Spy:捕获 run_turn 时 todo_service(证明 TodoService 已被 REPL 创建)
+    captured_services = []
 
     async def _spy(messages, llm, mcp, **kw):
-        captured_extras.append(kw.get("extra_native_specs"))
+        captured_services.append(kw.get("todo_service"))
         from cc_harness.tokens import TurnTokenStats
         return TurnTokenStats()
 
@@ -223,10 +243,8 @@ async def test_run_repl_live_panel_starts(tmp_path, monkeypatch):
 
     await run_repl(_NoopLLM(), _NoopMCP(), cwd=str(proj))
 
-    # extras 含 8 个 todo tools → 说明 todo_service + extras 注入成功
-    # (间接证明 Live panel 也在,因为只有 todo_service 创建后才会 inject_todo_tools)
-    # D1 Task 5:9 个 todo tools(8 原 todo + dispatch_subagent)
-    assert any(e and len(e) == 9 for e in captured_extras)
+    # 至少一次 run_turn 调用拿到 TodoService 实例(live_panel 启动链上必需)
+    assert any(isinstance(s, TodoService) for s in captured_services)
 
 
 # ---------------------------------------------------------------------------
@@ -235,10 +253,16 @@ async def test_run_repl_live_panel_starts(tmp_path, monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_run_repl_extra_native_specs_includes_todo_tools(tmp_path, monkeypatch):
-    """run_turn 收到的 extra_native_specs 包含 todo tools(7 个)。"""
+async def test_run_repl_todo_service_passed_to_run_turn(tmp_path, monkeypatch):
+    """REPL → run_turn 透传 TodoService(由 run_turn 内部 inject 9 todo tools)。
+
+    D1 final 改写:REPL 不再预 inject todo_extras(死代码);改为透传 todo_service
+    让 agent.run_turn 内部调 inject_todo_tools()(含 dispatch_subagent + 共享 runner)。
+    本 test 验证:todo_service 实例 + session_id 都正确透传。
+    """
     from cc_harness import repl as repl_mod
     from cc_harness.repl import run_repl
+    from cc_harness.project.service import TodoService
 
     proj = _seed_manifest(tmp_path)
     monkeypatch.setattr(repl_mod, "_read_user", _fake_inputs(["hi", "exit"]))
@@ -248,7 +272,8 @@ async def test_run_repl_extra_native_specs_includes_todo_tools(tmp_path, monkeyp
     captured = {}
 
     async def _spy(messages, llm, mcp, **kw):
-        captured["extras"] = kw.get("extra_native_specs")
+        captured["todo_service"] = kw.get("todo_service")
+        captured["session_id"] = kw.get("session_id")
         from cc_harness.tokens import TurnTokenStats
         return TurnTokenStats()
 
@@ -256,14 +281,19 @@ async def test_run_repl_extra_native_specs_includes_todo_tools(tmp_path, monkeyp
 
     await run_repl(_NoopLLM(), _NoopMCP(), cwd=str(proj))
 
-    extras = captured["extras"]
-    assert extras is not None
-    assert len(extras) >= 8   # todo tools always present in coding mode
+    # todo_service 实例 + session_id 都透传
+    assert isinstance(captured.get("todo_service"), TodoService)
+    assert isinstance(captured.get("session_id"), str)
+    assert captured["session_id"] != ""
 
 
 @pytest.mark.asyncio
-async def test_run_repl_extra_native_specs_none_safe_when_no_memory(tmp_path, monkeypatch):
-    """memory_extras 空 + todo_extras 7 个 → extras = todo_extras(7 个),非 None。"""
+async def test_run_repl_no_memory_extras_is_none_safe(tmp_path, monkeypatch):
+    """memory_extras 空 + todo_extras 不在 REPL 预 inject → extras = None/空,非 None 错。
+
+    D1 final 改写:todo 不在 REPL 预 inject,改由 run_turn 内部追加。memory 空时
+    REPL 透传给 run_turn 的 extras 是 None(None-safe 路径)。
+    """
     from cc_harness import repl as repl_mod
     from cc_harness.repl import run_repl
 
@@ -282,6 +312,7 @@ async def test_run_repl_extra_native_specs_none_safe_when_no_memory(tmp_path, mo
 
     async def _spy(messages, llm, mcp, **kw):
         captured["extras"] = kw.get("extra_native_specs")
+        captured["todo_service"] = kw.get("todo_service")
         from cc_harness.tokens import TurnTokenStats
         return TurnTokenStats()
 
@@ -289,10 +320,11 @@ async def test_run_repl_extra_native_specs_none_safe_when_no_memory(tmp_path, mo
 
     await run_repl(_NoopLLM(), _NoopMCP(), cwd=str(proj))
 
+    # 即便 memory 空 + todo 不预 inject,extras 是 None/空 list(不报错)
     extras = captured["extras"]
-    # 即便 memory 空,extras 仍含 todo 9 个(D1 Task 5:8 原 todo + dispatch_subagent);不存在 None 错。
-    assert extras is not None
-    assert len(extras) == 9
+    assert extras is None or extras == []
+    # todo_service 仍透传(由 run_turn 内部 inject)
+    assert captured["todo_service"] is not None
 
 
 # ---------------------------------------------------------------------------
@@ -302,7 +334,11 @@ async def test_run_repl_extra_native_specs_none_safe_when_no_memory(tmp_path, mo
 
 @pytest.mark.asyncio
 async def test_run_repl_session_id_new_format(tmp_path, monkeypatch):
-    """state.session_id 匹配 `repl-{int_ts}-{hex[:8]}`。"""
+    """state.session_id 匹配 `repl-{int_ts}-{hex[:8]}`,且透传给 run_turn。
+
+    D1 final 改写:session_id 不再从 todo extras deps 抓(REPL 不预 inject todo_extras),
+    直接从 run_turn kwarg 抓(`session_id=state.session_id` 透传)。
+    """
     from cc_harness import repl as repl_mod
     from cc_harness.repl import run_repl
 
@@ -315,11 +351,8 @@ async def test_run_repl_session_id_new_format(tmp_path, monkeypatch):
 
     async def _spy(messages, llm, mcp, **kw):
         nonlocal captured_session_id
-        # 不能直接拿 state,但可以从 todo extras deps 里抓 session_id
-        extras = kw.get("extra_native_specs") or []
-        for e in extras:
-            if e["spec"]["function"]["name"] == "todo_list":
-                captured_session_id = e["deps"]["session_id"]
+        # D1 final:session_id 直接透传为 run_turn kwarg(handler 用作 active_sessions)
+        captured_session_id = kw.get("session_id")
         from cc_harness.tokens import TurnTokenStats
         return TurnTokenStats()
 

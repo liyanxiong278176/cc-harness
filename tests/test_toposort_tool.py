@@ -371,10 +371,13 @@ def test_toposort_done_section_truncated_at_50():
 # ---------------------------------------------------------------------------
 
 
-def test_all_specs_count_8():
-    """ALL_SPECS 包含 8 个 SPEC(7 原有 + todo_toposort)。"""
+def test_all_specs_count_9():
+    """ALL_SPECS 包含 9 个 SPEC(7 原有 + todo_toposort + dispatch_subagent)。
+
+    D1 Task 5 加了第 9 个 spec dispatch_subagent(从 8 → 9)。
+    """
     from cc_harness.project.tools import ALL_SPECS
-    assert len(ALL_SPECS) == 8
+    assert len(ALL_SPECS) == 9
 
 
 def test_all_specs_include_toposort():
@@ -384,7 +387,7 @@ def test_all_specs_include_toposort():
     assert "todo_toposort" in names
 
 
-def test_inject_todo_tools_returns_8(svc):
+def test_inject_todo_tools_returns_9(svc):
     """inject_todo_tools 返回 9 个 entry(D1 Task 5:8 原 todo + dispatch_subagent)。"""
     extras = inject_todo_tools(svc, "test-session", "/tmp")
     assert isinstance(extras, list)
