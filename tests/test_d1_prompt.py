@@ -1,6 +1,8 @@
 """D1 Task 6: <subagent_hints> 静态提示注入(coding mode + HTN parent 已创建)。"""
 from __future__ import annotations
 
+import pytest
+
 from cc_harness.agent import _refresh_system_prompt
 
 
@@ -52,3 +54,58 @@ def test_subagent_hints_idempotent(tmp_path):
     _refresh_system_prompt(messages, str(tmp_path), "coding")
     twice = messages[0]["content"].count("<subagent_hints>")
     assert once == twice == 1
+
+
+async def _run_real_todo_create(tmp_path):
+    """Run a real todo_create(parent_task=...) tool call through run_turn."""
+    import json
+
+    from cc_harness.agent import run_turn
+    from cc_harness.cli.init import init_noninteractive
+    from cc_harness.llm import PendingToolCall
+    from cc_harness.policy import PolicyEngine
+    from cc_harness.project.service import TodoService
+    from tests.test_agent import FakeLLM, FakeMCP, FakeStreamEvent
+
+    service = TodoService(
+        project_root=tmp_path,
+        manifest=init_noninteractive(tmp_path, name="d1-prompt", write_gitignore=False),
+    )
+    parent = await service.create(title="existing parent", session_id="s")
+    pending = [PendingToolCall(
+        index=0,
+        id="create-child",
+        name="todo_create",
+        arguments_json=json.dumps({
+            "title": "created child",
+            "parent_task": parent.id,
+        }),
+    )]
+    llm = FakeLLM(responses=[
+        [FakeStreamEvent(kind="done", content="create", pending=pending,
+                         finish_reason="tool_calls")],
+        [FakeStreamEvent(kind="done", content="created", pending=[], finish_reason="stop")],
+    ])
+    mcp = FakeMCP(tools_spec=[], results={}, calls=[])
+    messages = [{"role": "user", "content": "create a child"}]
+    await run_turn(
+        messages,
+        llm,
+        mcp,
+        cwd=str(tmp_path),
+        max_iter=3,
+        policy=PolicyEngine(project_root=tmp_path, enabled=False),
+        todo_service=service,
+        session_id="s",
+    )
+    return messages
+
+
+@pytest.mark.asyncio
+async def test_d1_prompt_detects_htn_parent_from_real_tool_message(tmp_path):
+    """Real dispatcher output has a tool name but plain-text handler content."""
+    messages = await _run_real_todo_create(tmp_path)
+    tool_message = next(m for m in messages if m.get("role") == "tool")
+    assert tool_message["name"] == "todo_create"
+    _refresh_system_prompt(messages, str(tmp_path), "coding")
+    assert "<subagent_hints>" in messages[0]["content"]

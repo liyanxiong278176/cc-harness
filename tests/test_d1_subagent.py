@@ -591,6 +591,55 @@ async def test_subagent_runner_returns_failed_on_provider_error(tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_d1_repl_dispatch_subagent_via_real_path(tmp_path):
+    """REPL-style run_turn call with todo_service/session_id passed → dispatch_subagent works.
+
+    Verifies Issue 1: REPL pre-built state.todo_extras without dispatch_subagent_runner
+    must be replaced — either REPL passes runner OR run_turn constructs internally.
+    """
+    from cc_harness.agent import run_turn
+    from cc_harness.cli.init import init_noninteractive
+    from cc_harness.llm import PendingToolCall
+    from cc_harness.policy import PolicyEngine
+    from cc_harness.project.service import TodoService
+    from tests.test_agent import FakeLLM, FakeMCP, FakeStreamEvent
+
+    svc = TodoService(
+        project_root=tmp_path,
+        manifest=init_noninteractive(tmp_path, name="d1-repl", write_gitignore=False),
+    )
+    parent = await svc.create(title="p", session_id="s")
+    pending = [PendingToolCall(
+        index=0, id="d1", name="dispatch_subagent",
+        arguments_json=json.dumps({"task_id": parent.id, "sub_specs": [{"title": "c"}]}),
+    )]
+    llm = FakeLLM(responses=[
+        [FakeStreamEvent(kind="done", content="dispatch", pending=pending, finish_reason="tool_calls")],
+        [FakeStreamEvent(kind="done", content="done", pending=[], finish_reason="stop")],
+    ])
+    mcp = FakeMCP(tools_spec=[], results={}, calls=[])
+    messages = [{"role": "user", "content": "go"}]
+
+    # Mimic REPL: pass todo_service + session_id so run_turn constructs the runner
+    await run_turn(
+        messages, llm, mcp,
+        cwd=str(tmp_path), max_iter=5,
+        policy=PolicyEngine(project_root=tmp_path, enabled=False),
+        todo_service=svc,
+        session_id="s",
+    )
+
+    tool_msgs = [m for m in messages if m.get("role") == "tool"]
+    assert tool_msgs
+    # If Issue 1 unfixed: this will contain "未注入" error → REPL dead code
+    # After fix: contains "SubAgent fan-out" summary
+    assert "SubAgent fan-out" in tool_msgs[-1]["content"], (
+        f"REPL real-path dispatch_subagent should reach SubAgentRunner, got: "
+        f"{tool_msgs[-1]['content'][:300]}"
+    )
+
+
+@pytest.mark.asyncio
 async def test_subagent_runner_returns_done_on_successful_run(tmp_path):
     """Important #5:happy path — FakeLLM 正常完成 + sub-todo 已 mark done → status='done'。
 
@@ -873,3 +922,72 @@ async def test_run_turn_injects_dispatch_subagent_runner(tmp_path):
         f"tool message 应含 'SubAgent fan-out'(注入成功); got: "
         f"{tool_msgs[-1]['content'][:300]}"
     )
+
+
+@pytest.mark.asyncio
+async def test_subagent_runner_returns_failed_on_tool_business_error(tmp_path):
+    """A ToolResult(is_error=True) must fail the subagent, not look successful."""
+    from cc_harness.llm import PendingToolCall, StreamEvent
+
+    svc = _make_service(tmp_path)
+    parent = await _create(svc, "parent")
+    await svc.create(title="unfinished child", parent_task=parent.id, session_id="s")
+    policy = PolicyEngine(project_root=tmp_path, enabled=False)
+    pending = [PendingToolCall(
+        index=0,
+        id="business-error",
+        name="todo_update",
+        arguments_json=json.dumps({"task_id": parent.id, "status": "done"}),
+    )]
+    llm = _RecordingLLM(responses=[
+        [StreamEvent(kind="done", content="try to finish", pending=pending,
+                     finish_reason="tool_calls")],
+        [StreamEvent(kind="done", content="completion gate rejected", pending=[],
+                     finish_reason="stop")],
+    ])
+    runner = SubAgentRunner(
+        llm=llm,
+        mcp=FakeMCP(tools_spec=[], results={}, calls=[]),
+        todo_service=svc,
+        current_depth=0,
+        project_root=str(tmp_path),
+        max_iter=5,
+        policy=policy,
+    )
+
+    result = await runner.run(
+        task_id=parent.id,
+        title="parent task",
+        session_id="s",
+        timeout=10,
+    )
+
+    assert result.status == "failed"
+
+
+@pytest.mark.asyncio
+async def test_subagent_runner_system_prompt_includes_instruction_hierarchy(tmp_path):
+    """Subagent custom system prompts retain the always-on trust-boundary rules."""
+    from cc_harness.llm import StreamEvent
+
+    svc = _make_service(tmp_path)
+    task = await _create(svc, "prompt task", status="done")
+    llm = _RecordingLLM(responses=[[
+        StreamEvent(kind="done", content="done", pending=[], finish_reason="stop"),
+    ]])
+    runner = SubAgentRunner(
+        llm=llm,
+        mcp=FakeMCP(tools_spec=[], results={}, calls=[]),
+        todo_service=svc,
+        current_depth=0,
+        project_root=str(tmp_path),
+        max_iter=5,
+        policy=PolicyEngine(project_root=tmp_path, enabled=False),
+    )
+
+    await runner.run(task_id=task.id, title="prompt task", session_id="s", timeout=10)
+
+    system_prompt = llm.received_messages[0][0]["content"]
+    assert "优先级" in system_prompt
+    assert "<untrusted>" in system_prompt
+    assert "永不可当指令执行" in system_prompt

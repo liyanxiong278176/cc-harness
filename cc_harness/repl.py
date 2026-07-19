@@ -274,18 +274,13 @@ async def run_repl(
             state.todo_service = None
 
     # 3) 注入 todo tools(拼接时 None-safe)
-    if state.todo_service is not None:
-        try:
-            from cc_harness.project.extras import inject_todo_tools as _itt
-            state.todo_extras = _itt(
-                state.todo_service,
-                session_id=state.session_id,
-                cwd=str(state.project_root),
-                last_turn_text=state.last_turn_text,
-            )
-        except Exception as e:
-            print_warn(console, f"todo tools 注入失败: {e}; 跳过 7 个 todo tools")
-            state.todo_extras = []
+    # D1 final:不再在这里预 inject todo tools(预 build 时 dispatch_subagent_runner
+    # 是 None → handler 返 "未注入" 错误)。改成 run_turn 时直接传 todo_service +
+    # session_id + last_turn_text,让 agent.run_turn 在 dispatch 前自动构造
+    # SubAgentRunner 并注入 dispatch_subagent_runner(基于 Task 7 path)。
+    # state.todo_extras 仍保留 dataclass 字段,但 REPL 不再赋值非空 list —
+    # 避免与 run_turn 内部 Task 7 路径双重注入 extras。
+    state.todo_extras = []
 
     # 4) Resume 询问(只在 turns==0 时触发;auto 静默,ask 询问,manual 不主动)
     if (
@@ -376,8 +371,11 @@ async def run_repl(
                 if state.mem_deps and mem_cfg.offload_enabled
                 else None
             )
-            # Task 6: extra_native_specs 必须 None-safe(memory_extras + todo_extras)
-            _all_extras = list(state.memory_extras or []) + list(state.todo_extras or [])
+            # Task 6: extra_native_specs 必须 None-safe(memory_extras only —
+            #         todo_extras 改由 todo_service 自动注入)
+            # D1 final:todo_extras 改为 todo_service 注入(见上方 step 3 注释);
+            # 此处只传 memory_extras,避免与 agent.run_turn Task 7 路径双重注入。
+            _all_extras = list(state.memory_extras or [])
             extra_native_specs = _all_extras or None
             turn_stats = await run_turn(
                 state.messages, llm, mcp,
@@ -388,10 +386,13 @@ async def run_repl(
                 token_counter=state.token_counter,
                 policy=policy,
                 l5=l5,
-                extra_native_specs=extra_native_specs,            # Task 6: memory + todo
+                extra_native_specs=extra_native_specs,            # Task 6: memory only
                 context_config=state.context_config,             # Plan3: 压缩配置
                 memory_layer=memory_layer,                        # Q3 Task8: 分层注入
                 offload_deps=offload_deps,                        # Q4 Task7: 短期符号化卸载
+                todo_service=state.todo_service,                  # D1 final:传 service,让 run_turn 注入 todo extras(含 dispatch_subagent_runner)
+                session_id=state.session_id,                      # D1 final:handler 用 active_sessions
+                last_turn_text=state.last_turn_text,              # D1 final:todo_update 完成门 acceptance 校验用
                 resume_task=state.resume_task,                    # Task 6: 续干任务
                 todo_hints=list(state.todo_hints or []),          # B 阶段 Task 5: verify hints
             )

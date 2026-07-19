@@ -529,8 +529,10 @@ async def run_turn(
                     # 短错误串,天然不撞阈值,不走 offload hook
                     messages.append({
                         "role": "tool",
+                        "name": p.name or "",
                         "tool_call_id": placeholder_id,
                         "content": error_llm_text,
+                        "is_error": True,
                     })
                     continue
 
@@ -543,8 +545,10 @@ async def run_turn(
                     # 短错误串,天然不撞阈值,不走 offload hook
                     messages.append({
                         "role": "tool",
+                        "name": p.name or "",
                         "tool_call_id": p.id or f"unknown_{i}",
                         "content": error_text,
+                        "is_error": True,
                     })
                     continue
 
@@ -559,8 +563,10 @@ async def run_turn(
                     # 短错误串,天然不撞阈值,不走 offload hook
                     messages.append({
                         "role": "tool",
+                        "name": p.name or "",
                         "tool_call_id": p.id or f"unknown_{i}",
                         "content": error_text,
+                        "is_error": True,
                     })
                     continue
 
@@ -583,8 +589,10 @@ async def run_turn(
                         result.llm_text, p.name, args)
                     messages.append({
                         "role": "tool",
+                        "name": p.name,  # D1 final:加 name 字段(for `_has_recent_htn_parent_create` + downstream inspect)
                         "tool_call_id": p.id or f"unknown_{i}",
                         "content": _tool_content,
+                        "is_error": bool(getattr(result, "is_error", False)),
                     })
                 else:  # ask
                     print_warn(console, f"[需确认] {p.name} {decision.reason}")
@@ -604,8 +612,10 @@ async def run_turn(
                             result.llm_text, p.name, args)
                         messages.append({
                             "role": "tool",
+                            "name": p.name,  # D1 final:加 name 字段(同上)
                             "tool_call_id": p.id or f"unknown_{i}",
                             "content": _tool_content,
+                            "is_error": bool(getattr(result, "is_error", False)),
                         })
                     else:
                         error_text = (
@@ -622,8 +632,10 @@ async def run_turn(
                         # 短错误串,天然不撞阈值,不走 offload hook
                         messages.append({
                             "role": "tool",
+                            "name": p.name or "",
                             "tool_call_id": p.id or f"unknown_{i}",
                             "content": error_text,
+                            "is_error": True,
                         })
 
             # 5. Continue the loop — feed tool results back to LLM
@@ -824,7 +836,30 @@ def _refresh_system_prompt(messages: list[dict], cwd: str, mode: str,
 
 
 def _has_recent_htn_parent_create(messages: list[dict], lookback: int = 6) -> bool:
-    """最近 lookback 轮内是否含 todo_create + parent_task 非 None 的 tool result。"""
+    """最近 lookback 轮内是否含 todo_create + parent_task 非 None 的 tool call。
+
+    优先从 assistant tool_calls[*].function.arguments 取(parent_task 字段的可靠
+    来源 — `parent_task` 在 args JSON 里,不在 tool message content 里);fallback
+    检查 tool message content JSON(兼容历史手工构造的测试 message,以及未来
+    handler 直接回 JSON 的场景)。
+    """
+    # 路径 1:反查 assistant tool_calls args(parent_task 字段的来源)。
+    # todo_create_handler 返回 plain text(tool message content 不含 parent_task),
+    # 但 assistant message 的 tool_calls.arguments JSON 里一定有。lookback 倍数
+    # 放大 2 倍保险(每轮 1 user + 1 assistant + 多 tool message)。
+    asst_msgs = [m for m in messages if m.get("role") == "assistant"][-lookback * 2:]
+    for am in reversed(asst_msgs):
+        for tc in am.get("tool_calls") or []:
+            fn = tc.get("function", {}) or {}
+            if fn.get("name") != "todo_create":
+                continue
+            try:
+                args = json.loads(fn.get("arguments") or "{}")
+            except Exception:
+                continue
+            if args.get("parent_task"):  # 非 None / 非空字符串
+                return True
+    # 路径 2:fallback — 直接检查 tool message 的 name + content JSON(历史测试 / 未来 handler 回 JSON)。
     tool_msgs = [m for m in messages if m.get("role") == "tool"][-lookback:]
     for m in tool_msgs:
         if m.get("name") != "todo_create":
@@ -833,8 +868,7 @@ def _has_recent_htn_parent_create(messages: list[dict], lookback: int = 6) -> bo
             content = json.loads(m["content"])
         except Exception:
             continue
-        parent = content.get("parent_task")
-        if parent:  # 非 None / 非空字符串
+        if content.get("parent_task"):
             return True
     return False
 

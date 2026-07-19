@@ -110,8 +110,16 @@ def _build_subagent_system_prompt(
     - description / criteria 为空时跳过对应行,不留视觉 wart。
     - depth 显式标记,提示 max_fan_out 上限 = 2。
     - 强制提醒完成门(todo_update 完成门 + acceptance 校验,非绕)。
+    - D1 final:prepend `instruction_hierarchy` always-on block(从 prompts.SECTION_POOL),
+      保持 subagent 同样受信任边界保护 — 防止 subagent 透过工具返回
+      `<untrusted>` 块被 prompt-injection 劫持(纵深防御)。
     """
+    from cc_harness.prompts import SECTION_POOL  # 延迟 import(避免 cc_harness 启动期拽 subagent 链)
+    hierarchy = SECTION_POOL["instruction_hierarchy"].body
+
     parts = [
+        hierarchy,
+        "",
         "# SubAgent 上下文",
         f"你是 1 个 subagent(depth={depth}),被主 agent 派来跑 1 个并行子任务。",
         "",
@@ -360,6 +368,22 @@ class SubAgentRunner:
                 error=f"run_turn 错误: {stats.error}",
                 duration_s=time.time() - start,
             )
+
+        # D1 final:扫 messages 找任一 is_error=True 的 tool message(subagent 内
+        # 业务错误,如 todo_update 完成门拦) → status="failed"。
+        # agent.run_turn 现在把 ToolResult.is_error 透传到 tool message;否则仅看
+        # final_t.status 可能错过"工具拦了但 todo 状态没变"的失败信号。
+        for m in messages:
+            if m.get("role") != "tool":
+                continue
+            if m.get("is_error"):
+                err_content = (m.get("content") or "")[:200]
+                err_name = m.get("name") or "tool"
+                return SubAgentResult(
+                    task_id=task_id, title=title, status="failed",
+                    error=f"tool 业务错误 ({err_name}): {err_content}",
+                    duration_s=time.time() - start,
+                )
 
         # 4. 检测 max_iter 耗尽(没 timeout/exception/fatal 的话)
         try:
