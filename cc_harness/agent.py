@@ -835,30 +835,43 @@ def _refresh_system_prompt(messages: list[dict], cwd: str, mode: str,
     messages[0]["content"] = new
 
 
-def _has_recent_htn_parent_create(messages: list[dict], lookback: int = 6) -> bool:
+def _has_recent_htn_parent_create(messages: list[dict], lookback: int = 4) -> bool:
     """最近 lookback 轮内是否含 todo_create + parent_task 非 None 的 tool call。
 
     优先从 assistant tool_calls[*].function.arguments 取(parent_task 字段的可靠
     来源 — `parent_task` 在 args JSON 里,不在 tool message content 里);fallback
     检查 tool message content JSON(兼容历史手工构造的测试 message,以及未来
     handler 直接回 JSON 的场景)。
+
+    D1.1 (P2 §2.1 子项 3)stale hint heuristic — "最近 AND 仍相关":
+      ① lookback 从 6 缩到 4(更短,减少 stale)。
+      ② 若最新 4 轮的 assistant 已经发出过 `dispatch_subagent` tool call →
+         用户已 fan-out 过了,不再重复提示(避免提示 +1 干扰)。
+      ③ 若最近 assistant tool_calls 已含 `todo_update` 把某 child 标 done →
+         聚合正在推进,fan-out 提示已无意义,跳过。
     """
     # 路径 1:反查 assistant tool_calls args(parent_task 字段的来源)。
-    # todo_create_handler 返回 plain text(tool message content 不含 parent_task),
-    # 但 assistant message 的 tool_calls.arguments JSON 里一定有。lookback 倍数
-    # 放大 2 倍保险(每轮 1 user + 1 assistant + 多 tool message)。
     asst_msgs = [m for m in messages if m.get("role") == "assistant"][-lookback * 2:]
+    has_recent_parent_create = False
     for am in reversed(asst_msgs):
         for tc in am.get("tool_calls") or []:
             fn = tc.get("function", {}) or {}
-            if fn.get("name") != "todo_create":
-                continue
-            try:
-                args = json.loads(fn.get("arguments") or "{}")
-            except Exception:
-                continue
-            if args.get("parent_task"):  # 非 None / 非空字符串
-                return True
+            fname = fn.get("name")
+            if fname == "todo_create":
+                try:
+                    args = json.loads(fn.get("arguments") or "{}")
+                except Exception:
+                    continue
+                if args.get("parent_task"):
+                    has_recent_parent_create = True
+            elif fname == "dispatch_subagent":
+                # ② 已 fan-out 过 → 视为"已 relevant 处理",不再提示
+                return False
+            elif fname == "todo_update":
+                # ③ 聚合正在推进(某 child done)→ 不再提示 fan-out
+                return False
+    if has_recent_parent_create:
+        return True
     # 路径 2:fallback — 直接检查 tool message 的 name + content JSON(历史测试 / 未来 handler 回 JSON)。
     tool_msgs = [m for m in messages if m.get("role") == "tool"][-lookback:]
     for m in tool_msgs:
