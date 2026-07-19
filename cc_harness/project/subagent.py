@@ -53,6 +53,27 @@ SubAgentStatus = Literal[
 ]
 
 
+# D1.1 (P2 §2.1 子项 4):异常分类 — auth/config、网络/限流、参数/数据、兜底。
+# 用 importorskip 模式避免硬依赖 openai 包(subagent 模块无 openai import 也能
+# import 进 IDE / 测试 fixture);缺 openai 时退化为空 tuple → 落到兜底 except。
+try:
+    import openai  # noqa: F401  (用于异常分类)
+    _AUTH_EXCEPTIONS: tuple = (
+        openai.AuthenticationError,
+        openai.PermissionDeniedError,
+        openai.NotFoundError,
+    )
+    _NETWORK_EXCEPTIONS: tuple = (
+        openai.RateLimitError,
+        openai.APIConnectionError,
+        openai.APITimeoutError,
+        openai.InternalServerError,
+    )
+except ImportError:
+    _AUTH_EXCEPTIONS = ()
+    _NETWORK_EXCEPTIONS = ()
+
+
 @dataclass
 class SubAgentResult:
     """单个 subagent 跑完的结果。
@@ -333,6 +354,8 @@ class SubAgentRunner:
         # 3. 跑 subagent ReAct loop(超时由外层 asyncio.wait_for 控)
         # D1 Task 4 fix:传 system_prompt 跳过 mode-aware rebuild(避免主 agent
         # prompt 覆盖 subagent 独立 system);传 l5 继承脱敏(决策 6)。
+        # D1.1 (P2 §2.1 子项 4):broad Exception 收窄为可识别类别 — auth/网络/
+        # 参数 vs 兜底未分类 — error 字段带 type name 便于审计/log triage。
         try:
             stats = await asyncio.wait_for(
                 run_turn(
@@ -352,11 +375,31 @@ class SubAgentRunner:
                 error=f"subagent 超过 {timeout}s timeout",
                 duration_s=time.time() - start,
             )
-        except Exception as e:
-            log.exception("subagent run failed: %s", e)
+        except _AUTH_EXCEPTIONS as e:
             return SubAgentResult(
                 task_id=task_id, title=title, status="failed",
-                error=str(e)[:200],
+                error=f"auth/config 错误 ({type(e).__name__}): {e}",
+                duration_s=time.time() - start,
+            )
+        except _NETWORK_EXCEPTIONS as e:
+            return SubAgentResult(
+                task_id=task_id, title=title, status="failed",
+                error=f"网络/限流 错误 ({type(e).__name__}): {e}",
+                duration_s=time.time() - start,
+            )
+        except (ValueError, TypeError, KeyError, AttributeError) as e:
+            return SubAgentResult(
+                task_id=task_id, title=title, status="failed",
+                error=f"参数/数据 错误 ({type(e).__name__}): {e}",
+                duration_s=time.time() - start,
+            )
+        except Exception as e:
+            # 兜底(未识别类型)。仍 broad catch — 避免子 agent 抛意外把 dispatch
+            # 路径整个挂掉,但 error 字段带 type name,便于事后 triage 升级。
+            log.exception("subagent run failed (unclassified): %s", e)
+            return SubAgentResult(
+                task_id=task_id, title=title, status="failed",
+                error=f"未分类错误 ({type(e).__name__}): {e}",
                 duration_s=time.time() - start,
             )
 
@@ -402,9 +445,16 @@ class SubAgentRunner:
         # 5. 正常完成
         final_text = _extract_final_text(messages)[-500:]
         file_refs = _extract_file_refs(final_text)
+        # D1.1 (P2 §2.1 子项 2):tokens_used 接 SessionTokenStats / TurnTokenStats。
+        # api_total_tokens 优先(API 报告的权威账单数);若 run_turn 没报告(无 stream
+        # usage)则用 breakdown_subtotal(tiktoken 估算)兜底,保证数值非 0。
+        tokens = getattr(stats, "api_total_tokens", 0) or 0
+        if not tokens:
+            tokens = getattr(stats, "breakdown_subtotal", 0) or 0
         return SubAgentResult(
             task_id=task_id, title=title, status=final_status,
             final_text=final_text, duration_s=time.time() - start,
+            tokens_used=tokens,
             file_refs=file_refs,
         )
 
