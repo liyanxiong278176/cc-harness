@@ -34,6 +34,9 @@ packages = ["cc_harness"]
 asyncio_mode = "auto"
 addopts = "-q"
 testpaths = ["tests"]
+markers = [
+  "requires_llm: gated tests requiring real OPENAI_API_KEY + CC_HARNESS_RUN_REAL_LLM=1 (skipped by default)",
+]
 
 [tool.ruff]
 line-length = 100
