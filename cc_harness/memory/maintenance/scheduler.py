@@ -32,6 +32,9 @@ class MaintenanceScheduler:
         # E4 Task 2: staleness refresh 配置
         self._half_life_days: float = 30.0
         self._llm_recheck_enabled: bool = True
+        # E4 Task 3: TTL 过期清理配置
+        self._ttl_threshold: float = 0.85
+        self._ttl_limit: int = 100
 
     async def maybe_run(self, *, turn_idx: int | None = None,
                         just_wrote_n: int = 0) -> MaintenanceRun | None:
@@ -133,6 +136,11 @@ class MaintenanceScheduler:
                 await self._store.update_staleness_bulk(llm_updates)
         return len(updates)
 
-    async def _run_ttl(self) -> int: return 0
+    async def _run_ttl(self) -> int:
+        from cc_harness.memory.maintenance.ttl import purge_stale
+        threshold = getattr(self, "_ttl_threshold", 0.85)
+        limit = getattr(self, "_ttl_limit", 100)
+        deleted = await purge_stale(self._store, staleness_threshold=threshold, limit=limit)
+        return len(deleted)
     async def _run_consolidation(self) -> int: return 0
     async def _run_conflict(self) -> int: return 0

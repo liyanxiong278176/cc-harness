@@ -89,6 +89,9 @@ class MemoryConfig(BaseModel):
     # staleness (D5)
     staleness_half_life_days: float = 30.0
     staleness_llm_recheck_enabled: bool = True
+    # TTL (D3)
+    ttl_staleness_threshold: float = 0.85
+    ttl_limit: int = 100
 
     @field_validator("pipeline_threshold")
     @classmethod
@@ -109,7 +112,8 @@ class MemoryConfig(BaseModel):
                      "pipeline_every_n", "scenario_min_atoms",
                      "persona_trigger_every_n", "recall_top_k",
                      "offload_threshold",
-                     "maintenance_every_n_turns", "maintenance_count_threshold")
+                     "maintenance_every_n_turns", "maintenance_count_threshold",
+                     "ttl_limit")
     @classmethod
     def _check_positive_int(cls, v: int) -> int:
         if v <= 0:
