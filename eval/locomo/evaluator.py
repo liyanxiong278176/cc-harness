@@ -10,6 +10,13 @@ from eval.locomo.metrics import _judge
 
 logger = logging.getLogger(__name__)
 
+
+# M5-2 judge prompt(指标 3 context chunk usefulness)
+JUDGE_CHUNK = (
+    '这段 context(对话历史 / recall 结果)对该 QA 的回答是否有贡献?\n'
+    '返 JSON {"useful": "yes" | "minor" | "no"}。'
+)
+
 try:
     from deepeval.metrics import GEval
     from deepeval.test_case import LLMTestCase
@@ -125,3 +132,25 @@ async def evaluate_qa(prompt: str, predicted: str, gold: str, judge_llm=None) ->
             "pass": pass_,
         },
     }
+
+
+async def judge_chunk_usefulness(
+    chunk_content: str,
+    qa_q: str,
+    qa_gold: str,
+    judge_llm,
+) -> float:
+    """#3 context chunk 是否对最终 answer 有贡献(yes=1.0 / minor=0.5 / no=0.0)。
+
+    judge_llm is None → 0.0(无 judge 退化)。judge 返非 JSON / raise → 0.0(fail-soft)。
+    """
+    if judge_llm is None:
+        return 0.0
+    user = f"chunk:\n{chunk_content}\n\nquestion: {qa_q}\n\ngold_answer: {qa_gold}"
+    try:
+        resp = await _judge(judge_llm, JUDGE_CHUNK, user)
+        useful = json.loads(resp).get("useful", "no")
+        return {"yes": 1.0, "minor": 0.5, "no": 0.0}.get(useful, 0.0)
+    except Exception as e:
+        logger.warning("judge_chunk_usefulness failed: %s", e)
+        return 0.0
