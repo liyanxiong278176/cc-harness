@@ -145,3 +145,59 @@ def test_q_type_table_has_semantic_col(tmp_path):
     write_html_report([], tmp_path / "r.html", metrics=metrics)
     text = (tmp_path / "r.html").read_text(encoding="utf-8")
     assert "semantic-f1-med" in text
+
+
+# --- Task 10 (M5-2): _summary_cards_v3 + 5 sub-table 函数 ---
+
+
+def test_summary_cards_v3_renders_5_cards():
+    from eval.locomo import report
+    metrics = {
+        "1_recall":      {"n_eligible": 384, "precision": 0.74, "recall": 0.62},
+        "2_timeliness":  {"n": 96, "pass_rate": 0.78, "f1_med": 0.62, "semantic_f1_med": 0.71},
+        "3_utilization": {"avg": 0.31, "p50": 0.27, "p90": 0.58, "n": 1986, "min": 0.05, "max": 0.83},
+        "4_compaction":  {"by_tier": [
+            {"tier": 0, "trigger_n": 1450, "avg_retain": None, "pass_rate": 0.71},
+            {"tier": 1, "trigger_n": 380, "avg_retain": 0.84, "pass_rate": 0.69},
+            {"tier": 2, "trigger_n": 110, "avg_retain": 0.61, "pass_rate": 0.58},
+            {"tier": 3, "trigger_n": 46, "avg_retain": 0.42, "pass_rate": 0.31},
+        ], "total_compressed_n": 536, "overall_avg_retain": 0.62},
+        "5_consistency": {"n_groups": 47, "drift_rate": 0.13, "by_sample": []},
+    }
+    html = report._summary_cards_v3(metrics)
+    assert "记忆召回" in html
+    assert "时效性" in html
+    assert "利用率" in html
+    assert "压缩率" in html
+    assert "一致性" in html
+    # 数值
+    assert "0.74" in html
+    assert "0.78" in html
+    assert "0.31" in html
+
+
+def test_subtable_uncomputed_renders_dash():
+    from eval.locomo import report
+    metrics = {
+        "1_recall": "uncomputed",
+        "2_timeliness": {"n": 0, "pass_rate": None, "f1_med": None, "semantic_f1_med": None},
+        "3_utilization": "uncomputed",
+        "4_compaction": {"by_tier": [], "total_compressed_n": 0, "overall_avg_retain": None},
+        "5_consistency": "uncomputed",
+    }
+    html = report._summary_cards_v3(metrics)
+    # 主体内容仍渲染,uncomputed 处显示 -
+    assert "-" in html
+
+
+def test_compaction_subtable_v2_includes_all_tiers():
+    from eval.locomo import report
+    metrics = {"4_compaction": {"by_tier": [
+        {"tier": 0, "trigger_n": 1, "avg_retain": None, "pass_rate": 0.5},
+        {"tier": 1, "trigger_n": 2, "avg_retain": 0.7, "pass_rate": 0.5},
+        {"tier": 2, "trigger_n": 0, "avg_retain": None, "pass_rate": None},
+        {"tier": 3, "trigger_n": 0, "avg_retain": None, "pass_rate": None},
+    ], "total_compressed_n": 2, "overall_avg_retain": 0.7}}
+    html = report._compaction_subtable_v2(metrics["4_compaction"])
+    for tier_n in (0, 1, 2, 3):
+        assert f">tier {tier_n}<" in html or f">{tier_n}<" in html

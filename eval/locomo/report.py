@@ -18,7 +18,7 @@ STATUS_COLORS = {
 }
 
 
-def _card_val(obj, key: str, fmt: str = "{:.3f}") -> str:
+def _card_val_legacy(obj, key: str, fmt: str = "{:.3f}") -> str:
     """Safe read from a metrics sub-dict that may be the literal str "uncomputed".
 
     Returns formatted value, or "未计算" if obj is str / key missing / value None.
@@ -32,6 +32,20 @@ def _card_val(obj, key: str, fmt: str = "{:.3f}") -> str:
         return fmt.format(val)
     except (TypeError, ValueError):
         return "未计算"
+
+
+def _card_val(metrics_key, field: str) -> str:
+    """M5-2 helper: `uncomputed` / None / 缺失 → '-',float → 3dp,其余 str(v)。"""
+    if isinstance(metrics_key, str):
+        return "-"
+    if metrics_key is None:
+        return "-"
+    v = metrics_key.get(field)
+    if v is None:
+        return "-"
+    if isinstance(v, float):
+        return f"{v:.3f}"
+    return str(v)
 
 
 def _summary_cards(results: list[dict], metrics: dict | None = None) -> str:
@@ -70,10 +84,10 @@ def _summary_cards(results: list[dict], metrics: dict | None = None) -> str:
         peak_label = f"{peak*100:.1f}%" if isinstance(peak, (int, float)) else "未计算"
         cards.append(("util-peak", peak_label))
         mem = metrics.get("memory")
-        cards.append(("precision", _card_val(mem, "precision")))
-        cards.append(("recall", _card_val(mem, "recall")))
+        cards.append(("precision", _card_val_legacy(mem, "precision")))
+        cards.append(("recall", _card_val_legacy(mem, "recall")))
         ta = metrics.get("tool_accuracy")
-        cards.append(("tool-accuracy", _card_val(ta, "mean")))
+        cards.append(("tool-accuracy", _card_val_legacy(ta, "mean")))
     out = ['<div class="cards">']
     for cls, val in cards:
         out.append(f'<div class="card {cls}"><div class="card-num">{val}</div><div class="card-lbl">{cls}</div></div>')
@@ -230,3 +244,123 @@ tr:hover {{ background: #1c1c1c; }}
 
 def load_report_results(json_path: Path) -> list[dict]:
     return json.loads(Path(json_path).read_text(encoding="utf-8"))
+
+
+# --- M5-2 (Task 10): 5 卡 + 5 sub-table(uncomputed → '-')。
+# 旧 _summary_cards / _q_type_table / write_html_report 行为不变,
+# 仅在 metrics_v3 路径时由 Task 11 接入这些新 renderer(此处保留). ---
+
+
+def _summary_cards_v3(metrics: dict) -> str:
+    """M5-2:5 张顶层 metric 卡。每卡 3 个 (label, value) 行。"""
+    cards = [
+        ("#1 记忆召回",
+         [("n_eligible", _card_val(metrics.get("1_recall"), "n_eligible")),
+          ("precision",  _card_val(metrics.get("1_recall"), "precision")),
+          ("recall",     _card_val(metrics.get("1_recall"), "recall"))]),
+        ("#2 时效性",
+         [("n",         _card_val(metrics.get("2_timeliness"), "n")),
+          ("pass_rate", _card_val(metrics.get("2_timeliness"), "pass_rate")),
+          ("f1_med",    _card_val(metrics.get("2_timeliness"), "f1_med"))]),
+        ("#3 利用率",
+         [("avg", _card_val(metrics.get("3_utilization"), "avg")),
+          ("p50", _card_val(metrics.get("3_utilization"), "p50")),
+          ("p90", _card_val(metrics.get("3_utilization"), "p90"))]),
+        ("#4 压缩率",
+         [("tier 1-3 trigger_n",
+           _card_val(metrics.get("4_compaction"), "total_compressed_n")),
+          ("overall_retain",
+           _card_val(metrics.get("4_compaction"), "overall_avg_retain")),
+          ("(详见 sub-table)", "")]),
+        ("#5 一致性",
+         [("n_groups",  _card_val(metrics.get("5_consistency"), "n_groups")),
+          ("drift_rate",_card_val(metrics.get("5_consistency"), "drift_rate")),
+          ("(详见 sub-table)", "")]),
+    ]
+    out = ['<div class="metrics-v3-cards">']
+    for title, rows in cards:
+        out.append('<div class="metric-card">')
+        out.append(f'<h3>{title}</h3>')
+        for label, val in rows:
+            out.append(f'<div class="metric-row"><span>{label}</span><b>{val}</b></div>')
+        out.append('</div>')
+    out.append('</div>')
+    return "\n".join(out)
+
+
+def _recall_subtable(metrics_1_recall) -> str:
+    if isinstance(metrics_1_recall, str):
+        return '<p>1. 记忆召回: judge 未配置 —</p>'
+    return f"""
+<h4>1. 记忆召回(n_eligible={metrics_1_recall.get("n_eligible","-")})</h4>
+<p>precision: {_card_val(metrics_1_recall, "precision")},
+   recall: {_card_val(metrics_1_recall, "recall")},
+   total_recall: {_card_val(metrics_1_recall, "n_total_recall")}</p>
+"""
+
+
+def _timeliness_subtable(metrics_2_timeliness) -> str:
+    if not isinstance(metrics_2_timeliness, dict):
+        return '<p>2. 时效性: 数据不可得 —</p>'
+    return f"""
+<h4>2. 时效性(Temporal 子集)</h4>
+<p>n={_card_val(metrics_2_timeliness, "n")} ·
+   pass_rate={_card_val(metrics_2_timeliness, "pass_rate")} ·
+   f1_med={_card_val(metrics_2_timeliness, "f1_med")} ·
+   semantic_f1_med={_card_val(metrics_2_timeliness, "semantic_f1_med")}</p>
+"""
+
+
+def _utilization_subtable(metrics_3_utilization) -> str:
+    if isinstance(metrics_3_utilization, str):
+        return '<p>3. 利用率: chunk_usefulness 空 —</p>'
+    return f"""
+<h4>3. 利用率</h4>
+<p>avg={_card_val(metrics_3_utilization, "avg")} ·
+   p50={_card_val(metrics_3_utilization, "p50")} ·
+   p90={_card_val(metrics_3_utilization, "p90")} ·
+   n={_card_val(metrics_3_utilization, "n")} ·
+   min={_card_val(metrics_3_utilization, "min")} ·
+   max={_card_val(metrics_3_utilization, "max")}</p>
+"""
+
+
+def _compaction_subtable_v2(metrics_4_compaction) -> str:
+    if not isinstance(metrics_4_compaction, dict):
+        return '<p>4. 压缩率: 数据不可得 —</p>'
+    rows = []
+    for row in metrics_4_compaction.get("by_tier", []):
+        rows.append(
+            f"<tr><td>{row['tier']}</td>"
+            f"<td>{_card_val(row, 'trigger_n')}</td>"
+            f"<td>{_card_val(row, 'avg_retain')}</td>"
+            f"<td>{_card_val(row, 'pass_rate')}</td></tr>"
+        )
+    return f"""
+<h4>4. 压缩率(per-tier)</h4>
+<table class="subtable"><thead><tr><th>tier</th><th>trigger_n</th><th>avg_retain</th><th>pass_rate</th></tr></thead>
+<tbody>{''.join(rows)}</tbody></table>
+<p>total_compressed_n={metrics_4_compaction.get('total_compressed_n','-')};
+   overall_avg_retain={_card_val(metrics_4_compaction, "overall_avg_retain")}</p>
+"""
+
+
+def _consistency_subtable(metrics_5_consistency) -> str:
+    if isinstance(metrics_5_consistency, str):
+        return '<p>5. 一致性: judge 未配置 —</p>'
+    by_sample = metrics_5_consistency.get("by_sample") or []
+    rows = []
+    for s in by_sample:
+        rows.append(
+            f"<tr><td>{s.get('sample_id','-')}</td>"
+            f"<td>{_card_val(s, 'n_groups')}</td>"
+            f"<td>{_card_val(s, 'drift_groups')}</td>"
+            f"<td>{_card_val(s, 'drift_rate')}</td></tr>"
+        )
+    return f"""
+<h4>5. 一致性(per-sample)</h4>
+<p>n_groups={_card_val(metrics_5_consistency, "n_groups")};
+   drift_rate={_card_val(metrics_5_consistency, "drift_rate")}</p>
+<table class="subtable"><thead><tr><th>sample_id</th><th>n_groups</th><th>drift_groups</th><th>drift_rate</th></tr></thead>
+<tbody>{''.join(rows)}</tbody></table>
+"""
