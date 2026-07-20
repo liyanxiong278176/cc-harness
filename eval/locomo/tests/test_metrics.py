@@ -148,3 +148,54 @@ def test_compute_timeliness_no_temporal():
     out = metrics.compute_timeliness(results)
     assert out["n"] == 0
     assert out["pass_rate"] is None
+
+
+def test_compute_utilization_basic():
+    from eval.locomo import metrics
+    results = [
+        {
+            "prompt_tokens": 1000,
+            "chunk_usefulness": [
+                {"role": "system", "tokens": 200, "useful_score": 1.0},   # 200
+                {"role": "user",   "tokens": 500, "useful_score": 0.5},   # 250
+                {"role": "tool",   "tokens": 300, "useful_score": 0.0},   # 0
+            ],
+            # weighted useful = 200 + 250 + 0 = 450; ratio = 0.45
+        },
+        {
+            "prompt_tokens": 800,
+            "chunk_usefulness": [
+                {"role": "system", "tokens": 100, "useful_score": 1.0},   # 100
+                {"role": "user",   "tokens": 700, "useful_score": 1.0},   # 700
+            ],
+            # ratio = 1.0
+        },
+    ]
+    out = metrics.compute_utilization(results)
+    assert out["n"] == 2
+    assert abs(out["avg"] - 0.725) < 1e-6    # (0.45 + 1.0) / 2
+    # 排序 [0.45, 1.0], p50 = 0.725(p50 in this context uses median — OK to match avg here by chance)
+
+
+def test_compute_utilization_missing_chunks():
+    from eval.locomo import metrics
+    results = [
+        {"prompt_tokens": 1000, "chunk_usefulness": []},  # 全空
+        {"prompt_tokens": 800,  "chunk_usefulness": []},  # 全空
+    ]
+    out = metrics.compute_utilization(results)
+    assert out == "uncomputed"
+
+
+def test_compute_utilization_partial_chunks():
+    """n_chunks 全空之一记录被忽略,只算有 chunk 的。"""
+    from eval.locomo import metrics
+    results = [
+        {"prompt_tokens": 1000, "chunk_usefulness": []},  # skip
+        {"prompt_tokens": 500, "chunk_usefulness": [
+            {"role": "system", "tokens": 500, "useful_score": 1.0},
+        ]},  # ratio = 1.0
+    ]
+    out = metrics.compute_utilization(results)
+    assert out["n"] == 1
+    assert out["avg"] == 1.0

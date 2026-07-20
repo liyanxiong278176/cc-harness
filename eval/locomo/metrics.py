@@ -78,6 +78,33 @@ def compute_context_utilization(results: list[dict], context_window: int = 1_000
     }
 
 
+def compute_utilization(results: list[dict]) -> dict:
+    """#3 上下文利用率:weighted useful token / prompt_token,纯聚合。
+
+    chunk_usefulness 全空 records 全部 → 返回 'uncomputed' 字符串(spec §3.5)。
+    """
+    ratios = []
+    for r in results:
+        chunks = r.get("chunk_usefulness") or []
+        if not chunks:
+            continue
+        weighted = sum(c.get("tokens", 0) * c.get("useful_score", 0) for c in chunks)
+        prompt = r.get("prompt_tokens") or 0
+        if prompt > 0:
+            ratios.append(weighted / prompt)
+    if not ratios:
+        return "uncomputed"
+    ratios_sorted = sorted(ratios)
+    return {
+        "n": len(ratios),
+        "avg": st.mean(ratios),
+        "p50": st.median(ratios_sorted),
+        "p90": ratios_sorted[max(0, int(len(ratios_sorted) * 0.9) - 1)],
+        "min": ratios_sorted[0],
+        "max": ratios_sorted[-1],
+    }
+
+
 def compute_token_series(results: list[dict]) -> dict:
     """逐 record prompt token + 累计 cost(results 顺序)。"""
     return {
