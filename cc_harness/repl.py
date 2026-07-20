@@ -137,6 +137,7 @@ async def run_repl(
     default_mode: str = "coding",
     design_dir: Path | None = None,
     context_config: ContextConfig | None = None,
+    scheduler: object | None = None,
 ) -> None:
     """Run the interactive REPL.
 
@@ -425,6 +426,12 @@ async def run_repl(
                 await state.live_panel.stop() if asyncio.iscoroutine(state.live_panel.stop()) else state.live_panel.stop()
             except Exception as e:
                 print_warn(console, f"live panel stop failed: {e}")
+        # E4: scheduler 由 main 构造并注入;shutdown 时 _drain 等后台 task 收尾
+        if scheduler is not None:
+            try:
+                await scheduler._drain(timeout_s=5)
+            except Exception as e:
+                print_warn(console, f"scheduler _drain failed: {e}")
         # 主循环退出(正常 exit / EOF / Ctrl-C / 异常)→ shutdown 会话级 executor。
         # async,非 atexit;sandbox 时 kill 容器 + shutdown_owned_server,best-effort。
         await shutdown_session_executor()

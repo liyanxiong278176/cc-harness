@@ -127,6 +127,16 @@ class MemoryStore:
             await self._db.execute("ALTER TABLE memories ADD COLUMN layer TEXT DEFAULT 'L1'")
         if "session_id" not in m_cols:
             await self._db.execute("ALTER TABLE memories ADD COLUMN session_id TEXT")
+        # E4 维护列
+        for col, ddl in [
+            ("staleness", "ALTER TABLE memories ADD COLUMN staleness REAL DEFAULT 0.0"),
+            ("recall_count", "ALTER TABLE memories ADD COLUMN recall_count INTEGER DEFAULT 0"),
+            ("last_recalled_at", "ALTER TABLE memories ADD COLUMN last_recalled_at REAL"),
+            ("cluster_id", "ALTER TABLE memories ADD COLUMN cluster_id TEXT"),
+            ("merged_from", "ALTER TABLE memories ADD COLUMN merged_from TEXT"),
+        ]:
+            if col not in m_cols:
+                await self._db.execute(ddl)
         c_cols = {r[1] for r in (await (await self._db.execute("PRAGMA table_info(conversation)")).fetchall())}
         for col in ("dates", "entities", "keywords"):
             if col not in c_cols:

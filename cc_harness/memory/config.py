@@ -81,6 +81,12 @@ class MemoryConfig(BaseModel):
     mermaid_max_token_ratio: float = 0.2    # Mermaid canvas 注入 token 预算(占窗口比例)
     offload_canvas_inject: bool = True      # 是否在 system 段注入 Mermaid task canvas
 
+    # E4 维护
+    maintenance_enabled: bool = True
+    maintenance_every_n_turns: int = 5
+    maintenance_count_threshold: int = 50
+    maintenance_interval_s: float = 3600.0
+
     @field_validator("pipeline_threshold")
     @classmethod
     def _check_threshold(cls, v: float) -> float:
@@ -99,14 +105,15 @@ class MemoryConfig(BaseModel):
                      "pipeline_recent_turns", "pipeline_max_delta_tokens",
                      "pipeline_every_n", "scenario_min_atoms",
                      "persona_trigger_every_n", "recall_top_k",
-                     "offload_threshold")
+                     "offload_threshold",
+                     "maintenance_every_n_turns", "maintenance_count_threshold")
     @classmethod
     def _check_positive_int(cls, v: int) -> int:
         if v <= 0:
             raise ValueError(f"must be > 0, got {v}")
         return v
 
-    @field_validator("recall_timeout_s")
+    @field_validator("recall_timeout_s", "maintenance_interval_s")
     @classmethod
     def _check_positive(cls, v: float) -> float:
         if v <= 0:
