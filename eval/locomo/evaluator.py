@@ -132,6 +132,34 @@ def _chunk_hash(content: str) -> str:
     return hashlib.sha256(content.encode("utf-8")).hexdigest()[:16]
 
 
+async def judge_chunk_usefulness(
+    chunk_content: str,
+    qa_q: str,
+    qa_gold: str,
+    judge_llm,
+) -> float:
+    """#3 context chunk 是否对最终 answer 有贡献(yes=1.0 / minor=0.5 / no=0.0)。
+
+    judge_llm is None → 0.0(无 judge 退化)。judge 返非 JSON / raise → 0.0(fail-soft)。
+    """
+    if judge_llm is None:
+        return 0.0
+    user = f"chunk:\n{chunk_content}\n\nquestion: {qa_q}\n\ngold_answer: {qa_gold}"
+    try:
+        resp = await _judge(judge_llm, JUDGE_CHUNK, user)
+        useful = json.loads(resp).get("useful", "no")
+        return {"yes": 1.0, "minor": 0.5, "no": 0.0}.get(useful, 0.0)
+    except Exception as e:
+        logger.warning("judge_chunk_usefulness failed: %s", e)
+        return 0.0
+
+
+# Module-level alias used inside evaluate_qa(避开参数 shadow)。
+# evaluate_qa 的 ``judge_chunk_usefulness: bool`` 参数会 shadow 模块级同名函数,
+# 故通过此 alias 调用实际 judge 函数。
+_judge_chunk_usefulness_fn = judge_chunk_usefulness
+
+
 async def evaluate_qa(
     prompt: str,
     predicted: str,
@@ -139,18 +167,23 @@ async def evaluate_qa(
     *,
     messages: list[dict] | None = None,
     judge_llm=None,
+    judge_chunk_usefulness: bool = True,
 ) -> dict:
-    """M5-2 extended:返回 dict 含 chunk_usefulness。"""
+    """M5-2 extended:返回 dict 含 chunk_usefulness。
+
+    judge_chunk_usefulness (policy gate):False → 跳过每 chunk 的 judge 评分,
+    返空 list(运行 metric_v3 但不开 chunk judge 的成本)。
+    """
     f1 = token_f1(predicted, gold)
     semantic = await semantic_f1(prompt, predicted, gold, judge_llm)
     quality = quality_score(prompt, predicted, gold)
     pass_ = (semantic > 0.7) if semantic is not None else (f1 > 0.5)
 
     chunk_usefulness: list[dict] = []
-    if messages is not None and judge_llm is not None:
+    if judge_chunk_usefulness and messages is not None and judge_llm is not None:
         for c in _chunk_messages(messages):
             try:
-                score = await judge_chunk_usefulness(
+                score = await _judge_chunk_usefulness_fn(
                     c["content"], prompt, gold, judge_llm,
                 )
             except Exception:
@@ -175,25 +208,3 @@ async def evaluate_qa(
             "chunk_usefulness_n": len(chunk_usefulness),
         },
     }
-
-
-async def judge_chunk_usefulness(
-    chunk_content: str,
-    qa_q: str,
-    qa_gold: str,
-    judge_llm,
-) -> float:
-    """#3 context chunk 是否对最终 answer 有贡献(yes=1.0 / minor=0.5 / no=0.0)。
-
-    judge_llm is None → 0.0(无 judge 退化)。judge 返非 JSON / raise → 0.0(fail-soft)。
-    """
-    if judge_llm is None:
-        return 0.0
-    user = f"chunk:\n{chunk_content}\n\nquestion: {qa_q}\n\ngold_answer: {qa_gold}"
-    try:
-        resp = await _judge(judge_llm, JUDGE_CHUNK, user)
-        useful = json.loads(resp).get("useful", "no")
-        return {"yes": 1.0, "minor": 0.5, "no": 0.0}.get(useful, 0.0)
-    except Exception as e:
-        logger.warning("judge_chunk_usefulness failed: %s", e)
-        return 0.0

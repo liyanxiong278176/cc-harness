@@ -6,3 +6,5 @@ locomo_eval:
   sample_timeout_s: 1800
   inject_memory_tools: true
   clear_memory_tags: ["locomo/"]
+  metrics_v3: true             # NEW: M5-2 新指标体系(run_judge 5-key + write_html_report metrics_v3 路径)
+  judge_chunk_usefulness: true # NEW: evaluator 跑 chunk judge(每个 context chunk judge yes/minor/no)

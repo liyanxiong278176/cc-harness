@@ -9,6 +9,7 @@ Usage:
 from __future__ import annotations
 import argparse
 import asyncio
+import hashlib
 import json
 import os
 import sys
@@ -278,7 +279,11 @@ async def _run_sample(sample: dict, policy: dict, extras: list[dict], trace: Loc
                 })
                 continue
 
-            eval_result = await evaluate_qa(qa.question, predicted, qa.answer, judge_llm=llm)
+            eval_result = await evaluate_qa(
+                qa.question, predicted, qa.answer,
+                messages=qa_messages, judge_llm=llm,
+                judge_chunk_usefulness=policy.get("judge_chunk_usefulness", True),
+            )
             cost_usd = _estimate_cost(stats.api_prompt_tokens, stats.api_completion_tokens)
             results.append({
                 "sample_id": parsed.sample_id,
@@ -467,11 +472,15 @@ def main():
             judge_llm = None
 
     # evidence 索引(按 (sample_id, question),避免跨 sample / timeout 结果错位)
+    # + conversations_by_sample_id(compute_recall 契约:Dict[sample_id, conv])
     samples_all = verify_dataset(DEFAULT_FILE)
     evidence_idx: dict[tuple, list] = {}
+    conversations_by_sample_id: dict[str, dict] = {}
     for s in samples_all:
+        sid = s.get("sample_id", "")
+        conversations_by_sample_id[sid] = s.get("conversation", {})
         for qa in s.get("qa", []):
-            evidence_idx[(s["sample_id"], qa.get("question", ""))] = qa.get("evidence", []) or []
+            evidence_idx[(sid, qa.get("question", ""))] = qa.get("evidence", []) or []
 
     # qas 按 all_results 顺序构造(每 result 配其 evidence;无 question 的 → [])
     qas = [
@@ -480,9 +489,17 @@ def main():
         for r in all_results
     ]
 
-    judge_cache = args.output_dir / f"locomo-judge-{ts}-n{len(all_results)}.json"
-    metrics = run_judge(all_results, qas, judge_llm, judge_cache)
-    write_html_report(str(html_path), all_results, metrics=metrics)
+    # dataset_sha = sha256(locomo10.json)[:8](run_judge cache key)
+    dataset_sha = hashlib.sha256(DEFAULT_FILE.read_bytes()).hexdigest()[:8]
+    judge_cache_dir = args.output_dir / ".judge-cache"
+    judge_cache_dir.mkdir(parents=True, exist_ok=True)
+    metrics = asyncio.run(run_judge(
+        all_results, qas, conversations_by_sample_id, judge_llm,
+        cache_path=judge_cache_dir, dataset_sha=dataset_sha,
+    ))
+    # metrics_v3 双轨开关(false → M5-1 旧 _summary_cards + q_type 分桶表)
+    metrics_v3 = bool(policy.get("metrics_v3", True))
+    write_html_report(str(html_path), all_results, metrics=metrics, metrics_v3=metrics_v3)
     print(f"[runner] DONE. results: {json_path}  html: {html_path}")
     return 0
 
