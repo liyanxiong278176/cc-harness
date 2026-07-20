@@ -568,10 +568,12 @@ Co-Authored-By: Claude Fable 5 <noreply@anthropic.com>"
 
 **Interfaces:**
 - Consumes: `results, qas, conversations, judge_llm`
+  - `conversations`: **`Dict[str, conv_dict]`**(sample_id → conversation),非 list(plan 修订:list 形式 lookup bug-prone)
 - Produces: `compute_recall(results, qas, conversations, judge_llm) -> dict`
 
 > judge 形态:`LLMClient` 或 `async fn(str)->str` 或 `None`。`_judge`(`metrics.py:73`)已支持,直接复用。
 > 单元测试用 `async fn` 形式 FakeLLM,无需 mock LLMClient。
+> LoCoMo runner 调用:`{r["sample_id"]: conv for conv in conversations}` 一次构造 dict。
 
 ### Step 1: 顶部加 judge prompt 常量
 
@@ -626,8 +628,8 @@ async def test_compute_recall_basic_precision_recall():
     async def fake_judge(system, user):
         return '{"relevant": true}'
 
-    conversations = [
-        {
+    conversations = {
+        "conv-X": {
             "speaker_a": "D1", "speaker_b": "D2",
             "session_1_date_time": "2024-01-01T10:00:00",
             "session_1": [
@@ -635,8 +637,9 @@ async def test_compute_recall_basic_precision_recall():
                 {"speaker": "D1", "dia_id": 2, "text": "Alice works at OpenAI"},
             ],
         }
-    ]
+    }
     results = [{
+        "sample_id": "conv-X",
         "tool_calls": [{"name": "memory_recall", "result": "Alice lives in NYC works at OpenAI"}],
     }]
     qas = [{"evidence": ["D1:1", "D1:2"]}]  # 都在 session_1 → eligible
@@ -658,14 +661,16 @@ async def test_compute_recall_cross_session_excluded():
     async def fake_judge(system, user):
         return '{"relevant": true}'
 
-    conv = [{
-        "speaker_a": "D1", "speaker_b": "D2",
-        "session_1_date_time": "2024-01-01T10:00:00",
-        "session_1": [{"speaker": "D1", "dia_id": 1, "text": "x"}],
-        "session_2_date_time": "2024-01-02T10:00:00",
-        "session_2": [{"speaker": "D1", "dia_id": 2, "text": "y"}],
-    }]
-    results = [{"tool_calls": []}]
+    conv = {
+        "conv-Y": {
+            "speaker_a": "D1", "speaker_b": "D2",
+            "session_1_date_time": "2024-01-01T10:00:00",
+            "session_1": [{"speaker": "D1", "dia_id": 1, "text": "x"}],
+            "session_2_date_time": "2024-01-02T10:00:00",
+            "session_2": [{"speaker": "D1", "dia_id": 2, "text": "y"}],
+        }
+    }
+    results = [{"sample_id": "conv-Y", "tool_calls": []}]
     qas = [{"evidence": ["D1:1", "D1:2"]}]  # 跨 session
     out = await metrics.compute_recall(results, qas, conv, judge_llm=fake_judge)
     assert out["n_eligible"] == 0
@@ -686,7 +691,11 @@ Expected: FAIL `AttributeError: ... has no attribute 'compute_recall'`
 
 ```python
 async def compute_recall(results, qas, conversations, judge_llm) -> dict:
-    """#1 记忆召回准确率。"""
+    """#1 记忆召回准确率。
+
+    `conversations`: Dict[sample_id, conv_dict](非 list)。caller 负责构造,
+    例如:{r["sample_id"]: conv for conv in conversations_list}。
+    """
     if judge_llm is None:
         return "uncomputed"
 
@@ -698,15 +707,9 @@ async def compute_recall(results, qas, conversations, judge_llm) -> dict:
         evidence = qa.get("evidence") or []
         if not evidence:
             continue
-        # 找 conversation
-        sample_id = r.get("sample_id")
-        conv = next((c for c in conversations if c.get("sample_id") == sample_id), None)
-        if conv is None:
-            # fallback:按 list 索引(可能 caller 没传 sample_id)
-            try:
-                conv = conversations[len(results) - len(conversations)] if False else None
-            except Exception:
-                conv = None
+        # Dict 查找(plan 修订:list + sample_id 嵌套查找 bug-prone,改 Dict 接口)
+        sample_id = r.get("sample_id") or ""
+        conv = conversations.get(sample_id) if isinstance(conversations, dict) else None
         if conv is None:
             continue
         idx = build_session_index(conv)
