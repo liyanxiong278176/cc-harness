@@ -1854,7 +1854,108 @@ Co-Authored-By: Claude Fable 5 <noreply@anthropic.com>"
 
 ---
 
-## Task 12: `runner.py` 1 行改动 + `policy_local.yaml` 双轨开关
+## Task 12: `runner.py` 多处改动 + `policy_local.yaml` 双轨开关(SCOPE 扩展 — 涵盖原 1-line + Task 7 run_judge 迁移 + dataset_sha 计算)
+
+> **本 Task 在原 plan scope 上扩展(2026-07-20 实施期发现)**:`run_judge` Task 7 改写后(runner.py:484 调用未更新),runner 进入新指标体系需要进一步改动。本任务一并收口。
+
+**Files:**
+- Modify: `eval/locomo/runner.py`(多处改动,见 Steps)
+- Modify: `eval/locomo/policy_local.yaml`(2 keys)
+
+**Interfaces Touched (in runner.py):**
+1. `evaluate_qa` call site → 加 `messages=qa_messages` kwarg(M5-2 指标 3 chunk_usefulness 上游需要)
+2. `run_judge` call site → 从旧同步 4-arg `(all_results, qas, judge_llm, judge_cache)` 改为新异步 6-arg `await run_judge(all_results, qas, conversations_dict, judge_llm, cache_path, dataset_sha)`(Task 7 重写产物的对应迁移)
+3. 新增 `dataset_sha` 计算 — `hashlib.sha256(open(data_file,'rb').read()).hexdigest()[:8]`,cache 路径用这个 key
+4. 新增 `conversations_dict` 构造 — 从当前 sample 列表的 conversation,按 `sample_id` 索引成 dict(compute_recall 契约)
+
+**Interface contract (policy_local.yaml 新增):**
+
+```yaml
+locomo_eval:
+  enabled: true
+  trace_to_langfuse: true
+  max_turns_per_sample: 500
+  sample_timeout_s: 1800
+  inject_memory_tools: true
+  clear_memory_tags: ["locomo/"]
+  metrics_v3: true             # NEW: M5-2 新指标体系
+  judge_chunk_usefulness: true # NEW: evaluator 跑 chunk judge
+```
+
+**执行顺序**(每段独立可验):
+
+### Step 1: 修改 `evaluate_qa` 调用 — 加 `messages=`
+
+打开 `runner.py`,找 `eval_result = await evaluate_qa(qa.question, predicted, qa.answer, judge_llm=llm)`,改为:
+
+```python
+eval_result = await evaluate_qa(
+    qa.question, predicted, qa.answer,
+    messages=qa_messages, judge_llm=llm,
+)
+```
+
+### Step 2: 修改 `run_judge` 调用 — 旧 4-arg → 新 6-arg async
+
+找到 runner.py:484(原 4-arg 调用,可能在 Task 11 后偏移几行),改为:
+
+```python
+import asyncio
+import hashlib
+
+# 在 sample 处理循环后,add:
+conversations_by_sample_id = {}
+for parsed_conv, _ in conv_iter_pairs:  # 用 sample_list 的 conversation 列表
+    sid = parsed_conv.sample_id  # 视具体 runner 结构调整
+    conversations_by_sample_id[sid] = parsed_conv.conversation
+
+dataset_sha = hashlib.sha256(open(data_file, "rb").read()).hexdigest()[:8]
+metrics = await run_judge(
+    all_results,
+    all_qas,                     # 平行 list,与 all_results 对齐
+    conversations_by_sample_id, # Dict[sample_id, conv]
+    judge_llm=llm,
+    cache_path=Path(".report-cache"),
+    dataset_sha=dataset_sha,
+)
+```
+
+> **Note**:具体 runner 内的数据结构(怎么拿 `parsed_conv` / `sample_id` / `data_file` 路径)需要 implementer 在 `runner.py` 内搜索 `sample_id` / `parsed_conv` / `DEFAULT_FILE` 来定位。adjust as needed
+
+### Step 3: 改 `policy_local.yaml`
+
+若文件已存在,只追加 2 keys;不存在则新建完整 default block(同 §4.5 spec)。
+
+### Step 4: 端到端 smoke 验证
+
+```bash
+cd D:/agent_learning/cc-harness && PYTHONIOENCODING=utf-8 .venv/Scripts/python.exe -m pytest eval/locomo/tests/ -v
+```
+
+Expected: ALL PASS(incl. M5-2 新增 + M5-1 遗留)。1 已知预存失败 `test_runner_smoke_*`(Task 5 implementer 标记) — 与本 Task 无关。
+
+```bash
+PYTHONIOENCODING=utf-8 .venv/Scripts/python.exe eval/locomo/runner.py --limit 1 --no-trace --no-memory-tools
+```
+
+Expected: 看到 `[smoke OK]` + `eval/result/locomo-*.html` 落地;HTML 应含 5 张 metric_v3 标记。
+
+### Step 5: Commit
+
+分别对 runner.py / policy_local.yaml / runner.py 后续更新可合并为单 commit(若改动集中)。理想 commit:
+
+```
+feat(locomo-m5-2): runner integrate evaluate_qa messages + run_judge 6-arg + policy 双轨
+
+evaluate_qa 调用多传 messages=qa_messages;run_judge 调用从旧同步 4-arg
+改为新异步 6-arg(配套 asyncio.run 或 await 上下文);构造 conversations dict
+按 sample_id 索引;dataset_sha from sha256(locomo10.json)[:8]。
+
+policy_local.yaml 加 metrics_v3: true + judge_chunk_usefulness: true
+作为双轨开关(false → runner 旧报告路径)。
+
+Co-Authored-By: Claude Fable 5 <noreply@anthropic.com>
+```
 
 **Files:**
 - Modify: `eval/locomo/runner.py`(1 行)
