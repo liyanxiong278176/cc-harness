@@ -61,7 +61,7 @@ base          = 0.6 * age_score + 0.4 * usage_score
 
 - LLM 复检只覆盖中间区 `0.4 <= staleness < 0.7`(批量 ≤ 20,LLM 失败保留算子结果)
 - schema 加列:staleness REAL / recall_count INTEGER / last_recalled_at REAL
-- `retrieval` 命中时 store 端 `UPDATE recall_count += 1, last_recalled_at = now`(新方法 `MemoryStore.touch_recall(id)`)
+- `MemoryRetriever.search` 末尾(RecallWeighter 之前)调 `MemoryStore.touch_recall([id])` 批量更新召回计数(不在 write 路径,只在 read 路径)
 
 ### D6:矛盾检测触发(两者结合)
 
@@ -185,8 +185,8 @@ class ConflictDetector:
     async def scan_all(self, store, llm) -> int: ...  # maintenance 用
 ```
 
-- write-time:在 `MemoryService.save()` ADD/UPDATE 完成后接(不是替换现有 LLMDecider,是叠加)
-- 矛盾时:`delete_old` 走 store.delete;`delete_new` 需 rollback(本次 save 不写);`merge` 走 consolidation
+- write-time:在 `MemoryService.save()` **写盘后** 触发(对 ADD/UPDATE 结果调 `ConflictDetector.check(new_mem, similar_used_for_decide)`),不替换 LLMDecider
+- 矛盾时:`delete_old` 走 store.delete;`delete_new` 需 rollback(本次 save 已写 → 走 store.delete 删新);`merge` 走 consolidation
 - LLM 失败 → 跳过该对,不抛
 
 ### 组件 6:召回衰减(#6)
