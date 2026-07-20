@@ -174,7 +174,11 @@ def test_compute_utilization_basic():
     out = metrics.compute_utilization(results)
     assert out["n"] == 2
     assert abs(out["avg"] - 0.725) < 1e-6    # (0.45 + 1.0) / 2
-    # 排序 [0.45, 1.0], p50 = 0.725(p50 in this context uses median — OK to match avg here by chance)
+    # 排序 [0.45, 1.0]
+    assert abs(out["p50"] - 0.725) < 1e-6    # median([0.45, 1.0]) = (0.45+1.0)/2 = 0.725
+    assert abs(out["p90"] - 0.45) < 1e-6     # int(2*0.9)-1 = 0 → sorted[0] = 0.45(N<10 时偏低,brief 规定公式)
+    assert abs(out["min"] - 0.45) < 1e-6
+    assert abs(out["max"] - 1.0) < 1e-6
 
 
 def test_compute_utilization_missing_chunks():

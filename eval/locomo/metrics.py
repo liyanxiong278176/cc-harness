@@ -78,7 +78,7 @@ def compute_context_utilization(results: list[dict], context_window: int = 1_000
     }
 
 
-def compute_utilization(results: list[dict]) -> dict:
+def compute_utilization(results: list[dict]) -> dict | str:
     """#3 上下文利用率:weighted useful token / prompt_token,纯聚合。
 
     chunk_usefulness 全空 records 全部 → 返回 'uncomputed' 字符串(spec §3.5)。
