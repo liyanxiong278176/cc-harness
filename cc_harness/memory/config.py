@@ -86,6 +86,9 @@ class MemoryConfig(BaseModel):
     maintenance_every_n_turns: int = 5
     maintenance_count_threshold: int = 50
     maintenance_interval_s: float = 3600.0
+    # staleness (D5)
+    staleness_half_life_days: float = 30.0
+    staleness_llm_recheck_enabled: bool = True
 
     @field_validator("pipeline_threshold")
     @classmethod
