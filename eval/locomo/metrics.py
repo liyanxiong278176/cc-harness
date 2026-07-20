@@ -352,6 +352,85 @@ async def compute_tool_accuracy(results, contexts, judge_llm) -> dict:
     return {"mean": st.mean(scores) if scores else None, "n": len(scores)}
 
 
+def _sample_key(record) -> str:
+    return record.get("sample_id", "")
+
+
+async def compute_consistency(results: list[dict], judge_llm) -> dict:
+    """#5 多轮一致性:同 conversation 同 entity ≥2 records → judge 一致性。
+
+    Steps:
+      1) by_sample = groupby(results, sample_id)
+      2) per record:JUDGE_ENTITIES → [entity1, entity2, ...]
+      3) (sample, entity_lower) group:收录该 sample 该 entity 命中的所有 records
+      4) 仅保留 len(records) >= 2 的 group
+      5) per group:JUDGE_GROUP_CONSIST → consistent bool
+      6) drift_rate = inconsistent_groups / total_groups
+
+    Per-record / per-group fail-soft(judge 异常 → skip)。
+
+    judge_llm is None → return string ``"uncomputed"``。
+    """
+    if judge_llm is None:
+        return "uncomputed"
+
+    # 1) by sample
+    by_sample: dict[str, list[dict]] = {}
+    for r in results:
+        by_sample.setdefault(_sample_key(r), []).append(r)
+
+    entity_groups: dict[tuple[str, str], list[dict]] = {}
+
+    for sample_id, recs in by_sample.items():
+        for r in recs:
+            try:
+                resp = await _judge(judge_llm, JUDGE_ENTITIES,
+                                    f"gold: {r.get('gold','')}\nquestion: {r.get('question','')}")
+                ents = json.loads(resp).get("entities", []) or []
+            except Exception:
+                continue
+            for ent in ents:
+                if not isinstance(ent, str) or not ent.strip():
+                    continue
+                entity_groups.setdefault((sample_id, ent.strip().lower()), []).append(r)
+
+    # 4) 仅保留 ≥2 records 的 group
+    eligible = {k: v for k, v in entity_groups.items() if len(v) >= 2}
+
+    n_groups = len(eligible)
+    n_drift = 0
+    by_sample_drift: dict[str, dict] = {}
+    for (sample_id, ent), recs in eligible.items():
+        preds = [r.get("predicted", "") for r in recs]
+        golds = [r.get("gold", "") for r in recs]
+        try:
+            pred_block = "\n".join(f"- predicted: {p}" for p in preds)
+            gold_block = "\n".join(f"- gold: {g}" for g in golds)
+            resp = await _judge(judge_llm, JUDGE_GROUP_CONSIST,
+                                f"entity: {ent}\n{pred_block}\n{gold_block}")
+            consistent = bool(json.loads(resp).get("consistent", False))
+        except Exception:
+            continue
+        if not consistent:
+            n_drift += 1
+        bs = by_sample_drift.setdefault(sample_id, {"sample_id": sample_id, "n_groups": 0, "drift_groups": 0})
+        bs["n_groups"] += 1
+        if not consistent:
+            bs["drift_groups"] += 1
+
+    by_sample_rows = []
+    for sample_id, bs in by_sample_drift.items():
+        ng = bs["n_groups"]
+        bs["drift_rate"] = (bs["drift_groups"] / ng) if ng else 0.0
+        by_sample_rows.append(bs)
+
+    return {
+        "n_groups": n_groups,
+        "drift_rate": (n_drift / n_groups) if n_groups else 0.0,
+        "by_sample": by_sample_rows,
+    }
+
+
 def run_judge(results, qas, judge_llm, cache_path) -> dict:
     """编排:纯聚合(总跑)+ 离线 judge(有 llm 才跑,缓存)。
     无 judge_llm → judge 维度 'uncomputed'。返回汇总 dict。"""

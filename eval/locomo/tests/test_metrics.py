@@ -431,3 +431,60 @@ async def test_compute_recall_cross_session_excluded():
     assert out["n_eligible"] == 0
     assert out["precision"] is None
     assert out["recall"] is None
+
+
+@pytest.mark.asyncio
+async def test_compute_consistency_uncomputed_no_judge():
+    from eval.locomo import metrics
+    out = await metrics.compute_consistency([], judge_llm=None)
+    assert out == "uncomputed"
+
+
+@pytest.mark.asyncio
+async def test_compute_consistency_grouping():
+    """1 conversation,3 records:gold 含 'speaker_a' 实体 2 次,另 1 个 entity 1 次。
+
+    第一组('speaker_a', 出现 2 次)→ judge 期望返 consistent=True → drift 0。
+    期望:drift_rate = 0,n_groups = 1。
+    """
+    from eval.locomo import metrics
+
+    async def fake_judge(system, user):
+        if "key entities" in system.lower() or "抽取" in system:
+            # entity extraction call
+            if "Alice" in user or "speaker_a" in user:
+                return '{"entities": ["speaker_a"]}'
+            return '{"entities": []}'
+        # group consistency call
+        return '{"consistent": true, "reason": "ok"}'
+
+    results = [
+        {"sample_id": "conv-X", "question": "q1", "gold": "speaker_a is an engineer",
+         "predicted": "engineer"},
+        {"sample_id": "conv-X", "question": "q2", "gold": "speaker_a lives in NYC",
+         "predicted": "NYC"},
+        {"sample_id": "conv-X", "question": "q3", "gold": "Alice is a teacher",
+         "predicted": "no idea"},
+    ]
+    out = await metrics.compute_consistency(results, judge_llm=fake_judge)
+    assert out["n_groups"] == 1
+    assert out["drift_rate"] == 0.0
+
+
+@pytest.mark.asyncio
+async def test_compute_consistency_drift_detected():
+    """同 entity 跨 2 records 但 predicted 冲突 → drift。"""
+    from eval.locomo import metrics
+
+    async def fake_judge(system, user):
+        if "抽取" in system:
+            return '{"entities": ["speaker_a"]}'
+        return '{"consistent": false, "reason": "teacher vs engineer"}'
+
+    results = [
+        {"sample_id": "conv-Y", "question": "q1", "gold": "speaker_a is engineer", "predicted": "engineer"},
+        {"sample_id": "conv-Y", "question": "q2", "gold": "speaker_a is engineer", "predicted": "teacher"},
+    ]
+    out = await metrics.compute_consistency(results, judge_llm=fake_judge)
+    assert out["n_groups"] == 1
+    assert out["drift_rate"] == 1.0   # 1 group, 1 drift
