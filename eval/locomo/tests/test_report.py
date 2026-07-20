@@ -15,7 +15,7 @@ def test_write_html_report_creates_file(tmp_path):
          "tool_calls": []},
     ]
     out = tmp_path / "report.html"
-    write_html_report(results, out)
+    write_html_report(str(out), results, metrics_v3=False)
     assert out.exists()
     text = out.read_text(encoding="utf-8")
     assert "locomo" in text.lower()
@@ -32,7 +32,7 @@ def test_summary_cards_appear(tmp_path):
          "tool_calls": [{"name": "memory_recall", "args": {"query": "q"}, "ok": True, "result": "r"}]},
     ]
     out = tmp_path / "report.html"
-    write_html_report(results, out)
+    write_html_report(str(out), results, metrics_v3=False)
     text = out.read_text(encoding="utf-8")
     # summary cards 用 class 名
     assert 'class="card' in text
@@ -55,7 +55,7 @@ def test_status_badge_renders_as_html_not_escaped_text(tmp_path):
          "tool_calls": []},
     ]
     out = tmp_path / "report.html"
-    write_html_report(results, out)
+    write_html_report(str(out), results, metrics_v3=False)
     text = out.read_text(encoding="utf-8")
     # The <span> tag should be present as raw HTML, not as &lt;span&gt;
     assert '<span style="color:#3fb950' in text
@@ -79,8 +79,8 @@ def test_write_html_report_renders_q_type_table(tmp_path):
                "token_series": {"prompt": [70000], "completion": [100], "cumulative_cost": 0.01},
                "memory": {"precision": 0.6, "recall": 0.5},
                "tool_accuracy": {"mean": 0.8, "n": 1}}
-    p = write_html_report(results, tmp_path / "r.html", metrics=metrics)
-    html_text = p.read_text(encoding="utf-8")
+    write_html_report(str(tmp_path / "r.html"), results, metrics=metrics, metrics_v3=False)
+    html_text = (tmp_path / "r.html").read_text(encoding="utf-8")
     assert "single-hop" in html_text
     assert "q_type" in html_text.lower() or "分桶" in html_text
     assert "0.8" in html_text  # 工具准确率
@@ -93,8 +93,8 @@ def test_write_html_report_uncomputed_judge(tmp_path):
                "utilization": {"avg": 0.0, "peak": 0.0},
                "token_series": {"prompt": [], "completion": [], "cumulative_cost": 0},
                "memory": "uncomputed", "tool_accuracy": "uncomputed"}
-    p = write_html_report([], tmp_path / "r.html", metrics=metrics)
-    assert "未计算" in p.read_text(encoding="utf-8")
+    write_html_report(str(tmp_path / "r.html"), [], metrics=metrics, metrics_v3=False)
+    assert "未计算" in (tmp_path / "r.html").read_text(encoding="utf-8")
 
 
 def test_write_html_report_renders_compaction(tmp_path):
@@ -104,8 +104,8 @@ def test_write_html_report_renders_compaction(tmp_path):
                "utilization": {"avg": 0.05, "peak": 0.07},
                "token_series": {"prompt": [], "completion": [], "cumulative_cost": 0},
                "memory": "uncomputed", "tool_accuracy": "uncomputed"}
-    p = write_html_report([], tmp_path / "r.html", metrics=metrics)
-    text = p.read_text(encoding="utf-8")
+    write_html_report(str(tmp_path / "r.html"), [], metrics=metrics, metrics_v3=False)
+    text = (tmp_path / "r.html").read_text(encoding="utf-8")
     assert "上下文压缩" in text
     assert "触发 2 次" in text
     assert "tier 2" in text
@@ -118,7 +118,7 @@ def test_summary_cards_semantic_median(tmp_path):
          "f1": 0.1, "semantic_f1": 0.8, "quality": 0.6, "pass": True,
          "prompt_tokens": 10, "completion_tokens": 5, "cost_usd": 0.0001, "tool_calls": []},
     ]
-    write_html_report(results, tmp_path / "r.html")
+    write_html_report(str(tmp_path / "r.html"), results, metrics_v3=False)
     text = (tmp_path / "r.html").read_text(encoding="utf-8")
     assert "semantic-f1-median" in text
 
@@ -130,7 +130,7 @@ def test_row_has_semantic_f1_col(tmp_path):
          "f1": 0.1, "semantic_f1": 0.85, "quality": 0.6, "pass": True,
          "prompt_tokens": 10, "completion_tokens": 5, "cost_usd": 0.0001, "tool_calls": []},
     ]
-    write_html_report(results, tmp_path / "r.html")
+    write_html_report(str(tmp_path / "r.html"), results, metrics_v3=False)
     text = (tmp_path / "r.html").read_text(encoding="utf-8")
     assert "0.850" in text            # semantic_f1 格式化
 
@@ -142,7 +142,7 @@ def test_q_type_table_has_semantic_col(tmp_path):
                "utilization": {"avg": 0.0, "peak": 0.0},
                "token_series": {"prompt": [], "completion": [], "cumulative_cost": 0},
                "memory": "uncomputed", "tool_accuracy": "uncomputed"}
-    write_html_report([], tmp_path / "r.html", metrics=metrics)
+    write_html_report(str(tmp_path / "r.html"), [], metrics=metrics, metrics_v3=False)
     text = (tmp_path / "r.html").read_text(encoding="utf-8")
     assert "semantic-f1-med" in text
 
@@ -222,3 +222,45 @@ def test_consistency_subtable_none_returns_placeholder():
     html = report._consistency_subtable(None)
     assert "<p" in html
     assert "—" in html
+
+
+# --- Task 11 (M5-2): write_html_report metrics_v3 双轨 + raw <details> ---
+
+
+def test_write_html_report_v3_uses_5_cards(tmp_path):
+    from eval.locomo import report
+    out = tmp_path / "report.html"
+    results = [
+        {"sample_id": "x", "q_type": "3", "pass": True, "f1": 0.5, "semantic_f1": 0.6,
+         "predicted": "p", "gold": "g", "prompt_tokens": 100,
+         "tool_calls": [], "compaction": None, "chunk_usefulness": []},
+    ]
+    metrics = {
+        "1_recall": "uncomputed",
+        "2_timeliness": {"n": 1, "pass_rate": 1.0, "f1_med": 0.5, "semantic_f1_med": 0.6},
+        "3_utilization": "uncomputed",
+        "4_compaction": {"by_tier": [], "total_compressed_n": 0, "overall_avg_retain": None},
+        "5_consistency": "uncomputed",
+    }
+    report.write_html_report(str(out), results, metrics, metrics_v3=True)
+    text = out.read_text(encoding="utf-8")
+    # 5 卡 标记
+    assert "#1 记忆召回" in text
+    assert "时效性" in text
+    # raw records 在 <details> 折叠
+    assert "<details>" in text
+
+
+def test_write_html_report_v3_false_uses_legacy(tmp_path):
+    from eval.locomo import report
+    out = tmp_path / "report.html"
+    results = [
+        {"sample_id": "x", "q_type": "1", "pass": True, "f1": 0.5,
+         "predicted": "p", "gold": "g", "prompt_tokens": 100},
+    ]
+    # metrics_v3=False → 旧 _summary_cards 路径
+    metrics_legacy = {"by_q_type": {}, "compaction": {}, "utilization": {}, "memory": "uncomputed", "tool_accuracy": "uncomputed"}
+    report.write_html_report(str(out), results, metrics_legacy, metrics_v3=False)
+    text = out.read_text(encoding="utf-8")
+    # v3 卡 不应出现
+    assert "metrics-v3-cards" not in text

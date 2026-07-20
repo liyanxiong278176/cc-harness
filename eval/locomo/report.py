@@ -188,58 +188,126 @@ def _compaction_block(compaction) -> str:
     )
 
 
-def write_html_report(results: list[dict], out_path: Path,
+def write_html_report(out_path: str,
+                      results: list[dict],
                       metrics: dict | None = None,
-                      title: str = "cc-harness locomo 评测报告") -> Path:
-    """Write self-contained HTML report. Returns out_path.
+                      *,
+                      metrics_v3: bool = True) -> None:
+    """Write self-contained HTML report.
 
-    metrics=None 时行为不变(只渲染现有 5+1 卡 + 主表)。
-    metrics 提供时追加:峰值利用率/P/R/工具准确率卡 + q_type 分桶表 + token 时序。
+    metrics_v3=True (默认):5 卡新路径 + 5 sub-table(raw records 折叠)。
+    metrics_v3=False: M5-1 旧 cards + q_type 分桶表(raw records 同样折叠)。
     """
-    rows = "\n".join(_row(r) for r in results)
-    cards = _summary_cards(results, metrics)
-    # metrics 派生区块
-    q_type_html = ""
-    token_series_html = ""
-    compaction_html = ""
-    if metrics:
-        q_type_html = _q_type_table(metrics.get("by_q_type") or {})
-        token_series_html = _token_series_block(metrics.get("token_series") or {})
-        compaction_html = _compaction_block(metrics.get("compaction"))
-    safe_title = html.escape(title)
-    page = f"""<!DOCTYPE html>
-<html lang="zh"><head><meta charset="utf-8"><title>{safe_title}</title>
-<style>
-body {{ font-family: -apple-system, "PingFang SC", "Microsoft YaHei", sans-serif;
-       background: #0f1419; color: #e6edf3; margin: 0; padding: 24px; line-height: 1.5; }}
-h1 {{ margin: 0 0 16px 0; font-size: 24px; }}
-.cards {{ display: flex; gap: 12px; flex-wrap: wrap; margin: 16px 0 24px 0; }}
-.card {{ flex: 1; min-width: 140px; background: #161b22; border: 1px solid #30363d;
-        border-radius: 8px; padding: 12px; text-align: center; }}
-.card-num {{ font-size: 20px; font-weight: 600; }}
-.card-lbl {{ color: #7d8590; font-size: 12px; margin-top: 4px; }}
-table {{ width: 100%; border-collapse: collapse; margin-top: 16px; }}
-th, td {{ padding: 8px 12px; text-align: left; border-bottom: 1px solid #30363d; }}
-th {{ background: #161b22; color: #7d8590; font-weight: 600; }}
-tr:hover {{ background: #1c1c1c; }}
-</style></head><body>
-<h1>{safe_title}</h1>
-{cards}
-<table>
-<thead><tr>
-<th>sample_id</th><th>turn</th><th>q_type</th><th>status</th>
-<th>f1</th><th>semantic_f1</th><th>quality</th><th>pass</th>
-<th>prompt_tok</th><th>comp_tok</th><th>cost</th><th>tool_calls</th>
-</tr></thead>
-<tbody>{rows}</tbody>
-</table>
-{q_type_html}
-{token_series_html}
-{compaction_html}
-</body></html>"""
-    out_path = Path(out_path)
-    out_path.write_text(page, encoding="utf-8")
-    return out_path
+    safe_metrics = metrics or {}
+    if metrics_v3:
+        cards_block = _summary_cards_v3(safe_metrics)
+        subtables = (
+            _recall_subtable(safe_metrics.get("1_recall"))
+            + _timeliness_subtable(safe_metrics.get("2_timeliness"))
+            + _utilization_subtable(safe_metrics.get("3_utilization"))
+            + _compaction_subtable_v2(safe_metrics.get("4_compaction"))
+            + _consistency_subtable(safe_metrics.get("5_consistency"))
+        )
+        title_text = "Locomo Eval Report — M5-2 metrics v3"
+        extra_css = (
+            ".cards,.metrics-v3-cards{display:flex;gap:12px;flex-wrap:wrap;margin:16px 0 24px 0}"
+            ".card,.metric-card{flex:1;min-width:140px;background:#161b22;border:1px solid #30363d;"
+            "border-radius:8px;padding:12px;text-align:center}"
+            ".metric-card{text-align:left}"
+            ".card-num{font-size:20px;font-weight:600}"
+            ".card-lbl{color:#7d8590;font-size:12px;margin-top:4px}"
+            ".metric-row{display:flex;justify-content:space-between;font-size:13px;margin:4px 0}"
+        )
+    else:
+        cards_block = _summary_cards(results, safe_metrics)
+        subtables = _q_type_table(safe_metrics.get("by_q_type") or {}) if metrics else ""
+        title_text = "Locomo Eval Report — M5-1 legacy"
+        extra_css = (
+            ".cards{display:flex;gap:12px;flex-wrap:wrap;margin:16px 0 24px 0}"
+            ".card{flex:1;min-width:140px;background:#161b22;border:1px solid #30363d;"
+            "border-radius:8px;padding:12px;text-align:center}"
+            ".card-num{font-size:20px;font-weight:600}"
+            ".card-lbl{color:#7d8590;font-size:12px;margin-top:4px}"
+        )
+    raw = (
+        '<details><summary>raw per-record data(展开)</summary>'
+        + _raw_records_table(results)
+        + '</details>'
+    )
+    if metrics_v3:
+        body = (
+            f"<h1>{title_text}</h1>"
+            + cards_block
+            + subtables
+            + raw
+            + "</body></html>"
+        )
+    else:
+        # 旧路径保留主表(status badge)+ token_series + compaction(向后兼容)
+        rows = "\n".join(_row(r) for r in results)
+        main_table = (
+            "<table><thead><tr>"
+            "<th>sample_id</th><th>turn</th><th>q_type</th><th>status</th>"
+            "<th>f1</th><th>semantic_f1</th><th>quality</th><th>pass</th>"
+            "<th>prompt_tok</th><th>comp_tok</th><th>cost</th><th>tool_calls</th>"
+            "</tr></thead><tbody>" + rows + "</tbody></table>"
+        )
+        token_series_html = _token_series_block(safe_metrics.get("token_series") or {}) if metrics else ""
+        compaction_html = _compaction_block(safe_metrics.get("compaction")) if metrics else ""
+        body = (
+            f"<h1>{title_text}</h1>"
+            + cards_block
+            + subtables
+            + main_table
+            + token_series_html
+            + compaction_html
+            + raw
+            + "</body></html>"
+        )
+    head = (
+        "<html><head><meta charset='utf-8'>"
+        "<title>Locomo Report</title>"
+        "<style>"
+        "body{font-family:-apple-system,\"PingFang SC\",\"Microsoft YaHei\",sans-serif;"
+        "background:#0f1419;color:#e6edf3;margin:0;padding:24px;line-height:1.5}"
+        "h1{margin:0 0 16px 0;font-size:24px}"
+        "h2{margin:24px 0 8px 0;font-size:18px}"
+        "h4{margin:16px 0 4px 0;font-size:14px}"
+        + extra_css +
+        "table{width:100%;border-collapse:collapse;margin-top:16px}"
+        "th,td{padding:8px 12px;text-align:left;border-bottom:1px solid #30363d}"
+        "th{background:#161b22;color:#7d8590;font-weight:600}"
+        "tr:hover{background:#1c1c1c}"
+        "details{margin-top:24px}"
+        "summary{cursor:pointer;color:#7d8590}"
+        "</style></head><body>"
+    )
+    Path(out_path).write_text(head + body, encoding="utf-8")
+
+
+def _raw_records_table(results: list[dict]) -> str:
+    """每条 QA 一行:sample / q_type / pass / f1 / sem / quality / tokens / cost。"""
+    headers = ["sample_id", "q_type", "pass", "f1", "semantic_f1", "quality", "tokens", "cost"]
+    rows_html = []
+    for r in results:
+        cells = [
+            html.escape(str(r.get("sample_id", ""))),
+            html.escape(str(r.get("q_type", ""))),
+            "✓" if r.get("pass") else "✗",
+            f"{r.get('f1', 0):.3f}" if r.get('f1') is not None else "-",
+            f"{r.get('semantic_f1', 0):.3f}" if r.get('semantic_f1') is not None else "-",
+            f"{r.get('quality', 0):.3f}" if r.get('quality') is not None else "-",
+            html.escape(str(r.get("prompt_tokens", ""))),
+            f"{r.get('cost_usd', 0):.4f}" if r.get('cost_usd') is not None else "-",
+        ]
+        rows_html.append("<tr>" + "".join(f"<td>{c}</td>" for c in cells) + "</tr>")
+    return (
+        "<table class='raw-table'><thead><tr>"
+        + "".join(f"<th>{h}</th>" for h in headers)
+        + "</tr></thead><tbody>"
+        + "".join(rows_html)
+        + "</tbody></table>"
+    )
 
 
 def load_report_results(json_path: Path) -> list[dict]:

@@ -482,7 +482,7 @@ def main():
 
     judge_cache = args.output_dir / f"locomo-judge-{ts}-n{len(all_results)}.json"
     metrics = run_judge(all_results, qas, judge_llm, judge_cache)
-    write_html_report(all_results, html_path, metrics=metrics)
+    write_html_report(str(html_path), all_results, metrics=metrics)
     print(f"[runner] DONE. results: {json_path}  html: {html_path}")
     return 0
 
