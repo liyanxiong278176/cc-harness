@@ -115,3 +115,36 @@ async def test_compute_memory_precision_clamped():
     out = await compute_memory(results, qas, judge_llm=fake_judge)
     assert out["precision"] <= 1.0
     assert out["recall"] == pytest.approx(1.0)  # 3/3 evidence 覆盖
+
+
+def test_compute_timeliness_basic():
+    from eval.locomo import metrics
+    results = [
+        {"q_type": "3", "pass": True, "f1": 0.8, "semantic_f1": 0.9},
+        {"q_type": "3", "pass": True, "f1": 0.6, "semantic_f1": 0.7},
+        {"q_type": "3", "pass": False, "f1": 0.2, "semantic_f1": 0.1},
+        {"q_type": "3", "pass": True, "f1": 0.5, "semantic_f1": 0.6},
+        {"q_type": "1", "pass": True, "f1": 1.0, "semantic_f1": 1.0},  # 排除
+    ]
+    out = metrics.compute_timeliness(results)
+    assert out["n"] == 4
+    assert out["pass_rate"] == 0.75
+    # f1 sorted: [0.2, 0.5, 0.6, 0.8], median = (0.5+0.6)/2 = 0.55
+    assert abs(out["f1_med"] - 0.55) < 1e-6
+    assert abs(out["semantic_f1_med"] - 0.65) < 1e-6
+
+
+def test_compute_timeliness_empty():
+    from eval.locomo import metrics
+    out = metrics.compute_timeliness([])
+    assert out["n"] == 0
+    assert out["pass_rate"] is None
+    assert out["f1_med"] is None
+
+
+def test_compute_timeliness_no_temporal():
+    from eval.locomo import metrics
+    results = [{"q_type": "1", "pass": True, "f1": 0.5, "semantic_f1": 0.6}]
+    out = metrics.compute_timeliness(results)
+    assert out["n"] == 0
+    assert out["pass_rate"] is None

@@ -50,6 +50,23 @@ def compute_compaction(results: list[dict]) -> dict:
     }
 
 
+def compute_timeliness(results: list[dict]) -> dict:
+    """#2 时效性:category=3(Temporal)子集的 pass_rate + 中位数。纯聚合。"""
+    subset = [r for r in results if str(r.get("q_type")) == "3"]
+    n = len(subset)
+    if n == 0:
+        return {"n": 0, "pass_rate": None, "f1_med": None, "semantic_f1_med": None}
+    pass_rate = sum(1 for r in subset if r.get("pass")) / n
+    f1_vals = [r["f1"] for r in subset if r.get("f1") is not None]
+    sem_vals = [r["semantic_f1"] for r in subset if r.get("semantic_f1") is not None]
+    return {
+        "n": n,
+        "pass_rate": pass_rate,
+        "f1_med": st.median(f1_vals) if f1_vals else None,
+        "semantic_f1_med": st.median(sem_vals) if sem_vals else None,
+    }
+
+
 def compute_context_utilization(results: list[dict], context_window: int = 1_000_000) -> dict:
     """利用率 = prompt_tokens / context_window。"""
     pts = [r.get("prompt_tokens", 0) for r in results]
