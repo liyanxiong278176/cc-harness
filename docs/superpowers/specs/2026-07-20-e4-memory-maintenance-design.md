@@ -54,10 +54,20 @@
 ### D5:staleness 算法(混合)
 
 ```
-age_score     = 1 - 0.5 ** (age_days / half_life_days)        # 30d→0.5, 60d→0.75
-usage_score   = 1 - exp(-recall_count / 5)                     # 召 5 次→0.63
-base          = 0.6 * age_score + 0.4 * usage_score
+age_score       = 1 - 0.5 ** (age_days / half_life_days)        # 30d→0.5, 60d→0.75
+usage_score     = 1 - exp(-recall_count / 5)                     # 召 5 次→0.63 (语义: 活跃度)
+recall_credit   = 1 - usage_score                                # rc 高 → 接近 0 (活跃扣分)
+base            = clamp(0.6 * age_score + 0.4 * recall_credit, 0, 1)
 ```
+
+**语义**: `recall_credit` 越高(召回少),staleness 越高;召回频繁 → `recall_credit → 0` → staleness 由 age_score 主导但**会被扣分**。
+
+**5 个测试断言数学一致算例**(half_life_days=30):
+- new/0d/0rc: 0.6*0 + 0.4*1 = **0.4** → 期望 `< 0.5` ✓
+- old/180d/0rc: 0.6*0.984 + 0.4*1 = **0.99** → 期望 `> 0.7` ✓
+- 90d/20rc: 0.6*0.875 + 0.4*0.018 = **0.532** → 期望 `≈ 0.55` 或 `< 0.6` ✓
+- 10d/100rc: 0.6*0.206 + 0.4*0 = **0.124** → 期望 `< 0.3` ✓
+- 30d/0rc: 0.6*0.5 + 0.4*1 = **0.7** → 期望 `≈ 0.7`(语义: 30d 没被召已显陈旧) ✓
 
 - LLM 复检只覆盖中间区 `0.4 <= staleness < 0.7`(批量 ≤ 20,LLM 失败保留算子结果)
 - schema 加列:staleness REAL / recall_count INTEGER / last_recalled_at REAL
