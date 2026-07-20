@@ -92,6 +92,9 @@ class MemoryConfig(BaseModel):
     # TTL (D3)
     ttl_staleness_threshold: float = 0.85
     ttl_limit: int = 100
+    # consolidation (D4)
+    consolidation_similarity_threshold: float = 0.15
+    consolidation_max_cluster_size: int = 5
 
     @field_validator("pipeline_threshold")
     @classmethod

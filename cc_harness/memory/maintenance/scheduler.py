@@ -35,6 +35,10 @@ class MaintenanceScheduler:
         # E4 Task 3: TTL 过期清理配置
         self._ttl_threshold: float = 0.85
         self._ttl_limit: int = 100
+        # E4 Task 4: consolidation cluster + merge 配置
+        self._embedder = None  # 由 main 注入
+        self._consol_threshold: float = 0.15
+        self._consol_max: int = 5
 
     async def maybe_run(self, *, turn_idx: int | None = None,
                         just_wrote_n: int = 0) -> MaintenanceRun | None:
@@ -142,5 +146,14 @@ class MaintenanceScheduler:
         limit = getattr(self, "_ttl_limit", 100)
         deleted = await purge_stale(self._store, staleness_threshold=threshold, limit=limit)
         return len(deleted)
-    async def _run_consolidation(self) -> int: return 0
+    async def _run_consolidation(self) -> int:
+        from cc_harness.memory.maintenance.consolidation import consolidate
+        embedder = getattr(self, "_embedder", None)
+        if embedder is None:
+            return 0
+        return await consolidate(
+            self._store, embedder, self._llm,
+            similarity_threshold=getattr(self, "_consol_threshold", 0.15),
+            max_cluster_size=getattr(self, "_consol_max", 5),
+        )
     async def _run_conflict(self) -> int: return 0
