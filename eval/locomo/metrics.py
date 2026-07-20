@@ -431,32 +431,37 @@ async def compute_consistency(results: list[dict], judge_llm) -> dict:
     }
 
 
-def run_judge(results, qas, judge_llm, cache_path) -> dict:
-    """编排:纯聚合(总跑)+ 离线 judge(有 llm 才跑,缓存)。
-    无 judge_llm → judge 维度 'uncomputed'。返回汇总 dict。"""
-    import asyncio
-
+async def run_judge(
+    results: list[dict],
+    qas: list,
+    conversations: list,
+    judge_llm,
+    cache_path,
+    dataset_sha: str,
+) -> dict:
+    """5-key aggregate spec §3.4。"""
+    has_chunks = any(r.get("chunk_usefulness") for r in results)
     out = {
-        "by_q_type": compute_by_q_type(results),
-        "compaction": compute_compaction(results),
-        "utilization": compute_context_utilization(results),
-        "token_series": compute_token_series(results),
+        "1_recall":      "uncomputed",
+        "2_timeliness":  compute_timeliness(results),
+        "3_utilization": compute_utilization(results) if has_chunks else "uncomputed",
+        "4_compaction":  compute_compaction_v2(results),
+        "5_consistency": "uncomputed",
     }
     if judge_llm is None:
-        out["memory"] = out["tool_accuracy"] = "uncomputed"
         return out
-    if cache_path and cache_path.exists():
-        return {**out, **json.loads(cache_path.read_text(encoding="utf-8"))}
 
-    async def _run():
-        return {
-            "memory": await compute_memory(results, qas, judge_llm),
-            "tool_accuracy": await compute_tool_accuracy(
-                results, [r.get("q_type", "") for r in results], judge_llm
-            ),
-        }
+    cache_file = (cache_path / f"locomo-judge-{dataset_sha}.json") if cache_path else None
+    if cache_file is not None and cache_file.exists():
+        cached = json.loads(cache_file.read_text(encoding="utf-8"))
+        return {**out, **cached}
 
-    judged = asyncio.run(_run())
-    if cache_path:
-        cache_path.write_text(json.dumps(judged, ensure_ascii=False, indent=1), encoding="utf-8")
+    judged = {
+        "1_recall":      await compute_recall(results, qas, conversations, judge_llm),
+        "5_consistency": await compute_consistency(results, judge_llm),
+    }
+    if cache_file is not None:
+        cache_file.write_text(
+            json.dumps(judged, ensure_ascii=False, indent=1), encoding="utf-8"
+        )
     return {**out, **judged}

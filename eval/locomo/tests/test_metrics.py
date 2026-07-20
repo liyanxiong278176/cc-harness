@@ -1,4 +1,6 @@
 """metrics.py 纯聚合单测(无 LLM)。用 fixture results。"""
+from pathlib import Path
+
 import pytest
 
 FIXTURE = [  # 3 条 result,2 类 q_type
@@ -82,25 +84,37 @@ def test_compute_tool_accuracy():
 
 
 def test_run_judge_caches(tmp_path):
-    """judge 结果缓存到 json,二次读不重跑 judge。run_judge 是 sync(内部管 event loop,直接调)。"""
+    """judge 结果缓存到 json,二次读不重跑 judge(M5-2 async 编排,缓存 key 含 dataset_sha)。"""
+    import asyncio
     from eval.locomo.metrics import run_judge
     call_count = [0]
-    async def counting_judge(s, **kw):
+    async def counting_judge(*a, **kw):
         call_count[0] += 1
-        return '{"score": 0.5}'
-    cache = tmp_path / "judge.json"
-    r1 = run_judge(FIXTURE, [], counting_judge, cache)   # 直接调(sync)
-    r2 = run_judge(FIXTURE, [], counting_judge, cache)    # 命中缓存,不重跑
-    assert call_count[0] == 1  # FIXTURE 只 1 个 tool_call(record0)→ tool_accuracy 跑 1 次;memory qas=[]→0
+        # entity extraction path(consistency)→返空 entities 跳过 group;recall qas=[]→0 calls
+        return '{"entities": [], "consistent": true, "reason": ""}'
+    cache_path = tmp_path / "cache_dir"
+    cache_path.mkdir()
+    # FIXTURE 全 sample_id="conv-1" → 提供空 conv 让 compute_recall 跑过去(zip 算 0)
+    conversations = {"conv-1": {}}
+    r1 = asyncio.run(run_judge(FIXTURE, [], conversations, judge_llm=counting_judge,
+                                cache_path=cache_path, dataset_sha="m5_2_caches_v1"))
+    calls_after_first = call_count[0]
+    r2 = asyncio.run(run_judge(FIXTURE, [], conversations, judge_llm=counting_judge,
+                                cache_path=cache_path, dataset_sha="m5_2_caches_v1"))
+    assert calls_after_first > 0      # 真跑过 judge
+    assert call_count[0] == calls_after_first  # 二次跑走 cache,没新增调用
     assert r1 == r2
 
 
 def test_run_judge_no_key_degrades(tmp_path):
-    """无 judge_llm(None)→ judge 维度 'uncomputed',纯聚合仍返。"""
+    """无 judge_llm(None)→ 1_recall/5_consistency 'uncomputed',纯聚合仍返(M5-2)。"""
+    import asyncio
     from eval.locomo.metrics import run_judge
-    out = run_judge(FIXTURE, [], None, tmp_path / "j.json")  # 直接调(sync)
-    assert out["tool_accuracy"] == "uncomputed"
-    assert out["by_q_type"]  # 纯聚合仍有
+    out = asyncio.run(run_judge(FIXTURE, [], {}, judge_llm=None,
+                                  cache_path=tmp_path / "j_dir", dataset_sha="m5_2_nokey_v1"))
+    assert out["1_recall"] == "uncomputed"
+    assert out["5_consistency"] == "uncomputed"
+    assert out["2_timeliness"]  # 纯聚合仍有
 
 
 async def test_compute_memory_precision_clamped():
@@ -488,3 +502,56 @@ async def test_compute_consistency_drift_detected():
     out = await metrics.compute_consistency(results, judge_llm=fake_judge)
     assert out["n_groups"] == 1
     assert out["drift_rate"] == 1.0   # 1 group, 1 drift
+
+
+@pytest.mark.asyncio
+async def test_run_judge_no_judge_returns_5key():
+    from eval.locomo import metrics
+    results = [
+        {"q_type": "3", "pass": True, "f1": 0.5, "semantic_f1": 0.6,
+         "prompt_tokens": 100, "chunk_usefulness": [{"role":"system","tokens":50,"useful_score":1.0}],
+         "compaction": None, "tool_calls": [], "sample_id": "x"},
+    ]
+    out = await metrics.run_judge(results, [], [], judge_llm=None,
+                                   cache_path=None, dataset_sha="abc12345")
+    assert set(out.keys()) == {"1_recall", "2_timeliness", "3_utilization", "4_compaction", "5_consistency"}
+    assert out["1_recall"] == "uncomputed"
+    assert out["5_consistency"] == "uncomputed"
+    assert isinstance(out["2_timeliness"], dict)
+    assert isinstance(out["3_utilization"], dict)  # chunk 给齐
+    assert isinstance(out["4_compaction"], dict)
+
+
+@pytest.mark.asyncio
+async def test_run_judge_cache_hit():
+    """cache_file 存在 → 复用 cache,不调 judge。"""
+    from eval.locomo import metrics
+    import json
+    import tempfile
+    with tempfile.TemporaryDirectory() as tmp:
+        cache_path = Path(tmp)
+        (cache_path / "locomo-judge-abc12345.json").write_text(
+            json.dumps({"1_recall": {"n_eligible": 99, "precision": 0.5, "recall": 0.5},
+                        "5_consistency": {"n_groups": 10, "drift_rate": 0.1, "by_sample": []}}),
+            encoding="utf-8",
+        )
+        called = []
+        async def fake_judge(*a, **kw):
+            called.append(1)
+            return "{}"
+
+        out = await metrics.run_judge([], [], [], judge_llm=fake_judge,
+                                       cache_path=cache_path, dataset_sha="abc12345")
+        assert out["1_recall"]["n_eligible"] == 99  # 缓存命中
+        assert out["5_consistency"]["n_groups"] == 10
+        assert called == []  # 没调 judge
+
+
+def test_run_judge_signature():
+    """签名稳定:6 个 param 必须存在(防止未来 contract 回归)。"""
+    import inspect
+    from eval.locomo import metrics
+    sig = inspect.signature(metrics.run_judge)
+    params = list(sig.parameters.keys())
+    for name in ("results", "qas", "conversations", "judge_llm", "cache_path", "dataset_sha"):
+        assert name in params, f"missing param: {name}"
