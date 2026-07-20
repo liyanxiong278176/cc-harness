@@ -286,7 +286,6 @@ async def test_compute_recall_basic_precision_recall():
       recall     = 2 evidence / 2 total = 1.0
     """
     from eval.locomo import metrics
-    from eval.locomo import dataset as ds
 
     async def fake_judge(system, user):
         return '{"relevant": true}'
@@ -311,6 +310,99 @@ async def test_compute_recall_basic_precision_recall():
     assert out["n_total_recall"] == 1
     assert out["precision"] == 1.0
     assert out["recall"] == 1.0
+
+
+@pytest.mark.asyncio
+async def test_compute_recall_unresolved_evidence_excluded():
+    """任一 evidence ref 无法解析时,整个 QA 不算 n_eligible。"""
+    from eval.locomo import metrics
+
+    async def fake_judge(system, user):
+        return '{"relevant": true}'
+
+    conversations = {
+        "conv-missing": {
+            "speaker_a": "D1", "speaker_b": "D2",
+            "session_1_date_time": "2024-01-01T10:00:00",
+            "session_1": [
+                {"speaker": "D1", "dia_id": 1, "text": "Alice lives in NYC"},
+            ],
+        }
+    }
+    results = [{
+        "sample_id": "conv-missing",
+        "tool_calls": [{"name": "memory_recall", "result": "Alice lives in NYC"}],
+    }]
+    qas = [{"evidence": ["D1:1", "MISSING:99"]}]
+
+    out = await metrics.compute_recall(results, qas, conversations, judge_llm=fake_judge)
+
+    assert out["n_eligible"] == 0
+    assert out["n_total_recall"] == 0
+    assert out["precision"] is None
+    assert out["recall"] is None
+
+
+@pytest.mark.asyncio
+async def test_compute_recall_judge_exception_skips_pair():
+    """judge 异常时 evidence pair 整体跳过,r_den 不累加。"""
+    from eval.locomo import metrics
+
+    async def failing_judge(system, user):
+        raise RuntimeError("judge unavailable")
+
+    conversations = {
+        "conv-error": {
+            "speaker_a": "D1", "speaker_b": "D2",
+            "session_1_date_time": "2024-01-01T10:00:00",
+            "session_1": [
+                {"speaker": "D1", "dia_id": 1, "text": "Alice lives in NYC"},
+            ],
+        }
+    }
+    results = [{
+        "sample_id": "conv-error",
+        "tool_calls": [{"name": "memory_recall", "result": "Alice lives in NYC"}],
+    }]
+    qas = [{"evidence": ["D1:1"]}]
+
+    out = await metrics.compute_recall(results, qas, conversations, judge_llm=failing_judge)
+
+    assert out["recall"] is None
+    assert out["precision"] == 0.0
+
+
+@pytest.mark.asyncio
+async def test_compute_recall_judge_sees_evidence_text():
+    """recall judge 收到 evidence utterance 文本,而非仅 reference ID。"""
+    from eval.locomo import metrics
+
+    seen_users = []
+
+    async def recording_judge(system, user):
+        seen_users.append(user)
+        return '{"relevant": false}'
+
+    conversations = {
+        "conv-text": {
+            "speaker_a": "D1", "speaker_b": "D2",
+            "session_1_date_time": "2024-01-01T10:00:00",
+            "session_1": [
+                {"speaker": "D1", "dia_id": 1, "text": "Alice lives in NYC"},
+            ],
+        }
+    }
+    results = [{
+        "sample_id": "conv-text",
+        "tool_calls": [{"name": "memory_recall", "result": "Alice lives in NYC"}],
+    }]
+    qas = [{"evidence": ["D1:1"]}]
+
+    await metrics.compute_recall(results, qas, conversations, judge_llm=recording_judge)
+
+    assert len(seen_users) == 1
+    assert "证据:\nAlice lives in NYC" in seen_users[0]
+    assert "证据:\nD1:1" not in seen_users[0]
 
 
 @pytest.mark.asyncio

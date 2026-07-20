@@ -252,6 +252,32 @@ async def compute_recall(results, qas, conversations, judge_llm) -> dict:
     if judge_llm is None:
         return "uncomputed"
 
+    def _evidence_to_text(conv: dict, idx: dict, ev: str) -> str:
+        """Resolve LoCoMo evidence ref to utterance text.
+
+        Walks the conversation to find the matching utterance. Handles both:
+          - real data: dia_id is the same string as ev ("D1:1")
+          - synthetic: dia_id is int (1), speaker="D1", ev="D1:1" → match by speaker+int
+        """
+        session = idx.get(ev)
+        if not session:
+            return ""
+        # Try direct dia_id match (real data)
+        for utt in conv.get(session, []):
+            if utt.get("dia_id") == ev:
+                return utt.get("text", "")
+        # Synthetic: split "D1:1" → speaker="D1", n="1"
+        if ":" in ev:
+            speaker, _, dia_str = ev.partition(":")
+            try:
+                dia_int = int(dia_str)
+            except ValueError:
+                return ""
+            for utt in conv.get(session, []):
+                if utt.get("speaker") == speaker and utt.get("dia_id") == dia_int:
+                    return utt.get("text", "")
+        return ""
+
     from eval.locomo.dataset import build_session_index  # local import 防循环
 
     p_num, p_den, r_num, r_den = 0, 0, 0, 0
@@ -268,9 +294,16 @@ async def compute_recall(results, qas, conversations, judge_llm) -> dict:
         if conv is None:
             continue
         idx = build_session_index(conv)
-        sessions = {idx.get(ev) for ev in evidence if ev in idx}
-        sessions.discard(None)
-        if not sessions or len(sessions) > 1:
+        sessions = set()
+        for ev in evidence:
+            s = idx.get(ev)
+            if s is None:
+                sessions = None  # marker: at least one evidence didn't resolve
+                break
+            sessions.add(s)
+        if sessions is None:
+            continue
+        if len(sessions) != 1:
             continue
         n_eligible += 1
 
@@ -283,14 +316,16 @@ async def compute_recall(results, qas, conversations, judge_llm) -> dict:
 
         for ev in evidence:
             try:
+                text = _evidence_to_text(conv, idx, ev) or ev
                 resp = await _judge(judge_llm, JUDGE_RECALL,
-                                    f"记忆:\n{recall_text}\n\n证据:\n{ev}")
-                if json.loads(resp).get("relevant"):
+                                    f"记忆:\n{recall_text}\n\n证据:\n{text}")
+                parsed = json.loads(resp)
+                r_den += 1
+                if parsed.get("relevant"):
                     r_num += 1
                     p_num += 1
             except Exception:
                 pass
-            r_den += 1
         p_den += len(recall_calls)
 
     return {
