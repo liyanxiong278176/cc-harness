@@ -345,3 +345,52 @@ class MemoryStore:
         if self._db is not None:
             await self._db.close()
             self._db = None
+
+    # --- E4 维护公共方法 (Task 2) ---
+
+    async def touch_recall(self, ids: list[str]) -> None:
+        """批量更新 recall_count + last_recalled_at(召回命中时)。"""
+        assert self._db is not None
+        if not ids:
+            return
+        now = time.time()
+        placeholders = ",".join("?" * len(ids))
+        await self._db.execute(
+            f"UPDATE memories SET recall_count = recall_count + 1, last_recalled_at = ? "
+            f"WHERE id IN ({placeholders})",
+            [now, *ids],
+        )
+        await self._db.commit()
+
+    async def update_staleness_bulk(self, id_to_score: dict[str, float]) -> None:
+        """批量更新 staleness 列。LLM 复检结果写入。"""
+        assert self._db is not None
+        if not id_to_score:
+            return
+        for mid, score in id_to_score.items():
+            await self._db.execute(
+                "UPDATE memories SET staleness = ? WHERE id = ?",
+                (max(0.0, min(1.0, score)), mid),
+            )
+        await self._db.commit()
+
+    async def list_with_staleness(self, *, staleness_min: float = 0.0,
+                                  staleness_max: float = 1.0,
+                                  limit: int = 500) -> list[Memory]:
+        """返回 staleness 在 [min, max] 区间内的记忆,供 staleness refresh 用。"""
+        assert self._db is not None
+        cur = await self._db.execute(
+            "SELECT id, text, embedding, created_at, updated_at, source, layer, session_id "
+            "FROM memories WHERE staleness >= ? AND staleness <= ? "
+            "ORDER BY staleness DESC LIMIT ?",
+            (staleness_min, staleness_max, limit),
+        )
+        rows = await cur.fetchall()
+        return [
+            Memory(
+                id=r[0], text=r[1], embedding=_blob_to_vec(r[2]),
+                created_at=r[3], updated_at=r[4], source=r[5],
+                layer=r[6], session_id=r[7],
+            )
+            for r in rows
+        ]
