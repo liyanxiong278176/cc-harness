@@ -152,7 +152,7 @@ class MaintenanceScheduler:
                         just_wrote_n: int = 0) -> MaintenanceRun | None:
         if not self.enabled:
             return None
-        if not self._should_trigger(turn_idx, just_wrote_n):
+        if not await self._should_trigger_async(turn_idx, just_wrote_n):
             return None
         if self._lock.locked():
             return None
@@ -165,6 +165,26 @@ class MaintenanceScheduler:
             return True
         if turn_idx is not None and self.every_n_turns > 0 and turn_idx % self.every_n_turns == 0:
             return True
+        if self._last_run_at == 0.0:
+            return False
+        if (time.time() - self._last_run_at) > self.interval_s:
+            return True
+        # E4 D1 count_threshold 触发: 库内记忆总数超阈值
+        # 用 sync 调用 (store.count 是 async, 此处不 await; 由 maybe_run 在 _lock 外 await)
+        return False  # 实际判断移到 maybe_run 内 await
+
+    async def _should_trigger_async(self, turn_idx, just_wrote_n) -> bool:
+        if just_wrote_n > 0:
+            return True
+        if turn_idx is not None and self.every_n_turns > 0 and turn_idx % self.every_n_turns == 0:
+            return True
+        if self.count_threshold > 0 and self._store is not None:
+            try:
+                cur_count = await self._store.count()
+                if cur_count >= self.count_threshold:
+                    return True
+            except Exception:
+                pass
         if self._last_run_at == 0.0:
             return False
         if (time.time() - self._last_run_at) > self.interval_s:
