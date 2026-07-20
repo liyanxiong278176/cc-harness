@@ -1,5 +1,6 @@
 """QA evaluation: semantic F1 (LLM judge, primary) + token F1 (auxiliary) + GEval (diagnostic)."""
 from __future__ import annotations
+import hashlib
 import json
 import logging
 import os
@@ -109,27 +110,69 @@ async def semantic_f1(prompt, predicted, gold, judge_llm) -> Optional[float]:
         return None
 
 
-async def evaluate_qa(prompt: str, predicted: str, gold: str, judge_llm=None) -> dict:
-    """Returns dict with f1, semantic_f1, quality, pass, trace_payload.
+def _chunk_messages(messages: list[dict]) -> list[dict]:
+    """messages → chunks(list[{role, content, tokens}])。assistant 跳过。"""
+    out = []
+    for m in messages:
+        role = m.get("role")
+        if role == "assistant":
+            continue
+        content = m.get("content", "")
+        if isinstance(content, list):
+            # OpenAI 多模态格式(本 runner 不会出,容错)
+            content = json.dumps(content, ensure_ascii=False)
+        if not content:
+            continue
+        tokens = len(_tokenize(content))
+        out.append({"role": role, "content": content, "tokens": tokens})
+    return out
 
-    pass 重构(decision #1):semantic_f1>0.7 主;semantic=None(judge_llm=None 或
-    judge fail-soft)→ token_f1>0.5 fail-soft 兜底。quality 降为 diagnostic,不参与 pass。
-    token_f1 / quality 算法不动。
-    """
+
+def _chunk_hash(content: str) -> str:
+    return hashlib.sha256(content.encode("utf-8")).hexdigest()[:16]
+
+
+async def evaluate_qa(
+    prompt: str,
+    predicted: str,
+    gold: str,
+    *,
+    messages: list[dict] | None = None,
+    judge_llm=None,
+) -> dict:
+    """M5-2 extended:返回 dict 含 chunk_usefulness。"""
     f1 = token_f1(predicted, gold)
     semantic = await semantic_f1(prompt, predicted, gold, judge_llm)
     quality = quality_score(prompt, predicted, gold)
     pass_ = (semantic > 0.7) if semantic is not None else (f1 > 0.5)
+
+    chunk_usefulness: list[dict] = []
+    if messages is not None and judge_llm is not None:
+        for c in _chunk_messages(messages):
+            try:
+                score = await judge_chunk_usefulness(
+                    c["content"], prompt, gold, judge_llm,
+                )
+            except Exception:
+                score = 0.0
+            chunk_usefulness.append({
+                "role": c["role"],
+                "tokens": c["tokens"],
+                "useful_score": score,
+            })
+
     return {
         "f1": f1,
         "semantic_f1": semantic,
         "quality": quality,
         "pass": pass_,
+        "chunk_usefulness": chunk_usefulness,
         "trace_payload": {
             "f1": f1,
             "semantic_f1": semantic,
             "quality": quality,
             "pass": pass_,
+            "chunk_usefulness_n": len(chunk_usefulness),
         },
     }
 
