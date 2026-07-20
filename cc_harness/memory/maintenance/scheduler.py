@@ -29,8 +29,6 @@ class MaintenanceScheduler:
         self._last_run_at: float = 0.0
         self._lock = asyncio.Lock()
         self._current_task: asyncio.Task | None = None
-        self._half_life_days = 30.0
-        self._llm_recheck_enabled = True
 
     async def maybe_run(self, *, turn_idx: int | None = None,
                         just_wrote_n: int = 0) -> MaintenanceRun | None:
@@ -108,29 +106,7 @@ class MaintenanceScheduler:
                 self._current_task.cancel()
 
     # 占位实现, 后续 task 替换
-    async def _refresh_staleness(self) -> int:
-        from cc_harness.memory.maintenance.staleness import compute_staleness, LLMRechecker
-        now = time.time()
-        half_life = getattr(self, "_half_life_days", 30.0)
-        mems = await self._store.list_with_staleness(staleness_min=0.0, staleness_max=1.0, limit=500)
-        if not mems:
-            return 0
-        updates: dict[str, float] = {}
-        for m in mems:
-            rc = getattr(m, "recall_count", 0) or 0
-            updates[m.id] = compute_staleness(
-                m, now=now, recall_count=rc,
-                last_recalled_at=getattr(m, "last_recalled_at", None),
-                half_life_days=half_life,
-            )
-        await self._store.update_staleness_bulk(updates)
-        if getattr(self, "_llm_recheck_enabled", True) and self._llm is not None:
-            rechecker = LLMRechecker(self._llm)
-            mids = [(m.id, updates[m.id], m.text) for m in mems]
-            llm_updates = await rechecker.recheck_midrange(mids)
-            if llm_updates:
-                await self._store.update_staleness_bulk(llm_updates)
-        return len(updates)
+    async def _refresh_staleness(self) -> int: return 0
     async def _run_ttl(self) -> int: return 0
     async def _run_consolidation(self) -> int: return 0
     async def _run_conflict(self) -> int: return 0
