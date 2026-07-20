@@ -1,9 +1,25 @@
 """locomo 评测指标聚合。纯聚合(无 LLM)+ 离线 judge(见 Task 2)。"""
 from __future__ import annotations
 
+import inspect
 import json
 import statistics as st
 from collections import defaultdict
+
+
+# M5-2 judge prompts(集中常量,plan 写后统一复审)
+JUDGE_RECALL = (
+    '判断 memory(召回记忆)是否覆盖该 gold evidence(同事实 / 同实体即算覆盖)。\n'
+    '只返 JSON {"relevant": bool}。'
+)
+JUDGE_ENTITIES = (
+    '从 gold answer 抽取 key entities(人物 / 事件 / 物品 / 数字)。\n'
+    '只返 JSON {"entities": [str, ...]}。'
+)
+JUDGE_GROUP_CONSIST = (
+    '同一 entity 的多个 predicted answer 是否互相一致(同事实 / 同对象,允许近义)。\n'
+    '只返 JSON {"consistent": bool, "reason": str}。'
+)
 
 
 def compute_by_q_type(results: list[dict]) -> dict:
@@ -165,7 +181,9 @@ async def _judge(judge_llm, system, user) -> str:
     judge_llm 两种形态:
       ① LLMClient:有 ``.chat(messages, tools=None)`` → AsyncIterator[StreamEvent]。
          必须 ``async for ev in llm.chat(...)`` 迭代,取 done 事件的 ev.content(str)。
-      ② async fn(str)->str:无 .chat → ``await judge_llm(system + "\\n" + user)``。
+      ② async fn:无 .chat → 支持两种签名:
+         a) `(prompt: str) -> str`:旧形式,``await judge_llm(system + "\\n" + user)``。
+         b) `(system: str, user: str) -> str`:M5-2 形式,introspect positional 参数个数决定调用形态。
     """
     messages = [{"role": "system", "content": system}, {"role": "user", "content": user}]
     if hasattr(judge_llm, "chat"):
@@ -174,6 +192,17 @@ async def _judge(judge_llm, system, user) -> str:
             if ev.kind == "done":
                 content = ev.content or content
         return content
+    # async fn form: introspect n_positional params → 2 args vs 1 arg
+    try:
+        n_pos = sum(
+            1 for p in inspect.signature(judge_llm).parameters.values()
+            if p.kind in (inspect.Parameter.POSITIONAL_ONLY,
+                          inspect.Parameter.POSITIONAL_OR_KEYWORD)
+        )
+    except (ValueError, TypeError):
+        n_pos = 1
+    if n_pos >= 2:
+        return await judge_llm(system, user)
     return await judge_llm(system + "\n" + user)
 
 
@@ -204,6 +233,71 @@ async def compute_memory(results, qas, judge_llm) -> dict:
     return {
         "precision": min(1.0, p_num / p_den) if p_den else None,
         "recall": (r_num / r_den) if r_den else None,
+    }
+
+
+async def compute_recall(results, qas, conversations, judge_llm) -> dict:
+    """#1 记忆召回准确率(单 session 证据版本)。
+
+    `conversations`: Dict[sample_id, conv_dict](非 list)。caller 负责构造,
+    例如:{r["sample_id"]: conv for conv in conversations_list}。
+
+    仅算 evidence 全部在同一 session 的 QA(metrics-pass);
+    跨 session QA 直接排除(不计入 n_eligible)。
+
+    Returns:
+        {n_eligible, n_total_recall, precision, recall}。
+        judge_llm is None → 返字符串 'uncomputed'。
+    """
+    if judge_llm is None:
+        return "uncomputed"
+
+    from eval.locomo.dataset import build_session_index  # local import 防循环
+
+    p_num, p_den, r_num, r_den = 0, 0, 0, 0
+    n_eligible = 0
+    n_total_recall = 0
+
+    for r, qa in zip(results, qas):
+        evidence = qa.get("evidence") or []
+        if not evidence:
+            continue
+        # Dict 查找(plan 修订:list + sample_id 嵌套查找 bug-prone,改 Dict 接口)
+        sample_id = r.get("sample_id") or ""
+        conv = conversations.get(sample_id) if isinstance(conversations, dict) else None
+        if conv is None:
+            continue
+        idx = build_session_index(conv)
+        sessions = {idx.get(ev) for ev in evidence if ev in idx}
+        sessions.discard(None)
+        if not sessions or len(sessions) > 1:
+            continue
+        n_eligible += 1
+
+        recall_calls = [tc for tc in (r.get("tool_calls") or [])
+                        if tc.get("name") == "memory_recall"]
+        if not recall_calls:
+            continue
+        n_total_recall += len(recall_calls)
+        recall_text = "\n".join(tc.get("result", "") for tc in recall_calls)
+
+        for ev in evidence:
+            try:
+                resp = await _judge(judge_llm, JUDGE_RECALL,
+                                    f"记忆:\n{recall_text}\n\n证据:\n{ev}")
+                if json.loads(resp).get("relevant"):
+                    r_num += 1
+                    p_num += 1
+            except Exception:
+                pass
+            r_den += 1
+        p_den += len(recall_calls)
+
+    return {
+        "n_eligible": n_eligible,
+        "n_total_recall": n_total_recall,
+        "precision": min(1.0, p_num / p_den) if p_den else None,
+        "recall":    (r_num / r_den) if r_den else None,
     }
 
 

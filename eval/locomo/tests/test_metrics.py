@@ -263,3 +263,79 @@ def test_compute_compaction_v2_partial_retain():
     assert by_tier_map[1]["trigger_n"] == 2
     assert by_tier_map[1]["pass_rate"] == 1.0
     assert abs(by_tier_map[1]["avg_retain"] - 0.5) < 1e-6   # 仅第二条计入
+
+
+@pytest.mark.asyncio
+async def test_compute_recall_uncomputed_no_judge():
+    """judge_llm=None → 直接返 'uncomputed' 字符串。"""
+    from eval.locomo import metrics
+    results = [{"tool_calls": [{"name": "memory_recall", "result": "Alice lives in NYC"}]}]
+    qas = [{"evidence": ["D1:1"]}]
+    out = await metrics.compute_recall(results, qas, None, judge_llm=None)
+    assert out == "uncomputed"
+
+
+@pytest.mark.asyncio
+async def test_compute_recall_basic_precision_recall():
+    """1 QA,2 evidences,evidence 全在同一 session。
+
+    judge 总是返 {'relevant': True},expected:
+      n_eligible = 1
+      n_total_recall = 1(1 个 memory_recall tool_call)
+      precision  = 1 recall return
+      recall     = 2 evidence / 2 total = 1.0
+    """
+    from eval.locomo import metrics
+    from eval.locomo import dataset as ds
+
+    async def fake_judge(system, user):
+        return '{"relevant": true}'
+
+    conversations = {
+        "conv-X": {
+            "speaker_a": "D1", "speaker_b": "D2",
+            "session_1_date_time": "2024-01-01T10:00:00",
+            "session_1": [
+                {"speaker": "D1", "dia_id": 1, "text": "Alice lives in NYC"},
+                {"speaker": "D1", "dia_id": 2, "text": "Alice works at OpenAI"},
+            ],
+        }
+    }
+    results = [{
+        "sample_id": "conv-X",
+        "tool_calls": [{"name": "memory_recall", "result": "Alice lives in NYC works at OpenAI"}],
+    }]
+    qas = [{"evidence": ["D1:1", "D1:2"]}]  # 都在 session_1 → eligible
+    out = await metrics.compute_recall(results, qas, conversations, judge_llm=fake_judge)
+    assert out["n_eligible"] == 1
+    assert out["n_total_recall"] == 1
+    assert out["precision"] == 1.0
+    assert out["recall"] == 1.0
+
+
+@pytest.mark.asyncio
+async def test_compute_recall_cross_session_excluded():
+    """evidence 跨 ≥2 session → 该 QA 不算 n_eligible。
+
+    模拟 judge 返 True(理应返 False),验证只看 n_eligible(不应累加 recall numerator)。
+    """
+    from eval.locomo import metrics
+
+    async def fake_judge(system, user):
+        return '{"relevant": true}'
+
+    conv = {
+        "conv-Y": {
+            "speaker_a": "D1", "speaker_b": "D2",
+            "session_1_date_time": "2024-01-01T10:00:00",
+            "session_1": [{"speaker": "D1", "dia_id": 1, "text": "x"}],
+            "session_2_date_time": "2024-01-02T10:00:00",
+            "session_2": [{"speaker": "D1", "dia_id": 2, "text": "y"}],
+        }
+    }
+    results = [{"sample_id": "conv-Y", "tool_calls": []}]
+    qas = [{"evidence": ["D1:1", "D1:2"]}]  # 跨 session
+    out = await metrics.compute_recall(results, qas, conv, judge_llm=fake_judge)
+    assert out["n_eligible"] == 0
+    assert out["precision"] is None
+    assert out["recall"] is None
