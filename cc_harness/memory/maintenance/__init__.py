@@ -3,6 +3,8 @@ from cc_harness.memory.maintenance.scheduler import MaintenanceScheduler, Mainte
 from cc_harness.memory.maintenance.staleness import compute_staleness, LLMRechecker
 from cc_harness.memory.maintenance.ttl import purge_stale
 from cc_harness.memory.maintenance.consolidation import consolidate, _greedy_cluster
+from cc_harness.memory.maintenance.conflict import ConflictDetector, ConflictVerdict
 
 __all__ = ["MaintenanceScheduler", "MaintenanceRun", "compute_staleness", "LLMRechecker",
-           "purge_stale", "consolidate", "_greedy_cluster"]
+           "purge_stale", "consolidate", "_greedy_cluster",
+           "ConflictDetector", "ConflictVerdict"]

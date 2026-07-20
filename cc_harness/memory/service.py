@@ -33,6 +33,7 @@ class MemoryService:
 
     async def save(self, text: str, source: str, session_id: str | None = None) -> SaveResult:
         t0 = time.time()
+        result_action_mem = None
         try:
             embedding = await self.embedder.embed(text)
             similar = await self.store.search_similar(embedding, k=5)
@@ -43,23 +44,47 @@ class MemoryService:
 
             if decision.action == Decision.ADD:
                 mem = await self.store.add(text, embedding, source, session_id=session_id)
-                return SaveResult(action="ADD", memory=mem, duration_ms=_ms(t0))
+                result_action_mem = mem
+                result = SaveResult(action="ADD", memory=mem, duration_ms=_ms(t0))
 
-            if decision.action == Decision.UPDATE:
+            elif decision.action == Decision.UPDATE:
                 # UPDATE 走 store.update(改 text+embedding),不改 session_id(保持原归属)
                 old = await self.store.get(decision.target_id)
                 new_embedding = await self.embedder.embed(decision.merged_text)
                 mem = await self.store.update(decision.target_id, decision.merged_text, new_embedding)
-                return SaveResult(action="UPDATE", memory=mem, previous=old, duration_ms=_ms(t0))
+                result_action_mem = mem
+                result = SaveResult(action="UPDATE", memory=mem, previous=old, duration_ms=_ms(t0))
 
-            if decision.action == Decision.DELETE:
+            elif decision.action == Decision.DELETE:
                 old = await self.store.get(decision.target_id)
                 await self.store.delete(decision.target_id)
                 mem = await self.store.add(text, embedding, source, session_id=session_id)
-                return SaveResult(action="DELETE_THEN_ADD", memory=mem, previous=old,
-                                  deleted_id=decision.target_id, duration_ms=_ms(t0))
+                result_action_mem = mem
+                result = SaveResult(action="DELETE_THEN_ADD", memory=mem, previous=old,
+                                    deleted_id=decision.target_id, duration_ms=_ms(t0))
 
-            return SaveResult(action="NOOP", duration_ms=_ms(t0))
+            else:
+                result = SaveResult(action="NOOP", duration_ms=_ms(t0))
+
+            # E4 write-time 矛盾检测(写盘后, 仅 ADD/UPDATE/DELETE_THEN_ADD 触发)
+            if self.decider is not None and result_action_mem is not None:
+                try:
+                    from cc_harness.memory.maintenance.conflict import ConflictDetector
+                    det = ConflictDetector(self.decider._llm)
+                    similar_for_conflict = await self.store.search_similar(embedding, k=5)
+                    verdicts = await det.check(result_action_mem, similar_for_conflict)
+                    for v in verdicts:
+                        if v.action == "delete_old":
+                            await self.store.delete(v.other_id)
+                        elif v.action == "delete_new":
+                            await self.store.delete(result_action_mem.id)
+                            return SaveResult(action="ROLLBACK",
+                                              error=f"conflict:{v.verdict}",
+                                              duration_ms=_ms(t0))
+                except Exception:
+                    pass  # 矛盾检测失败不阻塞
+
+            return result
 
         except EmbeddingError as e:
             return SaveResult(action="ERROR", error=f"embedding: {e}", duration_ms=_ms(t0))

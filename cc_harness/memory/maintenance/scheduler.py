@@ -156,4 +156,10 @@ class MaintenanceScheduler:
             similarity_threshold=getattr(self, "_consol_threshold", 0.15),
             max_cluster_size=getattr(self, "_consol_max", 5),
         )
-    async def _run_conflict(self) -> int: return 0
+    async def _run_conflict(self) -> int:
+        from cc_harness.memory.maintenance.conflict import ConflictDetector
+        embedder = getattr(self, "_embedder", None)
+        if embedder is None or self._llm is None:
+            return 0
+        det = ConflictDetector(self._llm)
+        return await det.scan_all(self._store, embedder)
