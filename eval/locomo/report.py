@@ -289,8 +289,8 @@ def _summary_cards_v3(metrics: dict) -> str:
 
 
 def _recall_subtable(metrics_1_recall) -> str:
-    if isinstance(metrics_1_recall, str):
-        return '<p>1. 记忆召回: judge 未配置 —</p>'
+    if not isinstance(metrics_1_recall, dict):
+        return '<p>1. 记忆召回: 数据不可得 —</p>'
     return f"""
 <h4>1. 记忆召回(n_eligible={metrics_1_recall.get("n_eligible","-")})</h4>
 <p>precision: {_card_val(metrics_1_recall, "precision")},
@@ -312,8 +312,8 @@ def _timeliness_subtable(metrics_2_timeliness) -> str:
 
 
 def _utilization_subtable(metrics_3_utilization) -> str:
-    if isinstance(metrics_3_utilization, str):
-        return '<p>3. 利用率: chunk_usefulness 空 —</p>'
+    if not isinstance(metrics_3_utilization, dict):
+        return '<p>3. 利用率: 数据不可得 —</p>'
     return f"""
 <h4>3. 利用率</h4>
 <p>avg={_card_val(metrics_3_utilization, "avg")} ·
@@ -346,8 +346,8 @@ def _compaction_subtable_v2(metrics_4_compaction) -> str:
 
 
 def _consistency_subtable(metrics_5_consistency) -> str:
-    if isinstance(metrics_5_consistency, str):
-        return '<p>5. 一致性: judge 未配置 —</p>'
+    if not isinstance(metrics_5_consistency, dict):
+        return '<p>5. 一致性: 数据不可得 —</p>'
     by_sample = metrics_5_consistency.get("by_sample") or []
     rows = []
     for s in by_sample:

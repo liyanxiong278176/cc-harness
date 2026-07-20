@@ -201,3 +201,24 @@ def test_compaction_subtable_v2_includes_all_tiers():
     html = report._compaction_subtable_v2(metrics["4_compaction"])
     for tier_n in (0, 1, 2, 3):
         assert f">tier {tier_n}<" in html or f">{tier_n}<" in html
+
+
+def test_recall_subtable_none_returns_placeholder():
+    from eval.locomo import report
+    html = report._recall_subtable(None)
+    assert "<p" in html  # placeholder paragraph
+    assert "—" in html   # em-dash placeholder
+
+
+def test_utilization_subtable_none_returns_placeholder():
+    from eval.locomo import report
+    html = report._utilization_subtable(None)
+    assert "<p" in html
+    assert "—" in html
+
+
+def test_consistency_subtable_none_returns_placeholder():
+    from eval.locomo import report
+    html = report._consistency_subtable(None)
+    assert "<p" in html
+    assert "—" in html
