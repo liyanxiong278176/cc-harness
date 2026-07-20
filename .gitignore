@@ -24,3 +24,6 @@ build/
 # locomo dataset (大,不入仓)
 eval/locomo/data/locomo10.json
 eval/locomo/.checkpoint.json
+
+# M5-2 judge cache (locomo runner writes under output_dir / ".judge-cache")
+eval/result/.judge-cache/
