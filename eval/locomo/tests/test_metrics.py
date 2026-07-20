@@ -203,3 +203,63 @@ def test_compute_utilization_partial_chunks():
     out = metrics.compute_utilization(results)
     assert out["n"] == 1
     assert out["avg"] == 1.0
+
+
+def test_compute_compaction_v2_no_compaction():
+    """所有 record.compaction=None → by_tier 全 0;overall_avg_retain=None。"""
+    from eval.locomo import metrics
+    results = [
+        {"compaction": None, "pass": True},
+        {"compaction": None, "pass": False},
+    ]
+    out = metrics.compute_compaction_v2(results)
+    assert out["total_compressed_n"] == 0
+    assert out["overall_avg_retain"] is None
+    for row in out["by_tier"]:
+        if row["tier"] >= 1:
+            assert row["trigger_n"] == 0
+    by_tier_map = {r["tier"]: r for r in out["by_tier"]}
+    assert by_tier_map[0]["trigger_n"] == 2
+    assert by_tier_map[0]["pass_rate"] == 0.5   # 1 pass / 2 records
+
+
+def test_compute_compaction_v2_per_tier():
+    from eval.locomo import metrics
+    results = [
+        # tier 0
+        {"compaction": None, "pass": True},
+        # tier 1:avg retain = (0.8 + 0.6) / 2 = 0.7;1 pass,1 fail
+        {"compaction": {"tier": 1, "before_tokens": 1000, "after_tokens": 800}, "pass": True},
+        {"compaction": {"tier": 1, "before_tokens": 1000, "after_tokens": 600}, "pass": False},
+        # tier 2:retain = 0.5;pass True
+        {"compaction": {"tier": 2, "before_tokens": 800, "after_tokens": 400}, "pass": True},
+        # tier 3:retain = 0.2;pass False(失分)
+        {"compaction": {"tier": 3, "before_tokens": 500, "after_tokens": 100}, "pass": False},
+    ]
+    out = metrics.compute_compaction_v2(results)
+    by_tier_map = {r["tier"]: r for r in out["by_tier"]}
+    assert by_tier_map[0]["trigger_n"] == 1
+    assert by_tier_map[1]["trigger_n"] == 2
+    assert abs(by_tier_map[1]["avg_retain"] - 0.7) < 1e-6
+    assert by_tier_map[1]["pass_rate"] == 0.5
+    assert by_tier_map[2]["trigger_n"] == 1
+    assert by_tier_map[2]["avg_retain"] == 0.5
+    assert by_tier_map[3]["trigger_n"] == 1
+    assert by_tier_map[3]["avg_retain"] == 0.2
+    assert by_tier_map[3]["pass_rate"] == 0.0
+    assert out["total_compressed_n"] == 4
+    assert abs(out["overall_avg_retain"] - (0.7 + 0.5 + 0.2) / 3) < 1e-6
+
+
+def test_compute_compaction_v2_partial_retain():
+    """before/after 缺失 → 该 record 不计入 avg_retain,但计入 trigger_n 与 pass_rate。"""
+    from eval.locomo import metrics
+    results = [
+        {"compaction": {"tier": 1, "before_tokens": None, "after_tokens": None}, "pass": True},
+        {"compaction": {"tier": 1, "before_tokens": 1000, "after_tokens": 500}, "pass": True},
+    ]
+    out = metrics.compute_compaction_v2(results)
+    by_tier_map = {r["tier"]: r for r in out["by_tier"]}
+    assert by_tier_map[1]["trigger_n"] == 2
+    assert by_tier_map[1]["pass_rate"] == 1.0
+    assert abs(by_tier_map[1]["avg_retain"] - 0.5) < 1e-6   # 仅第二条计入

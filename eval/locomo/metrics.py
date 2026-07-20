@@ -50,6 +50,51 @@ def compute_compaction(results: list[dict]) -> dict:
     }
 
 
+def compute_compaction_v2(results: list[dict]) -> dict:
+    """#4 上下文压缩率:per-tier 分桶 + 整体 avg_retain。
+
+    tier=0 表示该 record 未触发压缩(compaction is None 或 tier=0);
+    tier>=1 表示压缩过。
+    """
+    by_tier: dict[int, dict] = {t: {"tier": t, "trigger_n": 0, "pass": 0,
+                                     "retain_sum": 0.0, "retain_count": 0}
+                                  for t in (0, 1, 2, 3)}
+    total_compressed = 0
+    for r in results:
+        c = r.get("compaction")
+        tier = 0 if c is None else int(c.get("tier", 0))
+        by_tier[tier]["trigger_n"] += 1
+        if r.get("pass"):
+            by_tier[tier]["pass"] += 1
+        if tier >= 1:
+            total_compressed += 1
+        before = c.get("before_tokens") if c else None
+        after = c.get("after_tokens") if c else None
+        if before and after and before > 0:
+            ratio = after / before
+            by_tier[tier]["retain_sum"] += ratio
+            by_tier[tier]["retain_count"] += 1
+    by_tier_rows = []
+    compressed_tier_avgs: list[float] = []
+    for t in (0, 1, 2, 3):
+        row = by_tier[t]
+        n = row["trigger_n"]
+        avg_retain = (row["retain_sum"] / row["retain_count"]) if row["retain_count"] else None
+        if t >= 1 and avg_retain is not None:
+            compressed_tier_avgs.append(avg_retain)
+        by_tier_rows.append({
+            "tier": t,
+            "trigger_n": n,
+            "avg_retain": avg_retain,
+            "pass_rate": (row["pass"] / n) if n else None,
+        })
+    return {
+        "by_tier": by_tier_rows,
+        "total_compressed_n": total_compressed,
+        "overall_avg_retain": st.mean(compressed_tier_avgs) if compressed_tier_avgs else None,
+    }
+
+
 def compute_timeliness(results: list[dict]) -> dict:
     """#2 时效性:category=3(Temporal)子集的 pass_rate + 中位数。纯聚合。"""
     subset = [r for r in results if str(r.get("q_type")) == "3"]
