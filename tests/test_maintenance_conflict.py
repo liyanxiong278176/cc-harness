@@ -1,7 +1,7 @@
 """E4 Task 5: 矛盾检测 — write-time + maintenance 全库扫。"""
 import pytest
 from unittest.mock import MagicMock
-from cc_harness.memory.maintenance.conflict import ConflictDetector, ConflictVerdict
+from cc_harness.memory.maintenance.conflict import ConflictDetector
 
 
 def make_mem(mid="m1", text="t"):
