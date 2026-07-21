@@ -33,7 +33,11 @@ class LLMDecider:
         self._llm = llm
 
     async def decide(
-        self, new_text: str, similar: list,  # similar: list[tuple[Memory, float]]
+        self,
+        new_text: str,
+        similar: list,  # similar: list[tuple[Memory, float]]
+        *,
+        recent_reflections: list | None = None,  # E2 注入,默认 None
     ) -> DecisionResult:
         if not similar:
             return DecisionResult(action=Decision.ADD)
@@ -43,9 +47,16 @@ class LLMDecider:
              for m, d in similar],
             ensure_ascii=False,
         )
+        user_content = memory_decide_user_prompt(new_text, similar_json)
+        if recent_reflections:
+            ref_section = "\n\n你过去 24h 对相似主题的反思如下(供你参考):\n" + "\n".join(
+                f"- {r.text[:150]}" for r in recent_reflections[:3]
+            )
+            user_content += ref_section
+
         msgs = [
             {"role": "system", "content": MEMORY_DECIDE_SYSTEM_PROMPT},
-            {"role": "user", "content": memory_decide_user_prompt(new_text, similar_json)},
+            {"role": "user", "content": user_content},
         ]
 
         try:

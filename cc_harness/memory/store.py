@@ -346,6 +346,35 @@ class MemoryStore:
             await self._db.close()
             self._db = None
 
+    # --- E2 reflection memory (T3.1) ---
+
+    async def search_reflections(
+        self, *, limit: int = 5, lookback_h: float = 24.0
+    ) -> list[Memory]:
+        """查最近 lookback_h 小时内 source='reflection' 的 Memory,按 created_at DESC。
+
+        E2 reflection 注入:ReflectionEngine 落盘时 source='reflection',
+        service.save 在调 decider 前召本方法,decider 把结果作为
+        recent_reflections 注入 prompt 帮 LLM 参考过去 24h 反思。
+        """
+        assert self._db is not None, "store.init_schema first"
+        cutoff = time.time() - lookback_h * 3600
+        cur = await self._db.execute(
+            "SELECT id, text, embedding, created_at, updated_at, source "
+            "FROM memories "
+            "WHERE source = 'reflection' AND created_at > ? "
+            "ORDER BY created_at DESC LIMIT ?",
+            (cutoff, limit),
+        )
+        rows = await cur.fetchall()
+        return [
+            Memory(
+                id=r[0], text=r[1], embedding=_blob_to_vec(r[2]),
+                created_at=r[3], updated_at=r[4], source=r[5],
+            )
+            for r in rows
+        ]
+
     # --- E4 维护公共方法 (Task 2) ---
 
     async def touch_recall(self, ids: list[str]) -> None:

@@ -40,7 +40,13 @@ class MemoryService:
             if not similar:
                 decision = DecisionResult(action=Decision.ADD)
             else:
-                decision = await self.decider.decide(text, similar)
+                # E2 T3.1: 召过去 24h 反思注入 decider,帮 LLM 参考历史反思做去重/更新
+                recent_reflections = await self.store.search_reflections(
+                    limit=5, lookback_h=24
+                )
+                decision = await self.decider.decide(
+                    text, similar, recent_reflections=recent_reflections
+                )
 
             if decision.action == Decision.ADD:
                 mem = await self.store.add(text, embedding, source, session_id=session_id)
