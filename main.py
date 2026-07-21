@@ -216,6 +216,44 @@ def main() -> None:
                 _scheduler._consol_threshold = _mem_cfg.consolidation_similarity_threshold
                 _scheduler._consol_max = _mem_cfg.consolidation_max_cluster_size
 
+            # E2 T2.3: 构造 ReflectionEngine(同 E4 I-1 wiring 模式)。
+            # - memory_service 复用 _mem_deps['service'](同 scheduler)。
+            # - llm_client 复用主 llm(同 scheduler / E4 I-1)。
+            # - judge_llm 走 JUDGE_* env;未配 → None(engine 内部 _ask_judge_with_fallback
+            #   走 local 兜底,沿用 E4 fail-soft 哲学)。
+            # - l5_engine 单独构(防与 repl 内自带 l5 复用,boot 走自己的 policy.yaml)。
+            # - project_root 走 working_dir(与 repl cwd 一致)。
+            from cc_harness.reflection.engine import ReflectionEngine as _RE
+            from cc_harness.l5 import build_l5_engine as _b5e
+            from cc_harness.config import load_l5_config as _l5c
+            _judge_base = os.getenv("JUDGE_BASE_URL")
+            _judge_key = os.getenv("JUDGE_API_KEY")
+            _judge_model = os.getenv("JUDGE_MODEL")
+            _judge_llm = (
+                LLMClient(
+                    api_key=_judge_key,
+                    model=_judge_model,
+                    base_url=_judge_base,
+                )
+                if (_judge_base and _judge_key and _judge_model) else None
+            )
+            _l5_engine = _b5e(_l5c(PROJECT_ROOT / "policy.yaml"))
+            _reflection_engine = (
+                _RE(
+                    memory_service=_mem_deps["service"],
+                    llm_client=llm,
+                    judge_llm=_judge_llm,
+                    l5_engine=_l5_engine,
+                    project_root=working_dir,
+                    enabled=_mem_cfg.reflection_enabled,
+                    every_n_turns=_mem_cfg.reflection_every_n_turns,
+                    max_pending=_mem_cfg.reflection_max_pending,
+                    drain_timeout_s=_mem_cfg.reflection_drain_timeout_s,
+                )
+                if _mem_deps is not None
+                else None
+            )
+
             # Pre-warm sandbox server when backend=sandbox.
             # Why: ensure_server() currently only fires on the first command,
             # which (a) hides config errors until something breaks, and
@@ -253,6 +291,7 @@ def main() -> None:
                 memory_extras=_memory_extras,
                 mem_deps=_mem_deps,
                 scheduler=_scheduler,
+                reflection_engine=_reflection_engine,           # E2 T2.3
             )
         finally:
             await mcp.shutdown()

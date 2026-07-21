@@ -20,6 +20,7 @@ import time
 import uuid as _uuid
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import TYPE_CHECKING
 from openai import AsyncOpenAI
 from rich.console import Console
 from cc_harness.audit import log_decision
@@ -32,6 +33,10 @@ from cc_harness.tokens import TokenCounter, SessionTokenStats
 from cc_harness.tools import init_session_executor, shutdown_session_executor
 
 log = logging.getLogger(__name__)
+
+if TYPE_CHECKING:
+    # E2 T2.3:类型注解(运行时 = None 形参,不拽入 cc_harness.reflection.* 避免启动开销)
+    from cc_harness.reflection.engine import ReflectionEngine
 
 _VALID_MODES = ("coding", "plan", "design", "chat")
 
@@ -138,6 +143,10 @@ async def run_repl(
     design_dir: Path | None = None,
     context_config: ContextConfig | None = None,
     scheduler: object | None = None,
+    # E2 T2.3:反思节点。main.py 构造 ReflectionEngine 后注入(同 scheduler
+    # 模式),None 时保持向后兼容(无反思)。run_turn 内的 4 类 emit 仅在
+    # reflection_engine 非 None 时触发(T2.2 默认 None 守卫)。
+    reflection_engine: ReflectionEngine | None = None,  # TYPE_CHECKING import,运行时不拽入
     # E4 I-1:memory 工具 extras + mem_deps 在 main.py 构造后传入
     # (让 main.py 也能拿到 store/service 构造 MaintenanceScheduler)。
     # backward compat:若都不传 → repl 内部自行 build(原行为)。
@@ -409,6 +418,7 @@ async def run_repl(
                 last_turn_text=state.last_turn_text,              # D1 final:todo_update 完成门 acceptance 校验用
                 resume_task=state.resume_task,                    # Task 6: 续干任务
                 todo_hints=list(state.todo_hints or []),          # B 阶段 Task 5: verify hints
+                reflection_engine=reflection_engine,              # E2 T2.3: 4 类 emit 注入
             )
             state.session_stats.add(turn_stats)
 
@@ -446,6 +456,16 @@ async def run_repl(
                 await scheduler._drain(timeout_s=5)
             except Exception as e:
                 print_warn(console, f"scheduler _drain failed: {e}")
+        # E2 T2.3: reflection engine 同样模式 — 等后台反思 task 收尾。
+        # timeout 走 engine 自身字段(单一来源,避免硬编码 5 与 default 5 漂移);
+        # try/except 兜底(同 scheduler)— engine 故障不阻塞 shutdown。
+        if reflection_engine is not None:
+            try:
+                await reflection_engine._drain(
+                    timeout_s=reflection_engine._drain_timeout_s,
+                )
+            except Exception as e:
+                print_warn(console, f"reflection_engine _drain failed: {e}")
         # 主循环退出(正常 exit / EOF / Ctrl-C / 异常)→ shutdown 会话级 executor。
         # async,非 atexit;sandbox 时 kill 容器 + shutdown_owned_server,best-effort。
         await shutdown_session_executor()
