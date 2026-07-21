@@ -31,10 +31,17 @@ from cc_harness.l5 import L5Engine
 from cc_harness.tools import confirm_tool, run_command, RUN_COMMAND_SPEC
 from cc_harness.tokens import TokenCounter, TurnTokenStats, UsageRecord
 from cc_harness.config import ContextConfig
+from cc_harness.reflection.events import (  # E2 T2.2:反思事件工厂
+    max_iter_reached,
+    empty_turn_loop,
+    tool_error_burst,
+    tool_retry_burst,
+)
 
 if TYPE_CHECKING:
     from cc_harness.project.models import TodoTask
     from cc_harness.project.service import TodoService  # D1 Task 7:TodoService 类型注解
+    from cc_harness.reflection.engine import ReflectionEngine  # E2 T2.2:类型注解(运行时 = None)
 
 _VALID_MODES = ("coding", "plan", "design", "chat")
 
@@ -97,6 +104,7 @@ async def run_turn(
     todo_service: "TodoService | None" = None,  # D1 Task 7:TodoService 实例,非 None 时自动构造 SubAgentRunner + 注入 extras
     session_id: str = "",  # D1 Task 7:handler 用作 active_sessions(显式,不靠 env var)
     last_turn_text: str = "",  # D1 Task 7:C 阶段 todo_update 完成门 acceptance 校验用
+    reflection_engine: "ReflectionEngine | None" = None,  # E2 T2.2:默认 None 保持向后兼容
 ) -> TurnTokenStats:
     """Run one user turn in the given mode.
 
@@ -177,6 +185,29 @@ async def run_turn(
     iter_count = 0
     _empty_retried = False  # one-shot retry guard for empty-content turns
     tool_call_log: list = []  # Plan1 Task4: [{name, args, ok, result}] per tool dispatch
+    # E2 T2.2 Step 3e:同 tool+args 调 2+ 次的检测(独立于 tool_call_log 避免冲突,
+    # tool_call_log 仍按 Plan1 契约存 dict 给 TurnTokenStats.tool_call_log 用)
+    _tool_retry_log: list[tuple] = []  # [(name, arguments_json), ...]
+    # E2 T2.2 Step 3d:tool is_error 累计计数器(本 turn 内连续 2+ 触发 emit)
+    _tool_error_count = 0
+
+    # E2 T2.2 Step 3d:tool is_error 计数 + 触发 emit(2+ 触发一次,清零防刷)。
+    # fail-soft:emit 异常 → pass,绝不影响主循环。
+    async def _note_tool_error(tool_name: str, error_text: str) -> None:
+        nonlocal _tool_error_count
+        _tool_error_count += 1
+        if _tool_error_count >= 2 and reflection_engine is not None:
+            try:
+                await reflection_engine.emit(
+                    tool_error_burst(
+                        session_id=session_id or "default",
+                        turn_idx=iter_count,
+                        errors=[{"tool": tool_name, "error": error_text[:200]}],
+                    )
+                )
+                _tool_error_count = 0  # 避免每个 tool 都 emit
+            except Exception:
+                pass
     last_compaction = None  # Plan3: CompactionStats from maybe_compact (or None)
     _last_node = None  # Q4 Task5: offload edge chain — node_id of last offloaded tool result
 
@@ -189,17 +220,26 @@ async def run_turn(
         else:
             messages.insert(0, {"role": "system", "content": system_prompt})
     elif cwd is not None:
+        # E2 T2.2: 把 reflection_engine.get_last_neg_reflection() 注入 extra_ctx,
+        # 让 SECTION_POOL 拼装把反思段加到 system prompt 末尾(只走 extra_ctx,绝不
+        # 走 messages 之外的旁路)。reflection_engine=None 时 key 不出现 = 不渲染。
+        _neg_extra = (
+            {"last_neg_reflection": reflection_engine.get_last_neg_reflection()}
+            if reflection_engine is not None
+            else {}
+        )
         # Phase 1 Q1 uplift: qa_context → render qa_intro section
         if qa_context and qa_context.get("q_type") is not None:
             _refresh_system_prompt(
                 messages, cwd, mode,
-                extra_ctx={"qa_category": qa_context["q_type"]},
+                extra_ctx={"qa_category": qa_context["q_type"], **_neg_extra},
                 resume_task=resume_task,
                 todo_hints=todo_hints,
             )
         else:
             _refresh_system_prompt(
                 messages, cwd, mode,
+                extra_ctx=_neg_extra,
                 resume_task=resume_task,
                 todo_hints=todo_hints,
             )
@@ -491,6 +531,19 @@ async def run_turn(
             # Coding mode: full ReAct loop with tool execution.
             if iter_count >= max_iter:
                 # Max-iter guard: drop the tool_calls, fall back to final.
+                # E2 T2.2 Step 3b:emit max_iter_reached 事件(fail-soft,不阻塞 turn)
+                if reflection_engine is not None:
+                    try:
+                        await reflection_engine.emit(
+                            max_iter_reached(
+                                session_id=session_id or "default",
+                                turn_idx=iter_count,
+                                iter_used=iter_count,
+                                last_content=content or "",
+                            )
+                        )
+                    except Exception:
+                        pass
                 print_warn(console, "max iterations reached with pending tool calls, forcing stop")
                 if content:
                     content = _redact(content, "result")
@@ -505,12 +558,35 @@ async def run_turn(
             # 3. Build assistant message (with tool_calls; content may be None)
             if content:
                 content = _redact(content, "thought")
+            # E2 T2.2 Step 3e:同 tool+args 在本 turn 累计 2+ 次 → emit tool_retry_burst
+            # (ambig)。仅在 reflection_engine 非 None 时跑;不阻塞 assistant 构造。
+            if reflection_engine is not None and pending:
+                for p in pending:
+                    _sig = (p.name, p.arguments_json or "")
+                    if _tool_retry_log.count(_sig) >= 1:
+                        try:
+                            await reflection_engine.emit(
+                                tool_retry_burst(
+                                    session_id=session_id or "default",
+                                    turn_idx=iter_count,
+                                    calls=[{
+                                        "tool": p.name,
+                                        "args": json.loads(p.arguments_json or "{}"),
+                                        "count": _tool_retry_log.count(_sig) + 1,
+                                    }],
+                                )
+                            )
+                        except Exception:
+                            pass
             assistant_msg: dict = {
                 "role": "assistant",
                 "content": content if content else None,
                 "tool_calls": [_pending_to_openai_tc(p) for p in pending],
             }
             messages.append(assistant_msg)
+            # 记录到 _tool_retry_log(放在 append 之后,下次再遇同 sig 才计数)
+            for p in pending:
+                _tool_retry_log.append((p.name, p.arguments_json or ""))
 
             # 3.5 Print the 思考 block (full LLM text for this iter)
             if content:
@@ -534,6 +610,7 @@ async def run_turn(
                         "content": error_llm_text,
                         "is_error": True,
                     })
+                    await _note_tool_error(p.name or "", error_llm_text)
                     continue
 
                 try:
@@ -550,6 +627,7 @@ async def run_turn(
                         "content": error_text,
                         "is_error": True,
                     })
+                    await _note_tool_error(p.name or "", error_text)
                     continue
 
                 # schema 校验
@@ -568,6 +646,7 @@ async def run_turn(
                         "content": error_text,
                         "is_error": True,
                     })
+                    await _note_tool_error(p.name or "", error_text)
                     continue
 
                 # 权限决策
@@ -587,13 +666,16 @@ async def run_turn(
                     print_observation(console, result.llm_text)
                     _tool_content = await _maybe_offload_content(
                         result.llm_text, p.name, args)
+                    _is_err = bool(getattr(result, "is_error", False))
                     messages.append({
                         "role": "tool",
                         "name": p.name,  # D1 final:加 name 字段(for `_has_recent_htn_parent_create` + downstream inspect)
                         "tool_call_id": p.id or f"unknown_{i}",
                         "content": _tool_content,
-                        "is_error": bool(getattr(result, "is_error", False)),
+                        "is_error": _is_err,
                     })
+                    if _is_err:
+                        await _note_tool_error(p.name, str(result.llm_text)[:200])
                 else:  # ask
                     print_warn(console, f"[需确认] {p.name} {decision.reason}")
                     choice = confirm_tool(p.name, args)
@@ -610,13 +692,16 @@ async def run_turn(
                         print_observation(console, result.llm_text)
                         _tool_content = await _maybe_offload_content(
                             result.llm_text, p.name, args)
+                        _is_err = bool(getattr(result, "is_error", False))
                         messages.append({
                             "role": "tool",
                             "name": p.name,  # D1 final:加 name 字段(同上)
                             "tool_call_id": p.id or f"unknown_{i}",
                             "content": _tool_content,
-                            "is_error": bool(getattr(result, "is_error", False)),
+                            "is_error": _is_err,
                         })
+                        if _is_err:
+                            await _note_tool_error(p.name, str(result.llm_text)[:200])
                     else:
                         error_text = (
                             f"[未执行:用户拒绝] {p.name} — {decision.reason}。"
@@ -637,6 +722,7 @@ async def run_turn(
                             "content": error_text,
                             "is_error": True,
                         })
+                        await _note_tool_error(p.name or "", error_text)
 
             # 5. Continue the loop — feed tool results back to LLM
             continue
@@ -671,6 +757,19 @@ async def run_turn(
                 print_warn(console, "空回复,重试中... (empty response, retrying)")
                 iter_count -= 1
                 continue
+            # E2 T2.2 Step 3c:empty-turn 二次仍空 → 放弃,emit empty_turn_loop
+            # 事件(fail-soft,不阻塞 turn)
+            if reflection_engine is not None:
+                try:
+                    await reflection_engine.emit(
+                        empty_turn_loop(
+                            session_id=session_id or "default",
+                            turn_idx=iter_count,
+                            attempts=1,
+                        )
+                    )
+                except Exception:
+                    pass
             print_warn(console, "empty LLM turn, ending")
             return _stats()
 
