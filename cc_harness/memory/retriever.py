@@ -26,7 +26,17 @@ class MemoryRetriever:
 
     async def search(self, query: str, top_k: int = 5) -> list:
         embedding = await self._embedder.embed(query)
-        return await self._store.search_similar(embedding, k=top_k)
+        results = await self._store.search_similar(embedding, k=top_k * 2)
+        if results:
+            ids = [m.id for m, _ in results]
+            try:
+                await self._store.touch_recall(ids)
+            except Exception:
+                pass
+        from cc_harness.memory.maintenance.recall_weight import RecallWeighter
+        weighter = RecallWeighter()
+        weighted = weighter.apply(results)
+        return weighted[:top_k]
 
     async def search_hybrid(
         self, query: str, top_k: int = 5, alpha: float = 0.5, rrf_k: int = 60,

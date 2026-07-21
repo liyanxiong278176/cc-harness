@@ -95,6 +95,10 @@ class MemoryConfig(BaseModel):
     # consolidation (D4)
     consolidation_similarity_threshold: float = 0.15
     consolidation_max_cluster_size: int = 5
+    # recall decay (D7)
+    recall_staleness_floor: float = 0.7
+    recall_staleness_soft: float = 0.5
+    recall_weight_floor: float = 0.5
 
     @field_validator("pipeline_threshold")
     @classmethod
@@ -151,6 +155,13 @@ class MemoryConfig(BaseModel):
     def _check_mermaid_ratio(cls, v: float) -> float:
         if not (0 < v < 1):
             raise ValueError(f"mermaid_max_token_ratio must be in (0, 1), got {v}")
+        return v
+
+    @field_validator("recall_staleness_soft", "recall_weight_floor")
+    @classmethod
+    def _check_recall_range(cls, v: float) -> float:
+        if not (0 < v < 1):
+            raise ValueError(f"must be in (0, 1), got {v}")
         return v
 
     def model_post_init(self, __context) -> None:

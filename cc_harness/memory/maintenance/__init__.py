@@ -4,7 +4,9 @@ from cc_harness.memory.maintenance.staleness import compute_staleness, LLMRechec
 from cc_harness.memory.maintenance.ttl import purge_stale
 from cc_harness.memory.maintenance.consolidation import consolidate, _greedy_cluster
 from cc_harness.memory.maintenance.conflict import ConflictDetector, ConflictVerdict
+from cc_harness.memory.maintenance.recall_weight import RecallWeighter
 
 __all__ = ["MaintenanceScheduler", "MaintenanceRun", "compute_staleness", "LLMRechecker",
            "purge_stale", "consolidate", "_greedy_cluster",
-           "ConflictDetector", "ConflictVerdict"]
+           "ConflictDetector", "ConflictVerdict",
+           "RecallWeighter"]
