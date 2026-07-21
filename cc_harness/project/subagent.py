@@ -38,6 +38,7 @@ if TYPE_CHECKING:  # 避免循环依赖:agent.run_turn 不在模块级 import(Ta
     from cc_harness.mcp_client import MCPClient
     from cc_harness.policy import PolicyEngine
     from cc_harness.project.service import TodoService
+    from cc_harness.reflection.engine import ReflectionEngine
 
 
 # spec decision 5:8 个合法 status 值(Literal 做静态约束)
@@ -96,6 +97,7 @@ class SubAgentResult:
     tokens_used: int = 0            # D1 暂不接 SessionTokenStats(见 decision 4)
     file_refs: list[str] = field(default_factory=list)  # 末轮提取的文件路径
     error: str | None = None        # 失败原因
+    fatal_error: bool = False       # E2 T3.2 兼容字段:任何 fatal 路径失败时 = True(供 reflection 判定)
 
 
 # Minor #1:path prefix 允许 0+ 字符,前后加锚定(so .env 单独出现也能匹配)
@@ -186,7 +188,10 @@ _STATUS_LABEL: dict[str, str] = {
 
 
 def _render_subagent_summary(
-    results: list[SubAgentResult], parent_id: str,
+    results: list[SubAgentResult],
+    parent_id: str,
+    *,
+    reflection_engine: "ReflectionEngine | None" = None,
 ) -> ToolResult:
     """N 个 subagent 结果合并成结构化摘要 ToolResult。
 
@@ -194,6 +199,10 @@ def _render_subagent_summary(
     - llm_text:每个 subagent 的 title/status/末轮/引用 + 父完成门 hint,给 LLM 看。
     - is_error:始终 False(失败聚合已在 llm_text 中表达,ToolResult 层不报错
       让主 agent 走正常路径而不是 ask 兜底)。
+
+    E2 T3.2:reflection_engine 非 None 时,llm_text 尾部追加 "## 最近反思(E2)" 段,
+    列出 engine.get_recent(limit=3) 拿到的反思文本(供父 agent 看见自己之前 fan-out
+    失败过的原因,避免重蹈覆辙)。
 
     无 timeout 参数(decision 3 + 开放 round 2 fix #3)。
     """
@@ -226,6 +235,18 @@ def _render_subagent_summary(
             f"父完成门: 有 {len(not_done)} 个 sub-task 未 done({', '.join(not_done)}),"
             f" 父任务 {parent_id} 不可标 done(子任务聚合不可绕)。"
         )
+
+    # E2 T3.2:追加 recent_reflections 段(失败类反思,供父 agent 看见原因)
+    if reflection_engine is not None:
+        try:
+            recent = reflection_engine.get_recent(limit=3)
+        except Exception:
+            recent = []
+        if recent:
+            lines.append("")
+            lines.append("## 最近反思(E2)")
+            for r in recent:
+                lines.append(f"- {r}")
 
     return ToolResult(
         is_error=False,
@@ -274,6 +295,10 @@ class SubAgentRunner:
         max_iter: int = 20,
         policy: PolicyEngine,
         l5: "L5Engine | None" = None,  # D1 Task 4 fix:subagent 继承主 agent 的 L5 引擎
+        # E2 T3.2:反思引擎注入(失败类 status 触发 emit subagent_failed)
+        reflection_engine: "ReflectionEngine | None" = None,
+        session_id: str | None = None,
+        turn_idx: int | None = None,
     ):
         self.llm = llm
         self.mcp = mcp
@@ -283,6 +308,9 @@ class SubAgentRunner:
         self.max_iter = max_iter
         self.policy = policy
         self.l5 = l5
+        self.reflection_engine = reflection_engine
+        self.session_id = session_id
+        self.turn_idx = turn_idx
 
     async def run(
         self,
@@ -356,107 +384,142 @@ class SubAgentRunner:
         # prompt 覆盖 subagent 独立 system);传 l5 继承脱敏(决策 6)。
         # D1.1 (P2 §2.1 子项 4):broad Exception 收窄为可识别类别 — auth/网络/
         # 参数 vs 兜底未分类 — error 字段带 type name 便于审计/log triage。
+        # E2 T3.2:失败类 status 走单点 emit — 用局部 result + 末尾 try/finally 统一处理。
+        result_obj: SubAgentResult | None = None
         try:
-            stats = await asyncio.wait_for(
-                run_turn(
-                    messages, self.llm, self.mcp,
-                    cwd=self.project_root,
-                    max_iter=self.max_iter,
-                    extra_native_specs=extras,
-                    policy=self.policy,
-                    l5=self.l5,
-                    system_prompt=system_prompt,
-                ),
-                timeout=timeout,
-            )
-        except asyncio.TimeoutError:
-            return SubAgentResult(
-                task_id=task_id, title=title, status="timeout",
-                error=f"subagent 超过 {timeout}s timeout",
-                duration_s=time.time() - start,
-            )
-        except _AUTH_EXCEPTIONS as e:
-            return SubAgentResult(
-                task_id=task_id, title=title, status="failed",
-                error=f"auth/config 错误 ({type(e).__name__}): {e}",
-                duration_s=time.time() - start,
-            )
-        except _NETWORK_EXCEPTIONS as e:
-            return SubAgentResult(
-                task_id=task_id, title=title, status="failed",
-                error=f"网络/限流 错误 ({type(e).__name__}): {e}",
-                duration_s=time.time() - start,
-            )
-        except (ValueError, TypeError, KeyError, AttributeError) as e:
-            return SubAgentResult(
-                task_id=task_id, title=title, status="failed",
-                error=f"参数/数据 错误 ({type(e).__name__}): {e}",
-                duration_s=time.time() - start,
-            )
-        except Exception as e:
-            # 兜底(未识别类型)。仍 broad catch — 避免子 agent 抛意外把 dispatch
-            # 路径整个挂掉,但 error 字段带 type name,便于事后 triage 升级。
-            log.exception("subagent run failed (unclassified): %s", e)
-            return SubAgentResult(
-                task_id=task_id, title=title, status="failed",
-                error=f"未分类错误 ({type(e).__name__}): {e}",
-                duration_s=time.time() - start,
-            )
-
-        # D1 Task 4 fix (Important #1):run_turn 不再 raise fatal provider
-        # error,而是塞 stats.error。SubAgentRunner 检测到 → status="failed"。
-        if stats.error:
-            return SubAgentResult(
-                task_id=task_id, title=title, status="failed",
-                error=f"run_turn 错误: {stats.error}",
-                duration_s=time.time() - start,
-            )
-
-        # D1 final:扫 messages 找任一 is_error=True 的 tool message(subagent 内
-        # 业务错误,如 todo_update 完成门拦) → status="failed"。
-        # agent.run_turn 现在把 ToolResult.is_error 透传到 tool message;否则仅看
-        # final_t.status 可能错过"工具拦了但 todo 状态没变"的失败信号。
-        for m in messages:
-            if m.get("role") != "tool":
-                continue
-            if m.get("is_error"):
-                err_content = (m.get("content") or "")[:200]
-                err_name = m.get("name") or "tool"
-                return SubAgentResult(
+            try:
+                stats = await asyncio.wait_for(
+                    run_turn(
+                        messages, self.llm, self.mcp,
+                        cwd=self.project_root,
+                        max_iter=self.max_iter,
+                        extra_native_specs=extras,
+                        policy=self.policy,
+                        l5=self.l5,
+                        system_prompt=system_prompt,
+                    ),
+                    timeout=timeout,
+                )
+            except asyncio.TimeoutError:
+                result_obj = SubAgentResult(
+                    task_id=task_id, title=title, status="timeout",
+                    error=f"subagent 超过 {timeout}s timeout",
+                    duration_s=time.time() - start,
+                )
+            except _AUTH_EXCEPTIONS as e:
+                result_obj = SubAgentResult(
                     task_id=task_id, title=title, status="failed",
-                    error=f"tool 业务错误 ({err_name}): {err_content}",
+                    error=f"auth/config 错误 ({type(e).__name__}): {e}",
+                    duration_s=time.time() - start,
+                )
+            except _NETWORK_EXCEPTIONS as e:
+                result_obj = SubAgentResult(
+                    task_id=task_id, title=title, status="failed",
+                    error=f"网络/限流 错误 ({type(e).__name__}): {e}",
+                    duration_s=time.time() - start,
+                )
+            except (ValueError, TypeError, KeyError, AttributeError) as e:
+                result_obj = SubAgentResult(
+                    task_id=task_id, title=title, status="failed",
+                    error=f"参数/数据 错误 ({type(e).__name__}): {e}",
+                    duration_s=time.time() - start,
+                )
+            except Exception as e:
+                # 兜底(未识别类型)。仍 broad catch — 避免子 agent 抛意外把 dispatch
+                # 路径整个挂掉,但 error 字段带 type name,便于事后 triage 升级。
+                log.exception("subagent run failed (unclassified): %s", e)
+                result_obj = SubAgentResult(
+                    task_id=task_id, title=title, status="failed",
+                    error=f"未分类错误 ({type(e).__name__}): {e}",
                     duration_s=time.time() - start,
                 )
 
-        # 4. 检测 max_iter 耗尽(没 timeout/exception/fatal 的话)
-        try:
-            final_t = await self.todo_service.get(task_id)
-            final_status = final_t.status
-        except Exception:
-            final_status = "unknown"
-        iter_used = sum(1 for m in messages if m.get("role") == "assistant")
-        if iter_used >= self.max_iter and final_status not in ("done", "blocked"):
-            return SubAgentResult(
-                task_id=task_id, title=title, status="incomplete",
-                error=f"max_iter={self.max_iter} 耗尽, todo 未 done/blocked",
-                duration_s=time.time() - start,
-            )
+            if result_obj is None:
+                # D1 Task 4 fix (Important #1):run_turn 不再 raise fatal provider
+                # error,而是塞 stats.error。SubAgentRunner 检测到 → status="failed"。
+                if stats.error:
+                    result_obj = SubAgentResult(
+                        task_id=task_id, title=title, status="failed",
+                        error=f"run_turn 错误: {stats.error}",
+                        duration_s=time.time() - start,
+                    )
 
-        # 5. 正常完成
-        final_text = _extract_final_text(messages)[-500:]
-        file_refs = _extract_file_refs(final_text)
-        # D1.1 (P2 §2.1 子项 2):tokens_used 接 SessionTokenStats / TurnTokenStats。
-        # api_total_tokens 优先(API 报告的权威账单数);若 run_turn 没报告(无 stream
-        # usage)则用 breakdown_subtotal(tiktoken 估算)兜底,保证数值非 0。
-        tokens = getattr(stats, "api_total_tokens", 0) or 0
-        if not tokens:
-            tokens = getattr(stats, "breakdown_subtotal", 0) or 0
-        return SubAgentResult(
-            task_id=task_id, title=title, status=final_status,
-            final_text=final_text, duration_s=time.time() - start,
-            tokens_used=tokens,
-            file_refs=file_refs,
-        )
+                # D1 final:扫 messages 找任一 is_error=True 的 tool message(subagent 内
+                # 业务错误,如 todo_update 完成门拦) → status="failed"。
+                # agent.run_turn 现在把 ToolResult.is_error 透传到 tool message;否则仅看
+                # final_t.status 可能错过"工具拦了但 todo 状态没变"的失败信号。
+                for m in messages:
+                    if m.get("role") != "tool":
+                        continue
+                    if m.get("is_error"):
+                        err_content = (m.get("content") or "")[:200]
+                        err_name = m.get("name") or "tool"
+                        result_obj = SubAgentResult(
+                            task_id=task_id, title=title, status="failed",
+                            error=f"tool 业务错误 ({err_name}): {err_content}",
+                            duration_s=time.time() - start,
+                        )
+                        break
+
+            if result_obj is None:
+                # 4. 检测 max_iter 耗尽(没 timeout/exception/fatal 的话)
+                try:
+                    final_t = await self.todo_service.get(task_id)
+                    final_status = final_t.status
+                except Exception:
+                    final_status = "unknown"
+                iter_used = sum(1 for m in messages if m.get("role") == "assistant")
+                if iter_used >= self.max_iter and final_status not in ("done", "blocked"):
+                    result_obj = SubAgentResult(
+                        task_id=task_id, title=title, status="incomplete",
+                        error=f"max_iter={self.max_iter} 耗尽, todo 未 done/blocked",
+                        duration_s=time.time() - start,
+                    )
+
+            if result_obj is None:
+                # 5. 正常完成
+                final_text = _extract_final_text(messages)[-500:]
+                file_refs = _extract_file_refs(final_text)
+                # D1.1 (P2 §2.1 子项 2):tokens_used 接 SessionTokenStats / TurnTokenStats。
+                # api_total_tokens 优先(API 报告的权威账单数);若 run_turn 没报告(无 stream
+                # usage)则用 breakdown_subtotal(tiktoken 估算)兜底,保证数值非 0。
+                tokens = getattr(stats, "api_total_tokens", 0) or 0
+                if not tokens:
+                    tokens = getattr(stats, "breakdown_subtotal", 0) or 0
+                result_obj = SubAgentResult(
+                    task_id=task_id, title=title, status=final_status,
+                    final_text=final_text, duration_s=time.time() - start,
+                    tokens_used=tokens,
+                    file_refs=file_refs,
+                )
+        except Exception:
+            # 兜底:整个 run 路径异常(理论上 inner except 已收)— 保持原始行为,不 throw
+            raise
+
+        # E2 T3.2:失败类 status 单点 emit subagent_failed
+        # 工厂 subagent_failed 内部按 status 映射 severity(neg/ambig/pos)
+        if self.reflection_engine is not None and result_obj.status in {
+            "failed", "incomplete", "timeout", "blocked"
+        }:
+            try:
+                from cc_harness.reflection.events import subagent_failed as _sf
+                result_dict = {
+                    "status": result_obj.status,
+                    "task_id": result_obj.task_id,
+                    "final_text": result_obj.final_text,
+                }
+                await self.reflection_engine.emit(
+                    _sf(
+                        session_id=self.session_id or "default",
+                        turn_idx=self.turn_idx if self.turn_idx is not None else 0,
+                        result=result_dict,
+                    )
+                )
+            except Exception:
+                # 反思 emit 失败不影响主流程(silent fallback)
+                pass
+
+        return result_obj
 
 
 def get_default_runner(
