@@ -138,7 +138,13 @@ def _build_subagent_system_prompt(
       `<untrusted>` 块被 prompt-injection 劫持(纵深防御)。
     """
     from cc_harness.prompts import SECTION_POOL  # 延迟 import(避免 cc_harness 启动期拽 subagent 链)
-    hierarchy = SECTION_POOL["instruction_hierarchy"].body
+    # E2 T3.3 fix: SECTION_POOL was refactored from dict to list-of-tuples in
+    # 738706b (T2.1). Look up by name instead of dict key.
+    hierarchy = next(
+        builder({"always_included": True})
+        for name, builder, _ in SECTION_POOL
+        if name == "instruction_hierarchy"
+    )
 
     parts = [
         hierarchy,
