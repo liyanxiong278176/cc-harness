@@ -4,6 +4,7 @@
 from __future__ import annotations
 import argparse
 import asyncio
+import os
 import sys
 import time
 from pathlib import Path
@@ -175,6 +176,46 @@ def main() -> None:
                 f"[dim]startup: {time.monotonic() - boot_start:.2f}s[/dim]"
             )
 
+            # E4 I-1: 提前构造 memory deps + scheduler — 让 4 件 background op
+            # (staleness / TTL / consolidation / conflict) + RecallWeighter 在
+            # REPL 实际跑时生效。`repl.py` 仍然接收 mem_deps 注入 run_turn,
+            # scheduler 注入 _after_turn_memory(在每轮末 maybe_run)。
+            from dotenv import dotenv_values as _dotenv
+            _mem_env = {**os.environ, **{k: v for k, v in _dotenv(PROJECT_ROOT / ".env").items() if v}}
+            from cc_harness.memory.extras import build_memory_extras as _bme
+            from cc_harness.memory.config import load_memory_config as _lmc
+            from cc_harness.memory.maintenance.scheduler import MaintenanceScheduler as _MSS
+            _memory_extras, _mem_deps = await _bme(
+                _mem_env, PROJECT_ROOT / "logs" / "memory.db",
+            )
+            _mem_cfg = _lmc(PROJECT_ROOT / "policy.yaml")
+            _scheduler = (
+                _MSS(
+                    store=_mem_deps["store"],
+                    service=_mem_deps["service"],
+                    llm=llm,
+                    every_n_turns=_mem_cfg.maintenance_every_n_turns,
+                    count_threshold=_mem_cfg.maintenance_count_threshold,
+                    interval_s=_mem_cfg.maintenance_interval_s,
+                    enabled=_mem_cfg.maintenance_enabled,
+                )
+                if _mem_deps is not None
+                else None
+            )
+            if _scheduler is not None:
+                # consolidation / conflict 需要 embedder;extras.py 不暴露到 deps dict,
+                # 从 service.embedder 取出后置注入。
+                _svc = _mem_deps.get("service")
+                if _svc is not None and getattr(_svc, "embedder", None) is not None:
+                    _scheduler._embedder = _svc.embedder
+                # staleness LLM recheck + D5/D7 配置
+                _scheduler._half_life_days = _mem_cfg.staleness_half_life_days
+                _scheduler._llm_recheck_enabled = _mem_cfg.staleness_llm_recheck_enabled
+                _scheduler._ttl_threshold = _mem_cfg.ttl_staleness_threshold
+                _scheduler._ttl_limit = _mem_cfg.ttl_limit
+                _scheduler._consol_threshold = _mem_cfg.consolidation_similarity_threshold
+                _scheduler._consol_max = _mem_cfg.consolidation_max_cluster_size
+
             # Pre-warm sandbox server when backend=sandbox.
             # Why: ensure_server() currently only fires on the first command,
             # which (a) hides config errors until something breaks, and
@@ -209,6 +250,9 @@ def main() -> None:
                 default_mode=args.mode,
                 design_dir=args.design_dir,
                 context_config=load_context_config(),
+                memory_extras=_memory_extras,
+                mem_deps=_mem_deps,
+                scheduler=_scheduler,
             )
         finally:
             await mcp.shutdown()

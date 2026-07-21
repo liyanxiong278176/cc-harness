@@ -138,6 +138,11 @@ async def run_repl(
     design_dir: Path | None = None,
     context_config: ContextConfig | None = None,
     scheduler: object | None = None,
+    # E4 I-1:memory 工具 extras + mem_deps 在 main.py 构造后传入
+    # (让 main.py 也能拿到 store/service 构造 MaintenanceScheduler)。
+    # backward compat:若都不传 → repl 内部自行 build(原行为)。
+    memory_extras: list | None = None,
+    mem_deps: dict | None = None,
 ) -> None:
     """Run the interactive REPL.
 
@@ -206,20 +211,28 @@ async def run_repl(
     # Plan2: 构造 memory 工具(session 级单例)。失败优雅降级(无 EMBEDDING_* 或
     # sqlite-vec 缺 → helper 返 ([], None);此处兜底构造异常)。生产 db=logs/memory.db
     # (与 eval logs/locomo_memory.db 隔离)。
+    # E4 I-1: 若 main.py 已构造并传入 → 复用;否则自行 build(向后兼容旧 caller)。
     from dotenv import dotenv_values
     _mem_env = {**os.environ, **{k: v for k, v in dotenv_values(Path(cwd) / ".env").items() if v}}
-    try:
-        from cc_harness.memory.extras import build_memory_extras
-        state.memory_extras, state.mem_deps = await build_memory_extras(
-            _mem_env, Path(cwd) / "logs" / "memory.db"
-        )
+    if memory_extras is not None or mem_deps is not None:
+        # main 已构造,直接复用
+        state.memory_extras = list(memory_extras or [])
+        state.mem_deps = mem_deps
         if state.memory_extras:
-            print_info(console, f"  memory tools: {len(state.memory_extras)} 个(memory_recall/save)")
-        else:
-            print_info(console, "  memory tools: 未启用(EMBEDDING_* 缺失或初始化失败)")
-    except Exception as e:
-        print_warn(console, f"memory 初始化异常: {e}; 不接入记忆工具")
-        state.memory_extras = []
+            print_info(console, f"  memory tools: {len(state.memory_extras)} 个(memory_recall/save,main 注入)")
+    else:
+        try:
+            from cc_harness.memory.extras import build_memory_extras
+            state.memory_extras, state.mem_deps = await build_memory_extras(
+                _mem_env, Path(cwd) / "logs" / "memory.db"
+            )
+            if state.memory_extras:
+                print_info(console, f"  memory tools: {len(state.memory_extras)} 个(memory_recall/save)")
+            else:
+                print_info(console, "  memory tools: 未启用(EMBEDDING_* 缺失或初始化失败)")
+        except Exception as e:
+            print_warn(console, f"memory 初始化异常: {e}; 不接入记忆工具")
+            state.memory_extras = []
 
     # --- Task 6 / spec 组件 9:6 处接线(Plan A) ---
     # 0) 统一锚点 — 所有下游 service / storage / policy 都用 state.project_root
@@ -411,7 +424,8 @@ async def run_repl(
                 print_compaction_summary(console, "本轮", turn_stats.compaction)
 
             # Q3 Task8: after-turn hook — L0 capture + L1 pipeline(every-N)+ L2 scenario + L3 persona
-            await _after_turn_memory(state, mem_cfg)
+            # E4 I-1: 末尾传 scheduler(后台 4 op 触发点)
+            await _after_turn_memory(state, mem_cfg, scheduler=scheduler)
 
             # Task 6: after-turn hook — A 阶段占位(verify hook 留 B 阶段)
             await _after_turn_todo(state, state.todo_service)
@@ -437,11 +451,14 @@ async def run_repl(
         await shutdown_session_executor()
 
 
-async def _after_turn_memory(state: ReplState, mem_cfg) -> None:
+async def _after_turn_memory(state: ReplState, mem_cfg, scheduler=None) -> None:
     """Q3 Task8 after-turn hook:capture L0 + pipeline L1(every-N)+ scenario L2 + persona L3。
 
     所有阶段 kill-switch 由 mem_cfg 控制(capture_enabled / pipeline_enabled);
     缺 mem_deps(记忆未初始化)→ 整体 no-op。fail-soft:单阶段异常不阻塞后续。
+    E4 I-1: 末尾跑 scheduler.maybe_run(后台 4 op: staleness/TTL/consolidation/conflict),
+    just_wrote_n 取 0(memory pipeline 自身已写,scheduler 走 every_n_turns /
+    count_threshold / interval_s 路径兜底触发);调度失败不阻塞 turn。
     """
     if not state.mem_deps:
         return
@@ -484,6 +501,15 @@ async def _after_turn_memory(state: ReplState, mem_cfg) -> None:
             )
         except Exception as e:
             print_warn(Console(), f"memory persona failed: {e}")
+
+    # E4 I-1: 后台 maintenance 调度。just_wrote_n=0 走 _should_trigger_async 路径
+    # (every_n_turns / count_threshold / interval_s 任一满足即后台 fire-and-forget)。
+    # 失败 swallow — 不阻塞 turn。
+    if scheduler is not None:
+        try:
+            await scheduler.maybe_run(turn_idx=turn_idx, just_wrote_n=0)
+        except Exception as e:
+            print_warn(Console(), f"memory maintenance scheduler failed: {e}")
 
 
 async def _after_turn_todo(state: ReplState, todo_service) -> None:
