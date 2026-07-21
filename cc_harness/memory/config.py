@@ -99,6 +99,11 @@ class MemoryConfig(BaseModel):
     recall_staleness_floor: float = 0.7
     recall_staleness_soft: float = 0.5
     recall_weight_floor: float = 0.5
+    # E2 反思节点
+    reflection_enabled: bool = True
+    reflection_every_n_turns: int = 10
+    reflection_max_pending: int = 3
+    reflection_drain_timeout_s: float = 5.0
 
     @field_validator("pipeline_threshold")
     @classmethod
@@ -127,9 +132,17 @@ class MemoryConfig(BaseModel):
             raise ValueError(f"must be > 0, got {v}")
         return v
 
-    @field_validator("recall_timeout_s", "maintenance_interval_s")
+    @field_validator("recall_timeout_s", "maintenance_interval_s",
+                     "reflection_drain_timeout_s")
     @classmethod
     def _check_positive(cls, v: float) -> float:
+        if v <= 0:
+            raise ValueError(f"must be > 0, got {v}")
+        return v
+
+    @field_validator("reflection_every_n_turns", "reflection_max_pending")
+    @classmethod
+    def _check_reflection_int(cls, v: int) -> int:
         if v <= 0:
             raise ValueError(f"must be > 0, got {v}")
         return v
