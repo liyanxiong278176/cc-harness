@@ -57,7 +57,7 @@
 
 ### D7:section 注入策略
 
-**neg-only inject** —— ambig/pos 反思只入库(供 long-term recall),不挤占 token 上下文。注入 section 短(≤200 token,1 行),避免 LLM 被反思淹没。
+**neg-only inject** —— ambig/pos 反思只入库(供 long-term recall),不挤占 token 上下文。注入 section 短(≤200 token,~1-3 行),避免 LLM 被反思淹没。
 
 ## 组件设计
 
