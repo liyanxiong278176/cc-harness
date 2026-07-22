@@ -105,6 +105,11 @@ class MemoryConfig(BaseModel):
     reflection_max_pending: int = 3
     reflection_drain_timeout_s: float = 5.0
 
+    # E5 漂移检测
+    drift_enabled: bool = True
+    drift_every_n_turns: int = 5
+    drift_drift_warn_threshold: float = 0.2
+
     @field_validator("pipeline_threshold")
     @classmethod
     def _check_threshold(cls, v: float) -> float:
@@ -125,7 +130,8 @@ class MemoryConfig(BaseModel):
                      "persona_trigger_every_n", "recall_top_k",
                      "offload_threshold",
                      "maintenance_every_n_turns", "maintenance_count_threshold",
-                     "ttl_limit")
+                     "ttl_limit",
+                     "drift_every_n_turns")
     @classmethod
     def _check_positive_int(cls, v: int) -> int:
         if v <= 0:
@@ -175,6 +181,13 @@ class MemoryConfig(BaseModel):
     def _check_recall_range(cls, v: float) -> float:
         if not (0 < v < 1):
             raise ValueError(f"must be in (0, 1), got {v}")
+        return v
+
+    @field_validator("drift_drift_warn_threshold")
+    @classmethod
+    def _check_drift_threshold(cls, v: float) -> float:
+        if not (0 < v <= 1):
+            raise ValueError(f"drift_drift_warn_threshold must be in (0, 1], got {v}")
         return v
 
     def model_post_init(self, __context) -> None:
