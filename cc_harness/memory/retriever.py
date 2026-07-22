@@ -18,11 +18,12 @@ def _format_age(ts: float) -> str:
 
 
 class MemoryRetriever:
-    def __init__(self, store, embedder, top_k: int = 5, token_budget: int = 800):
+    def __init__(self, store, embedder, top_k: int = 5, token_budget: int = 800, drift_detector=None):  # E5
         self._store = store
         self._embedder = embedder
         self.top_k = top_k
         self.token_budget = token_budget
+        self.drift_detector = drift_detector
 
     async def search(self, query: str, top_k: int = 5) -> list:
         embedding = await self._embedder.embed(query)
@@ -36,6 +37,20 @@ class MemoryRetriever:
         from cc_harness.memory.maintenance.recall_weight import RecallWeighter
         weighter = RecallWeighter()
         weighted = weighter.apply(results)
+
+        # E5 drift 检测(召出后, ≥2 同 entity 才判)
+        if self.drift_detector is not None and weighted:
+            try:
+                # weighted 是 list[(Memory, distance)],DriftDetector 要 list[Memory],拆 tuple
+                results_list = [m for m, _ in weighted]
+                await self.drift_detector.check_after_read(
+                    session_id=results_list[0].session_id or "default",
+                    turn_idx=0,  # 占位,真实 turn_idx 由 T2.2 注入
+                    results=results_list,
+                )
+            except Exception:
+                pass  # E5 fail-soft 不阻塞主 search
+
         return weighted[:top_k]
 
     async def search_hybrid(

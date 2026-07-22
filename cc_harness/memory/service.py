@@ -22,10 +22,11 @@ class SaveResult:
 
 
 class MemoryService:
-    def __init__(self, store, embedder, decider):
+    def __init__(self, store, embedder, decider, drift_detector=None):  # E5
         self.store = store
         self.embedder = embedder
         self.decider = decider
+        self.drift_detector = drift_detector
 
     async def recall(self, query: str, top_k: int = 5) -> list:
         embedding = await self.embedder.embed(query)
@@ -73,6 +74,7 @@ class MemoryService:
                 result = SaveResult(action="NOOP", duration_ms=_ms(t0))
 
             # E4 write-time 矛盾检测(写盘后, 仅 ADD/UPDATE/DELETE_THEN_ADD 触发)
+            similar_for_conflict: list = []
             if self.decider is not None and result_action_mem is not None:
                 try:
                     from cc_harness.memory.maintenance.conflict import ConflictDetector
@@ -89,6 +91,19 @@ class MemoryService:
                                               duration_ms=_ms(t0))
                 except Exception:
                     pass  # 矛盾检测失败不阻塞
+
+            # E5 drift 检测(写盘后, 复用 E2 reflection engine 写 source='drift')
+            # similar_for_conflict 来自上面 search_similar,直接复用不重查
+            if self.drift_detector is not None and result_action_mem is not None:
+                try:
+                    await self.drift_detector.check_after_write(
+                        session_id=session_id or "default",
+                        turn_idx=int(time.time() * 1000) % 1000,  # 占位,真实 turn_idx 由 T2.2 注入
+                        new_memory=result_action_mem,
+                        similar=similar_for_conflict,
+                    )
+                except Exception:
+                    pass  # E5 fail-soft 不阻塞主 save
 
             return result
 
