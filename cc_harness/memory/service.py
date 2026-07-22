@@ -96,11 +96,14 @@ class MemoryService:
             # similar_for_conflict 来自上面 search_similar,直接复用不重查
             if self.drift_detector is not None and result_action_mem is not None:
                 try:
+                    # F1: search_similar 返 list[tuple[Memory, float]],detector 要 list[Memory]
+                    # 原 round 1 把 tuples 原样传 → detector mem.text 失败被静默吞
+                    similar_mems = [m for m, _ in similar_for_conflict]
                     await self.drift_detector.check_after_write(
                         session_id=session_id or "default",
                         turn_idx=int(time.time() * 1000) % 1000,  # 占位,真实 turn_idx 由 T2.2 注入
                         new_memory=result_action_mem,
-                        similar=similar_for_conflict,
+                        similar=similar_mems,
                     )
                 except Exception:
                     pass  # E5 fail-soft 不阻塞主 save

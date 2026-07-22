@@ -49,7 +49,6 @@ async def test_full_pipeline_write_drift_emit_retrieve(tmp_path):
     fake_memory_service.save = fake_save
 
     det = DriftDetector(
-        memory_service=fake_memory_service,
         reflection_engine=fake_re_emit,
         judge_llm=fake_judge,
         l5_engine=MagicMock(sanitize=lambda x: x),

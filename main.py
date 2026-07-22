@@ -257,13 +257,11 @@ def main() -> None:
             # E5 漂移检测(沿 E4 I-1 / E2 T2.3 wiring 模式)
             # - judge_llm 复用 E2 JUDGE client(未配 → None,detector 内部 _ask_judge fallback)
             # - l5_engine 复用 E2 L5(沿 E2 _b5e)
-            # - memory_service 复用 _mem_deps['service'](detector __init__ 形参)
             # - project_root 走 working_dir
             # - every_n_turns / enabled 走 MemoryConfig 字段(T1.1 已加)
             from cc_harness.drift.detector import DriftDetector
             _drift_detector = (
                 DriftDetector(
-                    memory_service=_mem_deps["service"],
                     reflection_engine=_reflection_engine,
                     judge_llm=_judge_llm,
                     l5_engine=_l5_engine,
