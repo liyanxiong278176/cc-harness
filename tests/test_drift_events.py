@@ -119,7 +119,20 @@ def test_drift_evidence_shape():
     assert isinstance(ev, ReflectionEvent)
 
 
-# --- 4. 截断 ---
+# --- 4. F2 source 字段 (R2 part 1) ---
+
+
+def test_drift_event_has_source_drift():
+    """F2: drift_detected 工厂显式设置 source='drift',区别于其他 reflection。"""
+    ev = drift_detected(
+        session_id="s1", turn_idx=1, entity="Caroline",
+        drift_rate=0.5, total_groups=1, inconsistent_groups=1,
+        records=[], reason="x",
+    )
+    assert ev.source == "drift"
+
+
+# --- 5. 截断 ---
 
 
 def test_drift_records_truncated_at_10():

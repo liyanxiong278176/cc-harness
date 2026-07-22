@@ -18,6 +18,7 @@ class ReflectionEvent:
     session_id: str
     turn_idx: int
     created_at: float          # time.time() — 避免 datetime.now() 阻塞
+    source: str | None = None  # F2: drift 用 'drift',其他默认 None → engine 兜底 'reflection'
 
 
 def max_iter_reached(*, session_id: str, turn_idx: int, iter_used: int, last_content: str) -> ReflectionEvent:
@@ -136,4 +137,5 @@ def drift_detected(
         session_id=session_id,
         turn_idx=turn_idx,
         created_at=time.time(),
+        source="drift",  # F2
     )

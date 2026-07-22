@@ -64,3 +64,13 @@ def test_decider_rollback_factory():
     )
     assert ev.event_type == "decider_rollback"
     assert ev.severity == "neg"
+
+
+# --- F2 source 字段 (R2 part 1) ---
+
+
+def test_reflection_event_source_default_none():
+    """F2: 其他 6 事件工厂不传 source,默认 None(engine 兜底用 'reflection')。"""
+    from cc_harness.reflection.events import max_iter_reached
+    ev = max_iter_reached(session_id="s1", turn_idx=1, iter_used=20, last_content="...")
+    assert ev.source is None
