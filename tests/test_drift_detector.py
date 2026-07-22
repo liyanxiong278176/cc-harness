@@ -156,6 +156,37 @@ async def test_consistency_judge_fail_returns_none(
 
 
 @pytest.mark.asyncio
+async def test_judge_failure_falls_back_to_local_llm(
+    tmp_audit, fake_reflection_engine, fake_l5,
+):
+    """F3: judge_llm 抛 → _local_llm 接管 → 正常返回。"""
+    primary_called = []
+    local_called = []
+
+    async def primary_fn(system, user):
+        primary_called.append("x")
+        raise RuntimeError("primary down")
+
+    async def local_fn(system, user):
+        local_called.append("x")
+        return '{"entities": ["caroline"]}'
+
+    det = DriftDetector(
+        reflection_engine=fake_reflection_engine,
+        judge_llm=primary_fn,
+        l5_engine=fake_l5,
+        project_root=tmp_audit.parent,
+        audit_path=tmp_audit,
+        local_llm=local_fn,
+    )
+    # 触发 _judge_entities(调用 _ask_judge)
+    result = await det._judge_entities("Caroline 1990")
+    assert result == ["caroline"]
+    assert len(primary_called) == 1
+    assert len(local_called) == 1
+
+
+@pytest.mark.asyncio
 async def test_drift_audit_records_entity_hash(
     tmp_audit, fake_reflection_engine, fake_l5,
 ):

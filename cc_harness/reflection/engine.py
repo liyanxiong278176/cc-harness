@@ -150,11 +150,13 @@ class ReflectionEngine:
             except Exception:
                 pass
 
-            # 5. 走 MemoryService.save(source='reflection')
+            # 5. 走 MemoryService.save — F2: 优先用 event.source
+            # (drift_detected 显式传 'drift',其他 6 事件 source=None → 兜底 'reflection')
             try:
+                event_source = getattr(event, "source", None) or "reflection"
                 result = await self._memory_service.save(
                     text=reflection_text,
-                    source="reflection",
+                    source=event_source,
                     session_id=ev_safe.session_id,
                 )
             except Exception as e:

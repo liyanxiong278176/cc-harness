@@ -46,6 +46,7 @@ class DriftDetector:
         audit_path: Path | None = None,
         every_n_turns: int = 5,
         enabled: bool = True,
+        local_llm=None,  # F3: 真 local LLM fallback (主 LLM, 同 E2 _ask_judge_with_fallback)
     ):
         # F4: 不再接受 memory_service(从未用过)
         self._reflection_engine = reflection_engine
@@ -56,6 +57,7 @@ class DriftDetector:
         self._audit_path.parent.mkdir(parents=True, exist_ok=True)
         self._every_n_turns = every_n_turns
         self._enabled = enabled
+        self._local_llm = local_llm
 
     # ---------------- 公共 API ----------------
 
@@ -192,34 +194,41 @@ class DriftDetector:
         return None, "parse_error"  # F5: None not True
 
     async def _ask_judge(self, system, user):
-        """JUDGE → None(single LLM path in this round; commit R2 adds local fallback)。"""
-        llm = self._judge_llm
-        label = "judge"
-        try:
-            if hasattr(llm, "chat"):
-                content = ""
-                async for ev_obj in llm.chat(
-                    [{"role": "system", "content": system},
-                     {"role": "user", "content": user}],
-                    tools=None,
-                ):
-                    if getattr(ev_obj, "kind", None) == "done":
-                        content = getattr(ev_obj, "content", None) or content
-                return content
+        """F3: JUDGE → local LLM → None (audit noop)。"""
+
+        async def _try_llm(llm, label):
+            if llm is None:
+                return None
             try:
-                n_pos = sum(
-                    1 for p in inspect.signature(llm).parameters.values()
-                    if p.kind in (inspect.Parameter.POSITIONAL_ONLY,
-                                  inspect.Parameter.POSITIONAL_OR_KEYWORD)
-                )
-            except (ValueError, TypeError):
-                n_pos = 1
-            if n_pos >= 2:
-                return await llm(system, user)
-            return await llm(system + "\n" + user)
-        except Exception as e:
-            log.warning("drift: %s llm failed: %s", label, e)
-            return None
+                if hasattr(llm, "chat"):
+                    content = ""
+                    async for ev_obj in llm.chat(
+                        [{"role": "system", "content": system},
+                         {"role": "user", "content": user}],
+                        tools=None,
+                    ):
+                        if getattr(ev_obj, "kind", None) == "done":
+                            content = getattr(ev_obj, "content", None) or content
+                    return content
+                try:
+                    n_pos = sum(
+                        1 for p in inspect.signature(llm).parameters.values()
+                        if p.kind in (inspect.Parameter.POSITIONAL_ONLY,
+                                      inspect.Parameter.POSITIONAL_OR_KEYWORD)
+                    )
+                except (ValueError, TypeError):
+                    n_pos = 1
+                if n_pos >= 2:
+                    return await llm(system, user)
+                return await llm(system + "\n" + user)
+            except Exception as e:
+                log.warning("drift: %s llm failed: %s", label, e)
+                return None
+
+        primary = await _try_llm(self._judge_llm, "judge")
+        if primary is not None:
+            return primary
+        return await _try_llm(self._local_llm, "local")  # F3: 真 local fallback
 
     async def _emit_drift(self, *, session_id, turn_idx, verdict):
         try:

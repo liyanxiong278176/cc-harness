@@ -264,6 +264,7 @@ def main() -> None:
                 DriftDetector(
                     reflection_engine=_reflection_engine,
                     judge_llm=_judge_llm,
+                    local_llm=llm,  # F3: 主 LLM 作为本地 fallback
                     l5_engine=_l5_engine,
                     project_root=working_dir,
                     audit_path=working_dir / "logs" / "drift.jsonl",

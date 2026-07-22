@@ -10,7 +10,7 @@ from pathlib import Path
 from unittest.mock import MagicMock, AsyncMock
 
 from cc_harness.reflection.engine import ReflectionEngine
-from cc_harness.reflection.events import max_iter_reached
+from cc_harness.reflection.events import drift_detected, max_iter_reached
 
 
 @pytest.fixture
@@ -159,3 +159,31 @@ async def test_lock_prevents_duplicate(tmp_audit, fake_memory_service, fake_l5, 
     await eng.emit(ev2)  # 5s 内重复
     await eng._drain(timeout_s=2)
     assert fake_memory_service.save.await_count == 1
+
+
+# --- F2 source 字段 (R2 part 2) ---
+
+
+@pytest.mark.asyncio
+async def test_reflection_engine_saves_drift_source_as_drift(
+    tmp_audit, fake_memory_service, fake_l5, fake_judge_llm, fake_local_llm,
+):
+    """F2: drift_detected 事件 → engine.save 走 MemoryService.save(source='drift')。"""
+    eng = ReflectionEngine(
+        memory_service=fake_memory_service, llm_client=fake_local_llm,
+        judge_llm=fake_judge_llm, l5_engine=fake_l5,
+        project_root=tmp_audit.parent, audit_path=tmp_audit,
+    )
+    ev = drift_detected(
+        session_id="s1", turn_idx=5, entity="Caroline",
+        drift_rate=0.7, total_groups=1, inconsistent_groups=1,
+        records=[], reason="x",
+    )
+    await eng.emit(ev)
+    await eng._drain(timeout_s=2)
+    fake_memory_service.save.assert_awaited_once()
+    call = fake_memory_service.save.await_args
+    source_arg = call.kwargs.get("source")
+    if source_arg is None and len(call.args) >= 2:
+        source_arg = call.args[1]
+    assert source_arg == "drift"
