@@ -254,6 +254,34 @@ def main() -> None:
                 else None
             )
 
+            # E5 漂移检测(沿 E4 I-1 / E2 T2.3 wiring 模式)
+            # - judge_llm 复用 E2 JUDGE client(未配 → None,detector 内部 _ask_judge fallback)
+            # - l5_engine 复用 E2 L5(沿 E2 _b5e)
+            # - memory_service 复用 _mem_deps['service'](detector __init__ 形参)
+            # - project_root 走 working_dir
+            # - every_n_turns / enabled 走 MemoryConfig 字段(T1.1 已加)
+            from cc_harness.drift.detector import DriftDetector
+            _drift_detector = (
+                DriftDetector(
+                    memory_service=_mem_deps["service"],
+                    reflection_engine=_reflection_engine,
+                    judge_llm=_judge_llm,
+                    l5_engine=_l5_engine,
+                    project_root=working_dir,
+                    audit_path=working_dir / "logs" / "drift.jsonl",
+                    every_n_turns=_mem_cfg.drift_every_n_turns,
+                    enabled=_mem_cfg.drift_enabled,
+                )
+                if _mem_deps is not None and _reflection_engine is not None
+                else None
+            )
+
+            # 注入到 memory service / retriever(沿 E4 scheduler 模式:直接 setattr)
+            if _mem_deps is not None and _drift_detector is not None:
+                _mem_deps["service"].drift_detector = _drift_detector
+                if "retriever" in _mem_deps and _mem_deps["retriever"] is not None:
+                    _mem_deps["retriever"].drift_detector = _drift_detector
+
             # Pre-warm sandbox server when backend=sandbox.
             # Why: ensure_server() currently only fires on the first command,
             # which (a) hides config errors until something breaks, and
@@ -292,6 +320,7 @@ def main() -> None:
                 mem_deps=_mem_deps,
                 scheduler=_scheduler,
                 reflection_engine=_reflection_engine,           # E2 T2.3
+                drift_detector=_drift_detector,                  # E5 漂移检测
             )
         finally:
             await mcp.shutdown()

@@ -196,3 +196,25 @@ async def test_repl_without_drift_detector_skips_drain(tmp_path, monkeypatch):
     await repl.run_repl(
         llm=fake_llm, mcp=fake_mcp, cwd=str(tmp_path),
     )
+
+
+def test_main_boot_imports_drift_detector():
+    """main.py 可 import，且 DriftDetector API 已接入 run_repl。"""
+    import inspect
+
+    import main  # noqa: F401
+    from cc_harness.drift.detector import DriftDetector
+    from cc_harness.repl import run_repl
+
+    sig = inspect.signature(run_repl)
+    assert "drift_detector" in sig.parameters
+
+    methods = [
+        "check_after_write",
+        "check_after_read",
+        "_judge_entities",
+        "_judge_group_consistency",
+        "_audit",
+    ]
+    for method in methods:
+        assert hasattr(DriftDetector, method), f"DriftDetector 缺 {method}"
