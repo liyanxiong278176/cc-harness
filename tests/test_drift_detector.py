@@ -2,63 +2,17 @@
 
 Source of truth: docs/superpowers/plans/2026-07-21-e5-drift-detection.md lines 228-844.
 
-Stub 注:tests 顶部 stub `cc_harness.reflection.events.drift_detected` 工厂
-(T1.3 未实现,先 mock 注入以保持 emit 路径可断言)。
+依赖 T1.3 drift_detected 工厂已实现在 cc_harness.reflection.events (commit dc290f5)。
+直接用真工厂,不再需要 stub(T1.2 当时 stub 是因 T1.3 未到,T1.3 已落应清理)。
 """
 from __future__ import annotations
-import asyncio
-import json
-import sys
-import types
-
-import pytest
 from pathlib import Path
 from unittest.mock import MagicMock, AsyncMock
 
-# -----------------------------------------------------------------
-# Stub: cc_harness.reflection.events.drift_detected 工厂
-# (T1.3 才补;T1.2 先注入 fake factory 让 emit 路径可断言)
-#
-# 关键:必须**增量**绑定,不能替换整模块 — 否则其他测试文件 import
-# `ReflectionEvent` 等真符号时找不到。先 import 真模块(若未在 sys.modules),
-# 再在原模块上 patch `drift_detected`。
-# -----------------------------------------------------------------
-if "cc_harness.reflection.events" not in sys.modules:
-    import importlib
-    _ev_mod = importlib.import_module("cc_harness.reflection.events")
-    sys.modules["cc_harness.reflection.events"] = _ev_mod
-else:
-    _ev_mod = sys.modules["cc_harness.reflection.events"]
+import pytest
 
-
-def _stub_drift_detected(
-    *, session_id, turn_idx, entity, drift_rate,
-    total_groups, inconsistent_groups, records, reason,
-):
-    class _Stub:
-        pass
-    ev = _Stub()
-    ev.event_type = "drift_detected"
-    ev.severity = "neg" if drift_rate > 0.5 else ("ambig" if drift_rate >= 0.2 else "pos")
-    ev.session_id = session_id
-    ev.turn_idx = turn_idx
-    ev.evidence = {
-        "entity": entity,
-        "drift_rate": drift_rate,
-        "total_groups": total_groups,
-        "inconsistent_groups": inconsistent_groups,
-        "records": records,
-        "reason": reason,
-    }
-    ev.created_at = 0.0
-    return ev
-
-
-_ev_mod.drift_detected = _stub_drift_detected
-
-# 现在才 import detector(它的 _emit_drift 会在 try/except ImportError 里尝试 import)
-from cc_harness.drift.detector import DriftDetector, DriftVerdict  # noqa: E402
-from cc_harness.memory.store import Memory  # noqa: E402
+from cc_harness.drift.detector import DriftDetector
+from cc_harness.memory.store import Memory
 
 
 @pytest.fixture
