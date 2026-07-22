@@ -133,6 +133,7 @@ class ReflectionEngine:
                 session_id=event.session_id,
                 turn_idx=event.turn_idx,
                 created_at=event.created_at,
+                source=event.source,  # M1: ev_safe 重建补 source 字段,防 footgun
             )
 
             # 2. 调 JUDGE_MODEL → 退回本地

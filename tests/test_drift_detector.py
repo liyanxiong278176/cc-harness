@@ -214,3 +214,124 @@ async def test_drift_audit_records_entity_hash(
     assert "Caroline" not in audit_text  # 唯一 Caroline 是 entity 名,audit 不该有
     # 哈希字段存在
     assert "entity_hash" in audit_text
+
+
+# --- M3: sample_records text 走 L5 sanitize ---
+
+
+@pytest.mark.asyncio
+async def test_sample_records_passes_l5_sanitize(
+    tmp_audit, fake_reflection_engine,
+):
+    """M3: detector 给 drift_detected 工厂的 sample_records text 已被 l5.sanitize 替换。"""
+    fake_l5 = MagicMock()
+    # L5 替换 text 包含 '[REDACTED:phone]'
+    fake_l5.sanitize = MagicMock(side_effect=lambda x: x.replace("555-1234", "[REDACTED:phone]"))
+
+    det = DriftDetector(
+        reflection_engine=fake_reflection_engine,
+        judge_llm=MagicMock(),
+        l5_engine=fake_l5,
+        project_root=tmp_audit.parent,
+        audit_path=tmp_audit,
+    )
+    det._judge_entities = AsyncMock(return_value=["caroline"])
+    det._judge_group_consistency = AsyncMock(return_value=(False, "different"))
+
+    new = make_memory("m3", "Caroline 1990")
+    similar = [
+        make_memory("m1", "Caroline phone 555-1234"),  # 包含 PII
+        make_memory("m2", "Caroline 1985"),
+    ]
+    await det.check_after_write(
+        session_id="s1", turn_idx=5, new_memory=new, similar=similar,
+    )
+    # fake_reflection_engine.emit 收到的事件,records[0]['text'] 应被 sanitize
+    emit_event = fake_reflection_engine.emit.await_args.args[0]
+    # evidence 里的 records
+    rec_texts = [r["text"] for r in emit_event.evidence["records"]]
+    # 含 PII 的那条应被 [REDACTED:phone] 替换
+    assert any("[REDACTED:phone]" in t for t in rec_texts)
+    assert not any("555-1234" in t for t in rec_texts)
+
+
+# --- M4: 断言加强 ---
+
+
+@pytest.mark.asyncio
+async def test_severity_neg_high_drift_rate(
+    tmp_audit, fake_reflection_engine, fake_l5,
+):
+    """M4: drift_rate=0.5 → _severity_for 落 'else: neg'(0.5 < 0.5 False),severity 应 == "neg"。"""
+    det = DriftDetector(
+        reflection_engine=fake_reflection_engine,
+        judge_llm=MagicMock(),
+        l5_engine=fake_l5,
+        project_root=tmp_audit.parent,
+        audit_path=tmp_audit,
+    )
+    # 构造 2 组:1 inconsistent + 1 consistent → drift_rate = 1/2 = 0.5
+    det._judge_entities = AsyncMock(return_value=["caroline"])
+    judge_calls = []
+
+    async def judge_consist(entity, records):
+        text_set = {m.text.strip().lower() for m in records}
+        if "caroline 1990" in text_set:
+            judge_calls.append("inconsistent")
+            return False, "different"
+        judge_calls.append("consistent")
+        return True, "same"
+
+    det._judge_group_consistency = AsyncMock(side_effect=judge_consist)
+
+    new = make_memory("m3", "Caroline 1990")  # 单独成组,inconsistent
+    similar = [
+        make_memory("m1", "Caroline 1985"),
+        make_memory("m2", "Caroline 1985"),  # 双份同组,consistent
+    ]
+    await det.check_after_write(
+        session_id="s1", turn_idx=5, new_memory=new, similar=similar,
+    )
+    emit_calls = fake_reflection_engine.emit.await_args_list
+    assert emit_calls, "expected at least one emit"
+    ev = emit_calls[0].args[0]
+    assert ev.event_type == "drift_detected"
+    # drift_rate=0.5 → 0.5 < 0.5 False → else: "neg"
+    assert ev.severity == "neg"
+
+
+@pytest.mark.asyncio
+async def test_every_n_turns_throttling(
+    tmp_audit, fake_reflection_engine, fake_l5,
+):
+    """M4: every_n_turns=2 → turn_idx=1 (1%2=1) 不跑 → emit_count==0;
+    turn_idx=2 (2%2=0) 跑 → emit_count==1(精确)。"""
+    det = DriftDetector(
+        reflection_engine=fake_reflection_engine,
+        judge_llm=MagicMock(),
+        l5_engine=fake_l5,
+        project_root=tmp_audit.parent,
+        audit_path=tmp_audit,
+        every_n_turns=2,
+    )
+    det._judge_entities = AsyncMock(return_value=["caroline"])
+    det._judge_group_consistency = AsyncMock(return_value=(False, "different"))
+
+    new = make_memory("m3", "Caroline 1990")
+    similar = [
+        make_memory("m1", "Caroline 1985"),
+        make_memory("m2", "Caroline 1985"),
+    ]
+    # turn_idx=1 (1%2=1) → _should_run False → 不 emit
+    await det.check_after_write(
+        session_id="s1", turn_idx=1, new_memory=new, similar=similar,
+    )
+    emit_count_after_1 = fake_reflection_engine.emit.await_count
+    # turn_idx=2 (2%2=0) → _should_run True → emit 1 次
+    await det.check_after_write(
+        session_id="s1", turn_idx=2, new_memory=new, similar=similar,
+    )
+    emit_count_after_2 = fake_reflection_engine.emit.await_count
+    # 精确断言
+    assert emit_count_after_1 == 0, f"turn_idx=1 should not emit, got {emit_count_after_1}"
+    assert emit_count_after_2 == 1, f"turn_idx=2 should emit exactly 1, got {emit_count_after_2}"

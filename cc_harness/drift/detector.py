@@ -148,7 +148,11 @@ class DriftDetector:
                 drift_rate=drift_rate,
                 total_groups=total_groups,
                 inconsistent_groups=inconsistent_groups,
-                sample_records=[{"id": m.id, "text": m.text} for m in mems[:10]],
+                # M3: 文本过 L5 sanitize(spec §错误处理:drift 证据文本被 [REDACTED:...] 替换)
+                sample_records=[
+                    {"id": m.id, "text": self._l5.sanitize(m.text)}
+                    for m in mems[:10]
+                ],
                 reason="; ".join(group_reasons)[:500],
             )
             verdicts.append(verdict)
