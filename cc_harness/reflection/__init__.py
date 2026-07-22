@@ -8,6 +8,7 @@ from cc_harness.reflection.events import (
     tool_retry_burst,
     subagent_failed,
     decider_rollback,
+    drift_detected,
 )
 
 __all__ = [
@@ -20,4 +21,5 @@ __all__ = [
     "tool_retry_burst",
     "subagent_failed",
     "decider_rollback",
+    "drift_detected",
 ]

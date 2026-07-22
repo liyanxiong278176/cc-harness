@@ -12,7 +12,7 @@ from dataclasses import dataclass
 
 @dataclass
 class ReflectionEvent:
-    event_type: str            # "max_iter" | "empty_turn" | "tool_error_burst" | "tool_retry_burst" | "subagent_failed" | "decider_rollback"
+    event_type: str            # "max_iter" | "empty_turn" | "tool_error_burst" | "tool_retry_burst" | "subagent_failed" | "decider_rollback" | "drift_detected"
     severity: str              # "neg" | "ambig" | "pos"
     evidence: dict             # 原始事件载荷(去 PII,emit 前过 L5)
     session_id: str
@@ -90,6 +90,48 @@ def decider_rollback(*, session_id: str, turn_idx: int, save_result: dict) -> Re
         evidence={
             "action": save_result.get("action"),
             "error": save_result.get("error"),
+        },
+        session_id=session_id,
+        turn_idx=turn_idx,
+        created_at=time.time(),
+    )
+
+
+# E5 漂移检测
+def drift_detected(
+    *,
+    session_id: str,
+    turn_idx: int,
+    entity: str,
+    drift_rate: float,
+    total_groups: int,
+    inconsistent_groups: int,
+    records: list[dict],
+    reason: str,
+) -> ReflectionEvent:
+    """E5 drift 事件:同 entity 多 record predicted 不一致。
+
+    severity 按 drift_rate 三档:
+      < 0.2  → pos(健康,长期观测)
+      0.2-0.5 → ambig(轻度,可能 E4 consolidation 后续合并)
+      > 0.5  → neg(严重,需立即关注)
+    """
+    if drift_rate < 0.2:
+        severity = "pos"
+    elif drift_rate < 0.5:
+        severity = "ambig"
+    else:
+        severity = "neg"
+    return ReflectionEvent(
+        event_type="drift_detected",
+        severity=severity,
+        evidence={
+            "entity": entity,
+            "drift_rate": drift_rate,
+            "total_groups": total_groups,
+            "inconsistent_groups": inconsistent_groups,
+            "records": records[:10],  # 截断 10 条
+            "reason": reason[:500],  # 截断 500 字
         },
         session_id=session_id,
         turn_idx=turn_idx,
