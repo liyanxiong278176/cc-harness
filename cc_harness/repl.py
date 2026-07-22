@@ -37,6 +37,8 @@ log = logging.getLogger(__name__)
 if TYPE_CHECKING:
     # E2 T2.3:类型注解(运行时 = None 形参,不拽入 cc_harness.reflection.* 避免启动开销)
     from cc_harness.reflection.engine import ReflectionEngine
+    # E5 T2.2:DriftDetector 形参同样模式(字符串字面量,运行时不拽入 cc_harness.drift.*)
+    from cc_harness.drift.detector import DriftDetector
 
 _VALID_MODES = ("coding", "plan", "design", "chat")
 
@@ -147,6 +149,10 @@ async def run_repl(
     # 模式),None 时保持向后兼容(无反思)。run_turn 内的 4 类 emit 仅在
     # reflection_engine 非 None 时触发(T2.2 默认 None 守卫)。
     reflection_engine: ReflectionEngine | None = None,  # TYPE_CHECKING import,运行时不拽入
+    # E5 T2.2:漂移检测节点。main.py 构造 DriftDetector 后注入(同 reflection_engine
+    # 模式),None 时保持向后兼容(无漂移检测)。DriftDetector 自身不跑后台 task
+    # (T1.2 _drain 是 no-op),这里留接口对称 E2 模式;构造留给 T2.3 main.py:boot()。
+    drift_detector: "DriftDetector | None" = None,  # TYPE_CHECKING import,运行时不拽入
     # E4 I-1:memory 工具 extras + mem_deps 在 main.py 构造后传入
     # (让 main.py 也能拿到 store/service 构造 MaintenanceScheduler)。
     # backward compat:若都不传 → repl 内部自行 build(原行为)。
@@ -466,6 +472,14 @@ async def run_repl(
                 )
             except Exception as e:
                 print_warn(console, f"reflection_engine _drain failed: {e}")
+        # E5 T2.2:DriftDetector 自身不跑后台 task(commit 1 _drain 是 no-op),
+        # 这里留接口对称 E2 模式,等未来真实后台 task 出现时无需改 repl。try/except
+        # 兜底(同 scheduler / reflection_engine)— 故障不阻塞 shutdown。
+        if drift_detector is not None:
+            try:
+                await drift_detector._drain(timeout_s=5.0)
+            except Exception as e:
+                print_warn(console, f"drift_detector _drain failed: {e}")
         # 主循环退出(正常 exit / EOF / Ctrl-C / 异常)→ shutdown 会话级 executor。
         # async,非 atexit;sandbox 时 kill 容器 + shutdown_owned_server,best-effort。
         await shutdown_session_executor()
