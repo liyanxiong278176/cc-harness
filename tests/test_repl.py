@@ -4,6 +4,7 @@ Covers: _prompt_for, _handle_slash, ReplState, and the integration of
 run_repl with mocked input + FakeLLM.
 """
 from pathlib import Path
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 from cc_harness.repl import (
@@ -69,44 +70,51 @@ def _console():
     return Console(file=None, force_terminal=False)
 
 
-def test_handle_slash_plan_switches_mode():
+@pytest.mark.asyncio
+async def test_handle_slash_plan_switches_mode():
     s = ReplState(mode="coding")
-    handled = _handle_slash("/plan", s, _console())
+    handled = await _handle_slash("/plan", s, _console())
     assert handled is True
     assert s.mode == "plan"
 
 
-def test_handle_slash_design_switches_mode():
+@pytest.mark.asyncio
+async def test_handle_slash_design_switches_mode():
     s = ReplState(mode="coding")
-    _handle_slash("/design", s, _console())
+    await _handle_slash("/design", s, _console())
     assert s.mode == "design"
 
 
-def test_handle_slash_coding_switches_back():
+@pytest.mark.asyncio
+async def test_handle_slash_coding_switches_back():
     s = ReplState(mode="plan")
-    _handle_slash("/coding", s, _console())
+    await _handle_slash("/coding", s, _console())
     assert s.mode == "coding"
 
 
-def test_handle_slash_same_mode_is_noop():
+@pytest.mark.asyncio
+async def test_handle_slash_same_mode_is_noop():
     s = ReplState(mode="plan")
-    _handle_slash("/plan", s, _console())
+    await _handle_slash("/plan", s, _console())
     assert s.mode == "plan"
 
 
-def test_handle_slash_mode_command_returns_true():
+@pytest.mark.asyncio
+async def test_handle_slash_mode_command_returns_true():
     s = ReplState(mode="design")
-    assert _handle_slash("/mode", s, _console()) is True
+    assert await _handle_slash("/mode", s, _console()) is True
     # state.mode is unchanged
     assert s.mode == "design"
 
 
-def test_handle_slash_help_returns_true():
+@pytest.mark.asyncio
+async def test_handle_slash_help_returns_true():
     s = ReplState()
-    assert _handle_slash("/help", s, _console()) is True
+    assert await _handle_slash("/help", s, _console()) is True
 
 
-def test_handle_slash_clear_drops_history_keeps_system():
+@pytest.mark.asyncio
+async def test_handle_slash_clear_drops_history_keeps_system():
     s = ReplState(mode="coding")
     s.messages = [
         {"role": "system", "content": "x"},
@@ -114,27 +122,30 @@ def test_handle_slash_clear_drops_history_keeps_system():
         {"role": "assistant", "content": "a1"},
         {"role": "user", "content": "u2"},
     ]
-    _handle_slash("/clear", s, _console())
+    await _handle_slash("/clear", s, _console())
     assert s.messages == [{"role": "system", "content": "x"}]
 
 
-def test_handle_slash_clear_with_no_messages():
+@pytest.mark.asyncio
+async def test_handle_slash_clear_with_no_messages():
     s = ReplState()
-    _handle_slash("/clear", s, _console())
+    await _handle_slash("/clear", s, _console())
     assert s.messages == []
 
 
-def test_handle_slash_unknown_returns_false():
+@pytest.mark.asyncio
+async def test_handle_slash_unknown_returns_false():
     """Unknown commands fall through to the LLM as a normal message."""
     s = ReplState()
-    assert _handle_slash("/foo", s, _console()) is False
+    assert await _handle_slash("/foo", s, _console()) is False
     assert s.mode == "coding"  # unchanged
 
 
-def test_handle_slash_case_insensitive_command():
+@pytest.mark.asyncio
+async def test_handle_slash_case_insensitive_command():
     """Commands are matched lowercase even if the user types uppercase."""
     s = ReplState()
-    _handle_slash("/PLAN", s, _console())
+    await _handle_slash("/PLAN", s, _console())
     assert s.mode == "plan"
 
 
@@ -872,3 +883,52 @@ async def test_run_repl_prints_compaction_summary_when_tier_active(monkeypatch, 
     await run_repl(_StoppingLLM(), _NoopMCP(), cwd="/x")
     out = capfd.readouterr().out
     assert "上下文压缩" in out
+
+
+# --- E1 T6 /reject ---
+@pytest.mark.asyncio
+async def test_repl_reject_cancels_pending_todos():
+    """E1 D2:/reject 把 last_decomp_todo_ids 标 cancelled + 设 flag。"""
+    from cc_harness.repl import _handle_slash, ReplState
+
+    state = ReplState(
+        last_decomp_summary="📋 计划:...",
+        last_decomp_todo_ids=["t1", "t2"],
+        todo_service=MagicMock(),
+    )
+    state.todo_service.update = AsyncMock()
+
+    result = await _handle_slash("/reject", state, _console())
+    assert result is True
+    assert state.decomposition_rejected is True
+    assert state.last_decomp_summary is None
+    assert state.last_decomp_todo_ids == []
+    assert state.todo_service.update.await_count == 2
+
+
+@pytest.mark.asyncio
+async def test_repl_reject_warns_when_no_decomposition():
+    """E1 D2:无 plan 时 /reject 应 warn,不抛。"""
+    from cc_harness.repl import _handle_slash, ReplState
+
+    state = ReplState()
+    result = await _handle_slash("/reject", state, _console())
+    assert result is True
+    assert state.decomposition_rejected is False
+
+
+@pytest.mark.asyncio
+async def test_repl_reject_handles_todo_service_failure():
+    """E1 D2:todo_service.update 抛 → fail-soft,不崩。"""
+    from cc_harness.repl import _handle_slash, ReplState
+
+    state = ReplState(
+        last_decomp_summary="plan",
+        last_decomp_todo_ids=["t1"],
+        todo_service=MagicMock(),
+    )
+    state.todo_service.update = AsyncMock(side_effect=RuntimeError("db gone"))
+
+    result = await _handle_slash("/reject", state, _console())
+    assert result is True
+    assert state.decomposition_rejected is True

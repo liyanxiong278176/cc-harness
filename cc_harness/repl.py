@@ -88,6 +88,10 @@ class ReplState:
     # M2: turn_counter — 每轮 +1,MemoryService.save/MemoryRetriever.search 接 turn_idx 形参,
     # drift detector._should_run 守门用(默认 every_n_turns=2 → 隔轮跑)。
     turn_counter: int = 0
+    # E1 D2: /reject 状态(本轮分解计划的 user-confirm 边界)。
+    decomposition_rejected: bool = False
+    last_decomp_todo_ids: list[str] = field(default_factory=list)
+    last_decomp_summary: str | None = None
 
 
 async def _read_user(prompt: str) -> str:
@@ -104,7 +108,7 @@ def _prompt_for(mode: str) -> str:
     return f"> [{mode}] "
 
 
-def _handle_slash(cmd: str, state: ReplState, console: Console) -> bool:
+async def _handle_slash(cmd: str, state: ReplState, console: Console) -> bool:
     """Dispatch a slash command. Returns True if handled, False if the
     input should fall through to the LLM as a normal message.
 
@@ -134,6 +138,21 @@ def _handle_slash(cmd: str, state: ReplState, console: Console) -> bool:
         dropped = len(state.messages) - len(kept)
         state.messages = kept
         print_info(console, f"✓ 会话已清空(system 消息保留,丢弃 {dropped} 条历史)")
+        return True
+    if cmd in ("/reject", "/r"):
+        if not state.last_decomp_summary:
+            print_warn(console, "当前没有分解计划可 reject")
+            return True
+        state.decomposition_rejected = True
+        for tid in state.last_decomp_todo_ids:
+            try:
+                if state.todo_service is not None:
+                    await state.todo_service.update(tid, status="cancelled")
+            except Exception:
+                pass  # E1 fail-soft
+        state.last_decomp_summary = None
+        state.last_decomp_todo_ids = []
+        print_info(console, "已 reject 当前分解;LLM 继续走直接做路径")
         return True
     return False
 
@@ -354,7 +373,7 @@ async def run_repl(
 
             # Slash command dispatch
             if raw.startswith("/"):
-                if _handle_slash(raw, state, console):
+                if await _handle_slash(raw, state, console):
                     continue
                 # Unknown slash command — warn but let it through to the LLM
                 print_warn(console, f"未知命令: {raw!r}(当作普通消息处理)")
