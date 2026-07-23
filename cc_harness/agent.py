@@ -208,6 +208,30 @@ async def run_turn(
                 _tool_error_count = 0  # 避免每个 tool 都 emit
             except Exception:
                 pass
+
+    # E1 D2:todo_create 成功后 → user 摘要(plan 视图)。
+    # 守卫:mode==coding + not is_error + p.name=='todo_create' + todo_service 非 None。
+    # 从 result.llm_text 提取 task id → todo_service.get(tid) 拿 TodoTask → _print_decomp_summary。
+    # fail-soft:任何异常 → 跳过,不崩主循环(纯 cosmetic,不影响 turn).
+    async def _maybe_print_decomp_summary(p, result) -> None:
+        if mode != "coding":
+            return
+        if p.name != "todo_create":
+            return
+        if todo_service is None:
+            return
+        if getattr(result, "is_error", False):
+            return
+        try:
+            _m = re.search(r"created task (\S+)", result.llm_text or "")
+            if not _m:
+                return
+            _tid = _m.group(1)
+            _task = await todo_service.get(_tid)
+            _print_decomp_summary([_task])
+        except Exception:
+            pass
+
     last_compaction = None  # Plan3: CompactionStats from maybe_compact (or None)
     _last_node = None  # Q4 Task5: offload edge chain — node_id of last offloaded tool result
 
@@ -670,6 +694,8 @@ async def run_turn(
                     _tool_content = await _maybe_offload_content(
                         result.llm_text, p.name, args)
                     _is_err = bool(getattr(result, "is_error", False))
+                    # E1 D2:todo_create 成功后 → user 摘要(plan 视图)
+                    await _maybe_print_decomp_summary(p, result)
                     messages.append({
                         "role": "tool",
                         "name": p.name,  # D1 final:加 name 字段(for `_has_recent_htn_parent_create` + downstream inspect)
@@ -696,6 +722,8 @@ async def run_turn(
                         _tool_content = await _maybe_offload_content(
                             result.llm_text, p.name, args)
                         _is_err = bool(getattr(result, "is_error", False))
+                        # E1 D2:todo_create 成功后 → user 摘要(plan 视图)
+                        await _maybe_print_decomp_summary(p, result)
                         messages.append({
                             "role": "tool",
                             "name": p.name,  # D1 final:加 name 字段(同上)
@@ -1019,3 +1047,17 @@ def _save_design_output(
     path = base_dir / f"{ts}-{slug}.md"
     path.write_text(content, encoding="utf-8")
     return path
+
+
+def _print_decomp_summary(new_todos: list["TodoTask"]) -> None:
+    """E1 D2:user 第 1 轮看到 2-3 行 plan 摘要。"""
+    from cc_harness.render import print_info
+    from rich.console import Console
+    lines = [f"📋 计划:分解为 {len(new_todos)} 个 sub-task"]
+    for i, t in enumerate(new_todos[:5], 1):
+        crit = t.acceptance_criteria[0] if t.acceptance_criteria else "(无)"
+        lines.append(f"  [{i}] {t.title} — {crit[:80]}")
+    if len(new_todos) > 5:
+        lines.append(f"  ... +{len(new_todos) - 5} more")
+    lines.append("  (/reject 中断)")
+    print_info(Console(), "\n".join(lines))

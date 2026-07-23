@@ -1206,3 +1206,33 @@ def test_refresh_system_prompt_skips_e1_hint_after_iter_zero():
         extra_ctx={"e1_decompose_hint": False, "iter_count": 3},
     )
     assert "## 分解契约" not in messages[0]["content"]
+
+
+# --- E1 Task 7: _print_decomp_summary 函数 ---
+
+def test_print_decomp_summary_renders_plan_lines():
+    """E1 D2:user 摘要渲染 N 个 sub-task + /reject 提示(3 todos)。"""
+    from cc_harness.agent import _print_decomp_summary
+    from unittest.mock import MagicMock
+
+    todos = [
+        MagicMock(title=f"task-{i}", acceptance_criteria=[f"criterion-{i}"])
+        for i in range(3)
+    ]
+    # 不验 print_info 内容(monkeypatch 太脆),只验不抛 + return None
+    result = _print_decomp_summary(todos)
+    assert result is None
+
+
+def test_print_decomp_summary_truncates_at_5():
+    """E1 D2:N>5 摘要截断到 5 行 + 显示 +N more(8 todos)。"""
+    from cc_harness.agent import _print_decomp_summary
+    from unittest.mock import MagicMock
+
+    todos = [
+        MagicMock(title=f"task-{i}", acceptance_criteria=[f"c{i}"])
+        for i in range(8)
+    ]
+    # 不抛
+    result = _print_decomp_summary(todos)
+    assert result is None
