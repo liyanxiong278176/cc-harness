@@ -1171,6 +1171,8 @@ async def dispatch_subagent_handler(
     args: dict, *, service, session_id: str, cwd: str,
     last_turn_text: str = "",
     dispatch_subagent_runner=None,
+    progress_cb=None,
+    failure_pause_cb=None,
 ):
     """dispatch_subagent 第 9 个 todo tool。
 
@@ -1186,6 +1188,13 @@ async def dispatch_subagent_handler(
         dispatch_subagent_runner: SubAgentRunner 实例(inject_todo_tools 由
             deps['dispatch_subagent_runner'] 注入;**不可为 None** —
             重要 fix #1)。
+        progress_cb: E1 D6 per-subagent 进度 callback
+            ``async (task_id, status, detail="") -> None``。
+            默认 None 走 ``print_info`` 渲染(icon 字典 lock,spec D6)。
+        failure_pause_cb: E1 D6 失败 pause 决策 callback
+            ``async (SubAgentResult) -> "continue"|"retry"|"abort"``。
+            默认 None(不 pause);仅在 status ∈ {"failed", "timeout", "blocked"} 时触发。
+            "abort" → break(后续 sub-task 不再 pause,但仍走 _render_subagent_summary)。
 
     Returns:
         ToolResult:
@@ -1194,10 +1203,21 @@ async def dispatch_subagent_handler(
         - 正常 → _render_subagent_summary 合并结果(仍 is_error=False)。
     """
     from cc_harness.project.subagent import (
+        SubAgentResult,
         SubAgentRunner,
         _render_subagent_summary,
         _subagent_err,
     )
+    # E1 D6:实时进度 callback 默认实现(icon 字典 spec D6 lock)
+    if progress_cb is None:
+        from rich.console import Console
+        from cc_harness.render import print_info
+
+        async def progress_cb(task_id: str, status: str, detail: str = ""):
+            icon = {
+                "queued": "○", "running": "⠋", "done": "✓", "failed": "✗",
+            }.get(status, "?")
+            print_info(Console(), f"  {icon} [{task_id}] {status} {detail}")
 
     del cwd, last_turn_text
 
@@ -1277,20 +1297,33 @@ async def dispatch_subagent_handler(
             )
         sub_task_ids.append((t.id, spec))
 
-    # 5. 真并行跑 N 个 subagent
+    # 5. 真并行跑 N 个 subagent(E1 D6:每个 task 套 _run_with_progress 触发
+    #    progress_cb queued/running/done|failed,exception 也触发 failed)
     runner = dispatch_subagent_runner
+
+    async def _run_with_progress(tid: str, spec: dict):
+        await progress_cb(tid, "queued")
+        await progress_cb(tid, "running")
+        try:
+            result = await runner.run(
+                task_id=tid,
+                title=spec.get("title", ""),
+                description=spec.get("description") or "",
+                criteria=spec.get("criteria", []),
+                parent_id=task_id,
+                session_id=session_id,
+                timeout=timeout,
+            )
+            await progress_cb(tid, result.status)
+            return result
+        except Exception as e:
+            await progress_cb(tid, "failed", str(e)[:100])
+            raise
+
     try:
         results = await asyncio.wait_for(
             asyncio.gather(*[
-                runner.run(
-                    task_id=tid,
-                    title=spec.get("title", ""),
-                    description=spec.get("description") or "",
-                    criteria=spec.get("criteria", []),
-                    parent_id=task_id,
-                    session_id=session_id,
-                    timeout=timeout,
-                )
+                _run_with_progress(tid, spec)
                 for tid, spec in sub_task_ids
             ]),
             timeout=timeout * len(sub_specs) + 30,
@@ -1304,6 +1337,15 @@ async def dispatch_subagent_handler(
         return _subagent_err(
             "dispatch_subagent", f"subagent runner 异常: {e}"
         )
+
+    # E1 D6:失败 pause 决策(若有未 retry 已 fail 的)
+    # 沿用 plan Task 5 verbatim set: {"failed", "timeout", "blocked"}
+    if failure_pause_cb is not None:
+        for r in results:
+            if isinstance(r, SubAgentResult) and r.status in {"failed", "timeout", "blocked"}:
+                decision = await failure_pause_cb(r)
+                if decision == "abort":
+                    break
 
     return _render_subagent_summary(results, parent_id=task_id)
 

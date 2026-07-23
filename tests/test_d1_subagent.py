@@ -1101,3 +1101,114 @@ async def test_subagent_runner_no_retry_on_blocked():
 
     assert mocked_run_turn.await_count == 1
     assert result.status == "blocked"
+
+
+# ---------------------------------------------------------------------------
+# E1 Task 5:dispatch_subagent_handler 实时进度 + 失败 pause(spec D6)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_dispatch_progress_cb_invoked_per_subagent(tmp_path):
+    """E1 D6:progress_cb 在每个 subagent 状态变化时被调(queued / running / done)。"""
+    from cc_harness.project.tools import dispatch_subagent_handler
+
+    svc = _make_service(tmp_path)
+    parent = await svc.create(title="p", session_id="s")
+
+    progress_calls: list[tuple[str, str, str]] = []
+
+    async def cb(task_id, status, detail=""):
+        progress_calls.append((task_id, status, detail))
+
+    fake_runner = MagicMock()
+    fake_runner.run = AsyncMock(return_value=SubAgentResult(
+        task_id="sub1", title="x", status="done", final_text="ok",
+    ))
+    fake_runner.current_depth = 0
+    fake_runner.MAX_DEPTH = 2
+
+    args = {
+        "task_id": parent.id,
+        "sub_specs": [{"title": "sub1", "criteria": ["ok"]}],
+    }
+    await dispatch_subagent_handler(
+        args, service=svc, session_id="s", cwd=str(tmp_path),
+        dispatch_subagent_runner=fake_runner, last_turn_text="",
+        progress_cb=cb,
+    )
+
+    statuses = [c[1] for c in progress_calls]
+    assert "queued" in statuses, f"expected 'queued' in {statuses}"
+    assert "running" in statuses, f"expected 'running' in {statuses}"
+    assert "done" in statuses, f"expected 'done' in {statuses}"
+
+
+@pytest.mark.asyncio
+async def test_dispatch_default_progress_cb_uses_print_info(tmp_path):
+    """E1 D6:progress_cb=None → 默认 print_info 实现,monkeypatch 不抛。"""
+    from cc_harness.project.tools import dispatch_subagent_handler
+
+    svc = _make_service(tmp_path)
+    parent = await svc.create(title="p", session_id="s")
+
+    fake_runner = MagicMock()
+    fake_runner.run = AsyncMock(return_value=SubAgentResult(
+        task_id="t1", title="x", status="done",
+    ))
+    fake_runner.current_depth = 0
+    fake_runner.MAX_DEPTH = 2
+
+    args = {
+        "task_id": parent.id,
+        "sub_specs": [{"title": "sub1", "criteria": ["ok"]}],
+    }
+    # progress_cb=None 走默认(用 monkeypatch print_info 验不抛)
+    with patch("cc_harness.render.print_info") as mocked_print_info:
+        result = await dispatch_subagent_handler(
+            args, service=svc, session_id="s", cwd=str(tmp_path),
+            dispatch_subagent_runner=fake_runner, last_turn_text="",
+            # progress_cb=None 走默认
+        )
+
+    assert result is not None
+    assert result.is_error is False
+    # 默认 progress_cb 应至少被调 3 次(queued/running/done)
+    assert mocked_print_info.call_count >= 3, (
+        f"expected print_info called ≥3 times, got {mocked_print_info.call_count}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_dispatch_failure_pause_cb_called_on_failed(tmp_path):
+    """E1 D6:failure_pause_cb 在 sub-agent failed(已 retry 过)时被调。"""
+    from cc_harness.project.tools import dispatch_subagent_handler
+
+    svc = _make_service(tmp_path)
+    parent = await svc.create(title="p", session_id="s")
+
+    pause_calls = []
+
+    async def pause_cb(r):
+        pause_calls.append(r)
+        return "continue"
+
+    fake_runner = MagicMock()
+    fake_runner.run = AsyncMock(return_value=SubAgentResult(
+        task_id="t1", title="x", status="failed", error="boom",
+    ))
+    fake_runner.current_depth = 0
+    fake_runner.MAX_DEPTH = 2
+
+    args = {
+        "task_id": parent.id,
+        "sub_specs": [{"title": "sub1", "criteria": ["ok"]}],
+    }
+    await dispatch_subagent_handler(
+        args, service=svc, session_id="s", cwd=str(tmp_path),
+        dispatch_subagent_runner=fake_runner, last_turn_text="",
+        failure_pause_cb=pause_cb,
+    )
+
+    assert len(pause_calls) == 1
+    assert pause_calls[0].status == "failed"
