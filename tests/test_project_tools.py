@@ -14,6 +14,7 @@ from __future__ import annotations
 
 from datetime import datetime, timezone
 from pathlib import Path
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
@@ -127,7 +128,8 @@ def test_specs_have_distinct_names():
 
 
 async def test_create_handler_success_returns_llm_visible_text(deps):
-    result = await todo_create_handler({"title": "hello"}, **deps)
+    result = await todo_create_handler(
+        {"title": "hello", "acceptance_criteria": ["created"]}, **deps)
     assert isinstance(result, ToolResult)
     assert result.is_error is False
     assert "[todo_create]" in result.llm_text
@@ -138,7 +140,8 @@ async def test_create_handler_success_returns_llm_visible_text(deps):
 
 async def test_create_handler_appends_session_id(deps):
     """session_id 从 deps 透传到 Service.create → active_sessions。"""
-    result = await todo_create_handler({"title": "with session"}, **deps)
+    result = await todo_create_handler(
+        {"title": "with session", "acceptance_criteria": ["created"]}, **deps)
     assert result.is_error is False
     # 从 llm_text 抓 id,再去 svc 拿 task,确认 active_sessions 含 session_id
     # id 行形如 "id:       abc12345"
@@ -161,7 +164,8 @@ async def test_create_handler_missing_title_returns_error(deps):
 
 
 async def test_create_handler_with_invalid_priority_returns_error(deps):
-    result = await todo_create_handler({"title": "x", "priority": "urgent"}, **deps)
+    result = await todo_create_handler(
+        {"title": "x", "priority": "urgent", "acceptance_criteria": ["created"]}, **deps)
     assert result.is_error is True
     assert "InvalidFieldError" in result.llm_text
 
@@ -180,7 +184,7 @@ async def test_create_handler_with_cycle_raises(deps):
 
 async def test_create_handler_with_missing_dep_returns_error(deps):
     result = await todo_create_handler(
-        {"title": "x", "depends_on": ["ghost1234"]}, **deps)
+        {"title": "x", "depends_on": ["ghost1234"], "acceptance_criteria": ["created"]}, **deps)
     assert result.is_error is True
     assert "TaskNotFound" in result.llm_text
 
@@ -626,3 +630,48 @@ async def test_handlers_return_tool_result_on_invalid_input(handler, deps):
             "must return ToolResult on bad input"
         )
     assert isinstance(result, ToolResult)
+
+
+# ---------------------------------------------------------------------------
+# E1 T3: todo_create acceptance_criteria 长度 ∈ [1, 5] 硬校验(spec D4)
+# ---------------------------------------------------------------------------
+
+
+async def test_todo_create_rejects_empty_acceptance_criteria():
+    """E1 D4:acceptance_criteria 空 → 拒收。"""
+    fake_service = MagicMock()
+    args = {"title": "x", "description": "y", "acceptance_criteria": []}
+    result = await todo_create_handler(
+        args, service=fake_service, session_id="s1", cwd="/tmp",
+    )
+    assert result.is_error is True
+    assert "acceptance_criteria" in (result.llm_text or "")
+
+
+async def test_todo_create_rejects_over_5_acceptance_criteria():
+    """E1 D4:acceptance_criteria > 5 条 → 拒收。"""
+    fake_service = MagicMock()
+    args = {
+        "title": "x", "description": "y",
+        "acceptance_criteria": ["c1", "c2", "c3", "c4", "c5", "c6"],
+    }
+    result = await todo_create_handler(
+        args, service=fake_service, session_id="s1", cwd="/tmp",
+    )
+    assert result.is_error is True
+
+
+async def test_todo_create_accepts_1_to_5_acceptance_criteria():
+    """E1 D4:1-5 条 acceptance → pass(走既有创建逻辑)。"""
+    fake_service = MagicMock()
+    fake_service.create = AsyncMock(return_value=MagicMock(id="t1", title="x"))
+
+    for n in (1, 3, 5):
+        args = {
+            "title": "x", "description": "y",
+            "acceptance_criteria": [f"c{i}" for i in range(n)],
+        }
+        result = await todo_create_handler(
+            args, service=fake_service, session_id="s1", cwd="/tmp",
+        )
+        assert result.is_error is False, f"n={n} should pass"

@@ -145,7 +145,7 @@ async def test_extras_entries_are_directly_dispatchable(svc: TodoService):
     by_name = {e["spec"]["function"]["name"]: e for e in extras}
     entry = by_name["todo_create"]
     result = await entry["handler"](
-        {"title": "smoke"}, **entry["deps"],
+        {"title": "smoke", "acceptance_criteria": ["created"]}, **entry["deps"],
     )
     # ToolResult.success
     from cc_harness.mcp_client import ToolResult

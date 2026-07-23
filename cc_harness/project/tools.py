@@ -545,6 +545,16 @@ async def todo_create_handler(
             display="title is required",
             llm="[todo_create] ✗ InvalidFieldError: title is required",
         )
+    # E1 D4:硬校验 acceptance_criteria 1-5 条(spec verbatim lock)
+    criteria = args.get("acceptance_criteria") or []
+    if not isinstance(criteria, list) or len(criteria) < 1:
+        return _err("todo_create", TodoError(
+            "acceptance_criteria 必须 1-5 条(sub-task 必须可验收)"
+        ))
+    if len(criteria) > 5:
+        return _err("todo_create", TodoError(
+            f"acceptance_criteria {len(criteria)} 条 > 5 上限(粒度太粗,请拆 sub-task)"
+        ))
     try:
         task = await service.create(
             title=title,
