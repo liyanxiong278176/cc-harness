@@ -116,6 +116,31 @@ def test_load_policy_from_yaml(tmp_path):
     assert pc.enabled is False
 
 
+# --- E1 Task 8: e1_decompose_enabled kill-switch(spec 决策 D7) ---
+
+def test_policyconfig_e1_decompose_enabled_default_true():
+    """E1 D7:PolicyConfig() 默认 e1_decompose_enabled=True(向后兼容)。"""
+    from cc_harness.config import PolicyConfig
+    pc = PolicyConfig()
+    assert pc.e1_decompose_enabled is True
+
+
+def test_policyconfig_e1_decompose_enabled_can_be_disabled():
+    """E1 D7:PolicyConfig(e1_decompose_enabled=False) 可构造 + 字段透传。"""
+    from cc_harness.config import PolicyConfig
+    pc = PolicyConfig(e1_decompose_enabled=False)
+    assert pc.e1_decompose_enabled is False
+
+
+def test_load_policy_yaml_e1_decompose_enabled_passes_through(tmp_path):
+    """E1 D7:policy.yaml 写 e1_decompose_enabled: false → load_policy_config 透传。"""
+    from cc_harness.config import load_policy_config
+    y = tmp_path / "policy.yaml"
+    y.write_text("e1_decompose_enabled: false\n", encoding="utf-8")
+    pc = load_policy_config(y)
+    assert pc.e1_decompose_enabled is False
+
+
 def test_l2config_defaults():
     from cc_harness.config import L2Config
     c = L2Config()

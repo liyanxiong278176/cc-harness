@@ -9,7 +9,7 @@ import sys
 import time
 from pathlib import Path
 from rich.console import Console
-from cc_harness.config import load_config, ConfigError, load_executor_config, load_context_config
+from cc_harness.config import load_config, ConfigError, load_executor_config, load_context_config, load_policy_config
 from cc_harness.llm import LLMClient
 from cc_harness.mcp_client import MCPClient
 from cc_harness.repl import run_repl
@@ -288,6 +288,12 @@ def main() -> None:
             # at boot surfaces failures immediately and removes the cold-start
             # cliff. No-op when backend=native (default).
             exec_cfg = load_executor_config(PROJECT_ROOT / "policy.yaml")
+
+            # E1 D7:PolicyConfig.e1_decompose_enabled kill-switch 透传链。
+            # 单独 load(不与 load_executor_config 复用)— PolicyConfig 是顶层
+            # L4 闸门,与 executor 段独立。文件缺失 / 不写该字段 → 默认 True
+            # (向后兼容)。
+            _policy = load_policy_config(PROJECT_ROOT / "policy.yaml")
             if str(exec_cfg.backend.value) == "sandbox":
                 from cc_harness.sandbox_server import ensure_server
                 sb = exec_cfg.sandbox
@@ -320,6 +326,7 @@ def main() -> None:
                 scheduler=_scheduler,
                 reflection_engine=_reflection_engine,           # E2 T2.3
                 drift_detector=_drift_detector,                  # E5 漂移检测
+                e1_decompose_enabled=_policy.e1_decompose_enabled,  # E1 D7: kill-switch 透传
             )
         finally:
             await mcp.shutdown()

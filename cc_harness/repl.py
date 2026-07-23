@@ -180,6 +180,7 @@ async def run_repl(
     # backward compat:若都不传 → repl 内部自行 build(原行为)。
     memory_extras: list | None = None,
     mem_deps: dict | None = None,
+    e1_decompose_enabled: bool = True,  # E1 D7:kill-switch 透传 main.py → agent.run_turn
 ) -> None:
     """Run the interactive REPL.
 
@@ -450,6 +451,7 @@ async def run_repl(
                 resume_task=state.resume_task,                    # Task 6: 续干任务
                 todo_hints=list(state.todo_hints or []),          # B 阶段 Task 5: verify hints
                 reflection_engine=reflection_engine,              # E2 T2.3: 4 类 emit 注入
+                e1_decompose_enabled=e1_decompose_enabled,        # E1 D7: kill-switch 透传 → _e1_extra AND 守卫
             )
             state.session_stats.add(turn_stats)
 

@@ -105,6 +105,7 @@ async def run_turn(
     session_id: str = "",  # D1 Task 7:handler 用作 active_sessions(显式,不靠 env var)
     last_turn_text: str = "",  # D1 Task 7:C 阶段 todo_update 完成门 acceptance 校验用
     reflection_engine: "ReflectionEngine | None" = None,  # E2 T2.2:默认 None 保持向后兼容
+    e1_decompose_enabled: bool = True,  # E1 D7:kill-switch(从 main.py 透传 policy.e1_decompose_enabled,默认 True 向后兼容)
 ) -> TurnTokenStats:
     """Run one user turn in the given mode.
 
@@ -252,9 +253,14 @@ async def run_turn(
             if reflection_engine is not None
             else {}
         )
-        # E1 D7:分解契约 hint 注入 — 仅 iter==0 时 True(section 自身再三重 gate
-        # 防 leak)。iter_count 是 run_turn 局部变量,同作用域闭包可见。
-        _e1_extra = {"e1_decompose_hint": (iter_count == 0), "iter_count": iter_count}
+        # E1 D7:分解契约 hint 注入 — 仅 iter==0 且 policy kill-switch 开启时 True
+        # (section 自身再三重 gate 防 leak:flag + mode + iter_count)。iter_count 是
+        # run_turn 局部变量,同作用域闭包可见。policy 关掉 → flag 永远 False →
+        # section 不渲染(T1 test_decomposition_hint_skips_when_kill_switch_off 覆盖)。
+        _e1_extra = {
+            "e1_decompose_hint": (iter_count == 0) and e1_decompose_enabled,
+            "iter_count": iter_count,
+        }
         # Phase 1 Q1 uplift: qa_context → render qa_intro section
         if qa_context and qa_context.get("q_type") is not None:
             _refresh_system_prompt(

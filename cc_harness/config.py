@@ -77,8 +77,15 @@ def load_config(env_path: Path, mcp_json_path: Path) -> AppConfig:
 
 class PolicyConfig(BaseModel):
     """权限闸门配置。M1 只暴露 enabled(杀手开关)。
-    审计路径固定 <项目根>/logs/policy.jsonl(agent 写死),不在此配置。"""
+    审计路径固定 <项目根>/logs/policy.jsonl(agent 写死),不在此配置。
+
+    E1 D7:e1_decompose_enabled 控制 Decomposer hint 是否注入到 system prompt
+    (从 main.py 透传到 repl.py → agent.py run_turn,作为 _e1_extra["e1_decompose_hint"]
+    的 AND 守卫,与 iter_count==0 / mode==coding 共同三重 gate)。默认 True
+    (向后兼容;不写该字段也 default True — extra:ignore 已就位)。
+    """
     enabled: bool = True
+    e1_decompose_enabled: bool = True
 
     model_config = {"extra": "ignore"}
 
