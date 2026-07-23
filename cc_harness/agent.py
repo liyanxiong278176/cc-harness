@@ -228,18 +228,21 @@ async def run_turn(
             if reflection_engine is not None
             else {}
         )
+        # E1 D7:分解契约 hint 注入 — 仅 iter==0 时 True(section 自身再三重 gate
+        # 防 leak)。iter_count 是 run_turn 局部变量,同作用域闭包可见。
+        _e1_extra = {"e1_decompose_hint": (iter_count == 0), "iter_count": iter_count}
         # Phase 1 Q1 uplift: qa_context → render qa_intro section
         if qa_context and qa_context.get("q_type") is not None:
             _refresh_system_prompt(
                 messages, cwd, mode,
-                extra_ctx={"qa_category": qa_context["q_type"], **_neg_extra},
+                extra_ctx={"qa_category": qa_context["q_type"], **_neg_extra, **_e1_extra},
                 resume_task=resume_task,
                 todo_hints=todo_hints,
             )
         else:
             _refresh_system_prompt(
                 messages, cwd, mode,
-                extra_ctx=_neg_extra,
+                extra_ctx={**_neg_extra, **_e1_extra},
                 resume_task=resume_task,
                 todo_hints=todo_hints,
             )

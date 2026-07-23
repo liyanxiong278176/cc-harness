@@ -1182,3 +1182,27 @@ async def test_run_turn_compaction_disabled(tmp_path):
                                      cwd=str(tmp_path), max_iter=1,
                                      context_config=ContextConfig(enabled=False))
     assert stats.compaction is None
+
+
+# --- E1 Task 2: e1_decompose_hint + iter_count 注入 _refresh_system_prompt ---
+
+def test_refresh_system_prompt_injects_e1_hint_at_iter_zero():
+    """E1 D7:iter=0 → e1_decompose_hint=True 注入,section 出现在 system prompt。"""
+    messages = [{"role": "system", "content": "old system"}]
+    from cc_harness.agent import _refresh_system_prompt
+    _refresh_system_prompt(
+        messages, cwd="/tmp", mode="coding",
+        extra_ctx={"e1_decompose_hint": True, "iter_count": 0},
+    )
+    assert "## 分解契约" in messages[0]["content"]
+
+
+def test_refresh_system_prompt_skips_e1_hint_after_iter_zero():
+    """E1 D7:iter>=1 → e1_decompose_hint=False,section 不出现。"""
+    messages = [{"role": "system", "content": "old system"}]
+    from cc_harness.agent import _refresh_system_prompt
+    _refresh_system_prompt(
+        messages, cwd="/tmp", mode="coding",
+        extra_ctx={"e1_decompose_hint": False, "iter_count": 3},
+    )
+    assert "## 分解契约" not in messages[0]["content"]
