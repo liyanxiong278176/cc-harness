@@ -32,7 +32,9 @@ class MemoryService:
         embedding = await self.embedder.embed(query)
         return await self.store.search_similar(embedding, k=top_k)
 
-    async def save(self, text: str, source: str, session_id: str | None = None) -> SaveResult:
+    async def save(self, text: str, source: str, session_id: str | None = None, *, turn_idx: int | None = None) -> SaveResult:
+        # M2: turn_idx 优先用 caller 传,None 时退占位(向后兼容)
+        actual_turn_idx = turn_idx if turn_idx is not None else int(time.time() * 1000) % 1000
         t0 = time.time()
         result_action_mem = None
         try:
@@ -101,7 +103,7 @@ class MemoryService:
                     similar_mems = [m for m, _ in similar_for_conflict]
                     await self.drift_detector.check_after_write(
                         session_id=session_id or "default",
-                        turn_idx=int(time.time() * 1000) % 1000,  # 占位,真实 turn_idx 由 T2.2 注入
+                        turn_idx=actual_turn_idx,
                         new_memory=result_action_mem,
                         similar=similar_mems,
                     )

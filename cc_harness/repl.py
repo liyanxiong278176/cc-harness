@@ -85,6 +85,9 @@ class ReplState:
     # last_turn_text 是本轮 LLM 文本输出(给 verify 评 heuristic 用)。
     todo_hints: list[str] = field(default_factory=list)
     last_turn_text: str = ""
+    # M2: turn_counter — 每轮 +1,MemoryService.save/MemoryRetriever.search 接 turn_idx 形参,
+    # drift detector._should_run 守门用(默认 every_n_turns=2 → 隔轮跑)。
+    turn_counter: int = 0
 
 
 async def _read_user(prompt: str) -> str:
@@ -384,6 +387,9 @@ async def run_repl(
                 user_content = raw
 
             state.messages.append({"role": "user", "content": user_content})
+            # M2: turn counter 每轮 +1,drift detector._should_run(默认 every_n_turns=2)
+            # 守门用。agent.run_turn 内的 memory_recall/save 调透传这个 counter(E2 post-merge)。
+            state.turn_counter += 1
             turn_start = time.time()
             from cc_harness.agent import run_turn
             # Q3 Task8: memory_layer 注入(kill-switch:layered_inject or 无 mem_deps → None)

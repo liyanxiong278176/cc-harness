@@ -218,3 +218,53 @@ def test_main_boot_imports_drift_detector():
     ]
     for method in methods:
         assert hasattr(DriftDetector, method), f"DriftDetector 缺 {method}"
+
+
+# --- E5 R3 M2: turn_idx 注入测试 ---
+
+
+@pytest.mark.asyncio
+async def test_memory_service_save_accepts_turn_idx(store, fake_drift, fake_decider):
+    """M2: MemoryService.save 接 turn_idx 形参,不再硬编码。"""
+    from cc_harness.memory.service import MemoryService
+
+    # fake decider 返 ADD
+    from cc_harness.memory.decider import Decision, DecisionResult
+    fake_decider.decide = AsyncMock(
+        return_value=DecisionResult(action=Decision.ADD)
+    )
+    embedder = MagicMock()
+    embedder.embed = AsyncMock(return_value=[0.5, 0.5, 0.5, 0.5])
+
+    svc = MemoryService(
+        store=store, embedder=embedder, decider=fake_decider,
+        drift_detector=fake_drift,
+    )
+    await svc.save("test", source="llm", session_id="s1", turn_idx=42)
+    # 真 turn_idx 透传到 detector
+    call_kwargs = fake_drift.check_after_write.await_args.kwargs
+    assert call_kwargs["turn_idx"] == 42
+
+
+@pytest.mark.asyncio
+async def test_memory_retriever_search_accepts_turn_idx(store, fake_drift):
+    """M2: MemoryRetriever.search 接 turn_idx 形参,默认 None 时退占位。"""
+    from cc_harness.memory.retriever import MemoryRetriever
+
+    await store.add("a", [0.5, 0.5, 0.5, 0.5], "llm", session_id="s1")
+
+    embedder = MagicMock()
+    embedder.embed = AsyncMock(return_value=[0.5, 0.5, 0.5, 0.5])
+
+    retriever = MemoryRetriever(
+        store=store, embedder=embedder, drift_detector=fake_drift,
+    )
+    # 显式 turn_idx
+    await retriever.search("a", turn_idx=7)
+    call_kwargs = fake_drift.check_after_read.await_args.kwargs
+    assert call_kwargs["turn_idx"] == 7
+    # 默认 turn_idx=None 时退占位
+    fake_drift.reset_mock()
+    await retriever.search("a")
+    call_kwargs = fake_drift.check_after_read.await_args.kwargs
+    assert call_kwargs["turn_idx"] == 0  # 占位

@@ -25,7 +25,9 @@ class MemoryRetriever:
         self.token_budget = token_budget
         self.drift_detector = drift_detector
 
-    async def search(self, query: str, top_k: int = 5) -> list:
+    async def search(self, query: str, top_k: int = 5, *, turn_idx: int | None = None) -> list:
+        # M2: turn_idx 优先用 caller 传,None 时退占位(向后兼容)
+        actual_turn_idx = turn_idx if turn_idx is not None else 0
         embedding = await self._embedder.embed(query)
         results = await self._store.search_similar(embedding, k=top_k * 2)
         if results:
@@ -45,7 +47,7 @@ class MemoryRetriever:
                 results_list = [m for m, _ in weighted]
                 await self.drift_detector.check_after_read(
                     session_id=results_list[0].session_id or "default",
-                    turn_idx=0,  # 占位,真实 turn_idx 由 T2.2 注入
+                    turn_idx=actual_turn_idx,
                     results=results_list,
                 )
             except Exception:
