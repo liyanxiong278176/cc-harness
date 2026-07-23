@@ -371,3 +371,49 @@ def test_qa_intro_body_mentions_must_answer_rule():
     assert "简洁" in body
     assert "gold" in body
 
+
+# --- E1 Task 1: _decomposition_hint section ---
+
+def test_decomposition_hint_renders_when_iter_zero_and_coding():
+    """E1 D7:iter=0 + coding mode + flag True → 渲染分解契约。"""
+    composer = PromptComposer(
+        mode="coding",
+        ctx={"e1_decompose_hint": True, "iter_count": 0},
+    )
+    prompt = composer.render()
+    assert "## 分解契约" in prompt
+    assert "todo_create" in prompt
+    assert "acceptance_criteria" in prompt
+    assert "dispatch_subagent" in prompt
+
+
+def test_decomposition_hint_skips_when_iter_nonzero():
+    """E1 D7:iter>=1 不注入(避免后续轮次污染)。"""
+    composer = PromptComposer(
+        mode="coding",
+        ctx={"e1_decompose_hint": True, "iter_count": 3},
+    )
+    prompt = composer.render()
+    assert "## 分解契约" not in prompt
+
+
+def test_decomposition_hint_skips_in_plan_mode():
+    """E1 D7:plan/design/chat mode 不注入。"""
+    for mode in ("plan", "design", "chat"):
+        composer = PromptComposer(
+            mode=mode,
+            ctx={"e1_decompose_hint": True, "iter_count": 0},
+        )
+        prompt = composer.render()
+        assert "## 分解契约" not in prompt, f"mode={mode} should skip hint"
+
+
+def test_decomposition_hint_skips_when_kill_switch_off():
+    """E1 D7:policy.yaml 关掉 → flag=False 不注入。"""
+    composer = PromptComposer(
+        mode="coding",
+        ctx={"e1_decompose_hint": False, "iter_count": 0},
+    )
+    prompt = composer.render()
+    assert "## 分解契约" not in prompt
+

@@ -197,6 +197,34 @@ def _reflection_section(ctx: dict) -> str | None:
     return f"\n<上一轮反思>\n{body}\n</上一轮反思>"
 
 
+def _decomposition_hint(ctx: dict) -> str | None:
+    """E1 D1/D2/D3/D7:分解契约 — 提示 LLM 在 iter 0 自主评估是否需要分解。
+
+    Gate 三重:e1_decompose_hint flag + mode==coding + iter_count==0。
+    """
+    if not ctx.get("e1_decompose_hint"):
+        return None
+    if ctx.get("mode") != "coding":
+        return None
+    if ctx.get("iter_count", 1) != 0:
+        return None
+    return (
+        "## 分解契约\n"
+        "复杂任务先想清楚:能不能拆成 ≥2 个**独立** sub-task?拆得了 → "
+        "用 `todo_create` 建任务(每个 sub-task 必须有 1-5 条 acceptance_criteria),\n"
+        "再用 `dispatch_subagent` 派 subagent 并行跑(限制 N≤5,MaxDepth=2 硬拒)。\n"
+        "拆不了 / 单任务 → 直接做,不建 todo。\n"
+        "\n"
+        "判定标准:\n"
+        "- 任务描述含 ≥2 个动词 / 含'并且/以及/先 X 再 Y' / 含'并行/拆成/分步' → 倾向分解\n"
+        "- 单步修小 bug / 单行 fix → 直接做\n"
+        "- 粒度提示:每个 sub-task 应可在 ≤10 轮工具调用内完成\n"
+        "\n"
+        "失败兜底:任何 sub-agent failed/timeout → 系统自动 retry 1 次,"
+        "仍失败则聚合回主 agent 由你决策。"
+    )
+
+
 # SECTION_POOL: list of (name, builder, condition) tuples.
 # `condition` is a ctx-key string. Section is included only when
 # `ctx.get(condition) is not None`. Identity / cwd / honesty use
@@ -217,6 +245,7 @@ SECTION_POOL: list[tuple[str, Callable[[dict], str | None], str]] = [
     ("chat_mode", _chat_mode, "mode_chat"),
     ("qa_intro", _qa_intro, "qa_category"),
     ("reflection", _reflection_section, "last_neg_reflection"),
+    ("decomposition_hint", _decomposition_hint, "e1_decompose_hint"),  # E1 D7
 ]
 
 
