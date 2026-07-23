@@ -328,6 +328,7 @@ class SubAgentRunner:
         parent_id: str = "",
         session_id: str = "s",
         timeout: int = 240,
+        retried: bool = False,
     ) -> SubAgentResult:
         """跑 1 个 subagent,返回结果摘要。
 
@@ -524,6 +525,21 @@ class SubAgentRunner:
             except Exception:
                 # 反思 emit 失败不影响主流程(silent fallback)
                 pass
+
+        # E1 D5:auto retry 1 次(transient 兜底)
+        if (result_obj is not None
+                and result_obj.status in {"failed", "timeout", "incomplete"}
+                and not retried):
+            log.warning(
+                "subagent %s 失败 (status=%s),auto retry 1 次",
+                task_id, result_obj.status,
+            )
+            return await self.run(
+                task_id=task_id, title=title, description=description,
+                criteria=criteria, parent_id=parent_id,
+                session_id=session_id, timeout=timeout,
+                retried=True,
+            )
 
         return result_obj
 

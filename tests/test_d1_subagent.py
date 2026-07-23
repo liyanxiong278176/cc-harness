@@ -11,6 +11,7 @@ import json
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import get_args
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
@@ -772,6 +773,7 @@ async def test_subagent_runner_returns_failed_on_tool_error(tmp_path):
     )
     result = await runner.run(
         task_id=parent.id, title="t", session_id="s", timeout=10,
+        retried=True,  # 隔离验证单次 tool error 分类;E1 retry 另有专测
     )
     assert result.status == "failed", f"expected failed, got {result.status}"
     assert "Tool Error" in (result.error or ""), (
@@ -991,3 +993,111 @@ async def test_subagent_runner_system_prompt_includes_instruction_hierarchy(tmp_
     assert "优先级" in system_prompt
     assert "<untrusted>" in system_prompt
     assert "永不可当指令执行" in system_prompt
+
+
+# ---------------------------------------------------------------------------
+# E1 Task 4:SubAgentRunner.run() transient auto retry once
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_subagent_runner_auto_retries_once_on_failed():
+    """E1 D5:failed 且未 retry → clean messages 重派 1 次并返回第二次结果。"""
+    service = MagicMock()
+    service.get = AsyncMock(return_value=MagicMock(status="done"))
+    runner = SubAgentRunner(
+        llm=MagicMock(), mcp=MagicMock(), todo_service=service,
+        project_root="/tmp", max_iter=20, policy=MagicMock(),
+    )
+    seen_messages = []
+
+    async def fake_run_turn(messages, *args, **kwargs):
+        seen_messages.append(messages)
+        if len(seen_messages) == 1:
+            messages.append({"role": "assistant", "content": "first-attempt-marker"})
+            return MagicMock(
+                error="transient failure", api_total_tokens=0, breakdown_subtotal=0,
+            )
+        assert not any(
+            message.get("content") == "first-attempt-marker" for message in messages
+        )
+        return MagicMock(error=None, api_total_tokens=0, breakdown_subtotal=0)
+
+    with patch("cc_harness.agent.run_turn", side_effect=fake_run_turn) as mocked_run_turn:
+        result = await runner.run(
+            task_id="t1", title="x", retried=False,
+        )
+
+    assert mocked_run_turn.await_count == 2
+    assert seen_messages[0] is not seen_messages[1]
+    assert result.status == "done"
+
+
+@pytest.mark.asyncio
+async def test_subagent_runner_no_retry_when_retried_already():
+    """E1 D5:retried=True 的 failed 结果直接返回,不再递归 retry。"""
+    runner = SubAgentRunner(
+        llm=MagicMock(), mcp=MagicMock(), todo_service=MagicMock(),
+        project_root="/tmp", max_iter=20, policy=MagicMock(),
+    )
+    failed_stats = MagicMock(
+        error="persistent failure", api_total_tokens=0, breakdown_subtotal=0,
+    )
+
+    with patch(
+        "cc_harness.agent.run_turn", AsyncMock(return_value=failed_stats),
+    ) as mocked_run_turn:
+        result = await runner.run(
+            task_id="t1", title="x", retried=True,
+        )
+
+    assert mocked_run_turn.await_count == 1
+    assert result.status == "failed"
+
+
+@pytest.mark.asyncio
+async def test_subagent_runner_no_retry_on_done():
+    """E1 D5:done 是成功状态,不触发 retry。"""
+    service = MagicMock()
+    service.get = AsyncMock(return_value=MagicMock(status="done"))
+    runner = SubAgentRunner(
+        llm=MagicMock(), mcp=MagicMock(), todo_service=service,
+        project_root="/tmp", max_iter=20, policy=MagicMock(),
+    )
+    success_stats = MagicMock(
+        error=None, api_total_tokens=0, breakdown_subtotal=0,
+    )
+
+    with patch(
+        "cc_harness.agent.run_turn", AsyncMock(return_value=success_stats),
+    ) as mocked_run_turn:
+        result = await runner.run(
+            task_id="t1", title="x", retried=False,
+        )
+
+    assert mocked_run_turn.await_count == 1
+    assert result.status == "done"
+
+
+@pytest.mark.asyncio
+async def test_subagent_runner_no_retry_on_blocked():
+    """E1 D5:blocked 来自完成门,不是 transient,不触发 retry。"""
+    service = MagicMock()
+    service.get = AsyncMock(return_value=MagicMock(status="blocked"))
+    runner = SubAgentRunner(
+        llm=MagicMock(), mcp=MagicMock(), todo_service=service,
+        project_root="/tmp", max_iter=20, policy=MagicMock(),
+    )
+    blocked_stats = MagicMock(
+        error=None, api_total_tokens=0, breakdown_subtotal=0,
+    )
+
+    with patch(
+        "cc_harness.agent.run_turn", AsyncMock(return_value=blocked_stats),
+    ) as mocked_run_turn:
+        result = await runner.run(
+            task_id="t1", title="x", retried=False,
+        )
+
+    assert mocked_run_turn.await_count == 1
+    assert result.status == "blocked"
