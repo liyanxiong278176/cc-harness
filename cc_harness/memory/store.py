@@ -116,6 +116,34 @@ class MemoryStore:
         await self._db.execute(
             "CREATE INDEX IF NOT EXISTS idx_conv_session ON conversation(session_id, turn_idx)"
         )
+        # E3 T1 D2: cross-session auto-resume checkpoint
+        await self._db.execute("""
+            CREATE TABLE IF NOT EXISTS session_checkpoint (
+                session_id    TEXT PRIMARY KEY,
+                project_root  TEXT,
+                mode          TEXT NOT NULL,
+                turn_counter  INTEGER DEFAULT 0,
+                started_at    TEXT NOT NULL,
+                ended_at      TEXT NOT NULL,
+                cross_session_mode TEXT DEFAULT 'last_only',
+                extra_json    TEXT NOT NULL DEFAULT '{}'
+            )
+        """)
+        await self._db.execute("""
+            CREATE TABLE IF NOT EXISTS session_message (
+                id            INTEGER PRIMARY KEY AUTOINCREMENT,
+                session_id    TEXT NOT NULL,
+                turn_idx      INTEGER NOT NULL,
+                role          TEXT NOT NULL,
+                content_json  TEXT NOT NULL,
+                ts            TEXT NOT NULL,
+                FOREIGN KEY (session_id) REFERENCES session_checkpoint(session_id) ON DELETE CASCADE
+            )
+        """)
+        await self._db.execute(
+            "CREATE INDEX IF NOT EXISTS idx_session_message_session_turn "
+            "ON session_message(session_id, turn_idx)"
+        )
         await self._migrate()
 
     async def _migrate(self) -> None:
@@ -143,6 +171,39 @@ class MemoryStore:
                 await self._db.execute(
                     f"ALTER TABLE conversation ADD COLUMN {col} TEXT NOT NULL DEFAULT ''"
                 )
+        # E3 T1: 旧库可能缺 session_checkpoint / session_message(2026-07-24 前)
+        s_tables = {r[0] for r in (await (await self._db.execute(
+            "SELECT name FROM sqlite_master WHERE type='table'"
+        )).fetchall())}
+        if "session_checkpoint" not in s_tables:
+            await self._db.execute("""
+                CREATE TABLE session_checkpoint (
+                    session_id    TEXT PRIMARY KEY,
+                    project_root  TEXT,
+                    mode          TEXT NOT NULL,
+                    turn_counter  INTEGER DEFAULT 0,
+                    started_at    TEXT NOT NULL,
+                    ended_at      TEXT NOT NULL,
+                    cross_session_mode TEXT DEFAULT 'last_only',
+                    extra_json    TEXT NOT NULL DEFAULT '{}'
+                )
+            """)
+        if "session_message" not in s_tables:
+            await self._db.execute("""
+                CREATE TABLE session_message (
+                    id            INTEGER PRIMARY KEY AUTOINCREMENT,
+                    session_id    TEXT NOT NULL,
+                    turn_idx      INTEGER NOT NULL,
+                    role          TEXT NOT NULL,
+                    content_json  TEXT NOT NULL,
+                    ts            TEXT NOT NULL,
+                    FOREIGN KEY (session_id) REFERENCES session_checkpoint(session_id) ON DELETE CASCADE
+                )
+            """)
+            await self._db.execute(
+                "CREATE INDEX IF NOT EXISTS idx_session_message_session_turn "
+                "ON session_message(session_id, turn_idx)"
+            )
         await self._db.commit()
 
     async def add_conversation(
