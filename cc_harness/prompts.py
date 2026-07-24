@@ -225,7 +225,46 @@ def _decomposition_hint(ctx: dict) -> str | None:
     )
 
 
-# SECTION_POOL: list of (name, builder, condition) tuples.
+def _cross_session_prior(ctx: dict) -> str | None:
+    """E3 D1/D3:prior_messages 摘要注入。
+
+    Gate:e3_prior_messages flag + mode==coding。
+    spec 组件 6 字面 lock:返回 <cross_session_prior>...</cross_session_prior> 块。
+    """
+    prior = ctx.get("e3_prior_messages")
+    if not prior:
+        return None
+    if ctx.get("mode") != "coding":
+        return None
+    summary = _summarize_prior(prior)
+    if not summary:
+        return None
+    return f"\n<cross_session_prior>\n{summary}\n</cross_session_prior>\n"
+
+
+def _summarize_prior(messages: list[dict]) -> str:
+    """E3 D1/D3:取 system 摘要 + 最近 10 轮非 system + 中间压缩占位。
+
+    保守策略:过多 messages 时保留最近 10 条,前面加压缩占位说明,
+    让 LLM 知道中间被 Plan3 兜底压缩(Plan3 后续 turn 真正介入)。
+    """
+    if not messages:
+        return ""
+    system = next((m.get("content") for m in messages if m.get("role") == "system"), None)
+    lines = []
+    if system:
+        sys_text = str(system)[:200]
+        lines.append(f"[跨 session 系统摘要] {sys_text}")
+    non_system = [m for m in messages if m.get("role") != "system"]
+    if len(non_system) > 10:
+        lines.append(f"[中间 {len(non_system) - 10} 轮由 Plan3 兜底压缩]")
+        non_system = non_system[-10:]
+    for m in non_system:
+        role = m.get("role", "unknown")
+        content = str(m.get("content", ""))[:200]
+        lines.append(f"[{role}] {content}")
+    return "\n".join(lines)
+
 # `condition` is a ctx-key string. Section is included only when
 # `ctx.get(condition) is not None`. Identity / cwd / honesty use
 # `_ALWAYS_KEY` so they're included whenever the internal ctx has the
@@ -246,6 +285,7 @@ SECTION_POOL: list[tuple[str, Callable[[dict], str | None], str]] = [
     ("qa_intro", _qa_intro, "qa_category"),
     ("reflection", _reflection_section, "last_neg_reflection"),
     ("decomposition_hint", _decomposition_hint, "e1_decompose_hint"),  # E1 D7
+    ("cross_session_prior", _cross_session_prior, "e3_prior_messages"),  # E3 D1/D3
 ]
 
 

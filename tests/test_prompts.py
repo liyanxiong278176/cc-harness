@@ -417,3 +417,45 @@ def test_decomposition_hint_skips_when_kill_switch_off():
     prompt = composer.render()
     assert "## 分解契约" not in prompt
 
+
+def test_cross_session_prior_renders_when_coding():
+    """E3 D1: prior_messages + coding mode → 渲染 cross_session_prior block。"""
+    from cc_harness.prompts import PromptComposer
+    composer = PromptComposer(
+        mode="coding",
+        ctx={"e3_prior_messages": [{"role": "user", "content": "old hi"}], "iter_count": 0},
+    )
+    prompt = composer.render()
+    # either '跨 session' 中文 或 'cross_session' XML tag (OR 通过)
+    assert "cross_session" in prompt or "跨 session" in prompt
+
+
+def test_cross_session_prior_skips_when_mode_not_coding():
+    """E3 D6: plan/design/chat mode 不注入。"""
+    from cc_harness.prompts import PromptComposer
+    for mode in ("plan", "design", "chat"):
+        composer = PromptComposer(
+            mode=mode,
+            ctx={"e3_prior_messages": [{"role": "user", "content": "old"}]},
+        )
+        prompt = composer.render()
+        assert "cross_session" not in prompt and "跨 session" not in prompt
+
+
+def test_cross_session_prior_skips_when_no_messages():
+    """E3 D1: e3_prior_messages=None / [] → 不渲染。"""
+    from cc_harness.prompts import PromptComposer
+    composer = PromptComposer(
+        mode="coding",
+        ctx={"e3_prior_messages": None},
+    )
+    prompt = composer.render()
+    assert "cross_session" not in prompt and "跨 session" not in prompt
+    # 空列表也 skip
+    composer2 = PromptComposer(
+        mode="coding",
+        ctx={"e3_prior_messages": []},
+    )
+    prompt2 = composer2.render()
+    assert "cross_session" not in prompt2 and "跨 session" not in prompt2
+

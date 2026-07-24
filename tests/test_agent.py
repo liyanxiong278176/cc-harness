@@ -1236,3 +1236,29 @@ def test_print_decomp_summary_truncates_at_5():
     # 不抛
     result = _print_decomp_summary(todos)
     assert result is None
+
+
+def test_refresh_system_prompt_injects_cross_session_tools_block():
+    """E3 D7: tool_diff 非空 → <cross_session_tools> block 注入 system prompt。"""
+    messages = [{"role": "system", "content": "old system"}]
+    from cc_harness.agent import _refresh_system_prompt
+    _refresh_system_prompt(
+        messages, cwd="/tmp", mode="coding",
+        extra_ctx={},
+        tool_diff=["+newtool", "-oldtool"],
+    )
+    assert "<cross_session_tools>" in messages[0]["content"]
+    assert "+newtool" in messages[0]["content"]
+    assert "-oldtool" in messages[0]["content"]
+
+
+def test_refresh_system_prompt_no_tools_block_when_empty_diff():
+    """E3 D7: tool_diff=[] → 不注入 <cross_session_tools> block。"""
+    messages = [{"role": "system", "content": "old system"}]
+    from cc_harness.agent import _refresh_system_prompt
+    _refresh_system_prompt(
+        messages, cwd="/tmp", mode="coding",
+        extra_ctx={},
+        tool_diff=[],
+    )
+    assert "<cross_session_tools>" not in messages[0]["content"]

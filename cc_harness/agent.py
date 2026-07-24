@@ -100,6 +100,8 @@ async def run_turn(
     qa_context: dict | None = None,
     resume_task: "TodoTask | None" = None,
     todo_hints: list[str] | None = None,  # B 阶段 Task 5: verify hook hints
+    prior_messages: list[dict] | None = None,  # E3 D1:cross-session 旧 messages 摘要上下文
+    tool_diff: list[str] | None = None,  # E3 D7:mcp tool 变更 warn 列表
     system_prompt: str | None = None,  # D1 Task 4 fix:subagent override
     todo_service: "TodoService | None" = None,  # D1 Task 7:TodoService 实例,非 None 时自动构造 SubAgentRunner + 注入 extras
     session_id: str = "",  # D1 Task 7:handler 用作 active_sessions(显式,不靠 env var)
@@ -265,16 +267,20 @@ async def run_turn(
         if qa_context and qa_context.get("q_type") is not None:
             _refresh_system_prompt(
                 messages, cwd, mode,
-                extra_ctx={"qa_category": qa_context["q_type"], **_neg_extra, **_e1_extra},
+                extra_ctx={"qa_category": qa_context["q_type"], **_neg_extra, **_e1_extra,
+                           "e3_prior_messages": prior_messages},  # E3
                 resume_task=resume_task,
                 todo_hints=todo_hints,
+                tool_diff=tool_diff,  # E3 D7
             )
         else:
             _refresh_system_prompt(
                 messages, cwd, mode,
-                extra_ctx={**_neg_extra, **_e1_extra},
+                extra_ctx={**_neg_extra, **_e1_extra,
+                           "e3_prior_messages": prior_messages},  # E3
                 resume_task=resume_task,
                 todo_hints=todo_hints,
+                tool_diff=tool_diff,  # E3 D7
             )
 
     # --- Q3 Task7: 分层记忆 pre-turn 注入 ---
@@ -837,7 +843,9 @@ def _pending_to_openai_tc(p) -> dict:
 def _refresh_system_prompt(messages: list[dict], cwd: str, mode: str,
                            extra_ctx: dict | None = None,
                            resume_task: "TodoTask | None" = None,
-                           todo_hints: list[str] | None = None) -> None:
+                           todo_hints: list[str] | None = None,
+                           prior_messages: list[dict] | None = None,  # E3 D1
+                           tool_diff: list[str] | None = None) -> None:  # E3 D7
     """Insert or update the system prompt at messages[0] for the current mode.
 
     `extra_ctx` (Phase 1 Q1 uplift) is merged into the composer ctx so callers
@@ -969,6 +977,20 @@ def _refresh_system_prompt(messages: list[dict], cwd: str, mode: str,
     if mode == "coding" and _has_recent_htn_parent_create(messages):
         new = new.rstrip() + "\n\n" + SUBAGENT_HINTS_BLOCK.strip() + "\n"
     messages[0]["content"] = new
+
+    # E3 D7:tool 变更 warn — 新 session 启动时 mcp tool 列表变化列表写入 system。
+    # Idempotent:旧 block 在 inject 前 strip 掉(沿 `<resume_task>` pattern)。
+    if tool_diff:
+        # strip old
+        import re as _re
+        messages[0]["content"] = _re.sub(
+            r"\n<cross_session_tools>.*?</cross_session_tools>\n",
+            "",
+            messages[0]["content"],
+            flags=_re.DOTALL,
+        )
+        tool_block = "\n<cross_session_tools>\n" + "\n".join(tool_diff) + "\n</cross_session_tools>\n"
+        messages[0]["content"] += tool_block
 
 
 def _has_recent_htn_parent_create(messages: list[dict], lookback: int = 4) -> bool:
