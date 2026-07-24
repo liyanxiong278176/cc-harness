@@ -20,6 +20,7 @@ import yaml
 
 from cc_harness.project.exceptions import ManifestError as _ManifestError
 from cc_harness.project.models import (
+    CrossSessionMode,
     LiveConfig,
     Manifest,
     MemoryConfig,
@@ -139,6 +140,17 @@ def _parse_manifest(data: dict, source: str) -> Manifest:
             f"{source}: resume_mode={resume_mode!r} not in {_VALID_RESUME_MODES}"
         )
 
+    # 3.5) cross_session_mode (E3 D4)
+    raw_cross_session_mode = data.get("cross_session_mode", "last_only")
+    try:
+        cross_session_mode = CrossSessionMode(raw_cross_session_mode)
+    except ValueError as e:
+        raise ManifestError(
+            f"{source}: cross_session_mode={raw_cross_session_mode!r} "
+            f"must be one of {[m.value for m in CrossSessionMode]} "
+            f"(allowed: off / last_only / ask)"
+        ) from e
+
     # 4) created_at
     created_at_raw = data["created_at"]
     try:
@@ -158,7 +170,7 @@ def _parse_manifest(data: dict, source: str) -> Manifest:
     _warn_unknown_fields(
         data, source=source,
         known=set(_REQUIRED_FIELDS) | {
-            "schema_version", "resume_mode", "memory", "live",
+            "schema_version", "resume_mode", "memory", "live", "cross_session_mode",
         },
     )
 
@@ -171,6 +183,7 @@ def _parse_manifest(data: dict, source: str) -> Manifest:
         memory=memory,
         resume_mode=resume_mode,  # type: ignore[arg-type]
         live=live,
+        cross_session_mode=cross_session_mode,
     )
 
 

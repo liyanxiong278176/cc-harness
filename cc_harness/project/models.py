@@ -8,6 +8,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from datetime import datetime
+from enum import Enum
 from typing import Literal
 
 # ---------------------------------------------------------------------------
@@ -194,12 +195,19 @@ class LiveConfig:
     fold_done: int = 5
 
 
+class CrossSessionMode(str, Enum):
+    """E3 D4: 跨 session 自动续接模式(spec 组件 3 字面 lock)。"""
+    OFF = "off"
+    LAST_ONLY = "last_only"
+    ASK = "ask"
+
+
 @dataclass
 class Manifest:
     """`.cc-harness/project.yaml` 反序列化结果(组件 1)。
 
     必填:project_id / name / todos_path / created_at
-    可选(全部带默认):schema_version / memory / resume_mode / live
+    可选(全部带默认):schema_version / memory / resume_mode / live / cross_session_mode
     """
 
     # --- 必填 ---
@@ -213,6 +221,8 @@ class Manifest:
     memory: MemoryConfig = field(default_factory=MemoryConfig)
     resume_mode: ResumeMode = "ask"
     live: LiveConfig = field(default_factory=LiveConfig)
+    # E3 D4: 跨 session 自动续接配置
+    cross_session_mode: CrossSessionMode = CrossSessionMode.LAST_ONLY
 
 
 # ---------------------------------------------------------------------------

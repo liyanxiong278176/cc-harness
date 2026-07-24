@@ -11,7 +11,7 @@ from cc_harness.project.manifest import (
     load_manifest,
     save_manifest,
 )
-from cc_harness.project.models import Manifest
+from cc_harness.project.models import CrossSessionMode, Manifest
 
 
 # ---------------------------------------------------------------------------
@@ -431,3 +431,68 @@ def test_load_manifest_invalid_live_max_height(tmp_path):
     )
     with pytest.raises(ManifestError, match="max_height"):
         load_manifest(proj)
+
+
+# ---------------------------------------------------------------------------
+# E3 T3: cross_session_mode 字段 + 校验(spec 组件 3 / D4)
+# ---------------------------------------------------------------------------
+
+
+def test_manifest_default_cross_session_mode_is_last_only():
+    """E3 D4: Manifest 默认 cross_session_mode = LAST_ONLY。"""
+    m = Manifest(
+        project_id="p1", name="test", todos_path="t",
+        created_at=datetime(2026, 7, 24, 10, 0, 0, tzinfo=timezone.utc),
+    )
+    assert m.cross_session_mode == CrossSessionMode.LAST_ONLY
+
+
+def test_manifest_cross_session_mode_rejects_invalid(tmp_path):
+    """E3 D4: 非法 cross_session_mode 值 → ManifestError。"""
+    proj = tmp_path / "p"
+    proj.mkdir()
+    cc = proj / ".cc-harness"
+    cc.mkdir()
+    (cc / "project.yaml").write_text(
+        "project_id: x\nname: y\ntodos_path: t\n"
+        "created_at: 2026-07-24T10:00:00Z\n"
+        "cross_session_mode: always\n",  # 非法 — 必须是 off/last_only/ask
+        encoding="utf-8",
+    )
+    with pytest.raises(ManifestError, match="cross_session_mode"):
+        load_manifest(proj)
+
+
+def test_manifest_cross_session_mode_yaml_roundtrip_off(tmp_path):
+    """E3 D4: yaml 写 cross_session_mode=off → load 后值对。"""
+    proj = tmp_path / "p"
+    proj.mkdir()
+    cc = proj / ".cc-harness"
+    cc.mkdir()
+    # 'off' 必须加引号,否则 YAML 1.1 把它解析为布尔 False
+    (cc / "project.yaml").write_text(
+        "project_id: x\nname: y\ntodos_path: t\n"
+        "created_at: 2026-07-24T10:00:00Z\n"
+        "cross_session_mode: 'off'\n",
+        encoding="utf-8",
+    )
+    m = load_manifest(proj)
+    assert m is not None
+    assert m.cross_session_mode == CrossSessionMode.OFF
+
+
+def test_manifest_cross_session_mode_yaml_roundtrip_ask(tmp_path):
+    """E3 D4: yaml 写 cross_session_mode=ask → load 后值对。"""
+    proj = tmp_path / "p"
+    proj.mkdir()
+    cc = proj / ".cc-harness"
+    cc.mkdir()
+    (cc / "project.yaml").write_text(
+        "project_id: x\nname: y\ntodos_path: t\n"
+        "created_at: 2026-07-24T10:00:00Z\n"
+        "cross_session_mode: ask\n",
+        encoding="utf-8",
+    )
+    m = load_manifest(proj)
+    assert m is not None
+    assert m.cross_session_mode == CrossSessionMode.ASK
