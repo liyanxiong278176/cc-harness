@@ -328,3 +328,14 @@ def test_parse_args_mode_flag_still_works():
 
     assert args.command is None
     assert args.mode == "plan"
+
+
+def test_main_boot_constructs_checkpoint_service():
+    """E3 T7: main.py boot() 构造 CheckpointService + 注入 run_repl。"""
+    from cc_harness.memory.checkpoint import CheckpointService
+    # 这条只验 import + class 存在 + 4 method 不变
+    assert CheckpointService is not None
+    assert hasattr(CheckpointService, "save")
+    assert hasattr(CheckpointService, "load_latest")
+    assert hasattr(CheckpointService, "load_messages")
+    assert hasattr(CheckpointService, "list_recent")

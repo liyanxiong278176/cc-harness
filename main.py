@@ -281,6 +281,14 @@ def main() -> None:
                 if "retriever" in _mem_deps and _mem_deps["retriever"] is not None:
                     _mem_deps["retriever"].drift_detector = _drift_detector
 
+            # E3 T7:构造 CheckpointService(同 E4 I-1 / E2 T2.3 wiring pattern)。
+            # _mem_deps is None → silent no-op(run_repl 收到 None 时 _maybe_load_cross_session 跳过)。
+            from cc_harness.memory.checkpoint import CheckpointService
+            mem_store = _mem_deps.get("store") if _mem_deps else None
+            _checkpoint_service = (
+                CheckpointService(mem_store) if mem_store is not None else None
+            )
+
             # Pre-warm sandbox server when backend=sandbox.
             # Why: ensure_server() currently only fires on the first command,
             # which (a) hides config errors until something breaks, and
@@ -327,6 +335,8 @@ def main() -> None:
                 reflection_engine=_reflection_engine,           # E2 T2.3
                 drift_detector=_drift_detector,                  # E5 漂移检测
                 e1_decompose_enabled=_policy.e1_decompose_enabled,  # E1 D7: kill-switch 透传
+                checkpoint_service=_checkpoint_service,  # E3 T7
+                manifest=None,  # E3 T7:boot() 当前无 manifest 局部变量,silent no-op
             )
         finally:
             await mcp.shutdown()

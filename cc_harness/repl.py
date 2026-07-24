@@ -190,6 +190,8 @@ async def run_repl(
     memory_extras: list | None = None,
     mem_deps: dict | None = None,
     e1_decompose_enabled: bool = True,  # E1 D7:kill-switch 透传 main.py → agent.run_turn
+    checkpoint_service: object | None = None,  # E3 T7:由 main.py boot() 构造注入
+    manifest: object | None = None,  # E3 T7:由 main.py 透传(可为 None)
 ) -> None:
     """Run the interactive REPL.
 
@@ -213,7 +215,10 @@ async def run_repl(
         mode=default_mode,
         context_config=context_config or ContextConfig(),
         session_id=f"repl-{int(time.time())}-{_uuid.uuid4().hex[:8]}",
+        checkpoint_service=checkpoint_service,  # E3 T7
     )
+    if manifest is not None:
+        state.manifest = manifest
     state.started_at = datetime.now().isoformat()
 
     # Q3 Task8: 加载分层记忆 config(kill-switches:layered_inject/capture_enabled/pipeline_enabled)
