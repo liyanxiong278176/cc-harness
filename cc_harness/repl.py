@@ -101,6 +101,8 @@ class ReplState:
     tool_hash_snapshot: dict[str, str] = field(default_factory=dict)
     cross_session_tools_diff: list[str] = field(default_factory=list)
     started_at: str = ""
+    # E3 D6:上次 session fan-out 中断的 subagent 列表(load 时填)
+    subagent_cancelled: list[str] = field(default_factory=list)
 
 
 async def _read_user(prompt: str) -> str:
@@ -786,11 +788,29 @@ async def _maybe_load_cross_session(state, console, mcp, mode) -> None:
         state.cross_session_tools_diff = _diff_tool_hash(old_hash, new_hash)
     except Exception:
         pass
-    console.print(
-        f"\n🔁 续接上次 session({candidate.session_id}): mode={candidate.mode}, "
-        f"{candidate.turn_counter} 轮, 结束 {candidate.ended_at}",
-        markup=False,
+    # E3 D6:in-progress subagent cancelled 标记(load candidate.extra)
+    state.subagent_cancelled = list(candidate.extra.get("in_progress_subagents", []))
+
+    # E3 D7:跨 session 摘要渲染(T5 函数 + 第 4 形参 in_progress_subagents)
+    from cc_harness.render import print_cross_session_summary
+    print_cross_session_summary(
+        console, candidate,
+        tool_diff=state.cross_session_tools_diff,
+        in_progress_subagents=state.subagent_cancelled,
     )
+
+    # E3 D5:启动后自动 memory_recall(query=project name) — silent fallback
+    if state.mem_deps:
+        try:
+            from cc_harness.memory.recall import layered_recall
+            retriever = state.mem_deps.get("retriever")
+            persona_path = state.mem_deps.get("persona_path")
+            scenarios_dir = state.mem_deps.get("scenarios_dir")
+            query = str(state.project_root.name) if state.project_root else ""
+            if retriever is not None and persona_path is not None and scenarios_dir is not None:
+                await layered_recall(retriever, persona_path, scenarios_dir, query)
+        except Exception:
+            pass  # silent fallback — repl 启动不挂
 
 
 def _sha256_of_tool(tool) -> str:
