@@ -932,3 +932,51 @@ async def test_repl_reject_handles_todo_service_failure():
     result = await _handle_slash("/reject", state, _console())
     assert result is True
     assert state.decomposition_rejected is True
+
+
+@pytest.mark.asyncio
+async def test_repl_state_has_e3_checkpoint_fields():
+    """E3 D4/D7:ReplState 加 5 checkpoint 字段,默认值正确。"""
+    from cc_harness.repl import ReplState
+    state = ReplState()
+    assert state.checkpoint_service is None
+    assert state.checkpoint_path is None
+    assert state.last_loaded_session_id is None
+    assert state.tool_hash_snapshot == {}
+    assert state.cross_session_tools_diff == []
+
+
+@pytest.mark.asyncio
+async def test_maybe_load_cross_session_off_mode_skips():
+    """E3 D4:cross_session_mode=off → _maybe_load_cross_session 不调 load_latest。"""
+    from cc_harness.repl import _maybe_load_cross_session, ReplState
+    from cc_harness.project.models import Manifest, CrossSessionMode
+    state = ReplState()
+    state.manifest = Manifest(project_id="p1", name="test", todos_path="t.yaml", created_at="2026-07-24T10:00:00", cross_session_mode=CrossSessionMode.OFF)
+    mock_svc = MagicMock()
+    state.checkpoint_service = mock_svc
+    await _maybe_load_cross_session(state, console=MagicMock(), mcp=MagicMock(), mode="coding")
+    mock_svc.load_latest.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_maybe_load_cross_session_last_only_loads_silently():
+    """E3 D4:cross_session_mode=last_only → 静默 load,state.messages 替换。"""
+    from cc_harness.repl import _maybe_load_cross_session, ReplState
+    from cc_harness.project.models import Manifest, CrossSessionMode
+    from cc_harness.memory.checkpoint import CheckpointRecord
+    import pathlib
+    state = ReplState()
+    state.manifest = Manifest(project_id="p1", name="test", todos_path="t.yaml", created_at="2026-07-24T10:00:00", cross_session_mode=CrossSessionMode.LAST_ONLY)
+    state.project_root = pathlib.Path("/tmp")
+    candidate = CheckpointRecord(session_id="old1", project_root=pathlib.Path("/tmp"), mode="coding", turn_counter=3, started_at="2026-07-24T09:00:00", ended_at="2026-07-24T09:05:00", cross_session_mode="last_only", extra={})
+    state.checkpoint_service = MagicMock()
+    state.checkpoint_service.load_latest = AsyncMock(return_value=candidate)
+    state.checkpoint_service.load_messages = AsyncMock(return_value=[{"role": "user", "content": "hi from old"}])
+    mcp = MagicMock()
+    mcp.list_tools = AsyncMock(return_value=[])
+    await _maybe_load_cross_session(state, console=MagicMock(), mcp=mcp, mode="coding")
+    assert state.messages == [{"role": "user", "content": "hi from old"}]
+    assert state.last_loaded_session_id == "old1"
+    assert state.mode == "coding"
+    assert state.turn_counter == 0

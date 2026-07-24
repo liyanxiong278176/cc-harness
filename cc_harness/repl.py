@@ -18,6 +18,7 @@ import logging
 import os
 import time
 import uuid as _uuid
+from datetime import datetime
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -92,6 +93,14 @@ class ReplState:
     decomposition_rejected: bool = False
     last_decomp_todo_ids: list[str] = field(default_factory=list)
     last_decomp_summary: str | None = None
+    # E3 D4:跨 session 自动续接 — checkpoint_service 由 main.py:boot() 构造注入(T7);
+    # 若 None 则 _maybe_load_cross_session silent no-op(沿 reflection_engine 模式)。
+    checkpoint_service: object | None = None
+    checkpoint_path: Path | None = None
+    last_loaded_session_id: str | None = None
+    tool_hash_snapshot: dict[str, str] = field(default_factory=dict)
+    cross_session_tools_diff: list[str] = field(default_factory=list)
+    started_at: str = ""
 
 
 async def _read_user(prompt: str) -> str:
@@ -205,6 +214,7 @@ async def run_repl(
         context_config=context_config or ContextConfig(),
         session_id=f"repl-{int(time.time())}-{_uuid.uuid4().hex[:8]}",
     )
+    state.started_at = datetime.now().isoformat()
 
     # Q3 Task8: 加载分层记忆 config(kill-switches:layered_inject/capture_enabled/pipeline_enabled)
     from cc_harness.memory.config import load_memory_config
@@ -356,6 +366,13 @@ async def run_repl(
         except Exception as e:
             print_warn(console, f"resume 检测失败: {e}; 不 attach")
 
+    # E3 D4:跨 session 续接 — 优先级在 resume ask 之前
+    if state.checkpoint_service is not None and state.manifest is not None:
+        try:
+            await _maybe_load_cross_session(state, console, mcp, default_mode)
+        except Exception as e:
+            print_warn(console, f"cross-session load failed: {e}; 不 attach")
+
     try:
         while True:
             try:
@@ -477,6 +494,29 @@ async def run_repl(
             # can see real file state without F5-ing their file manager.
             _print_disk_changes(console, cwd, since=turn_start)
     finally:
+        # E3 D4:session 结束时 save checkpoint(T7 main.py 注入 checkpoint_service)。
+        if state.checkpoint_service is not None and state.messages and state.session_id:
+            try:
+                from datetime import datetime as _dt
+                cross_session_mode_value = (
+                    state.manifest.cross_session_mode.value
+                    if state.manifest is not None
+                    and getattr(state.manifest, "cross_session_mode", None) is not None
+                    else "last_only"
+                )
+                await state.checkpoint_service.save(
+                    session_id=state.session_id,
+                    project_root=state.project_root or Path(cwd),
+                    mode=state.mode,
+                    turn_counter=state.turn_counter,
+                    started_at=state.started_at or _dt.now().isoformat(),
+                    ended_at=_dt.now().isoformat(),
+                    cross_session_mode=cross_session_mode_value,
+                    messages=state.messages,
+                    extra={"tool_hash_snapshot": state.tool_hash_snapshot},
+                )
+            except Exception as e:
+                print_warn(console, f"checkpoint save failed: {e}")
         # Task 6: 退出前 stop live panel(避免 dangling Rich Live 影响 terminal)
         if getattr(state, "live_panel", None) is not None:
             try:
@@ -692,6 +732,80 @@ async def _maybe_ask_resume(console: Console, candidate, tasks) -> object | None
         return None
     # 其它输入按 n 处理
     return None
+
+
+async def _maybe_load_cross_session(state, console, mcp, mode) -> None:
+    """E3 D4/D5/D7:按 manifest.cross_session_mode 决策 + 加载旧 session 上下文。"""
+    if state.manifest is None or state.checkpoint_service is None:
+        return
+    cross_session_mode = getattr(state.manifest, "cross_session_mode", None)
+    if cross_session_mode is None or cross_session_mode.value == "off":
+        return
+    if state.project_root is None:
+        return
+    try:
+        candidate = await state.checkpoint_service.load_latest(state.project_root)
+    except Exception as e:
+        print_warn(console, f"checkpoint load_latest failed: {e}")
+        return
+    if candidate is None:
+        return
+    if cross_session_mode.value == "ask":
+        try:
+            ans = (await _read_user(
+                f"\n[cross-session] 检测到上次 session({candidate.session_id}, "
+                f"mode={candidate.mode}, {candidate.turn_counter} 轮, "
+                f"结束于 {candidate.ended_at})。续接? [Y/n]: "
+            )).strip().lower()
+        except (EOFError, KeyboardInterrupt):
+            ans = "n"
+        if ans in ("n", "no"):
+            return
+    try:
+        messages = await state.checkpoint_service.load_messages(candidate.session_id)
+    except Exception as e:
+        print_warn(console, f"checkpoint load_messages failed: {e}")
+        return
+    state.messages = messages
+    state.last_loaded_session_id = candidate.session_id
+    state.mode = candidate.mode
+    state.turn_counter = 0
+    state.decomposition_rejected = False
+    state.last_decomp_summary = None
+    state.last_decomp_todo_ids = []
+    try:
+        new_tools = await mcp.list_tools()
+        new_hash = {t.name: _sha256_of_tool(t) for t in new_tools}
+        state.tool_hash_snapshot = new_hash
+        old_hash = candidate.extra.get("tool_hash_snapshot", {})
+        state.cross_session_tools_diff = _diff_tool_hash(old_hash, new_hash)
+    except Exception:
+        pass
+    console.print(
+        f"\n🔁 续接上次 session({candidate.session_id}): mode={candidate.mode}, "
+        f"{candidate.turn_counter} 轮, 结束 {candidate.ended_at}",
+        markup=False,
+    )
+
+
+def _sha256_of_tool(tool) -> str:
+    """D7: mcp tool → sha256 hex of params。"""
+    import json as _json
+    params = getattr(tool, "params", {})
+    return f"sha256:{hashlib.sha256(_json.dumps(params, sort_keys=True).encode()).hexdigest()[:16]}"
+
+
+def _diff_tool_hash(old: dict, new: dict) -> list[str]:
+    """D7:比对 tool hash → 返回 +X / -Y / ~X 列表。"""
+    diff = []
+    for name in sorted(set(old) | set(new)):
+        if name not in old:
+            diff.append(f"+{name}")
+        elif name not in new:
+            diff.append(f"-{name}")
+        elif old[name] != new[name]:
+            diff.append(f"~{name}")
+    return diff
 
 
 # --- Disk change summary (printed after each LLM turn) ---
