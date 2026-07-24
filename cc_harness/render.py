@@ -201,3 +201,35 @@ def print_compaction_summary(console: Console, label: str, stats) -> None:
     if stats.error:
         console.print(f"⚠ 压缩异常: {stats.error}", highlight=False)
     _flush(console)
+
+
+def print_cross_session_summary(
+    console: "Console",
+    candidate,
+    tool_diff: list[str],
+    in_progress_subagents: list[str] | None = None,
+) -> None:
+    """E3 D4/D6/D7:新 session 启动时,若 load 了旧 session 上下文,渲染摘要。
+
+    Args:
+        console: rich.console.Console 实例
+        candidate: CheckpointRecord(loaded checkpoint 元数据)
+        tool_diff: D7 hash diff 列表,+X / -X / ~X 形式
+        in_progress_subagents: D6 cancelled subagent id 列表(可空)
+    """
+    in_progress_subagents = in_progress_subagents or []
+    lines = [
+        f"🔁 续接上次 session({candidate.session_id}):",
+        f"  • 模式: {candidate.mode}",
+        f"  • 轮次: {candidate.turn_counter}",
+        f"  • 结束: {candidate.ended_at}",
+    ]
+    if tool_diff:
+        added = sum(1 for d in tool_diff if d.startswith("+"))
+        removed = sum(1 for d in tool_diff if d.startswith("-"))
+        lines.append(f"  • 工具变更: +{added} -{removed}")
+    if in_progress_subagents:
+        lines.append(
+            f"  • 上次 fan-out 中断的 subagent:{len(in_progress_subagents)} 个已标 cancelled"
+        )
+    console.print("\n".join(lines), markup=False)

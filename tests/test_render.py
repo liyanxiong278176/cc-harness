@@ -11,6 +11,8 @@ Per the current design:
   - print_warn uses ⚠, print_error uses ✗, print_info is plain
 """
 from io import StringIO
+import pathlib
+from unittest.mock import MagicMock
 from rich.console import Console as C
 from cc_harness.render import (
     print_thought, print_action, print_observation, print_result,
@@ -321,3 +323,49 @@ def test_print_token_summary_no_summary_bucket_when_zero():
     print_token_summary(c, "本轮", stats)
     text = buf.getvalue()
     assert "摘要" not in text
+
+
+# --- print_cross_session_summary (E3 T5) ---
+
+def test_print_cross_session_summary_no_diff():
+    """E3 D4: 无 tool 变更 + 无 in-progress subagent → 简洁摘要。"""
+    from cc_harness.render import print_cross_session_summary
+    from cc_harness.memory.checkpoint import CheckpointRecord
+
+    console = MagicMock()
+    candidate = CheckpointRecord(
+        session_id="old1", project_root=pathlib.Path("/tmp"),
+        mode="coding", turn_counter=3,
+        started_at="2026-07-24T09:00:00",
+        ended_at="2026-07-24T09:05:00",
+        cross_session_mode="last_only", extra={},
+    )
+    print_cross_session_summary(console, candidate, tool_diff=[], in_progress_subagents=[])
+    call_str = " ".join(str(c) for c in console.print.call_args_list)
+    assert "续接上次 session" in call_str
+    assert "coding" in call_str
+    assert "工具变更" not in call_str
+
+
+def test_print_cross_session_summary_with_diff_and_subagents():
+    """E3 D6/D7: 有 tool 变更 + 有 cancelled subagent → 完整摘要。"""
+    from cc_harness.render import print_cross_session_summary
+    from cc_harness.memory.checkpoint import CheckpointRecord
+
+    console = MagicMock()
+    candidate = CheckpointRecord(
+        session_id="old2", project_root=pathlib.Path("/p"),
+        mode="coding", turn_counter=5,
+        started_at="2026-07-24T10:00:00",
+        ended_at="2026-07-24T10:10:00",
+        cross_session_mode="last_only", extra={},
+    )
+    print_cross_session_summary(
+        console, candidate,
+        tool_diff=["+newtool", "-oldtool"],
+        in_progress_subagents=["sa1", "sa2"],
+    )
+    call_str = " ".join(str(c) for c in console.print.call_args_list)
+    assert "工具变更" in call_str
+    assert "cancelled" in call_str or "取消" in call_str
+    assert "2" in call_str  # 2 个 subagent
