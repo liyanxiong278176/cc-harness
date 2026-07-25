@@ -27,24 +27,28 @@ async def capture(store, session_id: str, messages: list[dict], turn_idx: int) -
     from cc_harness.memory.extract import extract_dates, extract_entities, extract_keywords
 
     assert store._db is not None
-    await store._db.execute(
-        "DELETE FROM conversation WHERE session_id=? AND turn_idx=?",
-        (session_id, turn_idx))
-    ts = time.time()
-    for m in messages:
-        role = m.get("role", "?")
-        if role == "system":
-            continue
-        content = m.get("content", "")
-        if isinstance(content, list):
-            content = "<multimodal>"
-        text = str(content)
-        # Phase 3: L0 同步抽 dates/entities/keywords
-        dates = _join(extract_dates(text))
-        entities = _join(extract_entities(text))
-        keywords = _join(extract_keywords(text, n=5))
+    await store._db.execute("BEGIN")
+    try:
         await store._db.execute(
-            "INSERT INTO conversation(session_id,turn_idx,role,content,ts,"
-            "dates,entities,keywords) VALUES(?,?,?,?,?,?,?,?)",
-            (session_id, turn_idx, role, text, ts, dates, entities, keywords))
+            "DELETE FROM conversation WHERE session_id=? AND turn_idx=?",
+            (session_id, turn_idx))
+        ts = time.time()
+        for m in messages:
+            role = m.get("role", "?")
+            if role == "system":
+                continue
+            content = m.get("content", "")
+            if isinstance(content, list):
+                content = "<multimodal>"
+            text = str(content)
+            dates = _join(extract_dates(text))
+            entities = _join(extract_entities(text))
+            keywords = _join(extract_keywords(text, n=5))
+            await store._db.execute(
+                "INSERT INTO conversation(session_id,turn_idx,role,content,ts,"
+                "dates,entities,keywords) VALUES(?,?,?,?,?,?,?,?)",
+                (session_id, turn_idx, role, text, ts, dates, entities, keywords))
+    except BaseException:
+        await store._db.rollback()
+        raise
     await store._db.commit()

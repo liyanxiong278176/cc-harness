@@ -34,7 +34,7 @@ class EmbeddingClient:
             self._client = httpx.AsyncClient(
                 base_url=self.base_url,
                 headers={"Authorization": f"Bearer {self.api_key}"},
-                timeout=self.timeout_s,
+                timeout=httpx.Timeout(self.timeout_s, connect=self.timeout_s, read=self.timeout_s, write=self.timeout_s, pool=self.timeout_s),
             )
         return self._client
 

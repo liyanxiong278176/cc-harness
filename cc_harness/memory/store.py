@@ -1,11 +1,15 @@
 """SQLite + sqlite-vec memory storage. Pure CRUD — no LLM, no orchestration."""
 from __future__ import annotations
+import logging
+import re
 import time
 import uuid
 from dataclasses import dataclass
 from pathlib import Path
 import aiosqlite
 import numpy as np
+
+logger = logging.getLogger(__name__)
 
 try:
     import sqlite_vec
@@ -206,6 +210,22 @@ class MemoryStore:
                 "CREATE INDEX IF NOT EXISTS idx_session_message_session_turn "
                 "ON session_message(session_id, turn_idx)"
             )
+        # vec0 维度迁移校验:若已建的 vec_memories 列维度与当前配置不符,
+        # 继续插入会静默损坏向量列 → 告警(不自动重建,避免误删数据)。
+        try:
+            vrow = await (await self._db.execute(
+                "SELECT sql FROM sqlite_master WHERE type='table' AND name='vec_memories'"
+            )).fetchone()
+            if vrow and vrow[0]:
+                m = re.search(r"float\[(\d+)\]", vrow[0])
+                if m and int(m.group(1)) != self.embedding_dim:
+                    logger.warning(
+                        "vec_memories 维度 %s 与配置 embedding_dim %s 不符;"
+                        "新插入将损坏向量列,请手动重建 vec_memories 表",
+                        m.group(1), self.embedding_dim,
+                    )
+        except Exception as e:
+            logger.warning("vec_memories 维度校验失败: %s", e)
         await self._db.commit()
 
     async def add_conversation(
@@ -227,7 +247,7 @@ class MemoryStore:
         await self._db.commit()
 
     async def add(self, text: str, embedding: list[float], source: str,
-                  session_id: str | None = None) -> Memory:
+                  session_id: str | None = None, layer: str = "L1") -> Memory:
         assert self._db is not None, "init_schema first"
         if len(embedding) != self.embedding_dim:
             raise ValueError(f"embedding dim {len(embedding)} != configured {self.embedding_dim}")
@@ -238,13 +258,14 @@ class MemoryStore:
             created_at=time.time(),
             updated_at=time.time(),
             source=source,
+            layer=layer,
             session_id=session_id,
         )
         blob = _vec_to_blob(embedding)
         await self._db.execute(
-            "INSERT INTO memories (id, text, embedding, created_at, updated_at, source, session_id) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?)",
-            (mem.id, mem.text, blob, mem.created_at, mem.updated_at, mem.source, mem.session_id),
+            "INSERT INTO memories (id, text, embedding, created_at, updated_at, source, layer, session_id) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            (mem.id, mem.text, blob, mem.created_at, mem.updated_at, mem.source, mem.layer, mem.session_id),
         )
         await self._db.execute(
             "INSERT INTO vec_memories (id, embedding) VALUES (?, ?)",
@@ -259,24 +280,33 @@ class MemoryStore:
             raise ValueError(f"embedding dim {len(embedding)} != configured {self.embedding_dim}")
         now = time.time()
         blob = _vec_to_blob(embedding)
-        await self._db.execute(
-            "UPDATE memories SET text=?, embedding=?, updated_at=? WHERE id=?",
-            (text, blob, now, id),
-        )
-        await self._db.execute(
-            "UPDATE vec_memories SET embedding=? WHERE id=?",
-            (blob, id),
-        )
-        await self._db.commit()
+        try:
+            await self._db.execute(
+                "UPDATE memories SET text=?, embedding=?, updated_at=? WHERE id=?",
+                (text, blob, now, id),
+            )
+            await self._db.execute(
+                "UPDATE vec_memories SET embedding=? WHERE id=?",
+                (blob, id),
+            )
+            await self._db.commit()
+        except Exception:
+            # 两条 UPDATE 在同一隐式事务内;任一失败回滚,避免 text/vector 不一致
+            await self._db.rollback()
+            raise
         fetched = await self.get(id)
         assert fetched is not None
         return fetched
 
     async def delete(self, id: str) -> bool:
         assert self._db is not None
-        cur = await self._db.execute("DELETE FROM memories WHERE id=?", (id,))
-        await self._db.execute("DELETE FROM vec_memories WHERE id=?", (id,))
-        await self._db.commit()
+        try:
+            cur = await self._db.execute("DELETE FROM memories WHERE id=?", (id,))
+            await self._db.execute("DELETE FROM vec_memories WHERE id=?", (id,))
+            await self._db.commit()
+        except Exception:
+            await self._db.rollback()
+            raise
         return cur.rowcount > 0
 
     async def get(self, id: str) -> Memory | None:
@@ -389,19 +419,20 @@ class MemoryStore:
             scores = [r[1] for r in rows]
             placeholders = ",".join("?" * len(rowids))
             mem_cur = await self._db.execute(
-                f"SELECT id, text, embedding, created_at, updated_at, source, layer, session_id "
+                f"SELECT id, text, embedding, created_at, updated_at, source, layer, session_id, rowid "
                 f"FROM memories WHERE rowid IN ({placeholders})",
                 rowids,
             )
             mem_rows = await mem_cur.fetchall()
             mem_by_rowid = {
-                idx: Memory(id=r[0], text=r[1], embedding=_blob_to_vec(r[2]),
+                r[8]: Memory(id=r[0], text=r[1], embedding=_blob_to_vec(r[2]),
                             created_at=r[3], updated_at=r[4], source=r[5],
                             layer=r[6], session_id=r[7])
-                for idx, r in zip(rowids, mem_rows)
+                for r in mem_rows
             }
             return [(mem_by_rowid[i], s) for i, s in zip(rowids, scores) if i in mem_by_rowid]
-        except Exception:
+        except Exception as e:
+            logger.warning("search_fts failed, returning []: %s", e)
             return []
 
     async def close(self) -> None:

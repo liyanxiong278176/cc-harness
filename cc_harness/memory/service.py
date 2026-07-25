@@ -5,10 +5,13 @@ EmbeddingClient, MemoryStore, and LLMDecider. The 4-step flow is:
 from __future__ import annotations
 import sqlite3
 import time
+import logging
 from dataclasses import dataclass
 
 from cc_harness.memory.embedding import EmbeddingError
 from cc_harness.memory.decider import Decision, DecisionResult
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -40,6 +43,9 @@ class MemoryService:
         try:
             embedding = await self.embedder.embed(text)
             similar = await self.store.search_similar(embedding, k=5)
+            # 冲突检测用的 embedding:ADD/DELETE 用原文 embedding;UPDATE 用 merged 后的
+            # new_embedding(与写盘行一致),否则会用错邻域漏检真实矛盾。
+            conflict_embedding = embedding
             if not similar:
                 decision = DecisionResult(action=Decision.ADD)
             else:
@@ -61,6 +67,7 @@ class MemoryService:
                 old = await self.store.get(decision.target_id)
                 new_embedding = await self.embedder.embed(decision.merged_text)
                 mem = await self.store.update(decision.target_id, decision.merged_text, new_embedding)
+                conflict_embedding = new_embedding
                 result_action_mem = mem
                 result = SaveResult(action="UPDATE", memory=mem, previous=old, duration_ms=_ms(t0))
 
@@ -81,7 +88,7 @@ class MemoryService:
                 try:
                     from cc_harness.memory.maintenance.conflict import ConflictDetector
                     det = ConflictDetector(self.decider._llm)
-                    similar_for_conflict = await self.store.search_similar(embedding, k=5)
+                    similar_for_conflict = await self.store.search_similar(conflict_embedding, k=5)
                     verdicts = await det.check(result_action_mem, similar_for_conflict)
                     for v in verdicts:
                         if v.action == "delete_old":
@@ -91,8 +98,8 @@ class MemoryService:
                             return SaveResult(action="ROLLBACK",
                                               error=f"conflict:{v.verdict}",
                                               duration_ms=_ms(t0))
-                except Exception:
-                    pass  # 矛盾检测失败不阻塞
+                except Exception as e:
+                    logger.warning("memory conflict check failed: %s", e)
 
             # E5 drift 检测(写盘后, 复用 E2 reflection engine 写 source='drift')
             # similar_for_conflict 来自上面 search_similar,直接复用不重查
@@ -107,8 +114,8 @@ class MemoryService:
                         new_memory=result_action_mem,
                         similar=similar_mems,
                     )
-                except Exception:
-                    pass  # E5 fail-soft 不阻塞主 save
+                except Exception as e:
+                    logger.warning("memory drift check failed: %s", e)
 
             return result
 
@@ -141,13 +148,18 @@ class MemoryService:
             return 0
         ids = [r[0] for r in rows]
         placeholders = ",".join("?" * len(ids))
-        del_cur = await self.store._db.execute(
-            f"DELETE FROM memories WHERE id IN ({placeholders})", ids
-        )
-        await self.store._db.execute(
-            f"DELETE FROM vec_memories WHERE id IN ({placeholders})", ids
-        )
-        await self.store._db.commit()
+        try:
+            del_cur = await self.store._db.execute(
+                f"DELETE FROM memories WHERE id IN ({placeholders})", ids
+            )
+            await self.store._db.execute(
+                f"DELETE FROM vec_memories WHERE id IN ({placeholders})", ids
+            )
+            await self.store._db.commit()
+        except Exception:
+            # 两条 DELETE 同一事务;任一失败回滚,避免 memories/vec 不一致
+            await self.store._db.rollback()
+            raise
         return del_cur.rowcount
 
 

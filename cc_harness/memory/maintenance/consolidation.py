@@ -2,7 +2,6 @@
 from __future__ import annotations
 import json
 import math
-import re
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
@@ -135,11 +134,11 @@ async def _ask_llm_action(cluster: list, llm) -> str:
         elif ev.kind == "done" and ev.content:
             content_parts = [ev.content]
     full = "".join(content_parts).strip()
-    m = re.search(r"\{.*\}", full, re.DOTALL)
-    if not m:
+    start = full.find("{")
+    if start == -1:
         return "noop"
     try:
-        data = json.loads(m.group(0))
+        data, _ = json.JSONDecoder().raw_decode(full[start:])
     except Exception:
         return "noop"
     a = data.get("action", "noop")
@@ -162,11 +161,11 @@ async def _ask_llm_merge(cluster: list, llm) -> str:
         elif ev.kind == "done" and ev.content:
             content_parts = [ev.content]
     full = "".join(content_parts).strip()
-    m = re.search(r"\{.*\}", full, re.DOTALL)
-    if not m:
+    start = full.find("{")
+    if start == -1:
         return ""
     try:
-        data = json.loads(m.group(0))
+        data, _ = json.JSONDecoder().raw_decode(full[start:])
     except Exception:
         return ""
     return str(data.get("merged_text", "")).strip()

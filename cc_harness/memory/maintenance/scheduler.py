@@ -48,7 +48,6 @@ class MaintenanceScheduler:
             return None
         if self._lock.locked():
             return None
-        self._last_run_at = time.time()
         self._current_task = asyncio.create_task(self._run_all())
         return None  # 后台跑, 立即返 None
 
@@ -85,6 +84,7 @@ class MaintenanceScheduler:
 
     async def _run_all(self) -> MaintenanceRun:
         t0 = time.time()
+        self._last_run_at = t0
         run = MaintenanceRun()
         async with self._lock:
             for op_name, op in [
@@ -103,6 +103,8 @@ class MaintenanceScheduler:
                         run.consolidated = n
                     elif op_name == "conflict":
                         run.conflicts_resolved = n
+                except asyncio.CancelledError:
+                    raise
                 except Exception as e:
                     run.errors.append(f"{op_name}: {type(e).__name__}: {e}")
         run.duration_ms = int((time.time() - t0) * 1000)
@@ -114,6 +116,10 @@ class MaintenanceScheduler:
                 await asyncio.wait_for(self._current_task, timeout=timeout_s)
             except asyncio.TimeoutError:
                 self._current_task.cancel()
+                try:
+                    await self._current_task
+                except asyncio.CancelledError:
+                    pass
 
     # 占位实现, 后续 task 替换
     async def _refresh_staleness(self) -> int:

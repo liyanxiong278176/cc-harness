@@ -17,7 +17,7 @@ from cc_harness.memory.offload.models import OffloadResult
 
 def gen_id() -> str:
     """短稳定 node_id(uuid4 前 8 hex)。三处复用:refs 文件名 / pointer / refs_path。"""
-    return uuid4().hex[:8]
+    return uuid4().hex
 
 
 async def maybe_offload(
@@ -46,15 +46,18 @@ async def maybe_offload(
     if token_counter.count_text(result_text) <= threshold:
         return None
 
+    if len(result_text) > 256 * 1024:
+        raise ValueError("result_text exceeds 256KB hard limit")
+
     node_id = gen_id()
     refs_path = Path(refs_dir)
     refs_path.mkdir(parents=True, exist_ok=True)
     ref_file = refs_path / f"{node_id}.md"
-    ref_file.write_text(result_text, encoding="utf-8")  # 逐字落盘
+    ref_file.write_text(result_text[:256 * 1024], encoding="utf-8")  # 逐字落盘
 
     if llm is not None:
         try:
-            summary = await _llm_summary(llm, result_text)
+            summary = await _llm_summary(llm, result_text[:256 * 1024])
         except Exception:
             summary = ""
         if not summary:  # 空 content(refusal / filter / mid-stream err)→ fail-soft

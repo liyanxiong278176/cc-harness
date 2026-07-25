@@ -1,11 +1,16 @@
 """LLM-driven ADD/UPDATE/DELETE/NOOP decision for memory writes."""
 from __future__ import annotations
 import json
-import re
 from dataclasses import dataclass
 from enum import IntEnum
 from cc_harness.prompts import MEMORY_DECIDE_SYSTEM_PROMPT, memory_decide_user_prompt
 
+def _first_json_object(text: str) -> str:
+    start = text.find("{")
+    if start < 0:
+        raise ValueError("no JSON object found")
+    obj, end = json.JSONDecoder().raw_decode(text[start:])
+    return text[start:start + end]
 
 class Decision(IntEnum):
     ADD = 1
@@ -76,10 +81,10 @@ class LLMDecider:
             return DecisionResult.noop(error=f"parse: {type(e).__name__}: {e}")
 
     def _parse(self, text: str) -> DecisionResult:
-        m = re.search(r"\{.*\}", text, re.DOTALL)
+        m = _first_json_object(text)
         if not m:
             raise ValueError(f"no JSON object found in: {text[:120]}")
-        data = json.loads(m.group(0))
+        data = json.loads(m)
         action_str = data.get("action")
         if action_str not in ("ADD", "UPDATE", "DELETE", "NOOP"):
             raise ValueError(f"invalid action: {action_str!r}")

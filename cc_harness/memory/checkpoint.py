@@ -47,34 +47,39 @@ class CheckpointService:
         """session 结束时调。1 个事务 + UPSERT checkpoint + INSERT messages。"""
         assert self.store._db is not None
         extra = extra or {}
-        await self.store._db.execute(
-            "INSERT OR REPLACE INTO session_checkpoint "
-            "(session_id, project_root, mode, turn_counter, started_at, ended_at, "
-            " cross_session_mode, extra_json) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-            (
-                session_id,
-                str(project_root),
-                mode,
-                turn_counter,
-                started_at,
-                ended_at,
-                cross_session_mode,
-                json.dumps(extra),
-            ),
-        )
-        await self.store._db.execute(
-            "DELETE FROM session_message WHERE session_id = ?",
-            (session_id,),
-        )
-        now = datetime.now().isoformat()
-        for idx, msg in enumerate(messages):
+        await self.store._db.execute("BEGIN")
+        try:
             await self.store._db.execute(
-                "INSERT INTO session_message "
-                "(session_id, turn_idx, role, content_json, ts) "
-                "VALUES (?, ?, ?, ?, ?)",
-                (session_id, idx, msg.get("role", ""), json.dumps(msg), now),
+                "INSERT OR REPLACE INTO session_checkpoint "
+                "(session_id, project_root, mode, turn_counter, started_at, ended_at, "
+                " cross_session_mode, extra_json) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    session_id,
+                    str(project_root),
+                    mode,
+                    turn_counter,
+                    started_at,
+                    ended_at,
+                    cross_session_mode,
+                    json.dumps(extra),
+                ),
             )
+            await self.store._db.execute(
+                "DELETE FROM session_message WHERE session_id = ?",
+                (session_id,),
+            )
+            now = datetime.now().isoformat()
+            for idx, msg in enumerate(messages):
+                await self.store._db.execute(
+                    "INSERT INTO session_message "
+                    "(session_id, turn_idx, role, content_json, ts) "
+                    "VALUES (?, ?, ?, ?, ?)",
+                    (session_id, idx, msg.get("role", ""), json.dumps(msg), now),
+                )
+        except BaseException:
+            await self.store._db.rollback()
+            raise
         await self.store._db.commit()
 
     async def load_latest(self, project_root: Path) -> CheckpointRecord | None:

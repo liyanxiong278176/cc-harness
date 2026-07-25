@@ -1,7 +1,6 @@
 """staleness 算子 + LLM 复检(中间区 0.4-0.7)。"""
 from __future__ import annotations
 import json
-import re
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
@@ -67,8 +66,8 @@ class LLMRechecker:
             elif ev.kind == "done" and ev.content:
                 content_parts = [ev.content]
         full = "".join(content_parts).strip()
-        m = re.search(r"\{.*\}", full, re.DOTALL)
-        if not m:
+        start = full.find("{")
+        if start == -1:
             return {}
-        data = json.loads(m.group(0))
+        data, _ = json.JSONDecoder().raw_decode(full[start:])
         return {x["id"]: float(x["score"]) for x in data.get("scores", [])}

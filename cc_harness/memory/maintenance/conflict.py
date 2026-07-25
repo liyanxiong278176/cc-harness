@@ -1,7 +1,6 @@
 """矛盾检测: write-time + maintenance 全库扫。"""
 from __future__ import annotations
 import json
-import re
 from dataclasses import dataclass
 from unittest.mock import MagicMock
 
@@ -46,11 +45,12 @@ class ConflictDetector:
             full = "".join(content_parts).strip()
         except Exception:
             return []
-        m = re.search(r"\{.*\}", full, re.DOTALL)
-        if not m:
+        # 首个平衡 JSON 对象解析(容忍尾随解释文本 / 多余 })
+        start = full.find("{")
+        if start == -1:
             return []
         try:
-            data = json.loads(m.group(0))
+            data, _ = json.JSONDecoder().raw_decode(full[start:])
         except Exception:
             return []
         out: list[ConflictVerdict] = []

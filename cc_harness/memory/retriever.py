@@ -1,11 +1,14 @@
 """Per-query top-k retrieval + injection-block formatting."""
 from __future__ import annotations
 
+import logging
 import time
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
     from cc_harness.memory.store import Memory
+
+logger = logging.getLogger(__name__)
 
 
 def _format_age(ts: float) -> str:
@@ -34,8 +37,8 @@ class MemoryRetriever:
             ids = [m.id for m, _ in results]
             try:
                 await self._store.touch_recall(ids)
-            except Exception:
-                pass
+            except Exception as e:
+                logger.warning("touch_recall failed (non-fatal): %s", e)
         from cc_harness.memory.maintenance.recall_weight import RecallWeighter
         weighter = RecallWeighter()
         weighted = weighter.apply(results)
@@ -50,8 +53,8 @@ class MemoryRetriever:
                     turn_idx=actual_turn_idx,
                     results=results_list,
                 )
-            except Exception:
-                pass  # E5 fail-soft 不阻塞主 search
+            except Exception as e:
+                logger.warning("drift check_after_read failed (non-fatal): %s", e)  # E5 fail-soft
 
         return weighted[:top_k]
 
@@ -100,13 +103,15 @@ class MemoryRetriever:
     async def _search_vec_only(self, query: str, k: int) -> list:
         try:
             return await self.search(query, top_k=k)
-        except Exception:
+        except Exception as e:
+            logger.warning("_search_vec_only failed, returning []: %s", e)
             return []
 
     async def _search_fts_only(self, query: str, k: int) -> list:
         try:
             return await self._store.search_fts(query, k=k)
-        except Exception:
+        except Exception as e:
+            logger.warning("_search_fts_only failed, returning []: %s", e)
             return []
 
     async def build_injection_block(self, query: str) -> str:
@@ -114,7 +119,8 @@ class MemoryRetriever:
             return ""
         try:
             results = await self.search(query, top_k=self.top_k)
-        except Exception:
+        except Exception as e:
+            logger.warning("build_injection_block search failed, returning empty: %s", e)
             return ""
         if not results:
             return ""
