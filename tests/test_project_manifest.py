@@ -347,6 +347,25 @@ def test_save_manifest_then_load_roundtrip(tmp_path):
     assert m2.resume_mode == "auto"
 
 
+def test_save_load_manifest_round_trip_cross_session_mode(tmp_path):
+    """F T5 D4/组件 8: save/load round-trip 应保留 cross_session_mode。"""
+    proj = tmp_path / "p"
+    proj.mkdir()
+    manifest = Manifest(
+        project_id="test-f-t5",
+        name="test-f-t5",
+        todos_path="todos.yaml",
+        created_at=datetime(2026, 7, 25, 10, 0, 0, tzinfo=timezone.utc),
+        cross_session_mode=CrossSessionMode.ASK,
+    )
+
+    save_manifest(proj, manifest)
+    loaded = load_manifest(proj)
+
+    assert loaded is not None
+    assert loaded.cross_session_mode == CrossSessionMode.ASK
+
+
 def test_save_manifest_atomic_no_tmp_left(tmp_path):
     """原子写完成不应残留 .tmp 文件。"""
     proj = tmp_path / "p"

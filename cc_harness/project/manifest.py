@@ -284,6 +284,7 @@ def _manifest_to_yaml(m: Manifest) -> dict:
         },
     }
     payload["resume_mode"] = m.resume_mode
+    payload["cross_session_mode"] = m.cross_session_mode.value
     payload["live"] = {
         "position": m.live.position,
         "max_height": m.live.max_height,
