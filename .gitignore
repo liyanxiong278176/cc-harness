@@ -44,6 +44,9 @@ eval/result/.judge-cache/
 /logs/persona.md
 /logs/sandbox.jsonl
 /logs/scenarios/
+/logs/cross_session.jsonl
+/logs/l2.jsonl
+/logs/l5.jsonl
 
 # Locomo eval results / dryrun (large jsonl + screenshots — generated each run)
 eval/result/_dryrun/
