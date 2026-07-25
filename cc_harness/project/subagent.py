@@ -451,22 +451,28 @@ class SubAgentRunner:
                         duration_s=time.time() - start,
                     )
 
-                # D1 final:扫 messages 找任一 is_error=True 的 tool message(subagent 内
-                # 业务错误,如 todo_update 完成门拦) → status="failed"。
-                # agent.run_turn 现在把 ToolResult.is_error 透传到 tool message;否则仅看
-                # final_t.status 可能错过"工具拦了但 todo 状态没变"的失败信号。
+                # Fatal tool errors fail the subagent. A policy ask explicitly rejected by
+                # the user is a control-flow decision, not a tool execution failure.
                 for m in messages:
-                    if m.get("role") != "tool":
+                    if m.get("role") != "tool" or not m.get("is_error"):
                         continue
-                    if m.get("is_error"):
-                        err_content = (m.get("content") or "")[:200]
-                        err_name = m.get("name") or "tool"
-                        result_obj = SubAgentResult(
-                            task_id=task_id, title=title, status="failed",
-                            error=f"tool 业务错误 ({err_name}): {err_content}",
-                            duration_s=time.time() - start,
+                    err_content = (m.get("content") or "")[:200]
+                    err_name = m.get("name") or "tool"
+                    if "[未执行:用户拒绝]" in err_content:
+                        log.info(
+                            "subagent tool %s rejected by user; treating as non-fatal",
+                            err_name,
                         )
-                        break
+                        continue
+                    log.warning(
+                        "subagent fatal tool error (%s): %s", err_name, err_content
+                    )
+                    result_obj = SubAgentResult(
+                        task_id=task_id, title=title, status="failed",
+                        error=f"tool 业务错误 ({err_name}): {err_content}",
+                        duration_s=time.time() - start,
+                    )
+                    break
 
             if result_obj is None:
                 # 4. 检测 max_iter 耗尽(没 timeout/exception/fatal 的话)

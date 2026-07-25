@@ -172,7 +172,7 @@ class TodoService:
 
         - ids 中的 task_id: 调 update(task_id, status="cancelled")
         - todo 不存在或已 terminal(in {done, cancelled})→ no-op(silent)
-        - 失败 silent,不冒泡(避免 checkpoint load 失败影响 session 启动)
+        - 失败不冒泡;update 失败会写 warning(避免 checkpoint load 影响启动)
         """
         _TERMINAL_STATUSES = {"done", "cancelled"}
         for tid in ids:
@@ -182,14 +182,12 @@ class TodoService:
                 continue
             except Exception:
                 continue
-            if t is None:
-                continue
             if t.status in _TERMINAL_STATUSES:
                 continue
             try:
                 await self.update(tid, status="cancelled")
-            except Exception:
-                pass  # silent — checkpoint load 容错
+            except Exception as e:
+                log.warning("failed to mark task %s cancelled: %s", tid, e)
 
     async def validate(self) -> list[ValidationIssue]:
         """全表校验:引用完整性 + 环检测 + md/yaml 一致性。
@@ -458,9 +456,10 @@ class TodoService:
 
         # 持久化(直接过滤)
         remaining = [t for t in tasks if t.id != task_id]
-        # spec 组件 5 line 345:删 yaml 行同时删 md 文件,避免 disk orphan
-        await self._storage.adelete_task_md(task_id)
+        # 先提交 yaml 主索引,再删旧 md。后者失败时仅留下可校验的 orphan md,
+        # 不会出现 yaml 仍引用但 md 已缺失的状态。
         await self._storage.asave_all(remaining)
+        await self._storage.adelete_task_md(task_id)
 
         self._emit(task, TodoEvent(kind="deleted"))
 

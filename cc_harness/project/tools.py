@@ -744,17 +744,32 @@ async def todo_resolve_handler(
     except TodoError as e:
         return _err("todo_resolve", e)
 
-    # Service.resolve 的契约是 target-first BFS,与 spec 示例的 dependency-first
-    # 展示顺序不同。这里保留 Service 顺序,让目标上下文稳定出现在第一行。
-    # 算每个 node 的 BFS depth(以 task_id 为 0,传递 dep 按 dep_of_target 推进)
-    # 直接复用 resolve 返回顺序(target + 上游),深度 = index 顺序内推;
-    # 简化:list[0]=target depth=0, 其后 dep 标注相对深度。
+    # Service.resolve 返回去重后的 target-first BFS 列表。列表下标不是图深度
+    # (diamond 中同一节点可同时是直接依赖和传递依赖),因此从保留的边重算最短深度。
+    by_id = {task.id: task for task in chain}
+    depths = {task_id: 0}
+    queue = [task_id]
+    queue_index = 0
+    while queue_index < len(queue):
+        current_id = queue[queue_index]
+        queue_index += 1
+        current = by_id.get(current_id)
+        if current is None:
+            continue
+        next_depth = depths[current_id] + 1
+        for dep_id in current.depends_on:
+            if dep_id not in by_id:
+                continue
+            if dep_id not in depths or next_depth < depths[dep_id]:
+                depths[dep_id] = next_depth
+                queue.append(dep_id)
+
     lines = [f"[todo_resolve] {task_id} chain ({len(chain)} tasks)"]
     for i, t in enumerate(chain):
         if i == 0:
             marker = "← target"
         else:
-            marker = f"← depth {i}"
+            marker = f"← depth {depths.get(t.id, i)}"
         lines.append(f"{_format_task_line(t)}  {marker}")
     # Ready 判断:链中所有非 target 都 done
     upstream = chain[1:]
@@ -1267,6 +1282,18 @@ async def dispatch_subagent_handler(
             f"task_id={task_id} 已 done, 不能再派 subagent",
         )
 
+    # 所有 spec 必须在任何 sub-todo 落盘前通过校验,避免后项失败留下孤儿。
+    for index, spec in enumerate(sub_specs):
+        if not isinstance(spec, dict):
+            return _subagent_err(
+                "dispatch_subagent", f"sub_specs[{index}] 必须是 object"
+            )
+        title = spec.get("title")
+        if not isinstance(title, str) or not title.strip():
+            return _subagent_err(
+                "dispatch_subagent", f"sub_specs[{index}].title 必须是非空字符串"
+            )
+
     # 3. runner 注入校验 + 嵌套深度(decision 5:MAX_DEPTH=2)
     if dispatch_subagent_runner is None:
         return _subagent_err(
@@ -1286,7 +1313,7 @@ async def dispatch_subagent_handler(
     for spec in sub_specs:
         try:
             t = await service.create(
-                title=spec.get("title", "(untitled)"),
+                title=spec["title"],
                 acceptance_criteria=[],  # D1 重要 fix
                 parent_task=task_id,
                 session_id=session_id,
@@ -1321,11 +1348,11 @@ async def dispatch_subagent_handler(
             raise
 
     try:
-        results = await asyncio.wait_for(
+        gathered = await asyncio.wait_for(
             asyncio.gather(*[
                 _run_with_progress(tid, spec)
                 for tid, spec in sub_task_ids
-            ]),
+            ], return_exceptions=True),
             timeout=timeout * len(sub_specs) + 30,
         )
     except asyncio.TimeoutError:
@@ -1333,10 +1360,19 @@ async def dispatch_subagent_handler(
             "dispatch_subagent",
             f"subagent fan-out 总耗时超过 {timeout * len(sub_specs) + 30}s",
         )
-    except Exception as e:
-        return _subagent_err(
-            "dispatch_subagent", f"subagent runner 异常: {e}"
-        )
+
+    results: list[SubAgentResult] = []
+    for (tid, spec), result in zip(sub_task_ids, gathered):
+        if isinstance(result, Exception):
+            results.append(SubAgentResult(
+                task_id=tid,
+                title=spec["title"],
+                status="failed",
+                error=f"runner exception ({type(result).__name__}): {result}",
+                fatal_error=True,
+            ))
+        else:
+            results.append(result)
 
     # E1 D6:失败 pause 决策(若有未 retry 已 fail 的)
     # 沿用 plan Task 5 verbatim set: {"failed", "timeout", "blocked"}

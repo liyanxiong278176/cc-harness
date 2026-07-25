@@ -90,36 +90,43 @@ def check_no_cycle(tasks: list[TodoTask]) -> list[ValidationIssue]:
     by_id: dict[str, TodoTask] = {t.id: t for t in tasks}
     color: dict[str, int] = {t.id: _WHITE for t in tasks}
 
-    def visit(node_id: str, path: list[str]) -> None:
-        c = color[node_id]
-        if c == _GRAY:
-            # 回边:从 path 中找到当前节点位置,构造环路径
-            cycle_start = path.index(node_id)
-            chain = " -> ".join(path[cycle_start:] + [node_id])
-            issues.append(
-                ValidationIssue(
-                    task_id=node_id,
-                    severity="error",
-                    rule_id="cycle",
-                    message=f"dependency cycle detected: {chain}",
-                )
-            )
-            return
-        if c == _BLACK:
-            return  # 子树已探索完毕,无环
-        color[node_id] = _GRAY
-        node = by_id[node_id]
-        path.append(node_id)
-        for dep_id in node.depends_on:
-            # 只在已知节点中跟踪 — 缺失依赖由 check_references 报告
-            if dep_id in by_id:
-                visit(dep_id, path)
-        path.pop()
-        color[node_id] = _BLACK
+    for task in tasks:
+        if color[task.id] != _WHITE:
+            continue
 
-    for t in tasks:
-        if color[t.id] == _WHITE:
-            visit(t.id, [])
+        path: list[str] = []
+        stack: list[tuple[str, bool]] = [(task.id, False)]
+        while stack:
+            node_id, exiting = stack.pop()
+            if exiting:
+                if color[node_id] == _GRAY:
+                    color[node_id] = _BLACK
+                    path.pop()
+                continue
+
+            c = color[node_id]
+            if c == _GRAY:
+                cycle_start = path.index(node_id)
+                chain = " -> ".join(path[cycle_start:] + [node_id])
+                issues.append(
+                    ValidationIssue(
+                        task_id=node_id,
+                        severity="error",
+                        rule_id="cycle",
+                        message=f"dependency cycle detected: {chain}",
+                    )
+                )
+                continue
+            if c == _BLACK:
+                continue
+
+            color[node_id] = _GRAY
+            path.append(node_id)
+            stack.append((node_id, True))
+            for dep_id in reversed(by_id[node_id].depends_on):
+                # 缺失依赖由 check_references 报告。
+                if dep_id in by_id:
+                    stack.append((dep_id, False))
 
     return issues
 
@@ -147,28 +154,31 @@ def dep_check(
 
     color: dict[str, int] = {tid: _WHITE for tid in hypothetical}
     path: list[str] = []
+    stack: list[tuple[str, bool]] = [(task_id, False)]
+    while stack:
+        node_id, exiting = stack.pop()
+        if exiting:
+            if color[node_id] == _GRAY:
+                color[node_id] = _BLACK
+                path.pop()
+            continue
 
-    def visit(node_id: str) -> None:
         c = color[node_id]
         if c == _GRAY:
-            # 回边:从 path 中找到当前节点位置,构造环路径
             cycle_start = path.index(node_id)
             chain = " -> ".join(path[cycle_start:] + [node_id])
             raise DependencyCycleError(
                 f"adding depends_on would create cycle: {chain}"
             )
         if c == _BLACK:
-            return
-        color[node_id] = _GRAY
-        node = hypothetical[node_id]
-        path.append(node_id)
-        for dep_id in node.depends_on:
-            if dep_id in hypothetical:
-                visit(dep_id)
-        path.pop()
-        color[node_id] = _BLACK
+            continue
 
-    visit(task_id)
+        color[node_id] = _GRAY
+        path.append(node_id)
+        stack.append((node_id, True))
+        for dep_id in reversed(hypothetical[node_id].depends_on):
+            if dep_id in hypothetical:
+                stack.append((dep_id, False))
 
 
 # ---------------------------------------------------------------------------

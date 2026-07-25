@@ -301,6 +301,21 @@ def test_save_atomic_md_replace(tmp_path):
     assert not list(s.todos_dir.glob("*.md.tmp"))
 
 
+def test_save_md_failure_leaves_yaml_index_unchanged(tmp_path, monkeypatch):
+    """Per-task md files are committed before the authoritative yaml index."""
+    s = _make_storage(tmp_path)
+    original_yaml = s.yaml_path.read_text(encoding="utf-8")
+
+    def fail_md_write(task_id, content):
+        raise OSError("md write failed")
+
+    monkeypatch.setattr(s, "save_task_md", fail_md_write)
+    with pytest.raises(OSError, match="md write failed"):
+        s.save_all([_make_task(description="new")])
+
+    assert s.yaml_path.read_text(encoding="utf-8") == original_yaml
+
+
 # ---------------------------------------------------------------------------
 # active_sessions 自动 prune
 # ---------------------------------------------------------------------------
@@ -472,6 +487,18 @@ def test_render_md_chinese_description():
     t = _make_task(description="中文描述 测试")
     out = _render_md(t)
     assert "中文描述 测试" in out
+
+
+def test_render_md_truncates_cjk_at_utf8_character_boundary():
+    """Byte-limit truncation keeps only complete multibyte characters."""
+    task = _make_task(description="你" * 20000)
+
+    rendered = _render_md(task)
+    _, body = _parse_frontmatter(rendered)
+
+    byte_budget = 50 * 1024 - 4
+    assert body == "你" * (byte_budget // len("你".encode("utf-8")))
+    assert len(body.encode("utf-8")) <= byte_budget
 
 
 # ---------------------------------------------------------------------------

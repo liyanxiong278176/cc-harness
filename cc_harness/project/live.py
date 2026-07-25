@@ -130,12 +130,12 @@ class TodoLivePanel:
             if self._live is not None:
                 self._live.stop()
         except Exception as e:  # noqa: BLE001
-            log.warning("TodoLivePanel stop failed: %e", e)
+            log.warning("TodoLivePanel stop failed: %s", e)
         try:
             if self._unsubscribe is not None:
                 self._unsubscribe(self._on_change)
         except Exception as e:  # noqa: BLE001
-            log.warning("TodoLivePanel unsubscribe failed: %e", e)
+            log.warning("TodoLivePanel unsubscribe failed: %s", e)
         self._started = False
 
     def __enter__(self) -> "TodoLivePanel":
@@ -176,7 +176,7 @@ class TodoLivePanel:
             self._tasks = await self.service.list(include_done=True)
             self._refresh()
         except Exception as e:  # noqa: BLE001
-            log.warning("TodoLivePanel _reload_and_refresh failed: %e", e)
+            log.warning("TodoLivePanel _reload_and_refresh failed: %s", e)
 
     def _refresh(self) -> None:
         """更新 Live 当前 panel。_live 为 None 时 no-op(未启动)。"""
@@ -185,7 +185,7 @@ class TodoLivePanel:
         try:
             self._live.update(self._render())
         except Exception as e:  # noqa: BLE001
-            log.warning("TodoLivePanel _refresh failed: %e", e)
+            log.warning("TodoLivePanel _refresh failed: %s", e)
 
     # --------------------------------------------------------------- #
     # 渲染

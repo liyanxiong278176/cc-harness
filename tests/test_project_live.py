@@ -9,7 +9,7 @@ from __future__ import annotations
 
 from datetime import datetime, timezone
 from io import StringIO
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 from rich.console import Console
@@ -283,3 +283,41 @@ async def test_live_panel_unsubscribes_on_stop_no_dangling(svc):
         _make_task("aaa", "x", "pending"),
         TodoEvent(kind="created"),
     )
+
+
+def test_panel_warning_logs_format_exceptions(svc, caplog):
+    """Live lifecycle warning paths preserve exception text."""
+    import logging
+
+    panel = TodoLivePanel(Console(), svc, _make_manifest())
+    panel._started = True
+    panel._live = MagicMock()
+    panel._live.stop.side_effect = RuntimeError("stop boom")
+    panel._unsubscribe = MagicMock(side_effect=RuntimeError("unsubscribe boom"))
+
+    with caplog.at_level(logging.WARNING, logger="cc_harness.project.live"):
+        panel.stop()
+
+    messages = [record.getMessage() for record in caplog.records]
+    assert any("stop boom" in message for message in messages)
+    assert any("unsubscribe boom" in message for message in messages)
+
+
+@pytest.mark.asyncio
+async def test_panel_refresh_warning_logs_format_exceptions(svc, caplog):
+    """Async reload and Live.update warning paths preserve exception text."""
+    import logging
+
+    panel = TodoLivePanel(Console(), svc, _make_manifest())
+    panel.service = MagicMock()
+    panel.service.list = AsyncMock(side_effect=RuntimeError("reload boom"))
+    panel._live = MagicMock()
+    panel._live.update.side_effect = RuntimeError("refresh boom")
+
+    with caplog.at_level(logging.WARNING, logger="cc_harness.project.live"):
+        await panel._reload_and_refresh()
+        panel._refresh()
+
+    messages = [record.getMessage() for record in caplog.records]
+    assert any("reload boom" in message for message in messages)
+    assert any("refresh boom" in message for message in messages)

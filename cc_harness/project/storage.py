@@ -106,8 +106,14 @@ class TodoStorage:
         # active_sessions prune;返回值携带 md-only truncated_note 给后续 _render_md
         pruned_tasks = [self._prune_active_sessions(t) for t in tasks]
 
-        # 1) 写 todos.yaml(原子)
         self._ensure_todos_dir()
+
+        # 1) 写每任务 md。跨文件无法整体原子提交时先落 md,这样失败只会留下
+        # stale/orphan md,不会让 yaml 主索引引用尚不存在的 md。
+        for t in pruned_tasks:
+            self.save_task_md(t.id, _render_md(t))
+
+        # 2) 所有 md 成功后再原子替换 todos.yaml 主索引。
         payload = {"tasks": [t.to_yaml_dict() for t in pruned_tasks]}
         tmp = self.yaml_path.with_suffix(".yaml.tmp")
         tmp.write_text(
@@ -116,10 +122,6 @@ class TodoStorage:
             encoding="utf-8",
         )
         os.replace(tmp, self.yaml_path)
-
-        # 2) 写每任务 md
-        for t in pruned_tasks:
-            self.save_task_md(t.id, _render_md(t))
 
     async def aload_all(self) -> list[TodoTask]:
         return self.load_all()
@@ -417,9 +419,13 @@ def _render_md(task: TodoTask) -> str:
             "task %s: description exceeds %d bytes, truncating",
             task.id, _DESCRIPTION_MAX_BYTES,
         )
-        # 留 4 字节给末尾 \n + 编码 safety margin
         cut = _DESCRIPTION_MAX_BYTES - 4
-        desc = desc.encode("utf-8")[:cut].decode("utf-8", errors="ignore")
+        encoded_prefix = desc.encode("utf-8")[:cut]
+        try:
+            desc = encoded_prefix.decode("utf-8")
+        except UnicodeDecodeError as e:
+            # A valid source string can only be incomplete at the sliced tail.
+            desc = encoded_prefix[:e.start].decode("utf-8")
 
     fm_dict = task.to_yaml_dict()
     fm_text = yaml.safe_dump(

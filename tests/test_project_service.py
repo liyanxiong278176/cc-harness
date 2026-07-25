@@ -400,6 +400,25 @@ async def test_delete_md_idempotent_on_missing(svc: TodoService) -> None:
     assert not md_path.exists()
 
 
+async def test_delete_md_failure_leaves_stale_md_not_missing_md(
+    svc: TodoService, monkeypatch,
+) -> None:
+    """Delete commits yaml first so md cleanup failure leaves only an orphan md."""
+    t = await svc.create(title="x")
+    md_path = svc.project_root / ".cc-harness" / "todos" / f"{t.id}.md"
+
+    async def fail_md_delete(task_id):
+        raise OSError("md delete failed")
+
+    monkeypatch.setattr(svc._storage, "adelete_task_md", fail_md_delete)
+    with pytest.raises(OSError, match="md delete failed"):
+        await svc.delete(t.id, force=True)
+
+    with pytest.raises(TaskNotFound):
+        await svc.get(t.id)
+    assert md_path.is_file()
+
+
 # ---------------------------------------------------------------------------
 # resolve
 # ---------------------------------------------------------------------------
@@ -904,13 +923,22 @@ async def test_mark_cancelled_empty_list_noop(svc: TodoService) -> None:
     assert (await svc.get(t.id)).status == "pending"
 
 
-async def test_mark_cancelled_swallows_exceptions(svc: TodoService, monkeypatch) -> None:
-    """Service.update 抛异常 → mark_cancelled swallow,不冒泡(checkpoint load 容错)。"""
+async def test_mark_cancelled_logs_update_exceptions(
+    svc: TodoService, monkeypatch, caplog,
+) -> None:
+    """Cancel update failures stay non-fatal but remain observable."""
+    import logging
+
     t = await svc.create(title="x")
 
     async def boom(*args, **kwargs):
         raise RuntimeError("db crash")
 
     monkeypatch.setattr(svc, "update", boom)
-    # 不抛
-    await svc.mark_cancelled([t.id])
+    with caplog.at_level(logging.WARNING, logger="cc_harness.project.service"):
+        await svc.mark_cancelled([t.id])
+
+    assert any(
+        t.id in record.getMessage() and "db crash" in record.getMessage()
+        for record in caplog.records
+    )

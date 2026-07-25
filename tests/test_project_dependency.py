@@ -200,6 +200,32 @@ def test_dep_check_with_missing_new_dep() -> None:
     dep_check("aaa", ["ghost"], {"aaa": a})  # OK, no exception
 
 
+def test_check_no_cycle_handles_chain_beyond_python_recursion_limit() -> None:
+    """A long acyclic dependency chain is processed without RecursionError."""
+    count = 1500
+    tasks = [
+        _task(f"n{i}", depends_on=[f"n{i + 1}"] if i + 1 < count else [])
+        for i in range(count)
+    ]
+
+    assert check_no_cycle(tasks) == []
+
+
+def test_dep_check_long_cycle_raises_dependency_cycle_error() -> None:
+    """A long back-edge raises the domain error rather than RecursionError."""
+    count = 1500
+    tasks = {
+        f"n{i}": _task(
+            f"n{i}",
+            depends_on=[f"n{i + 1}"] if i + 1 < count else ["n0"],
+        )
+        for i in range(count)
+    }
+
+    with pytest.raises(DependencyCycleError):
+        dep_check("n0", ["n1"], tasks)
+
+
 def test_dependency_cycle_error_inherits_todo_error() -> None:
     """Task 3 起 DependencyCycleError 必须继承 TodoError,纳入统一异常层级。"""
     from cc_harness.project.exceptions import TodoError
