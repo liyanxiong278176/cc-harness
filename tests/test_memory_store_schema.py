@@ -67,3 +67,15 @@ async def test_session_message_cascade_delete():
         )).fetchone())[0]
         assert cnt == 0, f"expected 0 messages after cascade, got {cnt}"
         await store.close()
+
+
+@pytest.mark.asyncio
+async def test_store_enables_fk_on_open():
+    """F T4 D2: store.init_schema 后 PRAGMA foreign_keys 应自动为 1。"""
+    with tempfile.TemporaryDirectory() as tmp:
+        store = MemoryStore(db_path=pathlib.Path(tmp) / "test.db", embedding_dim=4)
+        await store.init_schema()
+        cur = await store._db.execute("PRAGMA foreign_keys")
+        row = await cur.fetchone()
+        assert row[0] == 1, f"PRAGMA foreign_keys expected 1, got {row[0]}"
+        await store.close()

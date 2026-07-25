@@ -52,6 +52,8 @@ class MemoryStore:
         await self._db.enable_load_extension(True)
         await self._db.load_extension(sqlite_vec.loadable_path())
         await self._db.enable_load_extension(False)
+        # F T4 D2: PRAGMA foreign_keys = ON, 启用 ON DELETE CASCADE(spec D2 防 orphan)
+        await self._db.execute("PRAGMA foreign_keys = ON")
         # Phase 4: 探测 FTS5 编译(connect 时若 FTS5 不可用则降级 vector-only)
         self._has_fts5 = await self._probe_fts5()
         await self._db.execute("""
