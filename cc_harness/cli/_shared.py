@@ -1,7 +1,8 @@
 """cc_harness.cli._shared — CLI 层共享 helpers。
 
 包含:
-    load_manifest_or_exit(cwd) — 加载 manifest,缺失 → 提示并 exit 1
+    load_manifest_or_exit(cwd) — 加载 manifest,缺失 → 抛 ManifestNotFoundError
+    ManifestNotFoundError      — helper 抛出的 typed exception(cmd_* 翻译为 exit 1)
     cli_session_id() — 生成一次性 CLI session id(`cli-{ts}-{hex[:8]}`,spec line 450)
     print_text() / print_error() — Rich + fallback 文本输出
     JsonOrText — TTY/JSON 检测的统一 sink(rich.Table ↔ plain text ↔ JSON)
@@ -36,8 +37,23 @@ from cc_harness.project.models import Manifest
 # ---------------------------------------------------------------------------
 
 
+class ManifestNotFoundError(Exception):
+    """`.cc-harness/project.yaml` 缺失(CLI 层 helper,不是 TodoError 子类)。
+
+    抛出让 cmd_* / cmd_resume / cmd_init 等显式 catch → 走 print_error + exit 1。
+    不在 helper 里 sys.exit:否则调用方无法 unit-test "manifest 缺失" 分支。
+    """
+
+    def __init__(self, cwd: Path) -> None:
+        super().__init__(
+            f"No .cc-harness/project.yaml found in {cwd}. "
+            f"Run `cc-harness init` first."
+        )
+        self.cwd = Path(cwd)
+
+
 def load_manifest_or_exit(cwd: Path) -> Manifest:
-    """加载项目 manifest;缺失 → stderr 提示并 `sys.exit(1)`。
+    """加载项目 manifest;缺失 → 抛 `ManifestNotFoundError`(由 cmd_* 翻译为 exit 1)。
 
     Args:
         cwd: 项目根目录。
@@ -45,16 +61,12 @@ def load_manifest_or_exit(cwd: Path) -> Manifest:
     Returns:
         解析后的 Manifest。
 
-    Side effects:
-        - manifest 缺失:写 stderr(不带 rich markup)+ raise SystemExit(1)。
+    Raises:
+        ManifestNotFoundError: manifest 文件不存在。
     """
     m = load_manifest(cwd)
     if m is None:
-        sys.stderr.write(
-            f"✗ No .cc-harness/project.yaml found in {cwd}. "
-            f"Run `cc-harness init` first.\n"
-        )
-        sys.exit(1)
+        raise ManifestNotFoundError(cwd)
     return m
 
 
@@ -231,6 +243,7 @@ def _format_cell(value: Any) -> str:
 
 __all__ = [
     "JsonOrText",
+    "ManifestNotFoundError",
     "cli_session_id",
     "load_manifest_or_exit",
     "print_error",

@@ -11,7 +11,11 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
-from cc_harness.cli._shared import cli_session_id, load_manifest_or_exit
+from cc_harness.cli._shared import (
+    ManifestNotFoundError,
+    cli_session_id,
+    load_manifest_or_exit,
+)
 from cc_harness.cli.init import (
     cmd_init,
     init_interactive,
@@ -52,15 +56,17 @@ def test_load_manifest_or_exit_returns_when_present(tmp_path, capsys):
     assert m.name == "t"
 
 
-def test_load_manifest_or_exit_exits_1_when_missing(tmp_path, capsys):
+def test_load_manifest_or_exit_raises_manifest_not_found(tmp_path, capsys):
+    """manifest 缺失 → 抛 ManifestNotFoundError(由 cmd_* 翻译为 exit 1)。"""
     proj = tmp_path / "p"
     proj.mkdir()
-    with pytest.raises(SystemExit) as ei:
+    with pytest.raises(ManifestNotFoundError) as ei:
         load_manifest_or_exit(proj)
-    assert ei.value.code == 1
+    assert "cc-harness init" in str(ei.value)
+    assert str(proj) in str(ei.value)
+    # 不再调用 sys.exit — stderr 保持干净(由 caller 决定怎么渲染)
     err = capsys.readouterr().err
-    assert "cc-harness init" in err
-    assert str(proj) in err
+    assert err == ""
 
 
 # ---------------------------------------------------------------------------
@@ -170,11 +176,39 @@ def test_cmd_init_force_reinit_overwrites(tmp_path, capsys, monkeypatch):
         resume_mode="ask",
         no_live=False,
         force_reinit=True,
+        backup_ts=None,
     )
     rc = cmd_init(args, tmp_path)
     assert rc == 0
     m = load_manifest(tmp_path)
     assert m.name == "new"
+
+
+def test_cmd_init_force_reinit_backs_up_existing_todos(
+    tmp_path, capsys, monkeypatch,
+):
+    """--force-reinit 在覆盖已有 todos.yaml 前先备份到 .bak-<ts>(防 silent data loss)。"""
+    monkeypatch.chdir(tmp_path)
+    init_noninteractive(tmp_path, name="old")
+    yaml_path = tmp_path / ".cc-harness" / "todos" / "todos.yaml"
+    yaml_path.write_text(
+        "tasks:\n  - id: keep01\n    title: keep_me\n    status: pending\n",
+        encoding="utf-8",
+    )
+    args = Namespace(
+        no_prompt=True, name="new", resume_mode="ask",
+        no_live=False, force_reinit=True, backup_ts=1700000000,
+    )
+    rc = cmd_init(args, tmp_path)
+    assert rc == 0
+    # 备份存在
+    backups = list(
+        (tmp_path / ".cc-harness" / "todos").glob("todos.yaml.bak-1700000000")
+    )
+    assert len(backups) == 1
+    assert "keep01" in backups[0].read_text(encoding="utf-8")
+    # 新 yaml 是空
+    assert "tasks: []" in yaml_path.read_text(encoding="utf-8")
 
 
 def test_cmd_init_no_prompt_existing_refuses(tmp_path, capsys, monkeypatch):
@@ -231,16 +265,21 @@ def test_init_interactive_existing_default_abort(tmp_path, capsys, monkeypatch):
     assert m.name == "old"
 
 
-def test_init_interactive_existing_merge_overwrites(tmp_path, capsys, monkeypatch):
-    """merge 选项 → 走 init_noninteractive 覆盖。"""
+def test_init_interactive_existing_merge_preserves(tmp_path, capsys, monkeypatch):
+    """merge 选项 → 沿用现有 manifest 字段,不重新询问 name / resume_mode 等。
+
+    防 silent data loss:merge 不会清空 todos.yaml。
+    """
     init_noninteractive(tmp_path, name="old")
+    # 在 todos.yaml 中塞一个 task,验证 merge 保留
+    yaml_path = tmp_path / ".cc-harness" / "todos" / "todos.yaml"
+    yaml_path.write_text(
+        "tasks:\n  - id: tst01\n    title: keep_me\n    status: pending\n",
+        encoding="utf-8",
+    )
     with patch("cc_harness.cli.init.Prompt.ask") as mock_ask:
         mock_ask.side_effect = [
-            "merge",                              # existing action
-            "renamed",                            # name
-            "ask",                                # resume_mode
-            "yes",                                # live
-            "yes",                                # gitignore
+            "merge",   # 1) existing action → merge → 不应继续询问
         ]
         with patch("subprocess.run", side_effect=FileNotFoundError):
             rc = cmd_init(
@@ -250,7 +289,55 @@ def test_init_interactive_existing_merge_overwrites(tmp_path, capsys, monkeypatc
             )
     assert rc == 0
     m = load_manifest(tmp_path)
+    assert m.name == "old"  # 沿用,不被改写
+    # todos.yaml 任务保留
+    import yaml as _y
+    data = _y.safe_load(yaml_path.read_text(encoding="utf-8"))
+    assert len(data["tasks"]) == 1
+    assert data["tasks"][0]["id"] == "tst01"
+    assert data["tasks"][0]["title"] == "keep_me"
+    # merge 不再问 name / resume_mode / live / gitignore
+    assert mock_ask.call_count == 1
+
+
+def test_init_interactive_existing_reinit_clobbers_with_backup(
+    tmp_path, capsys, monkeypatch,
+):
+    """reinit 选项 → 备份已有 todos.yaml(.bak-<ts>)后再覆盖。"""
+    init_noninteractive(tmp_path, name="old")
+    yaml_path = tmp_path / ".cc-harness" / "todos" / "todos.yaml"
+    yaml_path.write_text(
+        "tasks:\n  - id: tst01\n    title: keep_me\n    status: pending\n",
+        encoding="utf-8",
+    )
+    with patch("cc_harness.cli.init.Prompt.ask") as mock_ask:
+        mock_ask.side_effect = [
+            "reinit",   # 1) existing action
+            "renamed",  # 2) name
+            "ask",      # 3) resume_mode
+            "yes",      # 4) live
+            "yes",      # 5) gitignore
+        ]
+        with patch("subprocess.run", side_effect=FileNotFoundError):
+            rc = cmd_init(
+                Namespace(
+                    no_prompt=False, name=None, resume_mode=None,
+                    no_live=False, force_reinit=False,
+                ),
+                tmp_path,
+            )
+    assert rc == 0
+    m = load_manifest(tmp_path)
     assert m.name == "renamed"
+    # todos.yaml 被备份 + 新覆盖
+    backup_glob = list(
+        (tmp_path / ".cc-harness" / "todos").glob("todos.yaml.bak-*")
+    )
+    assert len(backup_glob) == 1
+    backup_text = backup_glob[0].read_text(encoding="utf-8")
+    assert "keep_me" in backup_text  # 旧 tasks 在备份里
+    # 新 yaml 是空 tasks
+    assert "tasks: []" in yaml_path.read_text(encoding="utf-8")
 
 
 # ---------------------------------------------------------------------------

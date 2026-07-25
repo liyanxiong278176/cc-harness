@@ -20,6 +20,7 @@ from pathlib import Path
 from rich.console import Console
 
 from cc_harness.cli._shared import (
+    ManifestNotFoundError,
     load_manifest_or_exit,
     print_error,
     print_text,
@@ -158,12 +159,21 @@ def cmd_resume(args: Namespace, cwd: Path) -> int:
             + _format_resume_summary(selected),
         )
         return 0
+    except ManifestNotFoundError as e:
+        # manifest 缺失(load_manifest_or_exit 抛):统一提示 + exit 1
+        print_error(console, str(e))
+        return 1
     except TodoError as e:
         # 缺 manifest、TaskNotFound、InvalidFieldError 等都走这里(exit 1)
         print_error(console, f"{type(e).__name__}: {e}")
         return 1
     except (OSError, StorageError) as e:
         print_error(console, f"system error: {type(e).__name__}: {e}")
+        return 2
+    except Exception as e:
+        # 兜底:防止 ValueError / TypeError / KeyError 等未分类异常
+        # 在 CLI 层泄露 traceback,给 user 留 "raw python error" 体验。
+        print_error(console, f"unexpected error: {type(e).__name__}: {e}")
         return 2
 
 

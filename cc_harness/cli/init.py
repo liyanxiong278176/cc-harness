@@ -15,11 +15,15 @@
     - 写 file:UTF-8,2-space 缩进,符合 manifest/storage 既有规范。
     - `.cc-harness/todos/` 写 `.gitkeep`(空占位,确保目录被 track;
       `.cc-harness/todos/*.md` 在 gitignore 里排除,内容不会被 track)。
+    - 覆盖既有 todos.yaml **前** 备份到 `todos.yaml.bak-<ts>`(防 silent data loss)。
+    - `merge` 模式:**保留**已有 tasks,**只**刷新 manifest / gitignore(真 merge)。
 """
 from __future__ import annotations
 
+import shutil
 import subprocess
 import sys
+import time
 import uuid
 from argparse import Namespace
 from datetime import datetime, timezone
@@ -98,20 +102,47 @@ def _write_gitignore(cwd: Path) -> Path:
 # ---------------------------------------------------------------------------
 
 
+def _backup_existing_todos_yaml(yaml_path: Path, ts: int) -> Path | None:
+    """覆盖 `todos.yaml` 前先备份到 `todos.yaml.bak-<ts>`。
+
+    Args:
+        yaml_path: 待覆盖的 todos.yaml 路径。
+        ts: 可注入时间戳(测试用);None → 自动取 `int(time.time())`。
+
+    Returns:
+        备份文件路径;原文件不存在 → None。
+    """
+    if not yaml_path.is_file():
+        return None
+    if ts is None:
+        ts = int(time.time())
+    backup = yaml_path.with_name(f"{yaml_path.name}.bak-{ts}")
+    # 同 ts 已存在 → 追加 pid 后缀避免冲突(并发 init)
+    if backup.exists():
+        backup = yaml_path.with_name(f"{yaml_path.name}.bak-{ts}-{uuid.uuid4().hex[:4]}")
+    shutil.copy2(yaml_path, backup)
+    return backup
+
+
 def _write_project_skeleton(
     cwd: Path,
     manifest: Manifest,
     *,
     write_gitignore: bool = True,
-) -> None:
+    backup_ts: int | None = None,
+) -> Path | None:
     """物理创建/写入 .cc-harness 目录 + project.yaml + todos/{yaml,.gitkeep}。
 
     顺序:
         1) mkdir .cc-harness + .cc-harness/todos
         2) write project.yaml(原子:.tmp + os.replace)
-        3) write todos/todos.yaml = `tasks: []\n`
-        4) write todos/.gitkeep = empty
-        5) git 探测 → 命中 + write_gitignore=True 则追加 .gitignore
+        3) **若已有** todos.yaml → 备份到 todos.yaml.bak-<ts>(防 silent data loss)
+        4) write todos/todos.yaml = `tasks: []\n`
+        5) write todos/.gitkeep = empty
+        6) git 探测 → 命中 + write_gitignore=True 则追加 .gitignore
+
+    Returns:
+        备份路径,或 None(原文件不存在)。
     """
     cc_dir = cwd / ".cc-harness"
     cc_dir.mkdir(parents=True, exist_ok=True)
@@ -121,6 +152,7 @@ def _write_project_skeleton(
     todos_dir.mkdir(parents=True, exist_ok=True)
 
     yaml_path = todos_dir / "todos.yaml"
+    backup_path = _backup_existing_todos_yaml(yaml_path, backup_ts)
     yaml_path.write_text("tasks: []\n", encoding="utf-8")
 
     gitkeep = todos_dir / ".gitkeep"
@@ -128,6 +160,7 @@ def _write_project_skeleton(
 
     if write_gitignore and _is_in_git_repo(cwd):
         _write_gitignore(cwd)
+    return backup_path
 
 
 def _make_default_manifest(
@@ -176,6 +209,7 @@ def init_noninteractive(
     resume_mode: str = "ask",
     live_enabled: bool = True,
     write_gitignore: bool = True,
+    backup_ts: int | None = None,
 ) -> Manifest:
     """非交互式 init(cwd 必须不存在 manifest 或 caller 已决定覆盖)。
 
@@ -185,6 +219,7 @@ def init_noninteractive(
         resume_mode: 透传 Manifest.resume_mode(ask/auto/manual)。
         live_enabled: True → live.position='top';False → live.position='off'。
         write_gitignore: git 探测命中时是否写 .gitignore(用户显式拒绝时设 False)。
+        backup_ts: 备份时间戳(测试可注入;None → 自动取当前时间)。
 
     Returns:
         写入并返回的 Manifest。
@@ -194,7 +229,9 @@ def init_noninteractive(
     m = _make_default_manifest(
         name, resume_mode=resume_mode, live_enabled=live_enabled,
     )
-    _write_project_skeleton(cwd, m, write_gitignore=write_gitignore)
+    _write_project_skeleton(
+        cwd, m, write_gitignore=write_gitignore, backup_ts=backup_ts,
+    )
     return m
 
 
@@ -211,6 +248,11 @@ def init_interactive(cwd: Path) -> Manifest:
 
     已存在 manifest → 询问 reinit / merge / abort,默认 abort。
     不存在 → 直接进入 fresh init 流程(4 个 prompt)。
+
+    Merge 语义(避免 silent data loss):
+        - 保留 existing todos.yaml 的所有 task
+        - 只刷新 manifest(project.yaml)+ gitignore
+        - 不动 todos dir 内容(除非不存在,才写空骨架)
     """
     existing = load_manifest(cwd)
 
@@ -225,7 +267,9 @@ def init_interactive(cwd: Path) -> Manifest:
             sys.stderr.write("✗ init aborted (manifest kept as-is)\n")
             sys.stderr.flush()
             raise SystemExit(1)
-        # reinit / merge 都走一遍 fresh init
+        if action == "merge":
+            return _merge_existing(cwd, existing)
+        # reinit:走完整 fresh init 流程(todos.yaml 会被备份后覆盖)
 
     name = Prompt.ask("Project name", default=cwd.name or "myapp")
     resume_mode = Prompt.ask(
@@ -252,6 +296,30 @@ def init_interactive(cwd: Path) -> Manifest:
     return m
 
 
+def _merge_existing(cwd: Path, existing: Manifest) -> Manifest:
+    """真 merge:保留 existing tasks,只询问并刷新 manifest 字段。
+
+    不询问 name / resume_mode / live —— 沿用现有值(用户选 merge 是想保留
+    数据,不是要重命名/改模式)。这一步直接刷新 manifest 写到磁盘,不动 todos.yaml。
+    """
+    # 沿用现有 manifest 字段;若用户希望后续改,可以用 `init --force-reinit`。
+    save_manifest(cwd, existing)
+    # 目录若已存在不动;若 todos dir 不存在(异常情况),创建骨架
+    cc_dir = cwd / ".cc-harness"
+    cc_dir.mkdir(parents=True, exist_ok=True)
+    todos_dir = cc_dir / "todos"
+    if not todos_dir.exists():
+        todos_dir.mkdir(parents=True, exist_ok=True)
+        yaml_path = todos_dir / "todos.yaml"
+        yaml_path.write_text("tasks: []\n", encoding="utf-8")
+        gitkeep = todos_dir / ".gitkeep"
+        gitkeep.write_text("", encoding="utf-8")
+    # gitignore:若已 git 仓库且尚未含规则,追加(幂等,见 _write_gitignore)
+    if _is_in_git_repo(cwd):
+        _write_gitignore(cwd)
+    return existing
+
+
 # ---------------------------------------------------------------------------
 # argparse dispatcher
 # ---------------------------------------------------------------------------
@@ -267,6 +335,7 @@ def cmd_init(args: Namespace, cwd: Path) -> int:
             - resume_mode: str | None (--resume-mode)
             - no_live: bool (--no-live)
             - force_reinit: bool (--force-reinit)
+            - backup_ts: int | None (--backup-ts, 测试用)
         cwd: 项目根目录。
 
     Returns:
@@ -286,13 +355,18 @@ def cmd_init(args: Namespace, cwd: Path) -> int:
         name = args.name or cwd.name or "myapp"
         resume_mode = args.resume_mode or "ask"
         live_enabled = not bool(getattr(args, "no_live", False))
+        backup_ts = getattr(args, "backup_ts", None)
         try:
             m = init_noninteractive(
                 cwd, name=name, resume_mode=resume_mode,
-                live_enabled=live_enabled,
+                live_enabled=live_enabled, backup_ts=backup_ts,
             )
         except OSError as e:
             print_error(console, f"failed to write project files: {e}")
+            return 2
+        except Exception as e:
+            # 兜底:防 ValueError / TypeError / KeyError 泄露 traceback
+            print_error(console, f"unexpected error: {type(e).__name__}: {e}")
             return 2
         print_text(console, f"✓ initialized cc-harness project: {m.name} ({m.project_id})")
         return 0
@@ -306,11 +380,15 @@ def cmd_init(args: Namespace, cwd: Path) -> int:
     except (KeyboardInterrupt, EOFError):
         print_error(console, "interactive init aborted by user")
         return 1
+    except Exception as e:
+        # 兜底:防 ValueError / TypeError / KeyError 泄露 traceback
+        print_error(console, f"unexpected error: {type(e).__name__}: {e}")
+        return 2
     print_text(console, f"✓ initialized cc-harness project: {m.name} ({m.project_id})")
     return 0
 
 
-__all__ = ["cmd_init", "init_interactive", "init_noninteractive"]
+__all__ = ["cmd_init", "init_interactive", "init_noninteractive", "_merge_existing"]
 
 
 # ---------------------------------------------------------------------------

@@ -27,6 +27,7 @@ from rich.console import Console
 
 from cc_harness.cli._shared import (
     JsonOrText,
+    ManifestNotFoundError,
     _json_dumps,
     cli_session_id,
     load_manifest_or_exit,
@@ -74,12 +75,19 @@ async def _list(svc: TodoService, args: Namespace, console: Console) -> int:
         sp = {"in_progress": 0, "blocked": 1, "pending": 2, "cancelled": 3, "done": 4}
         tasks.sort(key=lambda t: (sp.get(t.status, 99), -t.updated_at.timestamp()))
 
-    limit = int(args.limit or 20)
+    limit = int(args.limit) if args.limit is not None else 20
     truncated = len(tasks) > limit
     shown = tasks[:limit]
 
-    # header 含总量(不受 limit 影响)
-    all_tasks = await svc.list(include_done=include_done)
+    # header 含总量 — 避免第二次 svc.list() 全扫(原代码 line 82),只在
+    # 没设 status / parent 过滤时直接从已 fetch 的 tasks 算;否则需要
+    # 再取一遍拿"全集"计数(F7)。
+    status_filter = getattr(args, "status", None)
+    parent_filter = getattr(args, "parent", None)
+    if status_filter is None and parent_filter is None:
+        all_tasks = tasks
+    else:
+        all_tasks = await svc.list(include_done=include_done)
     counts: dict[str, int] = {}
     for t in all_tasks:
         counts[t.status] = counts.get(t.status, 0) + 1
@@ -314,18 +322,34 @@ async def _update(svc: TodoService, args: Namespace, console: Console) -> int:
     fields: dict[str, Any] = {}
 
     # 标量字段 — 直接复制
+    # due_date / effort_estimate 以前漏在 loop 里,被 silently dropped;
+    # 现纳入(F2)。
     for k in ("title", "description", "status", "parent", "assigned_to",
-              "priority", "label", "depends_on", "acceptance_criteria"):
+              "priority", "label", "depends_on", "acceptance_criteria",
+              "due_date", "effort_estimate"):
         v = getattr(args, k, None)
         if v is not None:
             if k == "parent":
                 fields["parent_task"] = v
             elif k == "label":
-                fields["labels"] = v
+                # argparse action="append":每次出现追加到 list。语义上
+                # 与 --append-acceptance-criteria 对齐:与现有 labels 合并
+                # 而非替换(防止单次 --label x 抹掉历史 labels)。
+                try:
+                    current = await svc.get(task_id)
+                except TodoError as e:
+                    print_error(console, f"{type(e).__name__}: {e}")
+                    return 1
+                merged = list(current.labels) + list(v)
+                fields["labels"] = merged
             elif k == "depends_on":
                 fields["depends_on"] = v
             elif k == "acceptance_criteria":
                 fields["acceptance_criteria"] = v
+            elif k == "due_date":
+                fields["due_date"] = v
+            elif k == "effort_estimate":
+                fields["effort_estimate"] = v
             else:
                 fields[k] = v
 
@@ -544,6 +568,10 @@ def cmd_todo(args: Namespace, cwd: Path) -> int:
         rc = asyncio.run(handler(svc, args, console))
     except SystemExit as e:
         return int(e.code) if e.code is not None else 1
+    except ManifestNotFoundError as e:
+        # manifest 缺失(load_manifest_or_exit 抛):统一提示 + exit 1
+        print_error(Console(), str(e))
+        return 1
     except TodoError as e:
         print_error(Console(), f"[{subcommand}] ✗ {type(e).__name__}: {e}")
         return 1
@@ -552,6 +580,14 @@ def cmd_todo(args: Namespace, cwd: Path) -> int:
         # OSError:文件操作失败
         # RuntimeError:其他运行时异常(防止 unhandled escape)
         print_error(Console(), f"[{subcommand}] system error: {type(e).__name__}: {e}")
+        return 2
+    except Exception as e:
+        # 兜底:防止 ValueError / TypeError / KeyError 等未分类异常
+        # 在 CLI 层泄露 traceback(给 user 留下 "raw python error" 体验)。
+        print_error(
+            Console(),
+            f"[{subcommand}] unexpected error: {type(e).__name__}: {e}",
+        )
         return 2
     return rc
 

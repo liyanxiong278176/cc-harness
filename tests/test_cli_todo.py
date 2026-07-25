@@ -240,6 +240,39 @@ def test_list_limit_truncates(proj, svc_args, capsys):
     assert "+2 more" in out
 
 
+def test_list_limit_zero_returns_empty(proj, svc_args, capsys):
+    """F3:`--limit 0` 不再被 `or 20` 吞成 20 → shown 0 行,但 header 仍报总数。"""
+    for i in range(3):
+        cmd_todo(svc_args("create", title=f"t{i}"), proj)
+    capsys.readouterr()  # 清掉 create 输出
+    args = svc_args(
+        "list", status=None, parent=None, no_done=False,
+        format="table", sort="status", limit=0,
+    )
+    rc = cmd_todo(args, proj)
+    assert rc == 0
+    out = capsys.readouterr().out
+    # header 仍显示总数 3
+    assert "3 tasks" in out
+    # 但 body 不含任何 task 行(title 不应出现)
+    for i in range(3):
+        assert f"t{i}" not in out
+    # +N more 行:shown==0 < total==3 → truncated;shown==limit==0 → shown_n==0
+    # 代码用 `truncated = len(tasks) > limit` → True(3 > 0),会打 +3 more
+    # (语义 OK,user 看到 "我有 3 个,显示 0 个,要 --limit=N 来看")
+    assert "+3 more" in out
+
+
+def test_list_default_limit_is_20(proj, svc_args, capsys):
+    """不传 --limit → 默认 20(F3 回归:不要把 0 当默认值)。"""
+    args = svc_args(
+        "list", status=None, parent=None, no_done=False,
+        format="table", sort="status", limit=None,
+    )
+    rc = cmd_todo(args, proj)
+    assert rc == 0
+
+
 # ---------------------------------------------------------------------------
 # get
 # ---------------------------------------------------------------------------
@@ -356,6 +389,73 @@ def test_update_no_such_task(proj, svc_args, capsys):
     err = capsys.readouterr().err
     assert rc == 1
     assert "TaskNotFound" in err
+
+
+def test_update_due_date_applies(proj, svc_args, capsys):
+    """F2:`--due-date` 之前 silently dropped,现已应用。"""
+    tid = _create_and_get_id(svc_args("create", title="dd"), proj)
+    args = svc_args(
+        "update", task_id=tid, due_date="2026-08-15T00:00:00",
+    )
+    rc = cmd_todo(args, proj)
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert "due_date" in out  # changed 列里出现
+    # 实际写盘验证
+    import yaml as _y
+    yaml_path = proj / ".cc-harness" / "todos" / "todos.yaml"
+    data = _y.safe_load(yaml_path.read_text(encoding="utf-8"))
+    entry = next(t for t in data["tasks"] if t["id"] == tid)
+    assert entry["due_date"] is not None
+    assert "2026-08-15" in str(entry["due_date"])
+
+
+def test_update_effort_estimate_applies(proj, svc_args, capsys):
+    """F2:`--effort-estimate` 之前 silently dropped,现已应用。"""
+    tid = _create_and_get_id(svc_args("create", title="ee"), proj)
+    args = svc_args("update", task_id=tid, effort_estimate="3.5")
+    rc = cmd_todo(args, proj)
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert "effort_estimate" in out
+    import yaml as _y
+    yaml_path = proj / ".cc-harness" / "todos" / "todos.yaml"
+    data = _y.safe_load(yaml_path.read_text(encoding="utf-8"))
+    entry = next(t for t in data["tasks"] if t["id"] == tid)
+    assert entry["effort_estimate"] == 3.5
+
+
+def test_update_clear_due_date_resets(proj, svc_args, capsys):
+    """--clear-due-date → due_date = None(没漏 clearable_simple loop)。"""
+    tid = _create_and_get_id(svc_args("create", title="cd"), proj)
+    # 先 set
+    cmd_todo(svc_args(
+        "update", task_id=tid, due_date="2026-08-15T00:00:00",
+    ), proj)
+    capsys.readouterr()
+    # 再 clear
+    args = svc_args("update", task_id=tid, clear_due_date=True)
+    rc = cmd_todo(args, proj)
+    assert rc == 0
+    import yaml as _y
+    yaml_path = proj / ".cc-harness" / "todos" / "todos.yaml"
+    data = _y.safe_load(yaml_path.read_text(encoding="utf-8"))
+    entry = next(t for t in data["tasks"] if t["id"] == tid)
+    assert entry["due_date"] is None
+
+
+def test_update_label_appends_not_replaces(proj, svc_args, capsys):
+    """F6:`--label x --label y` 与现有 labels 合并,不替换。"""
+    tid = _create_and_get_id(
+        svc_args("create", title="lb", label=["existing"]), proj)
+    args = svc_args("update", task_id=tid, label=["new1", "new2"])
+    rc = cmd_todo(args, proj)
+    assert rc == 0
+    import yaml as _y
+    yaml_path = proj / ".cc-harness" / "todos" / "todos.yaml"
+    data = _y.safe_load(yaml_path.read_text(encoding="utf-8"))
+    entry = next(t for t in data["tasks"] if t["id"] == tid)
+    assert entry["labels"] == ["existing", "new1", "new2"]
 
 
 # ---------------------------------------------------------------------------
@@ -744,3 +844,22 @@ def test_cmd_todo_storage_error_exit_2(proj, svc_args, capsys, monkeypatch):
     assert rc == 2
     assert "system error" in err
     assert "yaml parse failed" in err
+
+
+def test_cmd_todo_unexpected_exception_exit_2(proj, svc_args, capsys, monkeypatch):
+    """F5:ValueError / KeyError / TypeError 等未分类异常 → 走兜底 exit 2,
+    不泄露 traceback。
+    """
+    from cc_harness.cli import todo as todo_mod
+
+    async def boom(svc, args, console):
+        raise KeyError("missing key in dict")
+
+    monkeypatch.setitem(todo_mod._HANDLERS, "list", boom)
+    args = svc_args("list", status=None, parent=None, no_done=False,
+                    format="table", sort="status", limit=20)
+    rc = cmd_todo(args, proj)
+    err = capsys.readouterr().err
+    assert rc == 2
+    assert "unexpected error" in err
+    assert "KeyError" in err

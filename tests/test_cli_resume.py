@@ -200,14 +200,13 @@ def test_cmd_resume_no_flags_acts_as_no_resume(proj, capsys):
 def test_resume_missing_manifest_exits_1(tmp_path, capsys):
     """无 manifest(未 init)→ cmd_resume 退 1,stderr 含 init 提示。
 
-    load_manifest_or_exit 走 sys.exit(1),在 cmd_resume 内被 sys.excepthook / 顶层
-    重新 raise SystemExit;本测试验证整体退 1。
+    load_manifest_or_exit 抛 ManifestNotFoundError,cmd_resume catch 后
+    print_error + exit 1。本测试验证返回码与 stderr 文案。
     """
     # 注意:tmp_path 是空的,没有 .cc-harness
     args = Namespace(resume=True, resume_id="any", no_resume=False)
-    with pytest.raises(SystemExit) as ei:
-        cmd_resume(args, tmp_path)
-    assert ei.value.code == 1
+    rc = cmd_resume(args, tmp_path)
+    assert rc == 1
     err = capsys.readouterr().err
     assert "cc-harness init" in err or "No .cc-harness" in err
 
