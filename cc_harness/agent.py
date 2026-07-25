@@ -337,10 +337,15 @@ async def run_turn(
     if policy is None:
         policy = PolicyEngine(project_root=project_root)
     # Inject MCP schemas so schema.validate_mcp can check MCP tool args.
+    # F T7 fix:防御 sync/async MCP(production async + test mock sync 共存,沿 repl.py:253 iscoroutine pattern)
+    import inspect as _inspect
     try:
+        _tools_result = mcp.list_tools()
+        if _inspect.iscoroutine(_tools_result):
+            _tools_result = await _tools_result
         set_mcp_schemas({
             t["function"]["name"]: t["function"].get("parameters", {})
-            for t in (mcp.list_tools() or [])
+            for t in (_tools_result or [])
         })
     except Exception:
         pass
@@ -396,7 +401,11 @@ async def run_turn(
             except Exception as _e:
                 print_warn(console, f"subagent runner 注入失败: {_e}; 跳过 dispatch_subagent")
 
-        tool_specs = list(await mcp.list_tools())
+        # F T7 fix:防御 sync/async MCP(production async + test mock sync 共存,沿 repl.py:253 iscoroutine pattern)
+        _tools_result = mcp.list_tools()
+        if _inspect.iscoroutine(_tools_result):
+            _tools_result = await _tools_result
+        tool_specs = list(_tools_result or [])
         for native in NATIVE_TOOLS.values():
             tool_specs.append(native["spec"])
         for entry in (extra_native_specs or []):

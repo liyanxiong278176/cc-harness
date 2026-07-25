@@ -1,4 +1,3 @@
-import asyncio
 import pytest
 from unittest.mock import MagicMock
 from cc_harness.memory.maintenance.scheduler import MaintenanceScheduler
