@@ -483,6 +483,7 @@ async def run_repl(
                 todo_hints=list(state.todo_hints or []),          # B 阶段 Task 5: verify hints
                 reflection_engine=reflection_engine,              # E2 T2.3: 4 类 emit 注入
                 e1_decompose_enabled=e1_decompose_enabled,        # E1 D7: kill-switch 透传 → _e1_extra AND 守卫
+                tool_diff=state.cross_session_tools_diff,         # E3 D7 / F T2: cross-session tool diff 透传
             )
             state.session_stats.add(turn_stats)
 
@@ -763,6 +764,17 @@ async def _maybe_load_cross_session(state, console, mcp, mode) -> None:
         print_warn(console, f"checkpoint load_latest failed: {e}")
         return
     if candidate is None:
+        # F T2: 首次 session 也采集 tool hash(让 run_turn 收到合理 tool_diff,即便候选物为空)
+        try:
+            new_tools = await mcp.list_tools()
+            new_hash = {t["function"]["name"]: _sha256_of_tool(t) for t in new_tools}
+            state.tool_hash_snapshot = new_hash
+            # old={} → 全部 +X(spec _diff_tool_hash 行为)
+            state.cross_session_tools_diff = _diff_tool_hash({}, new_hash)
+        except Exception as e:
+            print_warn(console, f"tool hash 采集失败(首次 session): {e}")
+            state.tool_hash_snapshot = {}
+            state.cross_session_tools_diff = []
         return
     if cross_session_mode.value == "ask":
         try:

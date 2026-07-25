@@ -20,7 +20,9 @@ class FakeMCP:
     results: dict[str, Any]  # namespaced_name -> ToolResult
     calls: list[tuple[str, dict]]
 
-    def list_tools(self) -> list[dict]:
+    async def list_tools(self) -> list[dict]:
+        # F T2: agent.py:394 修真为 `await mcp.list_tools()`,sync 返 list 在
+        # production MCPClient 接口已 async,test fixture 必须保持 awaitable。
         return list(self.tools_spec)
 
     async def call_tool(self, name: str, args: dict):

@@ -473,7 +473,8 @@ class _StoppingLLM:
 
 
 class _NoopMCP:
-    def list_tools(self):
+    # F T2: agent.py:394 修真为 `await mcp.list_tools()`,fixture 必须 async。
+    async def list_tools(self):
         return []
 
 
@@ -1088,3 +1089,121 @@ async def test_maybe_load_cross_session_calls_recall(monkeypatch):
         assert len(recall_called) >= 1
     # 至少 state 不破 + mem_deps 保留
     assert state.mem_deps == {"service": MagicMock(), "retriever": MagicMock()} or state.mem_deps is not None
+
+
+# --- F T2: agent.py:394 切 await + run_turn 透传 tool_diff + 首次 session 采集 tool 快照 ---
+
+
+def _patch_repl_state_with_tool_diff(monkeypatch, repl_mod, diff_value):
+    """替换 repl.ReplState:run_repl 构造时返回预配置 state(注入 cross_session_tools_diff)。"""
+    OriginalState = repl_mod.ReplState
+
+    def _factory(*args, **kwargs):
+        s = OriginalState(*args, **kwargs)
+        s.cross_session_tools_diff = list(diff_value)
+        return s
+
+    monkeypatch.setattr(repl_mod, "ReplState", _factory)
+    return _factory
+
+
+@pytest.mark.asyncio
+async def test_run_repl_passes_tool_diff_to_run_turn(monkeypatch):
+    """F T2: run_repl 调 run_turn 时透传 state.cross_session_tools_diff(非空场景)。"""
+    from cc_harness import repl as repl_mod
+    from cc_harness.repl import run_repl
+    from cc_harness.tokens import TurnTokenStats
+
+    _patch_repl_state_with_tool_diff(monkeypatch, repl_mod, ["+tool1", "-tool2"])
+
+    inputs = iter(["hello", "exit"])
+    monkeypatch.setattr(repl_mod, "_read_user", _fake_read_user(inputs))
+
+    captured_kwargs: list[dict] = []
+
+    async def _spy(messages, llm, mcp, *, tool_diff=None, **kwargs):
+        captured_kwargs.append({"tool_diff": tool_diff, **kwargs})
+        return TurnTokenStats()
+
+    # repl 内部 `from cc_harness.agent import run_turn` 每轮重绑,patch 模块属性生效
+    monkeypatch.setattr("cc_harness.agent.run_turn", _spy)
+
+    await run_repl(_StoppingLLM(), _NoopMCP(), cwd="/x")
+
+    # 至少 1 次 run_turn 调用,且透传 tool_diff 形参
+    assert len(captured_kwargs) >= 1, "run_turn 应至少被调 1 次"
+    assert captured_kwargs[0]["tool_diff"] == ["+tool1", "-tool2"], (
+        f"tool_diff 透传丢失: 实际 {captured_kwargs[0].get('tool_diff')!r}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_run_repl_passes_empty_tool_diff_by_default(monkeypatch):
+    """F T2: state.cross_session_tools_diff 默认空 list 时,run_turn 收 [] 而非 None。"""
+    from cc_harness import repl as repl_mod
+    from cc_harness.repl import run_repl
+    from cc_harness.tokens import TurnTokenStats
+
+    inputs = iter(["hello", "exit"])
+    monkeypatch.setattr(repl_mod, "_read_user", _fake_read_user(inputs))
+
+    captured_kwargs: list[dict] = []
+
+    async def _spy(messages, llm, mcp, *, tool_diff=None, **kwargs):
+        captured_kwargs.append({"tool_diff": tool_diff, **kwargs})
+        return TurnTokenStats()
+
+    monkeypatch.setattr("cc_harness.agent.run_turn", _spy)
+    # 默认不 patch ReplState → cross_session_tools_diff 默认 []
+
+    await run_repl(_StoppingLLM(), _NoopMCP(), cwd="/x")
+
+    assert len(captured_kwargs) >= 1
+    assert captured_kwargs[0]["tool_diff"] == [], (
+        f"tool_diff 默认值应为空 list, 实际 {captured_kwargs[0].get('tool_diff')!r}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_first_session_captures_tool_snapshot():
+    """F T2: candidate=None(首次 session)时,_maybe_load_cross_session 仍采集 tool 快照。
+
+    spec 修真意图: 首次 session 不调 diff 渲染,但 tool_hash_snapshot + cross_session_tools_diff
+    必须填值(让 run_turn 始终收到合理 tool_diff),候选物为空 → diff 视为全部 +X。
+    """
+    from cc_harness.repl import _maybe_load_cross_session, ReplState
+    from cc_harness.project.models import Manifest, CrossSessionMode
+    import pathlib
+
+    state = ReplState()
+    state.manifest = Manifest(
+        project_id="p1", name="test", todos_path="t.yaml",
+        created_at="2026-07-24T10:00:00",
+        cross_session_mode=CrossSessionMode.LAST_ONLY,
+    )
+    state.project_root = pathlib.Path("/tmp")
+    state.checkpoint_service = MagicMock()
+    state.checkpoint_service.load_latest = AsyncMock(return_value=None)  # 首次 session
+    mcp = MagicMock()
+    mcp.list_tools = AsyncMock(return_value=[
+        {"type": "function", "function": {"name": "mcp__x__foo", "parameters": {"type": "object"}}},
+        {"type": "function", "function": {"name": "mcp__x__bar", "parameters": {}}},
+    ])
+
+    await _maybe_load_cross_session(state, console=MagicMock(), mcp=mcp, mode="coding")
+
+    # 首次 session: tool_hash_snapshot 应填值(candidate=None → 视为 old={} → 全 +X)
+    assert "mcp__x__foo" in state.tool_hash_snapshot
+    assert "mcp__x__bar" in state.tool_hash_snapshot
+    for h in state.tool_hash_snapshot.values():
+        assert h.startswith("sha256:")
+        assert len(h) == len("sha256:") + 64
+    # diff 应为全 +X(候选物为空)
+    assert "+mcp__x__foo" in state.cross_session_tools_diff
+    assert "+mcp__x__bar" in state.cross_session_tools_diff
+    assert state.cross_session_tools_diff == sorted(state.cross_session_tools_diff), (
+        "diff 应按字母排序(spec _diff_tool_hash)"
+    )
+    # 首次 session 不修改 messages / last_loaded_session_id
+    assert state.messages == []
+    assert state.last_loaded_session_id is None

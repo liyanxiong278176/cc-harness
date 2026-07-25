@@ -391,7 +391,7 @@ async def run_turn(
             except Exception as _e:
                 print_warn(console, f"subagent runner 注入失败: {_e}; 跳过 dispatch_subagent")
 
-        tool_specs = list(mcp.list_tools())
+        tool_specs = list(await mcp.list_tools())
         for native in NATIVE_TOOLS.values():
             tool_specs.append(native["spec"])
         for entry in (extra_native_specs or []):
