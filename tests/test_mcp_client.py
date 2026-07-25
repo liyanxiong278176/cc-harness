@@ -222,3 +222,40 @@ async def test_start_surfaces_failure_reason_for_empty_str_exception(capsys):
     line = next(line for line in out.splitlines() if "ghost failed to start" in line)
     after = line.split("failed to start:", 1)[1]
     assert after.strip() != "", "failure reason must not be empty"
+
+
+class _FatalStartError(BaseException):
+    pass
+
+
+@pytest.mark.asyncio
+async def test_start_isolates_baseexception_and_keeps_other_servers(monkeypatch, capsys):
+    client = MCPClient({
+        "bad": MCPServerConfig(type="stdio", command="unused"),
+        "good": MCPServerConfig(type="stdio", command="unused"),
+    })
+    good_tool = {
+        "type": "function",
+        "function": {"name": "mcp__good__echo", "parameters": {}},
+    }
+
+    async def fake_start_one(name, cfg, init_timeout_s):
+        if name == "bad":
+            raise _FatalStartError("fatal transport failure")
+        return name, [good_tool]
+
+    monkeypatch.setattr(client, "_start_one", fake_start_one)
+
+    await client.start(init_timeout_s=0.1)
+
+    assert await client.list_tools() == [good_tool]
+    output = capsys.readouterr().out
+    assert "server bad failed to start" in output
+    assert "_FatalStartError" in output
+
+
+def test_route_preserves_double_underscores_inside_tool_name():
+    client = MCPClient({})
+    assert client._route("mcp__server__tool__with__double") == (
+        "server", "tool__with__double",
+    )

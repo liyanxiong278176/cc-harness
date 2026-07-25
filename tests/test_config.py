@@ -1,10 +1,14 @@
 import json
+import logging
+import subprocess
+import sys
 from pathlib import Path
 
 import pytest
 
 from cc_harness.config import (AppConfig, MCPServerConfig, ConfigError, load_config,
-                                ExecutorConfig, ExecutorBackend, load_executor_config)
+                                ExecutorConfig, ExecutorBackend, SandboxConfig,
+                                load_executor_config)
 
 
 def test_stdio_server_config():
@@ -29,6 +33,18 @@ def test_http_alias_accepted():
     """streamable-http should also map to http transport."""
     cfg = MCPServerConfig(type="streamable-http", url="http://x/mcp")
     assert cfg.transport_type == "http"
+
+
+@pytest.mark.parametrize("server_type", ["stdio"])
+def test_stdio_server_requires_command(server_type):
+    with pytest.raises(ConfigError, match="command"):
+        MCPServerConfig(type=server_type)
+
+
+@pytest.mark.parametrize("server_type", ["sse", "http", "streamable-http"])
+def test_remote_server_requires_url(server_type):
+    with pytest.raises(ConfigError, match="url"):
+        MCPServerConfig(type=server_type)
 
 
 def test_appconfig_requires_base_url_and_model():
@@ -230,6 +246,22 @@ def test_load_executor_config_missing_file_returns_default():
     assert cfg.backend is ExecutorBackend.NATIVE   # 无文件 = native(现状)
 
 
+def test_sandbox_reserved_nondefaults_warn_while_unwired(caplog):
+    with caplog.at_level(logging.WARNING, logger="cc_harness.config"):
+        SandboxConfig(cpu=4, memory_mb=4096, egress_allow=["example.com"], vault=False)
+
+    warning = "\n".join(record.getMessage() for record in caplog.records)
+    for field in ("cpu", "memory_mb", "egress_allow", "vault"):
+        assert field in warning
+    assert "not wired" in warning
+
+
+def test_sandbox_reserved_defaults_do_not_warn(caplog):
+    with caplog.at_level(logging.WARNING, logger="cc_harness.config"):
+        SandboxConfig()
+    assert not caplog.records
+
+
 def test_load_executor_config_env_override_fallback(monkeypatch):
     """env CC_HARNESS_SANDBOX_FALLBACK=hard|native 覆盖 sandbox.fallback_on_error
     (红队 allow 模式 wrapper 注 → 绑死沙箱挂不降级)。"""
@@ -281,6 +313,33 @@ def test_context_config_threshold_validation():
     from cc_harness.config import ContextConfig
     with pytest.raises(Exception):
         ContextConfig(tier1_threshold=0.9, tier2_threshold=0.5)  # t1 > t2 非法
+
+
+def test_context_config_validation_survives_optimized_python():
+    """Validation must still reject invalid ranges when assertions are stripped."""
+    script = """
+from cc_harness.config import ContextConfig
+cases = [
+    {"tier1_threshold": 0},
+    {"tier1_threshold": 0.9, "tier2_threshold": 0.8},
+    {"protect_zone_tokens": -1},
+    {"context_window": 0},
+]
+for kwargs in cases:
+    try:
+        ContextConfig(**kwargs)
+    except Exception:
+        continue
+    raise SystemExit(f"accepted invalid config: {kwargs}")
+"""
+    completed = subprocess.run(
+        [sys.executable, "-O", "-c", script],
+        cwd=Path(__file__).resolve().parents[1],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert completed.returncode == 0, completed.stderr
 
 
 def test_context_config_env_override(monkeypatch):

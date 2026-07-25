@@ -1,4 +1,5 @@
 import json
+import logging
 import os
 from enum import Enum
 from pathlib import Path
@@ -13,6 +14,13 @@ if TYPE_CHECKING:
     from cc_harness.memory.config import MemoryConfig
 
 
+log = logging.getLogger(__name__)
+
+
+class ConfigError(Exception):
+    pass
+
+
 class MCPServerConfig(BaseModel):
     type: Literal["stdio", "sse", "http", "streamable-http"] = "stdio"
     command: str | None = None
@@ -20,15 +28,19 @@ class MCPServerConfig(BaseModel):
     url: str | None = None
     env: dict[str, str] = {}
 
+    @model_validator(mode="after")
+    def _validate_transport_fields(self) -> "MCPServerConfig":
+        if self.transport_type == "stdio" and not (self.command and self.command.strip()):
+            raise ConfigError("MCP stdio server requires a non-empty 'command'")
+        if self.transport_type in ("sse", "http") and not (self.url and self.url.strip()):
+            raise ConfigError(f"MCP {self.type} server requires a non-empty 'url'")
+        return self
+
     @property
     def transport_type(self) -> Literal["stdio", "sse", "http"]:
         if self.type in ("http", "streamable-http"):
             return "http"
         return self.type  # type: ignore[return-value]
-
-
-class ConfigError(Exception):
-    pass
 
 
 class AppConfig(BaseModel):
@@ -163,6 +175,27 @@ class SandboxConfig(BaseModel):
 
     model_config = {"extra": "ignore"}
 
+    @model_validator(mode="after")
+    def _warn_unwired_reserved_fields(self) -> "SandboxConfig":
+        reserved_defaults = {
+            "cpu": 2,
+            "memory_mb": 2048,
+            "egress_allow": [
+                "api.deepseek.com", "api.siliconflow.cn", "pypi.org", "github.com",
+            ],
+            "vault": True,
+        }
+        changed = [
+            name for name, default in reserved_defaults.items()
+            if getattr(self, name) != default
+        ]
+        if changed:
+            log.warning(
+                "Sandbox reserved fields are not wired and will be ignored: %s",
+                ", ".join(changed),
+            )
+        return self
+
 
 class ExecutorConfig(BaseModel):
     """执行后端配置。缺省 native(现状);sandbox 启用 OpenSandbox。"""
@@ -218,12 +251,18 @@ class ContextConfig(BaseModel):
 
     @model_validator(mode="after")
     def _validate(self) -> "ContextConfig":
-        for t in (self.tier1_threshold, self.tier2_threshold, self.tier3_threshold):
-            assert 0 < t < 1, f"threshold {t} not in (0,1)"
-        assert self.tier1_threshold < self.tier2_threshold < self.tier3_threshold, \
-            "thresholds must be strictly increasing"
+        for threshold in (
+            self.tier1_threshold, self.tier2_threshold, self.tier3_threshold,
+        ):
+            if not 0 < threshold < 1:
+                raise ValueError(f"threshold {threshold} not in (0,1)")
+        if not self.tier1_threshold < self.tier2_threshold < self.tier3_threshold:
+            raise ValueError("thresholds must be strictly increasing")
         # Plan3 tier1:若调整上限,MemoryConfig.offload_ratio validator 上限也需同步(< tier1)
-        assert self.protect_zone_tokens >= 0 and self.context_window > 0
+        if self.protect_zone_tokens < 0:
+            raise ValueError("protect_zone_tokens must be non-negative")
+        if self.context_window <= 0:
+            raise ValueError("context_window must be positive")
         return self
 
 

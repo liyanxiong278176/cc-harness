@@ -9,7 +9,6 @@ import asyncio
 import inspect
 import json
 import logging
-import re
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -19,6 +18,21 @@ from cc_harness.reflection.prompts import build_reflect_prompt
 
 
 log = logging.getLogger(__name__)
+
+
+def _first_json_object(text: str) -> dict | None:
+    """Return the first valid JSON object without consuming trailing prose."""
+    decoder = json.JSONDecoder()
+    for start, char in enumerate(text):
+        if char != "{":
+            continue
+        try:
+            value, _end = decoder.raw_decode(text, start)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(value, dict):
+            return value
+    return None
 
 
 @dataclass
@@ -141,6 +155,8 @@ class ReflectionEngine:
             text = await self._ask_judge_with_fallback(system, user)
             if text is None:
                 return self._audit_noop(ev_safe, reason="all_llm_unavailable")
+            if not text.strip():
+                return self._audit_noop(ev_safe, reason="empty_judge_response")
 
             # 3. 解析 JSON,容错:失败 → 当纯文本处理
             reflection_text = self._parse_reflection(text)
@@ -216,16 +232,12 @@ class ReflectionEngine:
 
     @staticmethod
     def _parse_reflection(text: str) -> str:
-        """解析 JSON 反射,容错回退。"""
-        m = re.search(r"\{.*\}", text, re.DOTALL)
-        if m:
-            try:
-                data = json.loads(m.group(0))
-                reflection = data.get("reflection", "")
-                if reflection:
-                    return reflection
-            except (json.JSONDecodeError, ValueError):
-                pass
+        """解析首个 JSON 对象,容错回退。"""
+        data = _first_json_object(text)
+        if data is not None:
+            reflection = data.get("reflection", "")
+            if reflection:
+                return reflection
         return text  # 容错:原文
 
     def _audit(self, event: ReflectionEvent, *, outcome: ReflectionOutcome) -> None:

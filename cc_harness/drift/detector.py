@@ -10,9 +10,9 @@ import hashlib
 import inspect
 import json
 import logging
-import re
 import time
 from dataclasses import dataclass, field
+from html import escape
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -23,6 +23,21 @@ if TYPE_CHECKING:
 
 
 log = logging.getLogger(__name__)
+
+
+def _first_json_object(text: str) -> dict | None:
+    """Return the first valid JSON object without consuming trailing prose."""
+    decoder = json.JSONDecoder()
+    for start, char in enumerate(text):
+        if char != "{":
+            continue
+        try:
+            value, _end = decoder.raw_decode(text, start)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(value, dict):
+            return value
+    return None
 
 
 @dataclass
@@ -171,30 +186,28 @@ class DriftDetector:
         return verdicts
 
     async def _judge_entities(self, text):
-        resp = await self._ask_judge(JUDGE_ENTITIES, text)
+        user = f"<untrusted>\n{escape(str(text), quote=False)}\n</untrusted>"
+        resp = await self._ask_judge(JUDGE_ENTITIES, user)
         if resp is None:
             return []
-        try:
-            m = re.search(r"\{.*\}", resp, re.DOTALL)
-            if m:
-                return json.loads(m.group(0)).get("entities", [])
-        except (json.JSONDecodeError, ValueError):
-            pass
-        return []
+        data = _first_json_object(resp)
+        if data is None:
+            return []
+        entities = data.get("entities", [])
+        return entities if isinstance(entities, list) else []
 
     async def _judge_group_consistency(self, entity, records):
         pred_block = "\n".join(f"- {m.text}" for m in records)
-        user = f"entity: {entity}\n{pred_block}"
+        evidence = f"entity: {entity}\n{pred_block}"
+        user = f"<untrusted>\n{escape(evidence, quote=False)}\n</untrusted>"
         resp = await self._ask_judge(JUDGE_GROUP_CONSIST, user)
         if resp is None:
             return None, "all_llm_unavailable"  # F5: None not True
-        try:
-            m = re.search(r"\{.*\}", resp, re.DOTALL)
-            if m:
-                data = json.loads(m.group(0))
-                return bool(data.get("consistent", True)), str(data.get("reason", ""))
-        except (json.JSONDecodeError, ValueError):
-            pass
+        data = _first_json_object(resp)
+        if data is not None:
+            consistent = data.get("consistent")
+            if isinstance(consistent, bool):
+                return consistent, str(data.get("reason", ""))
         return None, "parse_error"  # F5: None not True
 
     async def _ask_judge(self, system, user):

@@ -225,3 +225,31 @@ async def test_ev_safe_rebuild_carries_source_from_drift_event(
     assert saved_sources == ["drift"]
     # M1 间接验证:drift event.source='drift' → ev_safe 也应带 source='drift'
     # (下游 save 已走 'drift',证明 ev_safe rebuild 时 event.source 已传到位)
+
+
+@pytest.mark.asyncio
+async def test_empty_judge_response_is_audited_noop(
+    tmp_audit, fake_memory_service, fake_l5, fake_local_llm,
+):
+    async def empty_judge(system, user):
+        return "   \n"
+
+    eng = ReflectionEngine(
+        memory_service=fake_memory_service, llm_client=fake_local_llm,
+        judge_llm=empty_judge, l5_engine=fake_l5,
+        project_root=tmp_audit.parent, audit_path=tmp_audit,
+    )
+    ev = max_iter_reached(session_id="s1", turn_idx=3, iter_used=20, last_content="x")
+
+    await eng.emit(ev)
+    await eng._drain(timeout_s=2)
+
+    fake_memory_service.save.assert_not_awaited()
+    assert eng.get_recent() == []
+    assert eng.get_last_neg_reflection() is None
+    assert "empty_judge_response" in tmp_audit.read_text(encoding="utf-8")
+
+
+def test_parse_reflection_uses_first_json_object_before_trailing_brace():
+    text = 'prefix {"reflection": "use Grep first"} trailing prose }'
+    assert ReflectionEngine._parse_reflection(text) == "use Grep first"

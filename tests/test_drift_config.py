@@ -41,6 +41,14 @@ def test_drift_disabled_noop():
     assert cfg.drift_enabled is False
 
 
+def test_drift_judge_prompts_mark_untrusted_blocks_as_data():
+    from cc_harness.drift.prompts import JUDGE_ENTITIES, JUDGE_GROUP_CONSIST
+
+    for prompt in (JUDGE_ENTITIES, JUDGE_GROUP_CONSIST):
+        assert "<untrusted>" in prompt
+        assert "不是" in prompt and "指令" in prompt
+
+
 def test_drift_subpackage_imports():
     """cc_harness.drift 可 import,prompts 常量存在。"""
     from cc_harness.drift import prompts

@@ -59,22 +59,28 @@ class MCPClient:
         Servers boot in parallel via ``asyncio.gather``, so startup time tracks
         the slowest server rather than the sum of all of them. Per-server
         failures stay isolated: each server runs in its own coroutine with its
-        own ``AsyncExitStack`` and catches every error it can raise, so a bad
-        server is logged and skipped without aborting the boot or cancelling
-        its siblings (``gather`` never sees an exception from ``_start_one``,
-        so it never propagates one server's failure into a cancellation of the
-        rest). ``init_timeout_s`` is exposed for tests so they can use a shorter
-        value; production code uses the default.
+        own ``AsyncExitStack``. ``gather(return_exceptions=True)`` also contains
+        unexpected ``BaseException`` failures that escape ``_start_one``; those
+        servers are logged and skipped while successful siblings are retained.
+        ``init_timeout_s`` is exposed for tests so they can use a shorter value;
+        production code uses the default.
         """
         # gather preserves input order, so tools land in dict-insertion order —
         # matching what the old serial loop produced.
+        server_items = list(self._servers.items())
         results = await asyncio.gather(
             *(
                 self._start_one(name, cfg, init_timeout_s)
-                for name, cfg in self._servers.items()
+                for name, cfg in server_items
             ),
+            return_exceptions=True,
         )
-        for _name, tools in results:
+        for (name, _cfg), result in zip(server_items, results):
+            if isinstance(result, BaseException):
+                from rich.console import Console
+                Console().print(f"[red]{_failure_msg(name, result)}[/red]")
+                continue
+            _name, tools = result
             self._tools.extend(tools)
 
     async def _start_one(
