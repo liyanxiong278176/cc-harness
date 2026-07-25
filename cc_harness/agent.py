@@ -14,6 +14,7 @@ Modes (see task #4 / #6):
     "chat"    — same as coding (tools enabled, full ReAct loop)
 """
 from __future__ import annotations
+import asyncio
 import json
 import re
 import time
@@ -631,10 +632,15 @@ async def run_turn(
                             )
                         except Exception:
                             pass
+            # Finding 1 fix:生成稳定 tc_id BEFORE 构建 assistant message,
+            # assistant tool_calls[].id 与后续 tool message tool_call_id 共用
+            # 一份 id,避免 id 缺失/不匹配导致 messages history 走形。
+            tc_ids: list[str] = [p.id or f"call_{iter_count}_{i}"
+                                 for i, p in enumerate(pending)]
             assistant_msg: dict = {
                 "role": "assistant",
                 "content": content if content else None,
-                "tool_calls": [_pending_to_openai_tc(p) for p in pending],
+                "tool_calls": [_pending_to_openai_tc(p, tc_id) for p, tc_id in zip(pending, tc_ids)],
             }
             messages.append(assistant_msg)
             # 记录到 _tool_retry_log(放在 append 之后,下次再遇同 sig 才计数)
@@ -647,8 +653,8 @@ async def run_turn(
 
             # 4. Execute each tool with 行动 + 观察 labels
             for i, p in enumerate(pending):
+                tc_id = tc_ids[i]
                 if p.name is None:
-                    placeholder_id = f"unknown_{i}"
                     print_warn(console, "tool_call name missing; backfilling error")
                     error_llm_text = (
                         f"[Tool Error] tool_call name missing, raw: "
@@ -659,7 +665,7 @@ async def run_turn(
                     messages.append({
                         "role": "tool",
                         "name": p.name or "",
-                        "tool_call_id": placeholder_id,
+                        "tool_call_id": tc_id,
                         "content": error_llm_text,
                         "is_error": True,
                     })
@@ -676,7 +682,7 @@ async def run_turn(
                     messages.append({
                         "role": "tool",
                         "name": p.name or "",
-                        "tool_call_id": p.id or f"unknown_{i}",
+                        "tool_call_id": tc_id,
                         "content": error_text,
                         "is_error": True,
                     })
@@ -695,7 +701,7 @@ async def run_turn(
                     messages.append({
                         "role": "tool",
                         "name": p.name or "",
-                        "tool_call_id": p.id or f"unknown_{i}",
+                        "tool_call_id": tc_id,
                         "content": error_text,
                         "is_error": True,
                     })
@@ -711,9 +717,25 @@ async def run_turn(
                     log_decision(audit_path, iter_n=iter_count, tool=p.name, args=args,
                                  action=decision.action.value, outcome="executed",
                                  rule_id=decision.rule_id, reason=decision.reason, mode=mode)
-                    # NOTE: dispatch 异常传播出 run_turn(不 catch);tool_call_log 局部变量随栈帧
-                    # 销毁,故异常路径不记日志。异常 → runner 落 agent_crash result,整轮作废。
-                    result = await _dispatch(p, args, project_root)
+                    # Finding 1 fix:try/except 包 _dispatch — 单 tool 抛异常不能
+                    # 逃出 run_turn 破轮。失败时 append 一条 is_error tool message
+                    # (使用同一个 tc_id),然后 continue,本 turn 其余 tool 继续。
+                    try:
+                        result = await _dispatch(p, args, project_root)
+                    except Exception as dispatch_err:
+                        err_text = f"[Tool Error] dispatch 异常: {type(dispatch_err).__name__}: {dispatch_err}"
+                        print_observation(console, err_text)
+                        tool_call_log.append({"name": p.name, "args": args, "ok": False,
+                                              "result": err_text[:500]})
+                        messages.append({
+                            "role": "tool",
+                            "name": p.name,
+                            "tool_call_id": tc_id,
+                            "content": err_text,
+                            "is_error": True,
+                        })
+                        await _note_tool_error(p.name, err_text[:200])
+                        continue
                     tool_call_log.append({"name": p.name, "args": args, "ok": True,
                                           "result": str(result.llm_text)[:500]})
                     print_observation(console, result.llm_text)
@@ -725,7 +747,7 @@ async def run_turn(
                     messages.append({
                         "role": "tool",
                         "name": p.name,  # D1 final:加 name 字段(for `_has_recent_htn_parent_create` + downstream inspect)
-                        "tool_call_id": p.id or f"unknown_{i}",
+                        "tool_call_id": tc_id,
                         "content": _tool_content,
                         "is_error": _is_err,
                     })
@@ -733,7 +755,9 @@ async def run_turn(
                         await _note_tool_error(p.name, str(result.llm_text)[:200])
                 else:  # ask
                     print_warn(console, f"[需确认] {p.name} {decision.reason}")
-                    choice = confirm_tool(p.name, args)
+                    # Finding 5 fix:confirm_tool 是 sync input(),不能阻塞 event loop。
+                    # 用 asyncio.to_thread 派到 worker thread。
+                    choice = await asyncio.to_thread(confirm_tool, p.name, args)
                     if choice in ("yes", "always"):
                         if choice == "always":
                             policy.allowlist.add(p.name, args, project_root)
@@ -741,7 +765,22 @@ async def run_turn(
                         log_decision(audit_path, iter_n=iter_count, tool=p.name, args=args,
                                      action=decision.action.value, outcome="executed",
                                      rule_id=decision.rule_id, reason=decision.reason, mode=mode)
-                        result = await _dispatch(p, args, project_root)
+                        try:
+                            result = await _dispatch(p, args, project_root)
+                        except Exception as dispatch_err:
+                            err_text = f"[Tool Error] dispatch 异常: {type(dispatch_err).__name__}: {dispatch_err}"
+                            print_observation(console, err_text)
+                            tool_call_log.append({"name": p.name, "args": args, "ok": False,
+                                                  "result": err_text[:500]})
+                            messages.append({
+                                "role": "tool",
+                                "name": p.name,
+                                "tool_call_id": tc_id,
+                                "content": err_text,
+                                "is_error": True,
+                            })
+                            await _note_tool_error(p.name, err_text[:200])
+                            continue
                         tool_call_log.append({"name": p.name, "args": args, "ok": True,
                                               "result": str(result.llm_text)[:500]})
                         print_observation(console, result.llm_text)
@@ -753,7 +792,7 @@ async def run_turn(
                         messages.append({
                             "role": "tool",
                             "name": p.name,  # D1 final:加 name 字段(同上)
-                            "tool_call_id": p.id or f"unknown_{i}",
+                            "tool_call_id": tc_id,
                             "content": _tool_content,
                             "is_error": _is_err,
                         })
@@ -775,7 +814,7 @@ async def run_turn(
                         messages.append({
                             "role": "tool",
                             "name": p.name or "",
-                            "tool_call_id": p.id or f"unknown_{i}",
+                            "tool_call_id": tc_id,
                             "content": error_text,
                             "is_error": True,
                         })
@@ -842,10 +881,16 @@ async def run_turn(
     return _stats()
 
 
-def _pending_to_openai_tc(p) -> dict:
-    """Convert a PendingToolCall to OpenAI's tool_calls entry shape."""
+def _pending_to_openai_tc(p, tc_id: str | None = None) -> dict:
+    """Convert a PendingToolCall to OpenAI's tool_calls entry shape.
+
+    `tc_id` (Finding 1 fix): caller-supplied stable id, used in both the
+    assistant tool_calls[].id and the corresponding tool message tool_call_id.
+    Falls back to p.id (or empty string) for backwards compatibility when
+    caller does not pass a stable id.
+    """
     return {
-        "id": p.id or "",
+        "id": tc_id if tc_id is not None else (p.id or ""),
         "type": "function",
         "function": {
             "name": p.name or "",

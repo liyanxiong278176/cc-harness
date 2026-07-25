@@ -695,3 +695,122 @@ async def test_compaction_cascade_real_scenario():
     # Protect zone (last user) untouched
     assert msgs[-1]["content"] == original_protect_content
     assert msgs[-1]["role"] == "user"
+
+
+# --- Finding 3: Tier3 must remove summarized originals ---
+
+@pytest.mark.asyncio
+async def test_apply_tier3_summarize_replaces_delta_with_summary():
+    """Finding 3 fix: Tier3 生成的 summary 必须原子地替换被摘要的 delta 消息,
+    否则 history 单调增长 → 上下文压缩失败。"""
+    _, _, _, _, _, apply_tier3_summarize, _, _, _ = _import_context()
+    cfg = _cfg()
+    llm = FakeLLM(content="replacement summary")
+    msgs = [
+        {"role": "system", "content": "sys"},
+        {"role": "user", "content": "msg-1"},
+        {"role": "assistant", "content": "reply-1"},
+        {"role": "user", "content": "msg-2"},
+        {"role": "assistant", "content": "reply-2"},
+        {"role": "user", "content": "recent-protect"},
+    ]
+    pre_len = len(msgs)
+    pre_count_user = sum(1 for m in msgs if m.get("role") == "user")
+    pre_count_assistant = sum(1 for m in msgs if m.get("role") == "assistant")
+
+    await apply_tier3_summarize(msgs, 5, cfg, llm)
+
+    # 1. summary 必须存在
+    summary_count = sum(1 for m in msgs if m.get(SUMMARY_MARKER_KEY))
+    assert summary_count == 1, "must have exactly one summary"
+
+    # 2. protect zone(末 user)完整保留
+    assert msgs[-1]["content"] == "recent-protect"
+    assert msgs[-1]["role"] == "user"
+
+    # 3. Finding 3 fix:被摘要的 msg-1/reply-1/msg-2/reply-2 全部从 messages 中消失。
+    # 原 delta 是 msgs[1:5] = 4 条;新长度 = pre_len - 4 + 1(summary) = 3。
+    assert len(msgs) == 3, (
+        f"after Tier3, expected 3 messages (system + summary + protect user), "
+        f"got {len(msgs)}; delta messages NOT removed"
+    )
+    # 4. 没有任何 "msg-1" / "reply-1" / "msg-2" / "reply-2" 残留
+    for m in msgs:
+        assert "msg-1" not in m.get("content", ""), "delta message not removed"
+        assert "reply-1" not in m.get("content", ""), "delta message not removed"
+        assert "msg-2" not in m.get("content", ""), "delta message not removed"
+        assert "reply-2" not in m.get("content", ""), "delta message not removed"
+
+
+@pytest.mark.asyncio
+async def test_apply_tier3_summarize_incremental_replaces_old_and_delta():
+    """Finding 3 fix + incremental summary:second Tier3 pass 必须只保留:
+    1 个新 summary + protect zone;原旧 summary + 累积 delta 全部消失。"""
+    _, _, _, _, _, apply_tier3_summarize, _, _, _ = _import_context()
+    cfg = _cfg()
+    llm = FakeLLM(content="v2 summary")
+    msgs = [
+        {"role": "system", "content": "sys"},
+        # 第一次 Tier3 后这里会有 summary
+        {"role": "user", "content": "round-1"},
+        {"role": "assistant", "content": "answer-1"},
+        # 第二次 Tier3 之前新增的 delta
+        {"role": "user", "content": "round-2"},
+        {"role": "assistant", "content": "answer-2"},
+        # protect zone
+        {"role": "user", "content": "protect"},
+    ]
+    # 第一次 Tier3:delta = msgs[1:5] (round-1 / answer-1 / round-2 / answer-2)
+    await apply_tier3_summarize(msgs, 5, cfg, llm)
+    # 之后:sys + summary + protect = 3
+    assert len(msgs) == 3
+    assert msgs[1].get(SUMMARY_MARKER_KEY) is True
+
+    # 模拟第二轮历史增长:在 summary 后新增 delta
+    msgs.insert(2, {"role": "user", "content": "round-3"})
+    msgs.insert(3, {"role": "assistant", "content": "answer-3"})
+    # 现在:sys, summary, round-3, answer-3, protect = 5
+    assert len(msgs) == 5
+
+    # 第二次 Tier3:delta_start=2(summary idx+1),protect_until=4
+    # 期望:旧 summary 被替换,delta (round-3/answer-3) 被删除,只剩 sys + summary + protect
+    await apply_tier3_summarize(msgs, 4, cfg, llm)
+    assert len(msgs) == 3
+    assert msgs[1].get(SUMMARY_MARKER_KEY) is True
+    assert msgs[1]["content"] == "v2 summary"
+    assert msgs[-1]["content"] == "protect"
+    # round-3 / answer-3 都已删
+    for m in msgs:
+        assert "round-3" not in m.get("content", "")
+        assert "answer-3" not in m.get("content", "")
+
+
+@pytest.mark.asyncio
+async def test_maybe_compact_tier3_drops_message_count_and_tokens():
+    """Finding 3 fix: maybe_compact Tier3 cascade 跑完,消息数与 token 数必须下降。"""
+    from cc_harness.context import CompactionStats
+    _, _, _, _, _, _, _, maybe_compact, _ = _import_context()
+    cfg = _cfg(context_window=100, tier1_threshold=0.1, tier2_threshold=0.2,
+               tier3_threshold=0.3, protect_zone_tokens=5)
+    llm = FakeLLM(content="summary text")
+    msgs = [
+        {"role": "system", "content": "sys"},
+        {"role": "user", "content": "msg-1 " * 30},
+        {"role": "assistant", "content": "reply-1 " * 30},
+        {"role": "user", "content": "msg-2 " * 30},
+        {"role": "assistant", "content": "reply-2 " * 30},
+        {"role": "user", "content": "protect"},
+    ]
+    pre_count = len(msgs)
+    stats = await maybe_compact(msgs, None, FakeCounter(), cfg, llm)
+    from cc_harness.context import CompactionTier
+    assert stats.tier == CompactionTier.SUMMARIZE
+    # Finding 3 fix:消息数从 6 降到 3(sys + summary + protect)
+    assert len(msgs) == 3, (
+        f"after Tier3 maybe_compact, expected 3 messages, got {len(msgs)} "
+        f"(started with {pre_count})"
+    )
+    # stats.after_tokens < stats.before_tokens
+    assert stats.after_tokens < stats.before_tokens, (
+        f"after_tokens {stats.after_tokens} should be < before_tokens {stats.before_tokens}"
+    )

@@ -59,21 +59,28 @@ def print_thought(console: Console, text: str) -> None:
 
     Per user spec: the COMPLETE text the LLM emitted, no truncation.
     A leading blank line separates it from the prior phase.
+
+    Finding 8 fix:`text` 是 LLM 产生,untrusted。markup=False + highlight=False
+    防 Rich 把内容里的 `[bold]` / `[red]` / markdown 误当成样式/token 高亮。
     """
     _blank(console)
-    console.print(f"思考: {text}")
+    console.print(f"思考: {text}", markup=False, highlight=False)
     _flush(console)
 
 
 def print_action(console: Console, name: str, arguments: dict) -> None:
-    """Print '行动: <name>' with one argument per line, blank line before."""
+    """Print '行动: <name>' with one argument per line, blank line before.
+
+    Finding 8 fix:`arguments` 来自 LLM 工具调用,untrusted。markup=False
+    防 `[red]` 等样式逃逸。
+    """
     _blank(console)
-    console.print(f"行动: {name}")
+    console.print(f"行动: {name}", markup=False, highlight=False)
     if arguments:
         for k, v in arguments.items():
             val_repr = json.dumps(v, ensure_ascii=False)
-            # highlight=False stops Rich from colorizing the JSON-looking string
-            console.print(f"  {k}: {val_repr}", highlight=False)
+            # markup=False stops Rich from interpreting [bracket] in JSON values
+            console.print(f"  {k}: {val_repr}", markup=False, highlight=False)
     _flush(console)
 
 
@@ -84,34 +91,43 @@ def print_observation(console: Console, text: str) -> None:
     (i.e. ToolResult.llm_text, which includes "[Tool Error] ..." prefix for
     errors). For multi-line results (e.g. file contents), each line is
     indented under the label for readability.
+
+    Finding 8 fix:tool output 是 untrusted 外部数据,pass markup=False +
+    highlight=False 防 Rich 解释 `[red]` / `[bold]` 样式 / token 高亮污染终端。
     """
     _blank(console)
-    console.print("观察:")
+    console.print("观察:", markup=False, highlight=False)
     for line in (text or "").splitlines() or [""]:
-        console.print(f"  {line}")
+        console.print(f"  {line}", markup=False, highlight=False)
     _flush(console)
 
 
 def print_result(console: Console, text: str) -> None:
     """Print '结果: <text>' — the LLM's final answer, full text, with a
-    blank line before."""
+    blank line before.
+
+    Finding 8 fix:`text` 是 LLM 最终输出,untrusted,markup=False 防样式逃逸。
+    """
     _blank(console)
-    console.print(f"结果: {text}")
+    console.print(f"结果: {text}", markup=False, highlight=False)
     _flush(console)
 
 
 def print_warn(console: Console, text: str) -> None:
-    console.print(f"⚠ {text}")
+    # Finding 8 fix:warn text 可能含用户输入拼接(unknown slash cmd 等),markup=False。
+    console.print(f"⚠ {text}", markup=False, highlight=False)
     _flush(console)
 
 
 def print_error(console: Console, text: str) -> None:
-    console.print(f"✗ {text}")
+    console.print(f"✗ {text}", markup=False, highlight=False)
     _flush(console)
 
 
 def print_info(console: Console, text: str) -> None:
-    console.print(text)
+    # Finding 8 fix:info text 可能含 untrusted 来源(LLM 输出 / 文件内容 / 用户输入),
+    # markup=False 防样式逃逸。
+    console.print(text, markup=False, highlight=False)
     _flush(console)
 
 

@@ -41,10 +41,42 @@ def accumulate_delta(
 ) -> None:
     """Apply one delta.tool_calls[i] entry to the pending list.
 
-    If index is given, align by index (growing the list as needed).
-    If index is None, append to the end.
+    Resolution priority when ``index`` is None:
+      1. If ``id`` (or ``name``) matches an existing slot → append to that slot
+         (same call, new chunk).
+      2. Else if no id/name but ``arguments_json`` non-empty → append to the
+         LAST open slot (pure argument-continuation).
+      3. Otherwise → start a new PendingToolCall at the end.
+
+    When ``index`` is given, align by index (growing the list as needed).
     """
     if index is None:
+        # Empty delta (no id, no name, no args) → nothing to do, don't phantom
+        # create a slot just to discard it. Defensive against OpenAI providers
+        # that may emit an empty final-tool_calls delta.
+        if id is None and name is None and not arguments_json:
+            return
+        # Path 1: match by id first (deltas from providers that omit index but
+        # keep id stable across chunks)
+        if id is not None:
+            for slot in pending:
+                if slot.id == id:
+                    if name is not None:
+                        slot.name = name
+                    slot.arguments_json += arguments_json
+                    return
+        # Path 1b: match by name (some providers repeat name but omit id)
+        if name is not None and id is None:
+            for slot in pending:
+                if slot.name == name and slot.id is None:
+                    slot.arguments_json += arguments_json
+                    return
+        # Path 2: pure args continuation → last open slot
+        if (id is None and name is None) and arguments_json and pending:
+            slot = pending[-1]
+            slot.arguments_json += arguments_json
+            return
+        # Path 3: start a new slot
         slot = PendingToolCall()
         if id is not None:
             slot.id = id

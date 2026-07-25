@@ -452,6 +452,12 @@ async def apply_tier3_summarize(
             SUMMARY_MARKER_KEY: True,
         })
 
+        # 7. Finding 3 fix:原子地删除被摘要的 delta 消息,避免 history 单调增长。
+        # 用对象 id 集合做 O(n) filter — pop+insert 已打乱原 slice 索引,
+        # 改用 id(m) 引用比对,新插入的 summary 必然不在 to_delete_ids 集合里。
+        to_delete_ids = {id(m) for m in delta_messages}
+        messages[:] = [m for m in messages if id(m) not in to_delete_ids]
+
         return CompactionStats(
             tier=CompactionTier.SUMMARIZE,
             before_tokens=0,    # filled by maybe_compact

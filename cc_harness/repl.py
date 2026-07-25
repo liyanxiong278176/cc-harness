@@ -14,8 +14,10 @@ System prompt is refreshed at messages[0] on every turn to reflect the mode.
 from __future__ import annotations
 import asyncio
 import hashlib
+import inspect
 import logging
 import os
+import re
 import time
 import uuid as _uuid
 from datetime import datetime
@@ -49,6 +51,34 @@ _DISK_CHANGE_WINDOW_S = 30
 _PREVIEW_MAX_BYTES = 500
 # Max number of changed files to print (most recent first).
 _MAX_CHANGES_SHOWN = 10
+# Finding 9 fix:文件名/后缀命中这些 pattern 的小文件,跳过 content preview
+# (避免打印 .env / 凭据 / SSH 私钥 / 证书明文)。path/size/mtime 仍打印,
+# 用户能看到"动了什么文件",但不会泄露文件内容。匹配大小写不敏感,
+# 命中文件名任意位置(use search,不是 match)。
+_SENSITIVE_PATH_PATTERNS: tuple[str, ...] = (
+    r"\.env(\..*)?$",          # .env / .env.local / .env.production
+    r"\.envrc$",
+    r"(^|/)id_rsa(\.pub)?$",
+    r"(^|/)id_ed25519(\.pub)?$",
+    r"(^|/)id_dsa(\.pub)?$",
+    r"(^|/)id_ecdsa(\.pub)?$",
+    r"\.pem$",
+    r"(^|/)(aws|gcp|azure)[-_/]?credentials?(\.[a-z]+)?$",
+    r"(^|/)credentials?(\.[a-z]+)?$",  # credentials / credentials.json
+    r"secrets?\.(json|ya?ml|toml)$",
+    r"(^|/)secret[_-]?key(\.[a-z]+)?$",
+    r"(^|/)api[_-]?key(\.[a-z]+)?$",
+    r"(^|/)\.netrc$",
+    r"(^|/)\.pgpass$",
+    r"(^|/)\.npmrc$",
+    r"(^|/)\.pypirc$",
+    r"(^|/)\.aws/credentials$",
+    r"\.key$",
+    r"\.pfx$",
+    r"\.p12$",
+    r"\.keystore$",
+)
+_SENSITIVE_PATH_RE = re.compile("|".join(_SENSITIVE_PATH_PATTERNS), re.IGNORECASE)
 # Task 4 (Plan B): verify hook hints 截断 — 单 task 最多写 3 条,
 # 全局最多 10 条(防 system prompt 爆炸)。
 MAX_HINTS_PER_TASK = 3
@@ -224,18 +254,21 @@ async def run_repl(
 
     # Q3 Task8: 加载分层记忆 config(kill-switches:layered_inject/capture_enabled/pipeline_enabled)
     from cc_harness.memory.config import load_memory_config
-    mem_cfg = load_memory_config(Path("policy.yaml"))
+    # Finding 2 fix:policy.yaml 应相对于项目 cwd 读取(原 Path("policy.yaml")
+    # 走 process cwd — 与 executor config 同文件应同源)。Resolve once + reuse。
+    policy_yaml_path = Path(cwd) / "policy.yaml"
+    mem_cfg = load_memory_config(policy_yaml_path)
 
     # Construct ONE PolicyEngine for the whole session. policy.yaml is optional
     # (missing → default enabled=True). project_root is the REPL's cwd so path
     # containment checks anchor to the project, not wherever the process drifts.
-    policy_cfg = load_policy_config(Path("policy.yaml"))
+    policy_cfg = load_policy_config(policy_yaml_path)
     policy = PolicyEngine(project_root=Path(cwd), enabled=policy_cfg.enabled)
 
     # L2 输入防御:heuristic 命中即 BLOCK(不走 judge);否则 judge 判。
     # client 仅在 l2 启用 且 有 API key 时构造(空 key 时 SDK 会抛 OpenAIError;
     # heuristic 不需要 client,无 key 时仍可作为第一道防线)。
-    l2_cfg = load_l2_config(Path("policy.yaml"))
+    l2_cfg = load_l2_config(policy_yaml_path)
     l2_api_key = os.getenv("OPENAI_API_KEY")
     l2_client = (
         AsyncOpenAI(api_key=l2_api_key, base_url=os.getenv("OPENAI_BASE_URL"))
@@ -246,7 +279,7 @@ async def run_repl(
     l2_audit_path = Path(cwd) / "logs" / "l2.jsonl"
 
     # L5 输出 DLP:思考/结果段脱敏。无 [dlp] extra 时退化 Layer A(密钥正则)only。
-    l5_cfg = load_l5_config(Path("policy.yaml"))
+    l5_cfg = load_l5_config(policy_yaml_path)
     l5 = build_l5_engine(l5_cfg)
 
     # F T1: mcp_client.list_tools 修真 async(内部仍同步缓存读取)。
@@ -484,7 +517,14 @@ async def run_repl(
                 e1_decompose_enabled=e1_decompose_enabled,        # E1 D7: kill-switch 透传 → _e1_extra AND 守卫
                 tool_diff=state.cross_session_tools_diff,         # E3 D7 / F T2: cross-session tool diff 透传
             )
-            state.session_stats.add(turn_stats)
+            # Finding 7 fix:session breakdown buckets 必须基于当前 messages 重新计算
+            # (turn_stats 已含 full history snapshot,加和会重复)。API fields 仍由
+            # add() 内部 += 累加(per-LLM-call 总量,真累积)。
+            state.session_stats.add(
+                turn_stats,
+                messages=state.messages,
+                counter=state.token_counter,
+            )
 
             # Task 4 (Plan B): 提取本轮 LLM 输出文本,给下轮 verify hook 用
             state.last_turn_text = _extract_final_text(state.messages)
@@ -542,7 +582,12 @@ async def run_repl(
         # Task 6: 退出前 stop live panel(避免 dangling Rich Live 影响 terminal)
         if getattr(state, "live_panel", None) is not None:
             try:
-                await state.live_panel.stop() if asyncio.iscoroutine(state.live_panel.stop()) else state.live_panel.stop()
+                # Finding 6 fix:原条件表达式调 stop() 两次(iscoroutine + 真正调),
+                # sync stop() 路径会执行两遍,async 路径会 leak 一个未 await 的 coroutine。
+                # Resolve once + isawaitable 分派。
+                _stop_result = state.live_panel.stop()
+                if inspect.isawaitable(_stop_result):
+                    await _stop_result
             except Exception as e:
                 print_warn(console, f"live panel stop failed: {e}")
         # E4: scheduler 由 main 构造并注入;shutdown 时 _drain 等后台 task 收尾
@@ -923,7 +968,18 @@ def _collect_disk_changes(cwd: str, since: float) -> list[tuple[str, int, float,
         if stat.st_mtime < since:
             continue
         preview: str | None = None
-        if 0 < stat.st_size <= _PREVIEW_MAX_BYTES:
+        # Finding 9 fix:敏感/隐藏配置文件(.env / 凭据 / SSH 私钥等)即使 < 500B
+        # 也不打印 content preview,只显示 path + size。用户在终端看得见"动了什么",
+        # 但 secrets 不会经磁盘改动 summary 流出。
+        rel_for_check: str | None = None
+        try:
+            rel_for_check = str(p.relative_to(root)).replace("\\", "/")
+        except ValueError:
+            rel_for_check = p.name
+        if (
+            0 < stat.st_size <= _PREVIEW_MAX_BYTES
+            and not _SENSITIVE_PATH_RE.search(rel_for_check)
+        ):
             try:
                 with p.open("rb") as f:
                     raw = f.read()

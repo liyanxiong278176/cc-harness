@@ -179,14 +179,50 @@ class SessionTokenStats:
             + self.tool_definitions
         )
 
-    def add(self, turn: TurnTokenStats) -> None:
+    def add(
+        self,
+        turn: TurnTokenStats,
+        *,
+        messages: list[dict] | None = None,
+        counter: TokenCounter | None = None,
+        tools: list[dict] | None = None,
+    ) -> None:
+        """Merge a turn's stats into the session totals.
+
+        Finding 7 fix:the 6 token breakdown buckets (user_input, tool_calls,
+        llm_output, system_prompt, summary, tool_definitions) describe the
+        CURRENT history state — recomputing them from current messages each
+        turn is correct. Additive ``+= turn.foo`` would double-count (each
+        turn's stats already include the full history snapshot, so summing
+        across turns multiplies by turn count).
+
+        When caller passes ``messages`` + ``counter``, the breakdown buckets
+        are REPLACED (not added) with the recomputed values. API fields
+        (api_prompt_tokens / api_completion_tokens / api_total_tokens /
+        iters_total / turns_with_usage) remain additive — they are per-call
+        stats that genuinely accumulate across the session.
+
+        Backward compat: when caller omits messages/counter, the original
+        additive behavior is preserved (used by older tests).
+        """
         self.turns += 1
-        self.user_input += turn.user_input
-        self.tool_calls += turn.tool_calls
-        self.llm_output += turn.llm_output
-        self.system_prompt += turn.system_prompt
-        self.summary += turn.summary
-        self.tool_definitions += turn.tool_definitions
+        if messages is not None and counter is not None:
+            cats = counter.categorize(messages, tools=tools)
+            self.user_input = cats["user_input"]
+            self.tool_calls = cats["tool_calls"]
+            self.llm_output = cats["llm_output"]
+            self.system_prompt = cats["system_prompt"]
+            self.summary = cats["summary"]
+            self.tool_definitions = cats["tool_definitions"]
+        else:
+            # legacy additive fallback (preserves old behavior)
+            self.user_input += turn.user_input
+            self.tool_calls += turn.tool_calls
+            self.llm_output += turn.llm_output
+            self.system_prompt += turn.system_prompt
+            self.summary += turn.summary
+            self.tool_definitions += turn.tool_definitions
+        # API fields are per-LLM-call totals and always add.
         self.api_prompt_tokens += turn.api_prompt_tokens
         self.api_completion_tokens += turn.api_completion_tokens
         self.api_total_tokens += turn.api_total_tokens
