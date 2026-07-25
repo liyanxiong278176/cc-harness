@@ -974,12 +974,24 @@ async def test_maybe_load_cross_session_last_only_loads_silently():
     state.checkpoint_service.load_latest = AsyncMock(return_value=candidate)
     state.checkpoint_service.load_messages = AsyncMock(return_value=[{"role": "user", "content": "hi from old"}])
     mcp = MagicMock()
-    mcp.list_tools = AsyncMock(return_value=[])
+    mcp.list_tools = AsyncMock(return_value=[
+        {"type": "function", "function": {"name": "mcp__x__foo", "parameters": {"type": "object"}}},
+        {"type": "function", "function": {"name": "mcp__x__bar", "parameters": {}}},
+    ])
     await _maybe_load_cross_session(state, console=MagicMock(), mcp=mcp, mode="coding")
     assert state.messages == [{"role": "user", "content": "hi from old"}]
     assert state.last_loaded_session_id == "old1"
     assert state.mode == "coding"
     assert state.turn_counter == 0
+    # F T1: mcp.list_tools 返回 list[dict](OpenAI tool 形态),新工具 + 旧 snapshot 空 → diff 全 +
+    assert "mcp__x__foo" in state.tool_hash_snapshot
+    assert "mcp__x__bar" in state.tool_hash_snapshot
+    # SHA256 全 64 hex(spec D7 字面 lock)
+    for h in state.tool_hash_snapshot.values():
+        assert h.startswith("sha256:")
+        assert len(h) == len("sha256:") + 64
+    assert "+mcp__x__foo" in state.cross_session_tools_diff
+    assert "+mcp__x__bar" in state.cross_session_tools_diff
 
 
 @pytest.mark.asyncio
@@ -1008,10 +1020,16 @@ async def test_maybe_load_cross_session_cancels_in_progress_subagents():
     state.checkpoint_service.load_latest = AsyncMock(return_value=candidate)
     state.checkpoint_service.load_messages = AsyncMock(return_value=[])
     mcp = MagicMock()
-    mcp.list_tools = AsyncMock(return_value=[])
+    mcp.list_tools = AsyncMock(return_value=[
+        {"type": "function", "function": {"name": "mcp__x__alpha", "parameters": {"type": "object"}}},
+    ])
     await _maybe_load_cross_session(state, console=MagicMock(), mcp=mcp, mode="coding")
     assert hasattr(state, "subagent_cancelled")
     assert sorted(state.subagent_cancelled) == ["sa1", "sa2"]
+    # F T1: dict 形态 + SHA256 全长
+    assert state.tool_hash_snapshot.get("mcp__x__alpha", "").startswith("sha256:")
+    assert len(state.tool_hash_snapshot["mcp__x__alpha"]) == len("sha256:") + 64
+    assert "+mcp__x__alpha" in state.cross_session_tools_diff
 
 
 @pytest.mark.asyncio
@@ -1040,7 +1058,9 @@ async def test_maybe_load_cross_session_calls_recall(monkeypatch):
     state.checkpoint_service.load_latest = AsyncMock(return_value=candidate)
     state.checkpoint_service.load_messages = AsyncMock(return_value=[])
     mcp = MagicMock()
-    mcp.list_tools = AsyncMock(return_value=[])
+    mcp.list_tools = AsyncMock(return_value=[
+        {"type": "function", "function": {"name": "mcp__x__recall", "parameters": {"type": "object"}}},
+    ])
 
     # monkeypatch layered_recall(或 fallback 到其它 recall 函数)
     recall_called = []
@@ -1056,6 +1076,12 @@ async def test_maybe_load_cross_session_calls_recall(monkeypatch):
         pass
 
     await _maybe_load_cross_session(state, console=MagicMock(), mcp=mcp, mode="coding")
+
+    # F T1: dict 形态 + SHA256 全长(spec D7 字面 lock 64 hex)
+    assert "mcp__x__recall" in state.tool_hash_snapshot
+    assert state.tool_hash_snapshot["mcp__x__recall"].startswith("sha256:")
+    assert len(state.tool_hash_snapshot["mcp__x__recall"]) == len("sha256:") + 64
+    assert "+mcp__x__recall" in state.cross_session_tools_diff
 
     # 验证 recall 被调过(若有 layered_recall)或至少不抛异常
     if recall_called:

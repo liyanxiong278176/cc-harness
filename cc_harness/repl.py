@@ -250,7 +250,14 @@ async def run_repl(
     l5_cfg = load_l5_config(Path("policy.yaml"))
     l5 = build_l5_engine(l5_cfg)
 
-    n_tools = len(mcp.list_tools())
+    # F T1: mcp_client.list_tools 修真 async(内部仍同步缓存读取)。
+    # 这里防御两种 MCP:production 真实 MCPClient(async,coroutine)+ 测试 mock(同步 list)。
+    # agent.py:394 仍按 sync 调用,完整切 await 留待 T2。
+    import inspect as _inspect
+    _tools_result = mcp.list_tools()
+    if _inspect.iscoroutine(_tools_result):
+        _tools_result = await _tools_result
+    n_tools = len(_tools_result)
     print_info(console, "")
     print_info(console, f"  cc-harness ready  |  tools: {n_tools}  |  mode: {default_mode.upper()}")
     print_info(console, f"  prompt: {_prompt_for(default_mode).rstrip()}")
@@ -782,12 +789,16 @@ async def _maybe_load_cross_session(state, console, mcp, mode) -> None:
     state.last_decomp_todo_ids = []
     try:
         new_tools = await mcp.list_tools()
-        new_hash = {t.name: _sha256_of_tool(t) for t in new_tools}
+        # F T1: list_tools 返回 list[dict](OpenAI tool schema),name 在 t["function"]["name"]
+        new_hash = {t["function"]["name"]: _sha256_of_tool(t) for t in new_tools}
         state.tool_hash_snapshot = new_hash
-        old_hash = candidate.extra.get("tool_hash_snapshot", {})
+        old_hash = (candidate.extra.get("tool_hash_snapshot") or {}) if candidate is not None else {}
         state.cross_session_tools_diff = _diff_tool_hash(old_hash, new_hash)
-    except Exception:
-        pass
+    except Exception as e:
+        # F T1: 修真裸 except,改 print_warn(console 已在 _maybe_load_cross_session 形参)可见错误
+        print_warn(console, f"tool hash 采集失败:{e}")
+        state.tool_hash_snapshot = {}
+        state.cross_session_tools_diff = []
     # E3 D6:in-progress subagent cancelled 标记(load candidate.extra)
     state.subagent_cancelled = list(candidate.extra.get("in_progress_subagents", []))
 
@@ -813,11 +824,15 @@ async def _maybe_load_cross_session(state, console, mcp, mode) -> None:
             pass  # silent fallback — repl 启动不挂
 
 
-def _sha256_of_tool(tool) -> str:
-    """D7: mcp tool → sha256 hex of params。"""
-    import json as _json
-    params = getattr(tool, "params", {})
-    return f"sha256:{hashlib.sha256(_json.dumps(params, sort_keys=True).encode()).hexdigest()[:16]}"
+def _sha256_of_tool(tool: dict) -> str:
+    """D7: mcp tool → sha256 hex of params。F T1: dict 形态(OpenAI tool schema) + SHA256 全 64 hex。
+
+    tool 形如 {"type": "function", "function": {"name": ..., "parameters": {...}, ...}}。
+    spec D7 字面 lock 完整 64 hex,不再截短。
+    """
+    import json
+    params = tool.get("function", {}).get("parameters", {})
+    return f"sha256:{hashlib.sha256(json.dumps(params, sort_keys=True).encode()).hexdigest()}"
 
 
 def _diff_tool_hash(old: dict, new: dict) -> list[str]:

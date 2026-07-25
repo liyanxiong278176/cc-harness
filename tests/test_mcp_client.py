@@ -7,12 +7,37 @@ from cc_harness.mcp_client import MCPClient, ToolResult, _failure_msg
 FAKE_SERVER = str(Path(__file__).parent / "fake_mcp_server.py")
 
 @pytest.mark.asyncio
+async def test_list_tools_async_returns_dict_list():
+    """F T1: list_tools 改为 async 关键字(内部仍同步读缓存),返回 list[dict]。
+
+    调用方 (repl.py:_maybe_load_cross_session) 已用 `await mcp.list_tools()`。
+    旧实现是同步 def,await 一个同步方法在 pytest-asyncio 下不会立刻报错
+    (Python 会把返回值当作 awaitable),但生产里 MCPClient 之外 caller 期待
+    真 coroutine;修真后 `await list_tools()` 真实生效。
+    """
+    client = MCPClient({})  # 空 config:不启动任何 server,只验证签名
+    # 注入假 tools 缓存(OpenAI tool dict 形态)
+    client._tools = [
+        {"type": "function", "function": {"name": "foo", "parameters": {"type": "object"}}},
+        {"type": "function", "function": {"name": "bar", "parameters": {}}},
+    ]
+    result = await client.list_tools()
+    assert isinstance(result, list)
+    assert len(result) == 2
+    assert result[0]["function"]["name"] == "foo"
+    assert result[1]["function"]["name"] == "bar"
+    # 返回 list 副本(不是原 list 引用),避免外部 mutate 内部 _tools
+    result.append({"mutated": True})
+    assert len(client._tools) == 2
+
+
+@pytest.mark.asyncio
 async def test_list_tools_converts_to_openai_schema():
     cfg = MCPServerConfig(type="stdio", command=sys.executable, args=[FAKE_SERVER])
     client = MCPClient({"fake": cfg})
     await client.start()
     try:
-        tools = client.list_tools()
+        tools = await client.list_tools()
         names = {t["function"]["name"] for t in tools}
         assert "mcp__fake__echo" in names
         assert "mcp__fake__fail" in names
@@ -80,7 +105,7 @@ async def test_start_skips_unreachable_servers_without_raising():
         # Short init_timeout_s so the test stays fast.
         await client.start(init_timeout_s=2.0)
         # No server came up, so no tools should be registered.
-        assert client.list_tools() == []
+        assert await client.list_tools() == []
     finally:
         await client.shutdown()
 
@@ -105,7 +130,7 @@ async def test_start_boots_all_servers_when_some_are_slow():
     try:
         await client.start(init_timeout_s=10.0)
         # All three still came up despite the delay.
-        names = {t["function"]["name"] for t in client.list_tools()}
+        names = {t["function"]["name"] for t in await client.list_tools()}
         assert "mcp__slow-a__echo" in names
         assert "mcp__slow-b__echo" in names
         assert "mcp__slow-c__echo" in names
@@ -126,7 +151,7 @@ async def test_start_boots_good_server_alongside_a_bad_one():
     client = MCPClient({"good": good, "bad": bad})
     try:
         await client.start(init_timeout_s=2.0)
-        names = {t["function"]["name"] for t in client.list_tools()}
+        names = {t["function"]["name"] for t in await client.list_tools()}
         assert "mcp__good__echo" in names
         # The bad server contributed nothing.
         assert not any(n.startswith("mcp__bad__") for n in names)
@@ -185,7 +210,7 @@ async def test_start_surfaces_failure_reason_for_empty_str_exception(capsys):
     try:
         await client.start(init_timeout_s=2.0)
         # Failure was handled per-server-isolation style: no tools registered.
-        assert client.list_tools() == []
+        assert await client.list_tools() == []
     finally:
         await client.shutdown()
 

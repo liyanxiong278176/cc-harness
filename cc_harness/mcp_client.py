@@ -171,7 +171,11 @@ class MCPClient:
         except (asyncio.TimeoutError, Exception):
             pass
 
-    def list_tools(self) -> list[dict]:
+    async def list_tools(self) -> list[dict]:
+        # F T1: caller (repl.py:_maybe_load_cross_session) 已用 `await mcp.list_tools()`。
+        # 修真前是同步方法,await 同步方法返回非 awaitable — repl 端 `t.name` /
+        # `_sha256_of_tool` 修真 dict 形态后,这里必须保持 async 关键字让 await 真实生效。
+        # 内部仍是同步缓存读取,仅包装 async 关键字保持 repl.py await 风格一致。
         return list(self._tools)
 
     @staticmethod
