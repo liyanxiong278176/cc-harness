@@ -1264,3 +1264,20 @@ def test_refresh_system_prompt_no_tools_block_when_empty_diff():
         tool_diff=[],
     )
     assert "<cross_session_tools>" not in messages[0]["content"]
+
+
+# --- F T6:Standards cleanup — 模块级预编译 regex ---
+
+def test_cross_session_tools_block_uses_module_level_regex():
+    """F T6 Standards: agent 模块级 _CROSS_SESSION_TOOLS_BLOCK_RE 应存在且为 re.Pattern。"""
+    import re
+    from cc_harness import agent
+    assert hasattr(agent, "_CROSS_SESSION_TOOLS_BLOCK_RE"), (
+        "agent 模块缺 _CROSS_SESSION_TOOLS_BLOCK_RE — 应沿 _SUBAGENT_HINTS_RE 模式预编译"
+    )
+    assert isinstance(agent._CROSS_SESSION_TOOLS_BLOCK_RE, re.Pattern)
+    # 验证 pattern 包含 <cross_session_tools> 块
+    assert "<cross_session_tools>" in agent._CROSS_SESSION_TOOLS_BLOCK_RE.pattern
+    assert "</cross_session_tools>" in agent._CROSS_SESSION_TOOLS_BLOCK_RE.pattern
+    # DOTALL flag 必须开(块可跨行)
+    assert agent._CROSS_SESSION_TOOLS_BLOCK_RE.flags & re.DOTALL

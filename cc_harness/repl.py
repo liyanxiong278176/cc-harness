@@ -96,7 +96,6 @@ class ReplState:
     # E3 D4:跨 session 自动续接 — checkpoint_service 由 main.py:boot() 构造注入(T7);
     # 若 None 则 _maybe_load_cross_session silent no-op(沿 reflection_engine 模式)。
     checkpoint_service: object | None = None
-    checkpoint_path: Path | None = None
     last_loaded_session_id: str | None = None
     tool_hash_snapshot: dict[str, str] = field(default_factory=dict)
     cross_session_tools_diff: list[str] = field(default_factory=list)
@@ -803,6 +802,27 @@ async def _maybe_load_cross_session(state, console, mcp, mode) -> None:
     state.messages = messages
     state.last_loaded_session_id = candidate.session_id
     state.mode = candidate.mode
+    # F T6 D6 Standards: last_loaded_session_id 接入 audit(log_decision 复用 L4 通路)
+    if state.project_root is not None:
+        _cs_audit_path = Path(state.project_root) / "logs" / "cross_session.jsonl"
+        try:
+            log_decision(
+                _cs_audit_path,
+                iter_n=0,
+                tool="session_resume",
+                args={
+                    "session_id": state.last_loaded_session_id,
+                    "turn_counter": candidate.turn_counter,
+                    "mode": candidate.mode,
+                },
+                action="cross_session_load",
+                outcome="success",
+                rule_id="e3_session_resume",
+                reason="cross-session auto-resume loaded",
+                mode=state.mode,
+            )
+        except Exception as _e:
+            print_warn(console, f"cross-session audit log_decision failed: {_e}")
     state.turn_counter = 0
     state.decomposition_rejected = False
     state.last_decomp_summary = None

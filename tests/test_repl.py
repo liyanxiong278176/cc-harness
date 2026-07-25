@@ -937,14 +937,15 @@ async def test_repl_reject_handles_todo_service_failure():
 
 @pytest.mark.asyncio
 async def test_repl_state_has_e3_checkpoint_fields():
-    """E3 D4/D7:ReplState 加 5 checkpoint 字段,默认值正确。"""
+    """E3 D4/D7:ReplState 加 4 checkpoint 字段(checkpoint_path 已 F T6 删),默认值正确。"""
     from cc_harness.repl import ReplState
     state = ReplState()
     assert state.checkpoint_service is None
-    assert state.checkpoint_path is None
     assert state.last_loaded_session_id is None
     assert state.tool_hash_snapshot == {}
     assert state.cross_session_tools_diff == []
+    # F T6 Standards: checkpoint_path 已删(从未读写 — Speculative Generality)
+    assert not hasattr(state, "checkpoint_path")
 
 
 @pytest.mark.asyncio
@@ -1445,3 +1446,51 @@ async def test_maybe_load_no_op_when_no_in_progress_subagents(monkeypatch):
 
     # 没有任何关于 "跨 session 中断" 的 warn
     assert not any("跨 session 中断" in w for w in warn_calls)
+
+
+# --- F T6:Standards cleanup — last_loaded_session_id 接入 audit ---
+
+@pytest.mark.asyncio
+async def test_load_cross_session_writes_audit_log(tmp_path):
+    """F T6 Standards: last_loaded_session_id 接入 audit (logs/cross_session.jsonl)。"""
+    import json
+    from cc_harness.repl import _maybe_load_cross_session, ReplState
+    from cc_harness.project.models import Manifest, CrossSessionMode
+    from cc_harness.memory.checkpoint import CheckpointRecord
+
+    state = ReplState()
+    state.manifest = Manifest(
+        project_id="p1", name="test",
+        todos_path="t.yaml",
+        created_at="2026-07-25T10:00:00",
+        cross_session_mode=CrossSessionMode.LAST_ONLY,
+    )
+    state.project_root = tmp_path  # audit path = tmp_path/logs/cross_session.jsonl
+    candidate = CheckpointRecord(
+        session_id="old1", project_root=tmp_path,
+        mode="coding", turn_counter=3,
+        started_at="2026-07-25T09:00:00",
+        ended_at="2026-07-25T09:05:00",
+        cross_session_mode="last_only",
+        extra={},
+    )
+    state.checkpoint_service = MagicMock()
+    state.checkpoint_service.load_latest = AsyncMock(return_value=candidate)
+    state.checkpoint_service.load_messages = AsyncMock(return_value=[])
+    mcp = MagicMock()
+    mcp.list_tools = AsyncMock(return_value=[])
+
+    await _maybe_load_cross_session(state, console=MagicMock(), mcp=mcp, mode="coding")
+
+    # 验证 audit 文件被写
+    audit_file = tmp_path / "logs" / "cross_session.jsonl"
+    assert audit_file.exists(), f"audit file not written: {audit_file}"
+    lines = audit_file.read_text(encoding="utf-8").strip().splitlines()
+    assert len(lines) >= 1, f"audit file empty: {audit_file}"
+    entry = json.loads(lines[-1])
+    assert entry["tool"] == "session_resume"
+    assert entry["args"]["session_id"] == "old1"
+    assert entry["decision"] == "cross_session_load"
+    assert entry["rule_id"] == "e3_session_resume"
+    assert entry["mode"] == "coding"
+    assert entry["outcome"] == "success"

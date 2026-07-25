@@ -67,6 +67,11 @@ _SUBAGENT_HINTS_RE = re.compile(
     r"\s*<subagent_hints\b[^>]*>.*?</subagent_hints>\s*\Z",
     flags=re.DOTALL,
 )
+# F T6 Standards: cross_session_tools block strip pattern 预编译(沿 _SUBAGENT_HINTS_RE 模式)
+_CROSS_SESSION_TOOLS_BLOCK_RE = re.compile(
+    r"\n<cross_session_tools>.*?</cross_session_tools>\n",
+    flags=re.DOTALL,
+)
 
 
 # --- Native (non-MCP) tool registry ---
@@ -981,13 +986,9 @@ def _refresh_system_prompt(messages: list[dict], cwd: str, mode: str,
     # E3 D7:tool 变更 warn — 新 session 启动时 mcp tool 列表变化列表写入 system。
     # Idempotent:旧 block 在 inject 前 strip 掉(沿 `<resume_task>` pattern)。
     if tool_diff:
-        # strip old
-        import re as _re
-        messages[0]["content"] = _re.sub(
-            r"\n<cross_session_tools>.*?</cross_session_tools>\n",
-            "",
-            messages[0]["content"],
-            flags=_re.DOTALL,
+        # strip old(F T6: 用模块级预编译 _CROSS_SESSION_TOOLS_BLOCK_RE, 沿 _SUBAGENT_HINTS_RE 模式)
+        messages[0]["content"] = _CROSS_SESSION_TOOLS_BLOCK_RE.sub(
+            "", messages[0]["content"]
         )
         tool_block = "\n<cross_session_tools>\n" + "\n".join(tool_diff) + "\n</cross_session_tools>\n"
         messages[0]["content"] += tool_block
