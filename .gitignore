@@ -27,3 +27,36 @@ eval/locomo/.checkpoint.json
 
 # M5-2 judge cache (locomo runner writes under output_dir / ".judge-cache")
 eval/result/.judge-cache/
+# cc-harness:exclude per-task markdown descriptions (live in yaml main index)
+.cc-harness/todos/*.md
+# cc-harness:keep directory tracked even when empty
+
+# Local ad-hoc logs / debug dumps (do not commit)
+# NOTE: logs/ contains tracked mcp_server.log — do NOT ignore the directory.
+/debug.log
+/pytestdebug.log
+/tmpreg*.log
+/logs/locomo-*.log
+/logs/locomo_memory.db
+/logs/memory.db
+/logs/memory/
+/logs/memory_maintenance.jsonl
+/logs/persona.md
+/logs/sandbox.jsonl
+/logs/scenarios/
+
+# Locomo eval results / dryrun (large jsonl + screenshots — generated each run)
+eval/result/_dryrun/
+eval/result/conv-*.trace.jsonl
+eval/result/locomo-*/
+eval/result/locomo-*.json
+eval/result/promptfoo-result/
+/img/
+
+# cc-harness ad-hoc session/test memory DB
+cc_harness/memory/*.db
+
+# Local env / wrapper scripts (eval tooling)
+/eval/promptfoo/.cc_env.sh
+/eval/promptfoo/promptfoo.txt
+/eval/img/

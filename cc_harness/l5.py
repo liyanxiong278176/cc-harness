@@ -34,6 +34,8 @@ _KEY_PATTERNS: list[tuple[re.Pattern[str], str]] = [
     (re.compile(r"github_pat_[A-Za-z0-9_]{60,}"), "github_token"),
     (re.compile(r"\bglpat-[A-Za-z0-9_-]{20}\b"), "gitlab_token"),
     (re.compile(r"\bxox[baprs]-[A-Za-z0-9-]{10,}\b"), "slack_token"),
+    (re.compile(r"https://hooks\.slack\.com/services/T[A-Za-z0-9]+/B[A-Za-z0-9]+/[A-Za-z0-9]+"), "slack_webhook"),
+    (re.compile(r"\b[sr]k_live_[A-Za-z0-9]{20,}\b"), "stripe_key"),
     (re.compile(r"\bAIza[0-9A-Za-z_-]{35}\b"), "google_api_key"),
     # PEM 私钥块:DOTALL 跨行,非贪婪到匹配的 END 行(避免贪心吞掉后续输出)
     (re.compile(r"-----BEGIN [A-Z ]*PRIVATE KEY-----.*?-----END [A-Z ]*PRIVATE KEY-----", re.DOTALL), "private_key"),

@@ -9,6 +9,9 @@ import jsonschema
 
 _MCP_SCHEMAS: dict[str, dict] = {}
 
+# 单条 command 硬上限:防 LLM/注入产出多 MB command 字符串撑爆内存/子进程。
+_MAX_COMMAND_LEN = 64_000
+
 
 class RunCommandArgs(BaseModel):
     command: str
@@ -18,6 +21,8 @@ class RunCommandArgs(BaseModel):
     def _non_empty(cls, v: str) -> str:
         if not isinstance(v, str) or not v.strip():
             raise ValueError("'command' must be a non-empty string")
+        if len(v) > _MAX_COMMAND_LEN:
+            raise ValueError(f"'command' too long ({len(v)} > {_MAX_COMMAND_LEN} chars)")
         return v
 
 
