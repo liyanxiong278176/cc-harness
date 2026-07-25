@@ -528,7 +528,15 @@ async def run_repl(
                     ended_at=_dt.now().isoformat(),
                     cross_session_mode=cross_session_mode_value,
                     messages=state.messages,
-                    extra={"tool_hash_snapshot": state.tool_hash_snapshot},
+                    extra={
+                        "tool_hash_snapshot": state.tool_hash_snapshot,
+                        # F T3 D6: serialize in-progress subagents → 下次 session
+                        # 启动时 mark_cancelled + warn(标 cancelled, 不续跑)
+                        "in_progress_subagents": (
+                            await state.todo_service.list_in_progress()
+                            if state.todo_service is not None else []
+                        ),
+                    },
                 )
             except Exception as e:
                 print_warn(console, f"checkpoint save failed: {e}")
@@ -813,6 +821,19 @@ async def _maybe_load_cross_session(state, console, mcp, mode) -> None:
         state.cross_session_tools_diff = []
     # E3 D6:in-progress subagent cancelled 标记(load candidate.extra)
     state.subagent_cancelled = list(candidate.extra.get("in_progress_subagents", []))
+
+    # F T3 D6:跨 session 中断的 subagent 修真 mark_cancelled + warn
+    # spec 字面 lock:不续跑,标 cancelled + 告知 user。silent fallback 兜底
+    # (todo_service=None 跳过;mark_cancelled 内部 swallow 单条失败)。
+    if state.subagent_cancelled and state.todo_service is not None:
+        try:
+            await state.todo_service.mark_cancelled(state.subagent_cancelled)
+        except Exception as e:  # noqa: BLE001
+            print_warn(console, f"跨 session subagent 修真 cancelled 失败: {e}")
+        print_warn(
+            console,
+            f"以下 subagent 跨 session 中断,标 cancelled: {state.subagent_cancelled}",
+        )
 
     # E3 D7:跨 session 摘要渲染(T5 函数 + 第 4 形参 in_progress_subagents)
     from cc_harness.render import print_cross_session_summary

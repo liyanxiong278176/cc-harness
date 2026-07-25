@@ -812,3 +812,105 @@ async def test_dependency_cycle_error_inherits_todo_error_via_service_path() -> 
         b = await svc_local.create(title="b", depends_on=[a.id])
         with pytest.raises(TodoError):
             await svc_local.update(a.id, depends_on=[b.id])
+
+
+# ---------------------------------------------------------------------------
+# F T3 D6:list_in_progress + mark_cancelled(跨 session checkpoint 接入)
+# ---------------------------------------------------------------------------
+
+
+async def test_list_in_progress_returns_non_terminal_only(svc: TodoService) -> None:
+    """F T3 D6: list_in_progress 只返 non-terminal 状态(pending/in_progress/blocked)。
+
+    terminal={done, cancelled} 不返;被 cancelled 也仍为 terminal.
+    """
+    pending = await svc.create(title="p")
+    running = await svc.create(title="r")
+    await svc.update(running.id, status="in_progress")
+    blocked = await svc.create(title="b")
+    await svc.update(blocked.id, status="blocked")
+    done = await svc.create(title="d")
+    await svc.update(done.id, status="in_progress")
+    await svc.update(done.id, status="done")
+    cancelled = await svc.create(title="c")
+    await svc.update(cancelled.id, status="cancelled")
+
+    result = await svc.list_in_progress()
+    assert set(result) == {pending.id, running.id, blocked.id}
+
+
+async def test_list_in_progress_empty(svc: TodoService) -> None:
+    """无 todo → 返回空 list。"""
+    result = await svc.list_in_progress()
+    assert result == []
+
+
+async def test_list_in_progress_all_done(svc: TodoService) -> None:
+    """全 done → 空。"""
+    t1 = await svc.create(title="a")
+    await svc.update(t1.id, status="in_progress")
+    await svc.update(t1.id, status="done")
+    t2 = await svc.create(title="b")
+    await svc.update(t2.id, status="in_progress")
+    await svc.update(t2.id, status="done")
+    result = await svc.list_in_progress()
+    assert result == []
+
+
+async def test_mark_cancelled_sets_non_terminal_to_cancelled(svc: TodoService) -> None:
+    """F T3 D6: pending/in_progress/blocked todo → mark_cancelled 标 cancelled。"""
+    p = await svc.create(title="p")
+    r = await svc.create(title="r")
+    await svc.update(r.id, status="in_progress")
+    b = await svc.create(title="b")
+    await svc.update(b.id, status="blocked")
+
+    await svc.mark_cancelled([p.id, r.id, b.id])
+
+    assert (await svc.get(p.id)).status == "cancelled"
+    assert (await svc.get(r.id)).status == "cancelled"
+    assert (await svc.get(b.id)).status == "cancelled"
+
+
+async def test_mark_cancelled_skips_already_terminal(svc: TodoService) -> None:
+    """done/cancelled 的 todo → mark_cancelled no-op,前后 status 一致 + 不抛。"""
+    d = await svc.create(title="d")
+    await svc.update(d.id, status="in_progress")
+    await svc.update(d.id, status="done")
+    c = await svc.create(title="c")
+    await svc.update(c.id, status="cancelled")
+
+    # 不抛
+    await svc.mark_cancelled([d.id, c.id])
+
+    # 修真前/后 status 一致(no-op)
+    assert (await svc.get(d.id)).status == "done"
+    assert (await svc.get(c.id)).status == "cancelled"
+
+
+async def test_mark_cancelled_missing_id_is_silent(svc: TodoService) -> None:
+    """list 里有不存在的 task_id → swallow(避免 checkpoint load 影响 session 启动)。"""
+    t = await svc.create(title="keep")
+    # ghost 不存在
+    await svc.mark_cancelled(["ghost1234", t.id])
+    # t 修真
+    assert (await svc.get(t.id)).status == "cancelled"
+
+
+async def test_mark_cancelled_empty_list_noop(svc: TodoService) -> None:
+    """空 list → no-op,不该抛。"""
+    t = await svc.create(title="untouched")
+    await svc.mark_cancelled([])
+    assert (await svc.get(t.id)).status == "pending"
+
+
+async def test_mark_cancelled_swallows_exceptions(svc: TodoService, monkeypatch) -> None:
+    """Service.update 抛异常 → mark_cancelled swallow,不冒泡(checkpoint load 容错)。"""
+    t = await svc.create(title="x")
+
+    async def boom(*args, **kwargs):
+        raise RuntimeError("db crash")
+
+    monkeypatch.setattr(svc, "update", boom)
+    # 不抛
+    await svc.mark_cancelled([t.id])

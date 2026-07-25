@@ -1207,3 +1207,241 @@ async def test_first_session_captures_tool_snapshot():
     # 首次 session 不修改 messages / last_loaded_session_id
     assert state.messages == []
     assert state.last_loaded_session_id is None
+
+
+# --- F T3 D6:save 端 finally extra 含 in_progress_subagents + load 端 mark_cancelled + warn ---
+
+
+@pytest.mark.asyncio
+async def test_save_persists_in_progress_subagents(monkeypatch):
+    """F T3 D6: run_repl finally save 调 checkpoint_service.save 时,
+    extra["in_progress_subagents"] 来自 state.todo_service.list_in_progress() 返回值。
+    """
+    from cc_harness import repl as repl_mod
+    from cc_harness.repl import run_repl
+    from cc_harness.tokens import TurnTokenStats
+
+    inputs = iter(["hello", "exit"])
+    monkeypatch.setattr(repl_mod, "_read_user", _fake_read_user(inputs))
+
+    # 隔离 _maybe_load_cross_session — 不让它覆盖 state.messages / state.manifest
+    async def _no_load(*args, **kwargs):
+        return None
+
+    monkeypatch.setattr(repl_mod, "_maybe_load_cross_session", _no_load)
+
+    async def _spy(messages, llm, mcp, *, tool_diff=None, **kwargs):
+        return TurnTokenStats()
+
+    monkeypatch.setattr("cc_harness.agent.run_turn", _spy)
+
+    # mock checkpoint_service.save
+    save_mock = MagicMock()
+    save_mock.save = AsyncMock()
+    save_mock.load_latest = AsyncMock(return_value=None)
+    save_mock.load_messages = AsyncMock(return_value=[])
+
+    # mock todo_service — 用 spec=TodoService 让属性自动派生
+    list_in_progress_mock = AsyncMock(return_value=["sa-task-1", "sa-task-2"])
+    todo_mock = MagicMock()
+    todo_mock.list_in_progress = list_in_progress_mock
+    todo_mock.list = AsyncMock(return_value=[])  # resume 路径
+    todo_mock.mark_cancelled = AsyncMock()
+
+    # 注入 ReplState 工厂:boot 后 state.todo_service 被覆盖成我们的 mock
+    OriginalState = repl_mod.ReplState
+
+    def _state_factory(*args, **kwargs):
+        s = OriginalState(*args, **kwargs)
+        s.checkpoint_service = save_mock
+        s.messages = [{"role": "user", "content": "hi"}]
+        s.session_id = "repl-test-1"
+        return s
+
+    monkeypatch.setattr(repl_mod, "ReplState", _state_factory)
+
+    # post-boot 覆写 state.todo_service 的钩子:利用 _after_turn_todo 是 no-op 时
+    # 我们直接 monkeypatch 一段把 state.todo_service 替换成我们的 mock
+    async def _swap_todo(state, todo_service):
+        # 第一次 turn 跑完 → 替换 state.todo_service 为我们的 mock
+        state.todo_service = todo_mock
+
+    monkeypatch.setattr(repl_mod, "_after_turn_todo", _swap_todo)
+
+    await run_repl(_StoppingLLM(), _NoopMCP(), cwd="/x")
+
+    # list_in_progress 至少被调用 1 次(finally 块里被调以收集 in-progress)
+    assert list_in_progress_mock.await_count >= 1
+    # save 被调用(finally save 块被触发)
+    assert save_mock.save.await_count >= 1
+    # 捕获的 extra["in_progress_subagents"] 来自 list_in_progress 的返回值
+    extras = save_mock.save.call_args.kwargs.get("extra", {})
+    assert "in_progress_subagents" in extras
+    assert sorted(extras["in_progress_subagents"]) == ["sa-task-1", "sa-task-2"]
+
+
+@pytest.mark.asyncio
+async def test_save_extra_without_todo_service(monkeypatch):
+    """F T3 D6: state.todo_service=None → save 仍触发,extra["in_progress_subagents"]=[]。"""
+    from cc_harness import repl as repl_mod
+    from cc_harness.project import service as service_mod
+    from cc_harness.repl import run_repl
+    from cc_harness.tokens import TurnTokenStats
+
+    inputs = iter(["hello", "exit"])
+    monkeypatch.setattr(repl_mod, "_read_user", _fake_read_user(inputs))
+
+    async def _no_load(*args, **kwargs):
+        return None
+
+    monkeypatch.setattr(repl_mod, "_maybe_load_cross_session", _no_load)
+
+    async def _spy(messages, llm, mcp, *, tool_diff=None, **kwargs):
+        return TurnTokenStats()
+
+    monkeypatch.setattr("cc_harness.agent.run_turn", _spy)
+
+    # boot 时 TodoService 构造失败 → state.todo_service = None
+    todo_class_mock = MagicMock(side_effect=RuntimeError("todo init failed"))
+    monkeypatch.setattr(service_mod, "TodoService", todo_class_mock)
+
+    save_mock = MagicMock()
+    save_mock.save = AsyncMock()
+    save_mock.load_latest = AsyncMock(return_value=None)
+    save_mock.load_messages = AsyncMock(return_value=[])
+
+    OriginalState = repl_mod.ReplState
+
+    def _state_factory(*args, **kwargs):
+        s = OriginalState(*args, **kwargs)
+        s.checkpoint_service = save_mock
+        s.messages = [{"role": "user", "content": "hi"}]
+        s.session_id = "repl-test-2"
+        return s
+
+    monkeypatch.setattr(repl_mod, "ReplState", _state_factory)
+
+    await run_repl(_StoppingLLM(), _NoopMCP(), cwd="/x")
+
+    assert save_mock.save.await_count >= 1
+    extras = save_mock.save.call_args.kwargs.get("extra", {})
+    assert extras.get("in_progress_subagents") == []
+
+
+@pytest.mark.asyncio
+async def test_maybe_load_marks_in_progress_subagents_cancelled_and_warns(monkeypatch):
+    """F T3 D6: load candidate.extra 有 in_progress_subagents → mark_cancelled 调用 + print_warn 输出。
+    """
+    from cc_harness.repl import _maybe_load_cross_session, ReplState
+    from cc_harness.project.models import Manifest, CrossSessionMode
+    from cc_harness.memory.checkpoint import CheckpointRecord
+    import pathlib
+
+    state = ReplState()
+    state.manifest = Manifest(
+        project_id="p1", name="test", todos_path="t.yaml",
+        created_at="2026-07-24T10:00:00",
+        cross_session_mode=CrossSessionMode.LAST_ONLY,
+    )
+    state.project_root = pathlib.Path("/tmp")
+    candidate = CheckpointRecord(
+        session_id="old1", project_root=pathlib.Path("/tmp"),
+        mode="coding", turn_counter=3,
+        started_at="2026-07-24T09:00:00",
+        ended_at="2026-07-24T09:05:00",
+        cross_session_mode="last_only",
+        extra={"in_progress_subagents": ["sa-task-1", "sa-task-2"]},
+    )
+    state.checkpoint_service = MagicMock()
+    state.checkpoint_service.load_latest = AsyncMock(return_value=candidate)
+    state.checkpoint_service.load_messages = AsyncMock(return_value=[])
+
+    # mock todo_service
+    mark_cancelled_mock = AsyncMock()
+    state.todo_service = MagicMock()
+    state.todo_service.mark_cancelled = mark_cancelled_mock
+
+    # mock console with print_warn tracking
+    console = MagicMock()
+
+    mcp = MagicMock()
+    mcp.list_tools = AsyncMock(return_value=[
+        {"type": "function", "function": {"name": "mcp__x__foo", "parameters": {"type": "object"}}},
+    ])
+
+    # monkeypatch print_warn 让其可跟踪(避免 console.print 不被记录)
+    warn_calls: list[list[str]] = []
+
+    async def _async_noop(*args, **kwargs):
+        pass
+
+    def _fake_print_warn(c, msg, *args, **kwargs):
+        warn_calls.append([msg] + list(args))
+
+    monkeypatch.setattr("cc_harness.repl.print_warn", _fake_print_warn)
+
+    await _maybe_load_cross_session(state, console=console, mcp=mcp, mode="coding")
+
+    # mark_cancelled 被调用 1 次,参数为完整 id list
+    assert mark_cancelled_mock.await_count == 1
+    args, _ = mark_cancelled_mock.call_args
+    assert sorted(args[0]) == ["sa-task-1", "sa-task-2"]
+
+    # print_warn 被调用 1 次,内容含 "以下 subagent 跨 session 中断"
+    assert len(warn_calls) >= 1
+    joined = " ".join(" ".join(map(str, w)) for w in warn_calls)
+    assert "以下 subagent 跨 session 中断" in joined
+
+
+@pytest.mark.asyncio
+async def test_maybe_load_no_op_when_no_in_progress_subagents(monkeypatch):
+    """F T3 D6: load candidate.extra 无 in_progress_subagents → mark_cancelled 不调 + 不 warn。
+    """
+    from cc_harness.repl import _maybe_load_cross_session, ReplState
+    from cc_harness.project.models import Manifest, CrossSessionMode
+    from cc_harness.memory.checkpoint import CheckpointRecord
+    import pathlib
+
+    state = ReplState()
+    state.manifest = Manifest(
+        project_id="p1", name="test", todos_path="t.yaml",
+        created_at="2026-07-24T10:00:00",
+        cross_session_mode=CrossSessionMode.LAST_ONLY,
+    )
+    state.project_root = pathlib.Path("/tmp")
+    candidate = CheckpointRecord(
+        session_id="old1", project_root=pathlib.Path("/tmp"),
+        mode="coding", turn_counter=3,
+        started_at="2026-07-24T09:00:00",
+        ended_at="2026-07-24T09:05:00",
+        cross_session_mode="last_only",
+        extra={},  # no in_progress_subagents
+    )
+    state.checkpoint_service = MagicMock()
+    state.checkpoint_service.load_latest = AsyncMock(return_value=candidate)
+    state.checkpoint_service.load_messages = AsyncMock(return_value=[])
+
+    mark_cancelled_mock = AsyncMock()
+    state.todo_service = MagicMock()
+    state.todo_service.mark_cancelled = mark_cancelled_mock
+
+    console = MagicMock()
+    mcp = MagicMock()
+    mcp.list_tools = AsyncMock(return_value=[
+        {"type": "function", "function": {"name": "mcp__x__foo", "parameters": {"type": "object"}}},
+    ])
+
+    warn_calls: list[str] = []
+
+    def _fake_print_warn(c, msg, *args, **kwargs):
+        warn_calls.append(msg)
+
+    monkeypatch.setattr("cc_harness.repl.print_warn", _fake_print_warn)
+
+    await _maybe_load_cross_session(state, console=console, mcp=mcp, mode="coding")
+
+    # mark_cancelled 不被调用
+    assert mark_cancelled_mock.await_count == 0
+
+    # 没有任何关于 "跨 session 中断" 的 warn
+    assert not any("跨 session 中断" in w for w in warn_calls)

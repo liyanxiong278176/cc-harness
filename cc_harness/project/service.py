@@ -154,6 +154,43 @@ class TodoService:
 
         return ordered
 
+    async def list_in_progress(self) -> list[str]:
+        """F T3 D6: 返回所有 non-terminal 状态 todo 的 task_id。
+
+        non-terminal = status 不在 {done, cancelled} 里(legal TaskStatus:
+        pending / in_progress / done / blocked / cancelled)。
+
+        用于 E3 cross-session checkpoint:serialize in_progress_subagents 到
+        checkpoint extra,下次 session 启动时 mark_cancelled 标 cancelled。
+        """
+        tasks = await self.list(include_done=True)
+        _TERMINAL_STATUSES = {"done", "cancelled"}
+        return [t.id for t in tasks if t.status not in _TERMINAL_STATUSES]
+
+    async def mark_cancelled(self, ids: list[str]) -> None:
+        """F T3 D6: 批量标 cancelled。
+
+        - ids 中的 task_id: 调 update(task_id, status="cancelled")
+        - todo 不存在或已 terminal(in {done, cancelled})→ no-op(silent)
+        - 失败 silent,不冒泡(避免 checkpoint load 失败影响 session 启动)
+        """
+        _TERMINAL_STATUSES = {"done", "cancelled"}
+        for tid in ids:
+            try:
+                t = await self.get(tid)
+            except TaskNotFound:
+                continue
+            except Exception:
+                continue
+            if t is None:
+                continue
+            if t.status in _TERMINAL_STATUSES:
+                continue
+            try:
+                await self.update(tid, status="cancelled")
+            except Exception:
+                pass  # silent — checkpoint load 容错
+
     async def validate(self) -> list[ValidationIssue]:
         """全表校验:引用完整性 + 环检测 + md/yaml 一致性。
 
