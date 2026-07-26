@@ -195,6 +195,16 @@ async def run_turn(
     iter_count = 0
     _empty_retried = False  # one-shot retry guard for empty-content turns
     tool_call_log: list = []  # Plan1 Task4: [{name, args, ok, result}] per tool dispatch
+    # Task 3 (Codex Web UI): event_emitter 转发 hook,REPL(None)路径零调用。
+    # _safe_emit 包成 fail-soft call site,任意 emit 异常都不会破主 ReAct 循环。
+    # 字段 schema 由 tests/test_agent_event_emitter.py 与 Task 4 pydantic 锁定。
+    async def _safe_emit(ev: dict) -> None:
+        if event_emitter is None:
+            return
+        try:
+            await event_emitter(ev)
+        except Exception:
+            pass
     # E2 T2.2 Step 3e:同 tool+args 调 2+ 次的检测(独立于 tool_call_log 避免冲突,
     # tool_call_log 仍按 Plan1 契约存 dict 给 TurnTokenStats.tool_call_log 用)
     _tool_retry_log: list[tuple] = []  # [(name, arguments_json), ...]
@@ -608,6 +618,12 @@ async def run_turn(
                     fallback = "达到最大迭代次数,任务未完成。"
                     messages.append({"role": "assistant", "content": fallback})
                     print_result(console, fallback)
+                # Task 3:emit result(max_iter+content/fallback 兜底路径,ReAct 终止)
+                await _safe_emit({
+                    "type": "result",
+                    "text": content or fallback,
+                    "ts": time.time(),
+                })
                 return _stats()
 
             # 3. Build assistant message (with tool_calls; content may be None)
@@ -651,6 +667,14 @@ async def run_turn(
             # 3.5 Print the 思考 block (full LLM text for this iter)
             if content:
                 print_thought(console, content)
+                # Task 3: emit thought 事件(LLM stream 缓冲完成,出 thought)
+                # text = post-L5 脱敏 content;iteration = 当前 iter;ts = time.time()。
+                await _safe_emit({
+                    "type": "thought",
+                    "text": content,
+                    "ts": time.time(),
+                    "iteration": iter_count,
+                })
 
             # 4. Execute each tool with 行动 + 观察 labels
             for i, p in enumerate(pending):
@@ -670,6 +694,14 @@ async def run_turn(
                         "content": error_llm_text,
                         "is_error": True,
                     })
+                    # Task 3:emit observation(无 dispatch,is_error=True,duration=0)
+                    await _safe_emit({
+                        "type": "observation",
+                        "text": error_llm_text,
+                        "is_error": True,
+                        "duration_ms": 0,
+                        "iteration": iter_count,
+                    })
                     await _note_tool_error(p.name or "", error_llm_text)
                     continue
 
@@ -686,6 +718,14 @@ async def run_turn(
                         "tool_call_id": tc_id,
                         "content": error_text,
                         "is_error": True,
+                    })
+                    # Task 3:emit observation(JSON parse 失败,is_error=True,duration=0)
+                    await _safe_emit({
+                        "type": "observation",
+                        "text": error_text,
+                        "is_error": True,
+                        "duration_ms": 0,
+                        "iteration": iter_count,
                     })
                     await _note_tool_error(p.name or "", error_text)
                     continue
@@ -706,6 +746,14 @@ async def run_turn(
                         "content": error_text,
                         "is_error": True,
                     })
+                    # Task 3:emit observation(schema 校验失败,is_error=True,duration=0)
+                    await _safe_emit({
+                        "type": "observation",
+                        "text": error_text,
+                        "is_error": True,
+                        "duration_ms": 0,
+                        "iteration": iter_count,
+                    })
                     await _note_tool_error(p.name or "", error_text)
                     continue
 
@@ -718,14 +766,33 @@ async def run_turn(
                     log_decision(audit_path, iter_n=iter_count, tool=p.name, args=args,
                                  action=decision.action.value, outcome="executed",
                                  rule_id=decision.rule_id, reason=decision.reason, mode=mode)
+                    # Task 3:emit action(tool_call 派发前,allow 路径)
+                    await _safe_emit({
+                        "type": "action",
+                        "name": p.name,
+                        "args": args,
+                        "ts": time.time(),
+                        "iteration": iter_count,
+                    })
                     # Finding 1 fix:try/except 包 _dispatch — 单 tool 抛异常不能
                     # 逃出 run_turn 破轮。失败时 append 一条 is_error tool message
                     # (使用同一个 tc_id),然后 continue,本 turn 其余 tool 继续。
+                    _dispatch_t0 = time.time()
                     try:
                         result = await _dispatch(p, args, project_root)
+                        _dispatch_t1 = time.time()
                     except Exception as dispatch_err:
+                        _dispatch_t1 = time.time()
                         err_text = f"[Tool Error] dispatch 异常: {type(dispatch_err).__name__}: {dispatch_err}"
                         print_observation(console, err_text)
+                        # Task 3:emit observation(dispatch 异常,is_error=True)
+                        await _safe_emit({
+                            "type": "observation",
+                            "text": err_text,
+                            "is_error": True,
+                            "duration_ms": int((_dispatch_t1 - _dispatch_t0) * 1000),
+                            "iteration": iter_count,
+                        })
                         tool_call_log.append({"name": p.name, "args": args, "ok": False,
                                               "result": err_text[:500]})
                         messages.append({
@@ -743,6 +810,14 @@ async def run_turn(
                     _tool_content = await _maybe_offload_content(
                         result.llm_text, p.name, args)
                     _is_err = bool(getattr(result, "is_error", False))
+                    # Task 3:emit observation(allow 成功路径,is_error 来自 result)
+                    await _safe_emit({
+                        "type": "observation",
+                        "text": result.llm_text,
+                        "is_error": _is_err,
+                        "duration_ms": int((_dispatch_t1 - _dispatch_t0) * 1000),
+                        "iteration": iter_count,
+                    })
                     # E1 D2:todo_create 成功后 → user 摘要(plan 视图)
                     await _maybe_print_decomp_summary(p, result)
                     messages.append({
@@ -766,11 +841,30 @@ async def run_turn(
                         log_decision(audit_path, iter_n=iter_count, tool=p.name, args=args,
                                      action=decision.action.value, outcome="executed",
                                      rule_id=decision.rule_id, reason=decision.reason, mode=mode)
+                        # Task 3:emit action(ask+yes 路径,p_dispatch 派发前)
+                        await _safe_emit({
+                            "type": "action",
+                            "name": p.name,
+                            "args": args,
+                            "ts": time.time(),
+                            "iteration": iter_count,
+                        })
+                        _dispatch_t0 = time.time()
                         try:
                             result = await _dispatch(p, args, project_root)
+                            _dispatch_t1 = time.time()
                         except Exception as dispatch_err:
+                            _dispatch_t1 = time.time()
                             err_text = f"[Tool Error] dispatch 异常: {type(dispatch_err).__name__}: {dispatch_err}"
                             print_observation(console, err_text)
+                            # Task 3:emit observation(ask+yes dispatch 异常)
+                            await _safe_emit({
+                                "type": "observation",
+                                "text": err_text,
+                                "is_error": True,
+                                "duration_ms": int((_dispatch_t1 - _dispatch_t0) * 1000),
+                                "iteration": iter_count,
+                            })
                             tool_call_log.append({"name": p.name, "args": args, "ok": False,
                                                   "result": err_text[:500]})
                             messages.append({
@@ -788,6 +882,14 @@ async def run_turn(
                         _tool_content = await _maybe_offload_content(
                             result.llm_text, p.name, args)
                         _is_err = bool(getattr(result, "is_error", False))
+                        # Task 3:emit observation(ask+yes 成功)
+                        await _safe_emit({
+                            "type": "observation",
+                            "text": result.llm_text,
+                            "is_error": _is_err,
+                            "duration_ms": int((_dispatch_t1 - _dispatch_t0) * 1000),
+                            "iteration": iter_count,
+                        })
                         # E1 D2:todo_create 成功后 → user 摘要(plan 视图)
                         await _maybe_print_decomp_summary(p, result)
                         messages.append({
@@ -819,6 +921,14 @@ async def run_turn(
                             "content": error_text,
                             "is_error": True,
                         })
+                        # Task 3:emit observation(ask+no 用户拒绝,is_error=True)
+                        await _safe_emit({
+                            "type": "observation",
+                            "text": error_text,
+                            "is_error": True,
+                            "duration_ms": 0,
+                            "iteration": iter_count,
+                        })
                         await _note_tool_error(p.name or "", error_text)
 
             # 5. Continue the loop — feed tool results back to LLM
@@ -836,6 +946,12 @@ async def run_turn(
             content = _redact(content, "result")
             messages.append({"role": "assistant", "content": content})
             print_result(console, content)
+            # Task 3:emit result(ReAct 循环结束,无更多 tool_call,正常 final)
+            await _safe_emit({
+                "type": "result",
+                "text": content,
+                "ts": time.time(),
+            })
             if mode == "design":
                 saved = _save_design_output(messages, base_dir=design_dir)
                 if saved is not None:
@@ -868,6 +984,12 @@ async def run_turn(
                 except Exception:
                     pass
             print_warn(console, "empty LLM turn, ending")
+            # Task 3:emit result(空回复兜底,ReAct 终止)
+            await _safe_emit({
+                "type": "result",
+                "text": "",
+                "ts": time.time(),
+            })
             return _stats()
 
     # 6. max_iter reached (safety net — the inner has_tool_calls branch above
@@ -879,6 +1001,12 @@ async def run_turn(
         content = _redact(content, "result")
         messages.append({"role": "assistant", "content": content})
         print_result(console, content)
+    # Task 3:emit result(max_iter 安全网兜底,content 可能空,text=空串)
+    await _safe_emit({
+        "type": "result",
+        "text": content or "",
+        "ts": time.time(),
+    })
     return _stats()
 
 
