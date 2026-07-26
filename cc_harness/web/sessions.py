@@ -85,8 +85,25 @@ class SessionManager:
         await rec.event_queue.put(event)
 
     async def restore_from_checkpoint(self) -> None:
-        """Task 9 实现。stub 留空。"""
+        """从 WebSessionStore 还原所有 active sessions。
+
+        Phase 1 / Task 10 实现:
+            - 遍历 ``web_session_store.list_active()``
+            - 为每个 SessionMeta 重建 SessionRecord(state=None 占位,ReplState 待 Task 11+)
+            - 不 spawn task(Task 11+ 才接 WS 主循环)
+
+        Graceful:空 store / 损坏 row 都静默(boot 路径不因 restore 失败)。
+        """
         if self.web_session_store is None:
             return
-        # Task 9 will fill
-        pass
+        try:
+            metas = await self.web_session_store.list_active()
+        except Exception:
+            # SQLite 损坏 / 表缺失 / 连接错 → 静默 return(boot best-effort)
+            return
+        async with self._dict_lock:
+            for meta in metas:
+                if meta.session_id in self._sessions:
+                    continue  # 已在内存(避免覆盖)
+                rec = SessionRecord(meta=meta, state=None)
+                self._sessions[meta.session_id] = rec

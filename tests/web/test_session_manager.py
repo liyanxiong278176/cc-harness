@@ -88,3 +88,53 @@ async def test_emitter_observation_not_scanned(manager, tmp_path):
     })
     ev = await asyncio.wait_for(rec.event_queue.get(), timeout=1.0)
     assert ev.text == "包含 key=sk-xyz"  # 不脱敏
+
+
+async def test_restore_from_checkpoint_no_store(manager):
+    """web_session_store is None → restore_from_checkpoint 直接 return, 不抛。"""
+    await manager.restore_from_checkpoint()  # 不抛即通过
+    assert await manager.list() == []
+
+
+async def test_restore_from_checkpoint_with_store(tmp_path):
+    """web_session_store 有 active sessions → 还原进内存,state=None 占位。"""
+    from cc_harness.memory.store import MemoryStore
+    from cc_harness.memory.checkpoint import WebSessionStore, SessionMeta
+
+    mem_store = MemoryStore(db_path=tmp_path / "m.db", embedding_dim=4)
+    await mem_store.init_schema()
+    ws = WebSessionStore(mem_store)
+    for sid, mode in [("aaa", "coding"), ("bbb", "plan")]:
+        await ws.upsert(SessionMeta(
+            session_id=sid, cwd=tmp_path, mode=mode,
+            created_at=1000.0, last_active_at=1000.0,
+        ))
+
+    mgr = SessionManager(
+        llm=FakeLLM(), mcp_factory=FakeMCPFactory(),
+        web_session_store=ws, max_sessions=8,
+    )
+    await mgr.restore_from_checkpoint()
+    sessions = await mgr.list()
+    assert {s.session_id for s in sessions} == {"aaa", "bbb"}
+    # state 一定是 None(Task 11+ 才接 ReplState);task 一定是 None(不 spawn)
+    rec_a = await mgr.get("aaa")
+    rec_b = await mgr.get("bbb")
+    assert rec_a is not None and rec_b is not None
+    assert rec_a.state is None and rec_b.state is None
+    assert rec_a.task is None and rec_b.task is None
+
+
+async def test_restore_from_checkpoint_empty_store(manager, tmp_path):
+    """store 存在但无 active sessions → restore 不抛,sessions 空。"""
+    from cc_harness.memory.store import MemoryStore
+    from cc_harness.memory.checkpoint import WebSessionStore
+
+    mem_store = MemoryStore(db_path=tmp_path / "m.db", embedding_dim=4)
+    await mem_store.init_schema()
+    mgr = SessionManager(
+        llm=FakeLLM(), mcp_factory=FakeMCPFactory(),
+        web_session_store=WebSessionStore(mem_store), max_sessions=8,
+    )
+    await mgr.restore_from_checkpoint()
+    assert await mgr.list() == []
