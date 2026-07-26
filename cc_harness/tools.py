@@ -4,7 +4,7 @@ import os
 import re
 import sys
 from pathlib import Path
-from typing import Optional
+from typing import Awaitable, Callable, Optional
 
 from cc_harness.config import ExecutorConfig, ExecutorBackend
 from cc_harness.executor import Executor, NativeExecutor, build_executor
@@ -166,40 +166,104 @@ def _native_fallback(cwd: str) -> NativeExecutor:
     return NativeExecutor(project_root=Path(cwd), timeout_s=RUN_COMMAND_TIMEOUT_S)
 
 
-async def run_command(args: dict, *, cwd: str = ".") -> ToolResult:
-    """Built-in shell tool。走会话级 executor;sandbox 连败 3 次
-    (_with_retry 内)抛 SandboxUnavailableError → 降级 native + 警告。
+async def run_command(
+    args: dict | str,
+    *,
+    cwd: str = ".",
+    use_pty: bool = False,
+    pty_writer: Callable[[bytes], Awaitable[None]] | None = None,
+    timeout_s: float | None = None,
+) -> ToolResult | int:
+    """Built-in shell tool; optionally stream combined output through a POSIX PTY.
 
-    注意:会话路径中 cwd 被忽略——工作目录由 init_session_executor 的
-    project_root 决定(沙箱 mount / NativeExecutor 锁项目根)。cwd 仅在
-    降级路径(_native_fallback)构造 NativeExecutor 时使用。
-
-    执行加固(cwd 锁项目根 / env-strip 密钥 / 超时)在 NativeExecutor;
-    sandbox 时这些由容器隔离承担。权限决策(allow/ask)由 agent 层
-    PolicyEngine 在派发前完成,本函数不再 gate。timeout_s 仍 AT CALL TIME
-    读 RUN_COMMAND_TIMEOUT_S(测试可 monkeypatch)。
+    The dictionary API is the existing native-tool interface and remains unchanged
+    when ``use_pty`` is false.  The scalar command form is accepted for the web UI
+    PTY interface and returns the subprocess exit code.
     """
+    if use_pty:
+        if os.name != "posix":
+            raise NotImplementedError("PTY only supported on POSIX")
+        import asyncio
+        import pty
+        import select
+
+        command = args if isinstance(args, str) else args.get("command", "")
+        if not isinstance(command, str) or not command.strip():
+            return 1
+        master_fd, slave_fd = pty.openpty()
+        proc = None
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                "/bin/bash", "-c", command,
+                stdin=slave_fd, stdout=slave_fd, stderr=slave_fd,
+                cwd=str(cwd),
+            )
+            os.close(slave_fd)
+            slave_fd = -1
+            deadline = asyncio.get_running_loop().time() + (
+                timeout_s if timeout_s is not None else RUN_COMMAND_TIMEOUT_S
+            )
+            loop = asyncio.get_running_loop()
+            while True:
+                if loop.time() >= deadline:
+                    proc.kill()
+                    await proc.wait()
+                    return 124
+                readable, _, _ = await loop.run_in_executor(
+                    None, lambda: select.select([master_fd], [], [], 0.05)
+                )
+                if readable:
+                    try:
+                        chunk = os.read(master_fd, 4096)
+                    except OSError:
+                        chunk = b""
+                    if chunk and pty_writer is not None:
+                        await pty_writer(chunk)
+                if proc.returncode is not None and not readable:
+                    break
+            await proc.wait()
+            return proc.returncode if proc.returncode is not None else 1
+        finally:
+            if proc is not None and proc.returncode is None:
+                try:
+                    proc.kill()
+                except ProcessLookupError:
+                    pass
+            if slave_fd >= 0:
+                try:
+                    os.close(slave_fd)
+                except OSError:
+                    pass
+            try:
+                os.close(master_fd)
+            except OSError:
+                pass
+
+    # Existing non-PTY executor path. Keep this branch's behavior intact.
+    scalar_command = isinstance(args, str)
+    if scalar_command:
+        args = {"command": args}
     from cc_harness.sandbox import SandboxUnavailableError
     try:
-        return await get_session_executor().run(args, cwd=Path(cwd))
+        result = await get_session_executor().run(args, cwd=Path(cwd))
     except SandboxUnavailableError:
         # hard 模式:沙箱挂了不降级 → 返错(命令未执行)。
-        # 双重作用:① 防 L8 失真(沙箱没参与时测宿主=假突破数据);
-        # ② 防降级路径泄露(沙箱挂时命令在宿主/CI runner 真跑 → secret 外传)。
-        # 触发:config sandbox.fallback_on_error=hard(policy.yaml 或 env
-        # CC_HARNESS_SANDBOX_FALLBACK=hard,后者 config 层 load 时已 override)。
         cfg = _session_executor_config
         hard = (cfg is not None
                 and cfg.backend == ExecutorBackend.SANDBOX
                 and cfg.sandbox.fallback_on_error == "hard")
         if hard:
-            return ToolResult.error(
+            result = ToolResult.error(
                 display="sandbox unavailable (hard mode — no native fallback)",
                 llm="[Tool Error] 沙箱不可用且 fallback_on_error=hard,命令未执行"
                     "(防降级失真 + 防 secret 经降级路径外传)",
             )
-        print("[warn] 沙箱不可用,降级 native 执行(非隔离模式)", file=sys.stderr)
-        return await _native_fallback(cwd).run(args, cwd=Path(cwd))
+        else:
+            print("[warn] 沙箱不可用,降级 native 执行(非隔离模式)", file=sys.stderr)
+            result = await _native_fallback(cwd).run(args, cwd=Path(cwd))
+    if scalar_command:
+        return 0 if not result.is_error else 1
+    return result
 
 
 # OpenAI function-calling spec for run_command — matches the shape produced
