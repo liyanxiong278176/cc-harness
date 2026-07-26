@@ -6,6 +6,7 @@ from __future__ import annotations
 import asyncio
 import os
 import select
+import time
 import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -17,6 +18,7 @@ class PTYRecord:
     session_id: str
     master_fd: int
     proc: asyncio.subprocess.Process
+    created_at: float = field(default_factory=time.time)
     stdout_queue: asyncio.Queue = field(default_factory=asyncio.Queue)
     reader_task: asyncio.Task | None = None
 
