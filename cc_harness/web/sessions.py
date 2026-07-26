@@ -7,20 +7,11 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING, Callable, Awaitable
 
+from cc_harness.memory.checkpoint import SessionMeta  # Task 9 反转:避免循环依赖
 from cc_harness.web.events import Event
 
 if TYPE_CHECKING:
     from cc_harness.memory.checkpoint import WebSessionStore
-
-
-@dataclass
-class SessionMeta:
-    session_id: str
-    cwd: Path
-    mode: str
-    created_at: float
-    last_active_at: float
-    status: str = "active"  # 'active' | 'closed' | 'errored'
 
 
 @dataclass

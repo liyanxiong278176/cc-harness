@@ -122,6 +122,21 @@ class MemoryStore:
         await self._db.execute(
             "CREATE INDEX IF NOT EXISTS idx_conv_session ON conversation(session_id, turn_idx)"
         )
+        # Task 9: web_session (parent of session_checkpoint, FK cascade 方向
+        # session_checkpoint → web_session。brief DDL 字面是 web_session.id → session_checkpoint,
+        # 但这会让 test 1 (先 upsert web_session 再存 checkpoint) FK 违反;且 cascade 方向反向。
+        # 反转 FK 方向 + 放在 session_checkpoint 之前,FK 才能引用。)
+        await self._db.execute("""
+            CREATE TABLE IF NOT EXISTS web_session (
+                id            TEXT PRIMARY KEY,
+                cwd           TEXT NOT NULL,
+                mode          TEXT NOT NULL,
+                created_at    REAL NOT NULL,
+                last_active_at REAL NOT NULL,
+                status        TEXT NOT NULL DEFAULT 'active',
+                extra_json    TEXT NOT NULL DEFAULT '{}'
+            )
+        """)
         # E3 T1 D2: cross-session auto-resume checkpoint
         await self._db.execute("""
             CREATE TABLE IF NOT EXISTS session_checkpoint (
@@ -132,7 +147,8 @@ class MemoryStore:
                 started_at    TEXT NOT NULL,
                 ended_at      TEXT NOT NULL,
                 cross_session_mode TEXT DEFAULT 'last_only',
-                extra_json    TEXT NOT NULL DEFAULT '{}'
+                extra_json    TEXT NOT NULL DEFAULT '{}',
+                FOREIGN KEY (session_id) REFERENCES web_session(id) ON DELETE CASCADE
             )
         """)
         await self._db.execute("""
@@ -181,6 +197,19 @@ class MemoryStore:
         s_tables = {r[0] for r in (await (await self._db.execute(
             "SELECT name FROM sqlite_master WHERE type='table'"
         )).fetchall())}
+        # Task 9: 旧库补 web_session 表(FK target)
+        if "web_session" not in s_tables:
+            await self._db.execute("""
+                CREATE TABLE web_session (
+                    id            TEXT PRIMARY KEY,
+                    cwd           TEXT NOT NULL,
+                    mode          TEXT NOT NULL,
+                    created_at    REAL NOT NULL,
+                    last_active_at REAL NOT NULL,
+                    status        TEXT NOT NULL DEFAULT 'active',
+                    extra_json    TEXT NOT NULL DEFAULT '{}'
+                )
+            """)
         if "session_checkpoint" not in s_tables:
             await self._db.execute("""
                 CREATE TABLE session_checkpoint (
@@ -191,7 +220,8 @@ class MemoryStore:
                     started_at    TEXT NOT NULL,
                     ended_at      TEXT NOT NULL,
                     cross_session_mode TEXT DEFAULT 'last_only',
-                    extra_json    TEXT NOT NULL DEFAULT '{}'
+                    extra_json    TEXT NOT NULL DEFAULT '{}',
+                    FOREIGN KEY (session_id) REFERENCES web_session(id) ON DELETE CASCADE
                 )
             """)
         if "session_message" not in s_tables:

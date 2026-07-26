@@ -48,6 +48,12 @@ async def test_session_message_cascade_delete():
     with tempfile.TemporaryDirectory() as tmp:
         store = MemoryStore(db_path=pathlib.Path(tmp) / "test.db", embedding_dim=4)
         await store.init_schema()
+        # Task 9: session_checkpoint FK → web_session(id),先 UPSERT parent。
+        await store._db.execute(
+            "INSERT OR REPLACE INTO web_session "
+            "(id, cwd, mode, created_at, last_active_at) "
+            "VALUES ('s1', '/tmp', 'coding', 1000.0, 1000.0)"
+        )
         await store._db.execute(
             "INSERT OR REPLACE INTO session_checkpoint "
             "(session_id, project_root, mode, turn_counter, started_at, ended_at, cross_session_mode, extra_json) "

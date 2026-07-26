@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import time
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -9,6 +10,19 @@ from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
     from cc_harness.memory.store import MemoryStore
+
+
+@dataclass
+class SessionMeta:
+    """Web session 元数据。Task 9 反转:从 cc_harness.web.sessions 搬过来,
+    避免 checkpoint.py → web.sessions 的反向依赖(checkpoint 需要 SessionMeta,
+    web.sessions 也要用,但 web → checkpoint 是单向)。"""
+    session_id: str
+    cwd: Path
+    mode: str
+    created_at: float
+    last_active_at: float
+    status: str = "active"  # 'active' | 'closed' | 'errored'
 
 
 @dataclass(frozen=True)
@@ -44,11 +58,22 @@ class CheckpointService:
         messages: list[dict],
         extra: dict | None = None,
     ) -> None:
-        """session 结束时调。1 个事务 + UPSERT checkpoint + INSERT messages。"""
+        """session 结束时调。1 个事务 + UPSERT web_session (FK parent) +
+        UPSERT checkpoint + INSERT messages。"""
         assert self.store._db is not None
         extra = extra or {}
         await self.store._db.execute("BEGIN")
         try:
+            # Task 9: session_checkpoint FK → web_session(id),先 UPSERT parent。
+            # 用 INSERT OR IGNORE 避免覆盖 WebSessionStore 维护的 cwd/mode/last_active_at;
+            # 首调 save 时 web_session 通常已存在(WebSessionStore.upsert 先调),此条 no-op。
+            now_ts = time.time()
+            await self.store._db.execute(
+                "INSERT OR IGNORE INTO web_session "
+                "(id, cwd, mode, created_at, last_active_at, status, extra_json) "
+                "VALUES (?, ?, ?, ?, ?, 'active', '{}')",
+                (session_id, str(project_root), mode, now_ts, now_ts),
+            )
             await self.store._db.execute(
                 "INSERT OR REPLACE INTO session_checkpoint "
                 "(session_id, project_root, mode, turn_counter, started_at, ended_at, "
@@ -133,3 +158,54 @@ class CheckpointService:
             cross_session_mode=data["cross_session_mode"],
             extra=json.loads(data["extra_json"]),
         )
+
+
+class WebSessionStore:
+    """Web Session 元数据的 SQLite CRUD。"""
+    def __init__(self, store: "MemoryStore") -> None:
+        self.store = store
+
+    async def upsert(self, meta: SessionMeta) -> None:
+        assert self.store._db is not None
+        await self.store._db.execute(
+            "INSERT OR REPLACE INTO web_session "
+            "(id, cwd, mode, created_at, last_active_at, status, extra_json) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (
+                meta.session_id, str(meta.cwd), meta.mode,
+                meta.created_at, meta.last_active_at, meta.status, "{}",
+            ),
+        )
+        await self.store._db.commit()
+
+    async def delete(self, session_id: str) -> None:
+        assert self.store._db is not None
+        await self.store._db.execute(
+            "DELETE FROM web_session WHERE id=?", (session_id,),
+        )
+        await self.store._db.commit()
+
+    async def list_active(self) -> list[SessionMeta]:
+        assert self.store._db is not None
+        cur = await self.store._db.execute(
+            "SELECT id, cwd, mode, created_at, last_active_at, status "
+            "FROM web_session WHERE status='active' ORDER BY created_at DESC"
+        )
+        rows = await cur.fetchall()
+        out = []
+        for r in rows:
+            out.append(SessionMeta(
+                session_id=r[0], cwd=Path(r[1]), mode=r[2],
+                created_at=r[3], last_active_at=r[4], status=r[5],
+            ))
+        return out
+
+    async def touch(self, session_id: str) -> None:
+        """更新 last_active_at(每次 turn 末调用)。"""
+        import time
+        assert self.store._db is not None
+        await self.store._db.execute(
+            "UPDATE web_session SET last_active_at=? WHERE id=?",
+            (time.time(), session_id),
+        )
+        await self.store._db.commit()
