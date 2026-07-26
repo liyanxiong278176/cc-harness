@@ -225,3 +225,158 @@ async def test_observation_is_error_true_on_denial(tmp_path, monkeypatch):
         assert isinstance(e["duration_ms"], int)
         assert e["duration_ms"] >= 0
         assert isinstance(e["text"], str)
+
+
+# ---------- Fix round 1:Reviewer flagged Issues ----------
+
+@pytest.mark.asyncio
+async def test_action_with_non_dict_args_emits_error_observation(tmp_path):
+    """Fix #1:reviewer flagged `action.args` may not be dict。
+
+    OpenAI tool_calls 的 `arguments` JSON 顶层合法值含 list / null / scalar
+    (e.g. `"[]"` / `"null"` / `"42"`),不是所有 schema 都会卡掉。一旦 args 非 dict,
+    既有的 JSON parse + schema validate 都不会拦(validate_* 期望 dict),会让
+    非 dict 流到 `_dispatch` 与 emit action 事件,违反 brief 锁定的
+    `action.args: dict` schema。
+
+    期望:agent.py 在 json.loads 后加 `isinstance(args, dict)` 检查。非 dict:
+      - emit observation(is_error=True, text="tool args must be a JSON object")
+      - NOT emit action 事件
+      - 回填 tool message(messages 历史不能断)
+      - 不进 policy / dispatch
+    """
+    from cc_harness.agent import run_turn
+    from cc_harness.mcp_client import ToolResult
+    from cc_harness.policy import PolicyEngine
+
+    fs_tool = {"type": "function", "function": {
+        "name": "mcp__fs__read", "description": "r",
+        "parameters": {"type": "object",
+                        "properties": {"path": {"type": "string"}}},
+    }}
+    # 关键:arguments_json 是合法 JSON 但顶层非 object(list)
+    pending = [PendingToolCall(
+        index=0, id="c1", name="mcp__fs__read",
+        arguments_json="[]",
+    )]
+    llm = FakeLLM(responses=[
+        [FakeStreamEvent(kind="done", content="尝试调用",
+                         pending=pending, finish_reason="tool_calls")],
+        [FakeStreamEvent(kind="done", content="好的不调用",
+                         pending=[], finish_reason="stop")],
+    ])
+    mcp = FakeMCP(
+        tools_spec=[fs_tool],
+        results={"mcp__fs__read": ToolResult.success("never called")},
+        calls=[],
+    )
+
+    events, emit = await _make_emitter()
+    messages = [{"role": "user", "content": "试一下"}]
+    await run_turn(
+        messages, llm, mcp,
+        mode="coding",
+        cwd=str(tmp_path),
+        max_iter=5,
+        policy=PolicyEngine(project_root=tmp_path),
+        event_emitter=emit,
+    )
+
+    # 关键断言 1:不应 emit action 事件(non-dict args 跳过 dispatch)
+    action_evs = [e for e in events if e["type"] == "action"]
+    assert action_evs == [], \
+        f"non-dict args 不应 emit action 事件;实际 actions={action_evs}"
+
+    # 关键断言 2:必须 emit observation(is_error=True),text 提示 args 类型错误
+    obs_evs = [e for e in events if e["type"] == "observation"]
+    assert obs_evs, f"必须 emit observation 提示参数错误;events={events}"
+    assert any(e["is_error"] is True for e in obs_evs), \
+        f"必须 emit is_error=True observation;实际 obs={obs_evs}"
+    err_obs = [e for e in obs_evs if e["is_error"]
+               and "JSON object" in e["text"]]
+    assert err_obs, (
+        f"必须有一个 observation 说明 args 必须为 JSON object;实际 obs={obs_evs}"
+    )
+
+    # 关键断言 3:_dispatch 不应被调到(MCP calls 应为空)
+    assert mcp.calls == [], (
+        f"non-dict args 路径不应 dispatch;mcp.calls={mcp.calls}"
+    )
+
+    # 关键断言 4:messages 历史里仍有一条 tool message(role=tool, is_error=True),
+    # 否则下一轮 LLM 没有 tool_call_id 对应会报 schema 错
+    tool_msgs = [m for m in messages if m.get("role") == "tool"]
+    assert any(m.get("is_error") is True for m in tool_msgs), \
+        f"messages 历史应回填 is_error=True 的 tool message;messages={messages}"
+
+
+@pytest.mark.asyncio
+async def test_emitter_exception_does_not_break_run_turn(tmp_path, caplog):
+    """Fix #2:reviewer flagged `_safe_emit` 静默吞所有异常。
+
+    emit 异常(emitter 端 disconnect / 序列化错 / WS 层断)必须:
+      - 不破主 ReAct 循环(run_turn 仍正常结束,emit `result` 事件)
+      - 在 logger 留 debug 日志(便于诊断)
+
+    fail-soft 是契约:REPL 流不能因为 UI emitter 挂了就卡死。
+    """
+    import logging
+
+    from cc_harness.agent import run_turn
+    from cc_harness.mcp_client import ToolResult
+    from cc_harness.policy import PolicyEngine
+
+    fs_tool = {"type": "function", "function": {
+        "name": "mcp__fs__read", "description": "r",
+        "parameters": {"type": "object"},
+    }}
+    inside = tmp_path / "x.py"
+    inside.write_text("ok", encoding="utf-8")
+    pending = [PendingToolCall(
+        index=0, id="c1", name="mcp__fs__read",
+        arguments_json=json.dumps({"path": str(inside)}),
+    )]
+    llm = FakeLLM(responses=[
+        [FakeStreamEvent(kind="done", content="reading",
+                         pending=pending, finish_reason="tool_calls")],
+        [FakeStreamEvent(kind="done", content="done",
+                         pending=[], finish_reason="stop")],
+    ])
+    mcp = FakeMCP(
+        tools_spec=[fs_tool],
+        results={"mcp__fs__read": ToolResult.success("file contents")},
+        calls=[],
+    )
+
+    # 关键:emitter 每次调都抛 RuntimeError(模拟 WS 断 / 序列化错)
+    async def broken_emit(ev):
+        raise RuntimeError("simulated WS disconnect")
+
+    messages = [{"role": "user", "content": "读 x.py"}]
+    with caplog.at_level(logging.DEBUG, logger="cc_harness.agent"):
+        stats = await run_turn(
+            messages, llm, mcp,
+            mode="coding",
+            cwd=str(tmp_path),
+            max_iter=5,
+            policy=PolicyEngine(project_root=tmp_path),
+            event_emitter=broken_emit,
+        )
+
+    # 关键断言 1:run_turn 正常返回,不被 emitter 异常拖累
+    assert stats is not None, "emitter 异常不应让 run_return 返回 None"
+
+    # 关键断言 2:tool dispatch 实际仍跑了(emit 异常不拦主循环)
+    assert mcp.calls == [("mcp__fs__read", {"path": str(inside)})], (
+        f"emitter 异常不应阻止 _dispatch;mcp.calls={mcp.calls}"
+    )
+
+    # 关键断言 3:logger 收到至少一条 debug 日志(异常被记录便于诊断)
+    debug_msgs = [r for r in caplog.records
+                  if r.levelno == logging.DEBUG
+                  and r.name == "cc_harness.agent"
+                  and "event_emitter" in r.getMessage()]
+    assert debug_msgs, (
+        f"emitter 异常应被 _logger.debug 记录;caplog.records="
+        f"{[(r.levelname, r.name, r.getMessage()) for r in caplog.records]}"
+    )

@@ -16,6 +16,7 @@ Modes (see task #4 / #6):
 from __future__ import annotations
 import asyncio
 import json
+import logging
 import re
 import time
 from pathlib import Path
@@ -43,6 +44,8 @@ if TYPE_CHECKING:
     from cc_harness.project.models import TodoTask
     from cc_harness.project.service import TodoService  # D1 Task 7:TodoService 类型注解
     from cc_harness.reflection.engine import ReflectionEngine  # E2 T2.2:类型注解(运行时 = None)
+
+_logger = logging.getLogger(__name__)
 
 _VALID_MODES = ("coding", "plan", "design", "chat")
 
@@ -198,13 +201,15 @@ async def run_turn(
     # Task 3 (Codex Web UI): event_emitter 转发 hook,REPL(None)路径零调用。
     # _safe_emit 包成 fail-soft call site,任意 emit 异常都不会破主 ReAct 循环。
     # 字段 schema 由 tests/test_agent_event_emitter.py 与 Task 4 pydantic 锁定。
+    # Fix round 1:emit 异常 swallow 但记 debug 日志(只记异常 repr,不记 event
+    # payload — payload 可能含 L5 脱敏后的残留 / secrets,不外泄)。
     async def _safe_emit(ev: dict) -> None:
         if event_emitter is None:
             return
         try:
             await event_emitter(ev)
-        except Exception:
-            pass
+        except Exception as exc:
+            _logger.debug("event_emitter raised: %s", exc)
     # E2 T2.2 Step 3e:同 tool+args 调 2+ 次的检测(独立于 tool_call_log 避免冲突,
     # tool_call_log 仍按 Plan1 契约存 dict 给 TurnTokenStats.tool_call_log 用)
     _tool_retry_log: list[tuple] = []  # [(name, arguments_json), ...]
@@ -720,6 +725,35 @@ async def run_turn(
                         "is_error": True,
                     })
                     # Task 3:emit observation(JSON parse 失败,is_error=True,duration=0)
+                    await _safe_emit({
+                        "type": "observation",
+                        "text": error_text,
+                        "is_error": True,
+                        "duration_ms": 0,
+                        "iteration": iter_count,
+                    })
+                    await _note_tool_error(p.name or "", error_text)
+                    continue
+
+                # Fix round 1:action schema 锁定 `args` 必须是 dict(OpenAI tool_calls
+                # arguments JSON 合法但顶层非 object 也合法,如 `[]` / `null` / `42`)。
+                # 这里补一道防御,非 dict 视为参数错误:emit observation(is_error=True) +
+                # 回填 messages,不进 policy / action / dispatch。
+                if not isinstance(args, dict):
+                    print_error(console,
+                        f"tool_call args must be a JSON object, got {type(args).__name__}")
+                    error_text = (
+                        f"[Tool Error] tool args must be a JSON object, "
+                        f"got {type(args).__name__}: {p.arguments_json}"
+                    )
+                    print_observation(console, error_text)
+                    messages.append({
+                        "role": "tool",
+                        "name": p.name or "",
+                        "tool_call_id": tc_id,
+                        "content": error_text,
+                        "is_error": True,
+                    })
                     await _safe_emit({
                         "type": "observation",
                         "text": error_text,
