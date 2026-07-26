@@ -63,3 +63,28 @@ async def test_push_event_lands_in_queue(manager, tmp_path):
     # 给 queue.get() 一点时间
     ev = await asyncio.wait_for(rec.event_queue.get(), timeout=1.0)
     assert ev.text == "hi"
+
+
+async def test_emitter_pushes_thought_through_l5(manager, tmp_path):
+    """Emitter 把 thought dict 转 Event,push 到 queue。"""
+    from cc_harness.web.emitter import EventEmitter
+    from cc_harness.web.events import ThoughtEvent
+    rec = await manager.create(cwd=tmp_path, mode="coding")
+    emitter = EventEmitter(manager, rec.meta.session_id, l5_engine=None)
+    await emitter({"type": "thought", "text": "openai_key = sk-abc", "iteration": 0, "ts": 0.0})
+    ev = await asyncio.wait_for(rec.event_queue.get(), timeout=1.0)
+    assert isinstance(ev, ThoughtEvent)
+    assert "sk-abc" in ev.text or "[REDACTED" in ev.text  # L5 没装 → 原文
+
+
+async def test_emitter_observation_not_scanned(manager, tmp_path):
+    """observation 不过 L5(沿 CLAUDE.md M3:工具观察不扫)。"""
+    from cc_harness.web.emitter import EventEmitter
+    rec = await manager.create(cwd=tmp_path, mode="coding")
+    emitter = EventEmitter(manager, rec.meta.session_id, l5_engine=None)
+    await emitter({
+        "type": "observation", "text": "包含 key=sk-xyz",
+        "is_error": False, "duration_ms": 1, "iteration": 0, "ts": 0.0,
+    })
+    ev = await asyncio.wait_for(rec.event_queue.get(), timeout=1.0)
+    assert ev.text == "包含 key=sk-xyz"  # 不脱敏
