@@ -46,6 +46,14 @@ def _parse_args() -> argparse.Namespace:
         "--design-dir", type=Path, default=None,
         help="Where design-mode outputs are saved (default: ~/.cc-harness/designs/)",
     )
+    p.add_argument(
+        "--serve", action="store_true",
+        help="Run as FastAPI server (web UI) instead of REPL",
+    )
+    p.add_argument("--port", type=int, default=8765,
+                   help="[--serve only] Bind port (default 8765)")
+    p.add_argument("--static-dir", type=Path, default=None,
+                   help="[--serve only] Static files dir (built frontend)")
 
     # Sub-commands(spec 组件 8)
     sub = p.add_subparsers(dest="command")
@@ -127,6 +135,15 @@ def main() -> None:
     working_dir = Path.cwd()
 
     # --- Task 6 / spec 组件 8:CLI sub-command 分派 ---
+    if getattr(args, "serve", False):
+        from cc_harness.web.app import run_serve
+        run_serve(
+            host="127.0.0.1",
+            port=args.port,
+            static_dir=getattr(args, "static_dir", None),
+        )
+        return
+
     if args.command == "init":
         from cc_harness.cli.init import cmd_init
         sys.exit(cmd_init(args, working_dir))
