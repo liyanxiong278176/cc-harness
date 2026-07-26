@@ -19,7 +19,7 @@ import json
 import re
 import time
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Awaitable, Callable
 from rich.console import Console
 from cc_harness.render import (
     print_thought, print_action, print_observation, print_result,
@@ -114,6 +114,7 @@ async def run_turn(
     last_turn_text: str = "",  # D1 Task 7:C 阶段 todo_update 完成门 acceptance 校验用
     reflection_engine: "ReflectionEngine | None" = None,  # E2 T2.2:默认 None 保持向后兼容
     e1_decompose_enabled: bool = True,  # E1 D7:kill-switch(从 main.py 透传 policy.e1_decompose_enabled,默认 True 向后兼容)
+    event_emitter: Callable[[dict], Awaitable[None]] | None = None,
 ) -> TurnTokenStats:
     """Run one user turn in the given mode.
 
