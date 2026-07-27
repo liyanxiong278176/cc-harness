@@ -32,11 +32,16 @@ async def ws_chat(websocket: WebSocket, session_id: str):
     # Consumer:从 event_queue 推到 WS(SRP:ws.py 拥有;run_loop 不开 consumer)。
     consumer_task = asyncio.create_task(_consume(websocket, rec))
 
+    # L2 / L5 在 create_app 注入到 app.state(测试 / boot 路径)。getattr
+    # 兜底:旧 create_app 调用未传 l2/l5 时返 None,session_run_loop 内部
+    # 守卫跳过对应层(L2 不扫 + L5 不脱敏)。
+    l2_checker = getattr(websocket.app.state, "l2", None)
+    l5_engine = getattr(websocket.app.state, "l5", None)
+
     # 委托给 session_run_loop(函数体内 import 避免 ws↔run_loop 循环依赖)。
-    # l2/l5 kwargs 当前 None — 后续 boot 层在 app.state 暴露后传。
     from cc_harness.web.run_loop import session_run_loop
     try:
-        await session_run_loop(rec, websocket, sm, sm.llm)
+        await session_run_loop(rec, websocket, sm, sm.llm, l2=l2_checker, l5=l5_engine)
     except WebSocketDisconnect:
         pass
     finally:

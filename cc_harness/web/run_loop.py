@@ -44,13 +44,20 @@ async def session_run_loop(
     """单 session 的 WS ↔ run_turn 主循环。
 
     处理 4 类反向事件(前端 → 后端):
-      - UserInputEvent: L2 短路 → 触发 run_turn → 等 turn_task 完成
+      - UserInputEvent: L2 短路 → 触发 run_turn → fire-and-forget task
       - SlashCommand:   cmd_to_mode 切 mode → emit ModeEvent + SlashAckEvent
       - L4ResponseEvent: 解决 pending_l4[ask_id] Future(保留字段,实装 L4 提示
                          在 PolicyEngine 与 emitter 桥后续 task 接入)
       - InterruptEvent: cancel 当前 turn_task
 
+    Receive loop 不阻塞等待 turn_task:每个 UserInputEvent spawn 后立即
+    回到 ``receive_text``,短超时轮询让 ``turn_task.done()`` 触发清理。
+    这样 InterruptEvent 在 turn 跑时仍可命中 cancel。
+
     WebSocketDisconnect 向上传播(ws.py 接住做 consumer cleanup)。
+    注意:``ws.receive_text()`` 抛 WebSocketDisconnect(非 asyncio.TimeoutError),
+    所以 ``asyncio.wait_for(receive_text, timeout=...)`` 的 TimeoutError 分支
+    只在 timeout 时触发,不会吞 Disconnect。
 
     Args:
         rec: SessionRecord
@@ -66,29 +73,57 @@ async def session_run_loop(
     async def _send(event) -> None:
         await ws.send_text(serialize(event))
 
+    async def _await_turn_done() -> None:
+        """turn 完成后回收 task(异常透传,CancelledError 静默)。"""
+        nonlocal turn_task
+        if turn_task is None:
+            return
+        try:
+            await turn_task
+        except asyncio.CancelledError:
+            pass
+        finally:
+            turn_task = None
+
     try:
         while True:
-            raw = await ws.receive_text()
+            # 1. 收 turn 完成:DoneEvent 已由 _run_turn_for_session 推过。
+            #    显式 await 以传播异常(CancelledError 已抑制)。
+            if turn_task is not None and turn_task.done():
+                await _await_turn_done()
+
+            # 2. 短超时轮询 receive:让 turn_task 完成可被及时检测,
+            #    又不阻塞 InterruptEvent 分支。
+            try:
+                raw = await asyncio.wait_for(ws.receive_text(), timeout=0.05)
+            except asyncio.TimeoutError:
+                continue  # 回到顶:重新检查 turn_task.done()
+
             ev = deserialize(f"data: {raw}\n\n")
             if ev is None:
                 continue
 
             if isinstance(ev, UserInputEvent):
-                # L2 检查:命中 → 发 L2RefusedEvent + continue(不进 run_turn)
+                # L2 检查(命中 → 发 L2RefusedEvent + continue, 不进 run_turn)
+                # try/except 兜底:L2 客户端异常 → log + fail-open, 不破 WS loop
                 if l2 is not None:
-                    scan = await l2(ev.text)
-                    if not scan.allowed:
+                    try:
+                        scan = await l2(ev.text)
+                    except Exception:
+                        log.exception(
+                            "L2 scan failed for session %s; failing open",
+                            rec.meta.session_id,
+                        )
+                        scan = None
+                    if scan is not None and not scan.allowed:
                         await _send(L2RefusedEvent(template=REFUSAL_TEMPLATE))
                         continue
 
-                # 触发 run_turn(异步 task,允许 InterruptEvent 取消)
+                # 触发 run_turn:fire-and-forget,不等完成。
+                # 下一次轮询(_await_turn_done)负责回收。
                 turn_task = asyncio.create_task(
                     _run_turn_for_session(rec, ev.text, llm, sm, l5=l5)
                 )
-                try:
-                    await turn_task
-                finally:
-                    turn_task = None
 
             elif isinstance(ev, SlashCommand):
                 cmd = ev.command
@@ -106,12 +141,14 @@ async def session_run_loop(
                     fut.set_result(ev.decision)
 
             elif isinstance(ev, InterruptEvent):
+                # turn_task 没完成 → cancel + await 回收
                 if turn_task is not None and not turn_task.done():
                     turn_task.cancel()
                     try:
                         await turn_task
                     except asyncio.CancelledError:
                         pass
+                    turn_task = None
     finally:
         # 兜底清理:WS 断开时若 turn_task 还在跑,取消它。
         if turn_task is not None and not turn_task.done():

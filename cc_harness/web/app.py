@@ -16,6 +16,8 @@ from cc_harness.web.events import PROTOCOL_VERSION
 def create_app(
     static_dir: Path | None = None,
     session_manager=None,  # SessionManager | None(测试时 None)
+    l2_checker=None,       # L2Checker | None — 测试 / REPL 路径 None
+    l5_engine=None,        # L5Engine | None — 测试 / REPL 路径 None
 ) -> FastAPI:
     @asynccontextmanager
     async def lifespan(app: FastAPI):
@@ -44,6 +46,10 @@ def create_app(
 
     # session_manager 通过 app.state 注入
     app.state.session_manager = session_manager
+    # L2 / L5 在 ws.py 由 session_run_loop 读取。None 表示该层未装配
+    # (测试 / REPL 路径)— session_run_loop 内有 None 守卫跳过对应层。
+    app.state.l2 = l2_checker
+    app.state.l5 = l5_engine
     return app
 
 
