@@ -56,7 +56,64 @@ def create_app(
 
 
 def run_serve(host: str, port: int, static_dir: Path | None) -> None:
-    """main.py 调用的入口。"""
+    """main.py 调用的入口:装配 runtime + SessionManager + PTYManager + 起 uvicorn。
+
+    步骤:
+      1. ``build_runtime`` 装配 LLM / MCP / memory / checkpoint / web_session_store
+      2. SessionManager + ``restore_from_checkpoint`` 从 WebSessionStore 还原 sessions
+      3. PTYManager 单例(Windows 上 .create() 不可用,这里只构造不算 PTY)
+      4. ``create_app`` 注入所有 wiring + lifespan 关 mcp
+      5. ``uvicorn.run`` 起服务
+
+    失败路径 graceful:
+      - ``build_runtime`` 内部 ConfigError / memory 失败都 try/except 兜底
+      - PTYManager 单例构造永不抛(只有 .create() 才抛 NotImplementedError on Windows)
+      - SessionManager 内存模式可工作(无 web_session_store 时 restore 是 no-op)
+    """
+    import asyncio
     import uvicorn
-    app = create_app(static_dir=static_dir)
+
+    from cc_harness.web.boot import build_runtime
+    from cc_harness.web.pty import PTYManager
+    from cc_harness.web.sessions import SessionManager
+
+    # cc_harness/web/app.py → ../.. → project root
+    PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
+
+    async def _setup():
+        rt = await build_runtime(
+            project_root=PROJECT_ROOT,
+            env_path=PROJECT_ROOT / ".env",
+            mcp_json_path=PROJECT_ROOT / "mcp.json",
+        )
+        # SessionManager.mcp_factory 返回 rt.mcp(client 自身,start 已在 boot 跑过);
+        # web session 路径实际用 _MCPStub,此 mcp_factory 留作 L4 / future 扩展。
+        sm = SessionManager(
+            llm=rt.llm,
+            mcp_factory=lambda: rt.mcp,
+            web_session_store=rt.web_session_store,
+        )
+        try:
+            await sm.restore_from_checkpoint()
+        except Exception:
+            # SQLite 损坏 / web_session_store 异常 → boot 路径不破
+            pass
+        pm = PTYManager()
+        # l2 / l5:boot 当前未在 RuntimeContext 暴露(getattr 兜底拿 None,
+        # session_run_loop 内 None 守卫跳过对应层)。
+        l2_checker = getattr(rt, "l2_checker", None)
+        l5_engine = getattr(rt, "l5_engine", None)
+        app = create_app(
+            static_dir=static_dir,
+            session_manager=sm,
+            l2_checker=l2_checker,
+            l5_engine=l5_engine,
+            pty_manager=pm,
+        )
+        # mcp 注入 app.state 供 lifespan 关(mcp.shutdown 在 startup loop 外
+        # 仍可调 — 主要清理 subprocess / SSE 连接)
+        app.state.mcp = getattr(rt, "mcp", None)
+        return app
+
+    app = asyncio.run(_setup())
     uvicorn.run(app, host=host, port=port, log_level="info")
