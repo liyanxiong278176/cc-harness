@@ -3,9 +3,7 @@ from __future__ import annotations
 import asyncio
 from fastapi import APIRouter, WebSocket, WebSocketDisconnect, status
 
-from cc_harness.web.events import (
-    deserialize, UserInputEvent, SlashCommand, L4ResponseEvent, InterruptEvent,
-)
+from cc_harness.web.events import serialize
 from cc_harness.web.sessions import SessionManager
 
 router = APIRouter()
@@ -31,26 +29,14 @@ async def ws_chat(websocket: WebSocket, session_id: str):
 
     await websocket.accept()
 
-    # Consumer:从 event_queue 推到 WS
+    # Consumer:从 event_queue 推到 WS(SRP:ws.py 拥有;run_loop 不开 consumer)。
     consumer_task = asyncio.create_task(_consume(websocket, rec))
+
+    # 委托给 session_run_loop(函数体内 import 避免 ws↔run_loop 循环依赖)。
+    # l2/l5 kwargs 当前 None — 后续 boot 层在 app.state 暴露后传。
+    from cc_harness.web.run_loop import session_run_loop
     try:
-        while True:
-            raw = await websocket.receive_text()
-            ev = deserialize(f"data: {raw}\n\n")
-            if ev is None:
-                continue
-            if isinstance(ev, UserInputEvent):
-                # TODO:Task 15 接入 run_turn 循环
-                pass  # 占位
-            elif isinstance(ev, SlashCommand):
-                # TODO:Task 15 切 mode + emit ModeEvent
-                pass
-            elif isinstance(ev, L4ResponseEvent):
-                # TODO:Task 15 解决 pending L4 ask
-                pass
-            elif isinstance(ev, InterruptEvent):
-                # TODO:Task 15 取消 run_turn Task
-                pass
+        await session_run_loop(rec, websocket, sm, sm.llm)
     except WebSocketDisconnect:
         pass
     finally:
@@ -63,7 +49,6 @@ async def ws_chat(websocket: WebSocket, session_id: str):
 
 async def _consume(ws: WebSocket, rec) -> None:
     """从 session.event_queue 推到 WS。"""
-    from cc_harness.web.events import serialize
     try:
         while True:
             ev = await rec.event_queue.get()
