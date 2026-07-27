@@ -18,6 +18,7 @@ def create_app(
     session_manager=None,  # SessionManager | None(测试时 None)
     l2_checker=None,       # L2Checker | None — 测试 / REPL 路径 None
     l5_engine=None,        # L5Engine | None — 测试 / REPL 路径 None
+    pty_manager=None,      # PTYManager | None — 测试 / REPL 路径 None
 ) -> FastAPI:
     @asynccontextmanager
     async def lifespan(app: FastAPI):
@@ -50,6 +51,7 @@ def create_app(
     # (测试 / REPL 路径)— session_run_loop 内有 None 守卫跳过对应层。
     app.state.l2 = l2_checker
     app.state.l5 = l5_engine
+    app.state.pty_manager = pty_manager
     return app
 
 

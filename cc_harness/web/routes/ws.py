@@ -1,6 +1,8 @@
 """WebSocket chat 流 + PTY 流。"""
 from __future__ import annotations
 import asyncio
+import base64
+import json
 from fastapi import APIRouter, WebSocket, WebSocketDisconnect, status
 
 from cc_harness.web.events import serialize
@@ -62,14 +64,55 @@ async def _consume(ws: WebSocket, rec) -> None:
         pass
 
 
-# PTY WS(独立连接)— Task 16 实现
 @router.websocket("/ws/pty/{pty_id}")
 async def ws_pty(websocket: WebSocket, pty_id: str):
-    """PTY 双向:前端 stdin ↔ 后端 master_fd,后端 stdout → 前端。"""
     await websocket.accept()
-    # TODO:Task 16 实现完整 PTY 桥
+    pm = getattr(websocket.app.state, "pty_manager", None)
+    if pm is None:
+        await websocket.close(code=status.WS_1008_POLICY_VIOLATION)
+        return
+    rec = pm.get(pty_id)
+    if rec is None:
+        await websocket.close(code=status.WS_1008_POLICY_VIOLATION)
+        return
+
+    # stdin 协程:从 WS 写到 master_fd
+    async def _stdin():
+        try:
+            while True:
+                raw = await websocket.receive_text()
+                ev = json.loads(raw)
+                if ev.get("type") == "stdin":
+                    data = base64.b64decode(ev["data"])
+                    await pm.write_stdin(pty_id, data)
+                elif ev.get("type") == "exit":
+                    break
+        except (WebSocketDisconnect, asyncio.CancelledError):
+            pass
+
+    # stdout 协程:从 stdout_queue 推到 WS
+    async def _stdout():
+        try:
+            while True:
+                chunk = await rec.stdout_queue.get()
+                await websocket.send_json({
+                    "type": "stdout",
+                    "data": base64.b64encode(chunk).decode("ascii"),
+                })
+        except (WebSocketDisconnect, asyncio.CancelledError):
+            pass
+
+    stdin_task = asyncio.create_task(_stdin())
+    stdout_task = asyncio.create_task(_stdout())
     try:
-        while True:
-            await websocket.receive_text()
-    except WebSocketDisconnect:
+        await asyncio.gather(stdin_task, stdout_task)
+    except (WebSocketDisconnect, asyncio.CancelledError):
         pass
+    finally:
+        stdin_task.cancel()
+        stdout_task.cancel()
+        await asyncio.gather(stdin_task, stdout_task, return_exceptions=True)
+        try:
+            await websocket.close()
+        except (WebSocketDisconnect, RuntimeError):
+            pass

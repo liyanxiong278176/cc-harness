@@ -71,6 +71,9 @@ class PTYManager:
         except asyncio.CancelledError:
             pass
 
+    def get(self, pty_id: str) -> PTYRecord | None:
+        return self._records.get(pty_id)
+
     async def write_stdin(self, pty_id: str, data: bytes) -> None:
         rec = self._records.get(pty_id)
         if rec is None:
