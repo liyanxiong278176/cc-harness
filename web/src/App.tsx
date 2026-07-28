@@ -1,4 +1,4 @@
-import { useState } from 'react';
+import { useEffect, useState } from 'react';
 import { ModeBadge } from './components/ModeBadge';
 import { SessionList } from './components/SessionList';
 import { Chat } from './components/Chat';
@@ -9,6 +9,10 @@ import { useSessionStore } from './store/session';
 export default function App() {
   const [filePath, setFilePath] = useState<string | null>(null);
   const sid = useSessionStore((s) => s.currentSessionId);
+  // session 切换 → 清 filePath,避免 CodeViewer 显示前 session 的文件内容
+  useEffect(() => {
+    setFilePath(null);
+  }, [sid]);
   return (
     <div className="h-screen flex flex-col">
       <header className="border-b px-4 py-2 flex items-center gap-4">
