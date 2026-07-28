@@ -146,6 +146,28 @@ def deserialize(line: str) -> BaseModel | None:
         return Event.model_validate({"type": event_type, "ts": data.get("ts", time.time())})
 
 
+def to_jsonl_line(event: BaseModel) -> str:
+    """单行 JSON(eval trajectory 落盘)。无 data: 前缀,无尾换行。"""
+    return event.model_dump_json()
+
+
+def parse_jsonl_line(line: str) -> BaseModel | None:
+    """反序列化 JSONL 行(复用 deserialize 的 _REGISTRY,但行无 data: 前缀)。
+    返回 None 当行不是合法 JSON(让 caller 跳过截断/空行)。"""
+    line = line.strip()
+    if not line:
+        return None
+    try:
+        data = json.loads(line)
+    except json.JSONDecodeError:
+        return None
+    cls = _REGISTRY.get(data.get("type", ""), Event)
+    try:
+        return cls.model_validate(data)
+    except Exception:
+        return Event.model_validate({"type": data.get("type", ""), "ts": data.get("ts", time.time())})
+
+
 _REGISTRY: dict[str, type[BaseModel]] = {
     "thought": ThoughtEvent,
     "action": ActionEvent,
