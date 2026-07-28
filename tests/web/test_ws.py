@@ -42,6 +42,20 @@ def test_ws_version_header_required(app_with_session):
     pytest.skip(reason="TestClient doesn't support WS headers; manual test required")
 
 
+def test_ws_query_param_version_fallback(app_with_session):
+    """不带 header,带 ?v=1 → 协商通过。"""
+    app, sm, cwd = app_with_session
+    client = TestClient(app)
+    r = client.post("/api/sessions", json={"cwd": str(cwd), "mode": "coding"})
+    sid = r.json()["session_id"]
+    asyncio.run(sm.push_event(sid, ThoughtEvent(text="via-query", iteration=0)))
+    with client.websocket_connect(f"/ws/{sid}?v=1") as ws:  # no headers
+        line = ws.receive_text()
+        assert line.startswith("data: ")
+        body = json.loads(line[len("data: "):])
+        assert body["text"] == "via-query"
+
+
 def test_ws_receives_pushed_events(app_with_session):
     """session 推 event → WS 收到。"""
     app, sm, cwd = app_with_session

@@ -1,6 +1,7 @@
 import type {
   ClientEvent, ServerEvent, SessionMeta, FileEntry,
 } from './types';
+import { PROTOCOL_VERSION } from './types';
 
 const BASE = '';  // dev 走 Vite proxy;prod 同源
 
@@ -42,9 +43,8 @@ export async function readFile(sid: string, path: string): Promise<{ content: st
 export function openChatWS(sid: string): WebSocket {
   const proto = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
   const host = window.location.host;
-  const ws = new WebSocket(`${proto}//${host}/ws/${sid}`);
-  // 版本 header 由浏览器 WS API 不支持,改用 query param
-  // (后端 Task 14 已用 header,这里加 query param fallback)
+  // 浏览器 WS API 不能设自定义 header,版本协商走 ?v= query param (后端 ws.py 已加 fallback)
+  const ws = new WebSocket(`${proto}//${host}/ws/${sid}?v=${PROTOCOL_VERSION}`);
   return ws;
 }
 

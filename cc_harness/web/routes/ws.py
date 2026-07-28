@@ -13,8 +13,10 @@ router = APIRouter()
 
 @router.websocket("/ws/{session_id}")
 async def ws_chat(websocket: WebSocket, session_id: str):
-    # 版本协商
-    version = websocket.headers.get("x-cc-harness-web-version", "0")
+    # 版本协商:header 优先,query param fallback (浏览器 WS API 不能设自定义 header)
+    header_v = websocket.headers.get("x-cc-harness-web-version")
+    query_v = websocket.query_params.get("v")
+    version = header_v if header_v is not None else (query_v if query_v is not None else "0")
     try:
         if int(version) < 1:
             await websocket.close(code=status.WS_1008_POLICY_VIOLATION)
