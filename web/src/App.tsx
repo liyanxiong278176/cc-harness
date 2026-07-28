@@ -4,10 +4,12 @@ import { SessionList } from './components/SessionList';
 import { Chat } from './components/Chat';
 import { FileTree } from './components/FileTree';
 import { CodeViewer } from './components/CodeViewer';
+import { TerminalPane } from './components/TerminalPane';
 import { useSessionStore } from './store/session';
 
 export default function App() {
   const [filePath, setFilePath] = useState<string | null>(null);
+  const [tab, setTab] = useState<'files' | 'terminal'>('files');
   const sid = useSessionStore((s) => s.currentSessionId);
   // session 切换 → 清 filePath,避免 CodeViewer 显示前 session 的文件内容
   useEffect(() => {
@@ -23,11 +25,28 @@ export default function App() {
         <aside className="w-64 border-r overflow-y-auto"><SessionList /></aside>
         <section className="flex-1"><Chat /></section>
         <aside className="w-96 border-l flex flex-col">
-          <div className="h-1/3 border-b overflow-y-auto">
-            {sid && <FileTree sessionId={sid} onSelect={setFilePath} />}
+          <div className="flex border-b">
+            <button
+              onClick={() => setTab('files')}
+              className={`px-4 py-2 ${tab === 'files' ? 'bg-white' : 'bg-gray-100'}`}
+            >Files</button>
+            <button
+              onClick={() => setTab('terminal')}
+              className={`px-4 py-2 ${tab === 'terminal' ? 'bg-white' : 'bg-gray-100'}`}
+            >Terminal</button>
           </div>
-          <div className="h-2/3">
-            {sid && filePath && <CodeViewer sessionId={sid} path={filePath} />}
+          <div className="flex-1 overflow-hidden">
+            {tab === 'files' && sid && (
+              <div className="h-full flex flex-col">
+                <div className="h-1/3 border-b overflow-y-auto">
+                  <FileTree sessionId={sid} onSelect={setFilePath} />
+                </div>
+                <div className="h-2/3">
+                  {filePath && <CodeViewer sessionId={sid} path={filePath} />}
+                </div>
+              </div>
+            )}
+            {tab === 'terminal' && sid && <TerminalPane sessionId={sid} />}
           </div>
         </aside>
       </main>
