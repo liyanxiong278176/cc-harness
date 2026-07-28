@@ -6,6 +6,15 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 cc-harness 是一个**跑在终端里的编程代理**:通过 OpenAI 兼容 LLM(默认配 DeepSeek)执行 ReAct 循环,工具来自 MCP server(fs/git)+ 一个内置 `run_command`,输出 思考/行动/观察/结果 4 段。
 
+## Web UI (`--serve` 模式)
+
+2026-07-25 起加 FastAPI + WebSocket 后端 + React/Vite 前端。**与 REPL 并存**:`python main.py` 走 REPL,`python main.py --serve --port 8765` 走 Web。两路径共享 boot wiring,防御层 L2/L4/L5/L8 原样透传。
+
+详见:
+- spec: `docs/superpowers/specs/2026-07-25-codex-web-ui-design.md`
+- plan: `docs/superpowers/plans/2026-07-25-codex-web-ui.md`
+- 前端 dev 手册: `docs/web-frontend.md`
+
 ## Common commands
 
 ```bash
@@ -29,6 +38,10 @@ pip install -e '.[dev]'          # pytest / pytest-asyncio / pytest-cov / ruff
 
 # Phase-1 regression (creates + runs hello.py end-to-end)
 .venv/Scripts/python.exe run_verify.py
+
+# Web UI serve (FastAPI + WS; spec/code/plan: docs/superpowers/specs + plans/2026-07-25-codex-web-ui*)
+PYTHONIOENCODING=utf-8 .venv/Scripts/python.exe main.py --serve --port 8765  # 后端;浏览器: web/dist/ (prod) or vite dev
+cd web && npm run dev                                                      # Vite dev (proxy /api + /ws → 8765)
 
 # Eval / red-team (see "Eval / red-team" section below)
 cd eval/promptfoo && npm run security     # static + dynamic attacks → eval
