@@ -2,7 +2,7 @@ import { create } from 'zustand';
 import type { ServerEvent, SessionMeta } from '../api/types';
 
 interface Message {
-  type: 'thought' | 'action' | 'observation' | 'result' | 'l4_ask' | 'error' | 'compaction';
+  type: 'thought' | 'action' | 'observation' | 'result' | 'l4_ask' | 'l2_refused' | 'error' | 'compaction';
   data: ServerEvent;
 }
 

@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState } from 'react';
 import { useSessionStore } from '../store/session';
-import { openChatWS, sendEvent, parseServerEvent } from '../api/client';
+import { openChatWS, sendEvent, parseServerEvent, listSessions } from '../api/client';
 import type { ServerEvent } from '../api/types';
 
 export function Chat() {
@@ -9,6 +9,7 @@ export function Chat() {
   const append = useSessionStore((s) => s.appendMessage);
   const setPendingAsk = useSessionStore((s) => s.setPendingAsk);
   const pendingAsk = useSessionStore((s) => s.pendingAsk);
+  const setSessions = useSessionStore((s) => s.setSessions);
   const [input, setInput] = useState('');
   const wsRef = useRef<WebSocket | null>(null);
   const endRef = useRef<HTMLDivElement>(null);
@@ -21,16 +22,26 @@ export function Chat() {
       const data = parseServerEvent(e.data);
       if (!data) return;
       const ev = data as ServerEvent;
+      // 5 个流式消息类型 + l2_refused 都进 messages 流;l4_ask 单走 pendingAsk
       if (ev.type === 'thought' || ev.type === 'action' || ev.type === 'observation'
-          || ev.type === 'result' || ev.type === 'error') {
+          || ev.type === 'result' || ev.type === 'error' || ev.type === 'l2_refused') {
         append(sid, { type: ev.type, data: ev });
       }
       if (ev.type === 'l4_ask') {
         setPendingAsk({ ask_id: ev.ask_id, question: ev.question });
       }
+      if (ev.type === 'done') {
+        // turn 结束:把 messages 末端插一个 status 行(用 error 类型 channel?),或简化只 console
+        // TODO polish pass:done 应触发 loading 状态清除。这里最小改动。
+        console.info('[chat] turn done', ev.session_id, 'turn', ev.turn_idx);
+      }
+      if (ev.type === 'mode') {
+        // 简单实现:重新拉 sessions 让 ModeBadge 更新(它读 sessions[].mode)
+        listSessions().then(setSessions).catch(console.error);
+      }
     };
     return () => ws.close();
-  }, [sid, append, setPendingAsk]);
+  }, [sid, append, setPendingAsk, setSessions]);
 
   useEffect(() => {
     endRef.current?.scrollIntoView({ behavior: 'smooth' });
@@ -76,6 +87,11 @@ export function Chat() {
             {m.data.type === 'error' && (
               <p className={m.data.fatal ? 'text-red-900 font-bold' : 'text-orange-700'}>
                 错误: {m.data.message}
+              </p>
+            )}
+            {m.data.type === 'l2_refused' && (
+              <p className="text-yellow-700 bg-yellow-50 border-l-4 border-yellow-400 pl-2 -ml-2">
+                拒绝: {m.data.template}
               </p>
             )}
           </div>
