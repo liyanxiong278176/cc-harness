@@ -5,11 +5,43 @@ Usage:
 """
 from __future__ import annotations
 import argparse
+import hashlib
 import json
+import math
 from pathlib import Path
 import re
 
 import yaml
+
+
+# --- Pass^k + Wilson CI (Task 6) ---
+# critical-severity attack 在 promptfoo 层跑 N 次(同 testId 出现 N 个 result);
+# report 收到 results 后 aggregate_repeats 按 testId 分组,顶层加"critical 采样 ×N"段,
+# 每组出 hold^N、σ、95% Wilson CI。Wilson 比 normal approx 在小样本(典型 N=5)更稳。
+def wilson_ci(k: int, n: int, z: float = 1.96) -> tuple[float, float]:
+    """Wilson score 95% CI。n=0 → (0,1)。n 小样本比 normal approx 准。"""
+    if n == 0:
+        return 0.0, 1.0
+    p = k / n
+    denom = 1 + z * z / n
+    center = (p + z * z / (2 * n)) / denom
+    spread = z * math.sqrt(p * (1 - p) / n + z * z / (4 * n * n)) / denom
+    return max(0.0, center - spread), min(1.0, center + spread)
+
+
+def aggregate_repeats(results: list[dict]) -> dict[str, dict]:
+    """同 testCase.id 的重复 result 聚合 → {id: {hold, n}}。
+    无 id 的 result 用 vars.prompt 哈希做 key(pseudo-id)。"""
+    agg: dict[str, dict] = {}
+    for r in results:
+        tc = r.get("testCase") or {}
+        tid = tc.get("id") or hashlib.md5(
+            str((r.get("vars") or {}).get("prompt", "")).encode()).hexdigest()[:12]
+        a = agg.setdefault(tid, {"hold": 0, "n": 0})
+        a["n"] += 1
+        if r.get("success"):
+            a["hold"] += 1
+    return agg
 
 # --- Trajectory metric extraction (Task 4) ---
 # wrapper (Task 3) appends '--- trajectory ---\n步数={n} 工具错误={n} borderline={T|F}\n...'
@@ -244,6 +276,28 @@ def generate_report(results_list: list[list[dict]]) -> str:
     if unknowns:
         lines.append(f"\n> ⚠ **未知 category/plugin**(matrix 未定义,fail-closed):"
                      f"{', '.join(unknowns)} — 需补 defense_matrix.yaml")
+    # Pass^k 聚合(critical 采样重复时才有意义;无重复 → 不动)
+    # brief: 任一 testId 出现 >1 次 → 顶部加"critical 采样 ×N"段。
+    # 检测时机在报告生成时(runtime 决定,不是 yaml 静态事实)。
+    repeat_agg = aggregate_repeats(probes)
+    repeated = {tid: a for tid, a in repeat_agg.items() if a["n"] > 1}
+    if repeated:
+        # 用所有重复组的最大 n 作为段标题的"×N";通常所有 critical 都跑同样次数,
+        # 但混进 wrapper / 飞书 / CI 重复时 max 仍是诚实表达。
+        n_max = max(a["n"] for a in repeated.values())
+        lines.append("")
+        lines.append(f"## Pass^k 统计(critical 采样 ×{n_max})")
+        lines.append("| testId | hold^k | σ | 95%CI |")
+        lines.append("|---|---|---|---|")
+        # 稳定排序:id 字典序(报告可重现)
+        for tid in sorted(repeated):
+            a = repeated[tid]
+            n = a["n"]
+            hold = a["hold"]
+            p = hold / n
+            lo, hi = wilson_ci(hold, n)
+            sigma = math.sqrt(p * (1 - p) / n)
+            lines.append(f"| `{tid}` | {hold}/{n} | {sigma:.3f} | [{lo:.2f}, {hi:.2f}] |")
     # 防御矩阵(每层 ASR = 真实突破/总数)
     asr = compute_asr_by_layer(probes)
     lines.append("\n## 防御矩阵(每层 ASR = 真实突破/总数)")
