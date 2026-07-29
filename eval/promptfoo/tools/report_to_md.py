@@ -7,8 +7,23 @@ from __future__ import annotations
 import argparse
 import json
 from pathlib import Path
+import re
 
 import yaml
+
+# --- Trajectory metric extraction (Task 4) ---
+# wrapper (Task 3) appends '--- trajectory ---\n步数={n} 工具错误={n} borderline={T|F}\n...'
+# 到 response.output 末尾。report 只抽指标,thought_text 留给 JSONL。
+_TRAJ_RE = re.compile(r"步数=(\d+) 工具错误=(\d+) borderline=(True|False)")
+
+
+def extract_trajectory_from_output(output: str) -> dict:
+    """从 wrapper 塞的 '--- trajectory ---' 段抽指标。无 → 全 0。"""
+    m = _TRAJ_RE.search(output or "")
+    if not m:
+        return {"steps": 0, "tool_errors": 0, "borderline": False}
+    return {"steps": int(m.group(1)), "tool_errors": int(m.group(2)),
+            "borderline": m.group(3) == "True"}
 
 # --- Classification (single source of truth: defense_matrix.yaml) ---
 _MATRIX_PATH = Path(__file__).resolve().parent.parent / "defense_matrix.yaml"
@@ -169,6 +184,7 @@ def extract_fields(result: dict) -> dict:
         "error": str(resp.get("error") or ""),
         "agent_response": str(resp.get("output") or ""),
         "unknown_key": unknown_key,
+        "traj": extract_trajectory_from_output(str(resp.get("output") or "")),
     }
 
 
@@ -213,9 +229,12 @@ def generate_report(results_list: list[list[dict]]) -> str:
     infra = [f for f in failed if f["is_infra"]]
 
     lines = ["# 红队评估报告", ""]
+    n_borderline = sum(1 for f in fields if f["traj"]["borderline"])
     lines.append(f"- 总数 **{len(fields)}** ｜ 通过 **{len(passed)}** ｜ "
                  f"失败 **{len(failed)}**(真实突破 **{len(real_fail)}** / "
                  f"⚠测试故障 **{len(infra)}**)")
+    if n_borderline:
+        lines.append(f"- borderline 标记: **{n_borderline} 条**(需人工复核)")
     from collections import Counter
     cats = Counter(f["category"] for f in real_fail)
     if cats:
@@ -252,13 +271,20 @@ def generate_report(results_list: list[list[dict]]) -> str:
             lines.append(f"- 不通过原因: {f['reason']}")
             if f["agent_response"]:
                 lines.append(f"- agent 实际响应: {_md_escape(f['agent_response'])[:300]}")
+        t = f["traj"]
+        bd_label = "是" if t["borderline"] else "否"
+        lines.append(f"- 轨迹: 步数={t['steps']} 工具错误={t['tool_errors']} borderline={bd_label}")
         lines.append("")
     lines.append("## 三、通过")
-    lines.append("| 严重度 | 分类 | 攻击内容 | 通过原因 |")
-    lines.append("|---|---|---|---|")
+    lines.append("| 严重度 | 分类 | 攻击内容 | 步数 | 工具错误 | borderline | 通过原因 |")
+    lines.append("|---|---|---|---|---|---|---|")
     for f in passed:
+        t = f["traj"]
+        bd_label = "是" if t["borderline"] else "否"
         lines.append(f"| {f['severity']} | {f['category']} | "
-                     f"{_md_escape(f['prompt'])[:80]} | {_md_escape(f['reason'])[:80]} |")
+                     f"{_md_escape(f['prompt'])[:80]} | {t['steps']} | "
+                     f"{t['tool_errors']} | {bd_label} | "
+                     f"{_md_escape(f['reason'])[:80]} |")
     return "\n".join(lines) + "\n"
 
 
