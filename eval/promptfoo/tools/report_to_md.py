@@ -57,6 +57,27 @@ def extract_trajectory_from_output(output: str) -> dict:
     return {"steps": int(m.group(1)), "tool_errors": int(m.group(2)),
             "borderline": m.group(3) == "True"}
 
+# --- 双 judge 一致率(Task 8)---
+# Task 7 在 defaultTest.assert 加了第二源 llm-rubric(MiMo),gradingResult.componentResults
+# 现在含两份 score。extract_judge_scores 按 componentResults 出现序抽所有 llm-rubric,
+# judge_agreement 算 (score_a, score_b) 对 Δ>threshold 的分歧率。
+# 单 grader config 也能跑(只产 1 个 score,paired 空,不进一致率段)。
+def extract_judge_scores(result: dict) -> list[float]:
+    """从 componentResults 抽所有 llm-rubric 的 score。"""
+    gr = result.get("gradingResult") or {}
+    return [float(c.get("score", 0.0))
+            for c in (gr.get("componentResults") or [])
+            if (c.get("assertion") or {}).get("type") == "llm-rubric"]
+
+
+def judge_agreement(paired: list[tuple[float, float]], threshold: float = 0.3) -> dict:
+    """paired: [(score_a, score_b), ...]。返一致率 + 分歧数。"""
+    if not paired:
+        return {"agree_pct": 0.0, "disagreements": 0, "n": 0}
+    disagree = sum(1 for a, b in paired if abs(a - b) > threshold)
+    return {"agree_pct": 1 - disagree / len(paired),
+            "disagreements": disagree, "n": len(paired)}
+
 # --- Classification (single source of truth: defense_matrix.yaml) ---
 _MATRIX_PATH = Path(__file__).resolve().parent.parent / "defense_matrix.yaml"
 
@@ -217,6 +238,7 @@ def extract_fields(result: dict) -> dict:
         "agent_response": str(resp.get("output") or ""),
         "unknown_key": unknown_key,
         "traj": extract_trajectory_from_output(str(resp.get("output") or "")),
+        "judge_scores": extract_judge_scores(result),
     }
 
 
@@ -276,6 +298,20 @@ def generate_report(results_list: list[list[dict]]) -> str:
     if unknowns:
         lines.append(f"\n> ⚠ **未知 category/plugin**(matrix 未定义,fail-closed):"
                      f"{', '.join(unknowns)} — 需补 defense_matrix.yaml")
+    # 双 judge 一致率(Task 8)— 顶部段,先于 Pass^k(judge 可靠度先讲,再讲重复采样)
+    # 任一 probe 含 ≥2 llm-rubric → 配对进 paired;单 grader 或旧 config → 空,不出段
+    paired: list[tuple[float, float]] = [
+        (s[0], s[1]) for f in fields
+        if len(s := f["judge_scores"]) >= 2
+    ]
+    if paired:
+        ja = judge_agreement(paired)
+        lines.append("")
+        lines.append(f"## 双 judge 一致率(cloud + MiMo,Δ>{0.3} 算分歧)")
+        lines.append(f"- 一致率 **{ja['agree_pct']:.1%}**"
+                     f"(共 {ja['n']} 对,分歧 **{ja['disagreements']}** 条)")
+        if ja["disagreements"] > 0:
+            lines.append("- 分歧行见下文失败/通过表 ⚠ judge 分歧 标记")
     # Pass^k 聚合(critical 采样重复时才有意义;无重复 → 不动)
     # brief: 任一 testId 出现 >1 次 → 顶部加"critical 采样 ×N"段。
     # 检测时机在报告生成时(runtime 决定,不是 yaml 静态事实)。
@@ -314,8 +350,14 @@ def generate_report(results_list: list[list[dict]]) -> str:
     lines.append("")
     lines.append("## 二、失败(按严重度 critical→low)")
     for f in failed:
-        lines.append(f"### [{f['category']}] {f['severity']} · {f['source']}")
+        js = f["judge_scores"]
+        disagree = len(js) >= 2 and abs(js[0] - js[1]) > 0.3
+        marker = " ⚠ judge 分歧" if disagree else ""
+        lines.append(f"### [{f['category']}] {f['severity']} · {f['source']}{marker}")
         lines.append(f"- 攻击内容: {f['prompt']}")
+        if len(js) >= 2:
+            lines.append(f"- 双 judge 分数: cloud={js[0]:.2f} MiMo={js[1]:.2f}"
+                         f"(Δ={abs(js[0] - js[1]):.2f})")
         lines.append("- 是否通过: ❌ 未通过")
         if f["is_infra"]:
             lines.append(f"- {f['infra_label']}")
@@ -330,15 +372,18 @@ def generate_report(results_list: list[list[dict]]) -> str:
         lines.append(f"- 轨迹: 步数={t['steps']} 工具错误={t['tool_errors']} borderline={bd_label}")
         lines.append("")
     lines.append("## 三、通过")
-    lines.append("| 严重度 | 分类 | 攻击内容 | 步数 | 工具错误 | borderline | 通过原因 |")
-    lines.append("|---|---|---|---|---|---|---|")
+    lines.append("| 严重度 | 分类 | 攻击内容 | 步数 | 工具错误 | borderline | 通过原因 | 分歧 |")
+    lines.append("|---|---|---|---|---|---|---|---|")
     for f in passed:
         t = f["traj"]
         bd_label = "是" if t["borderline"] else "否"
+        js = f["judge_scores"]
+        disagree = len(js) >= 2 and abs(js[0] - js[1]) > 0.3
+        marker = "⚠" if disagree else ""
         lines.append(f"| {f['severity']} | {f['category']} | "
                      f"{_md_escape(f['prompt'])[:80]} | {t['steps']} | "
                      f"{t['tool_errors']} | {bd_label} | "
-                     f"{_md_escape(f['reason'])[:80]} |")
+                     f"{_md_escape(f['reason'])[:80]} | {marker} |")
     return "\n".join(lines) + "\n"
 
 
