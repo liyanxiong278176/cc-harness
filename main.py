@@ -27,16 +27,11 @@ if sys.platform == "win32":
 PROJECT_ROOT = Path(__file__).parent
 
 
-def _parse_args() -> argparse.Namespace:
-    """Argparse:支持 sub-commands(init / todo / resume) + 默认 REPL 入口。
-
-    向后兼容守卫:
-        - 无参数 → REPL(原有行为)
-        - 仅 --mode / --design-dir → REPL(原有行为)
-        - `init` / `todo` / `resume` 子命令 → CLI 分派
-    """
-    p = argparse.ArgumentParser(description="cc-harness: terminal coding agent with MCP tools")
+def _build_arg_parser() -> argparse.ArgumentParser:
+    """Build the CLI argument parser without parsing process arguments."""
+    p = argparse.ArgumentParser(description="cc-harness: terminal coding agent with MCP tools", add_help=False)
     # REPL 默认参数(无 sub-command 时生效)
+    p.add_argument("-h", "--help", action="help", help="show this help message and exit")
     p.add_argument(
         "--mode", choices=("coding", "plan", "design", "chat"),
         default="coding",
@@ -50,6 +45,8 @@ def _parse_args() -> argparse.Namespace:
         "--serve", action="store_true",
         help="Run as FastAPI server (web UI) instead of REPL",
     )
+    p.add_argument("--emit-events", default=None, metavar="PATH",
+                   help="Emit each ReAct event (thought/action/observation/result) to a JSONL file for eval trajectory analysis")
     p.add_argument("--port", type=int, default=8765,
                    help="[--serve only] Bind port (default 8765)")
     p.add_argument("--static-dir", type=Path, default=None,
@@ -126,7 +123,12 @@ def _parse_args() -> argparse.Namespace:
     p.add_argument("--no-resume", dest="no_resume_legacy", action="store_true",
                    help="[deprecated] Skip resume (use `resume` sub-command)")
 
-    return p.parse_args()
+    return p
+
+
+def _parse_args() -> argparse.Namespace:
+    """Parse command-line arguments."""
+    return _build_arg_parser().parse_args()
 
 
 def main() -> None:
@@ -354,6 +356,7 @@ def main() -> None:
                 e1_decompose_enabled=_policy.e1_decompose_enabled,  # E1 D7: kill-switch 透传
                 checkpoint_service=_checkpoint_service,  # E3 T7
                 manifest=None,  # E3 T7:boot() 当前无 manifest 局部变量,silent no-op
+                emit_events=args.emit_events,
             )
         finally:
             await mcp.shutdown()

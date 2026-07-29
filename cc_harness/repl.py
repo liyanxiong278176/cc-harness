@@ -15,6 +15,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import inspect
+import json
 import logging
 import os
 import re
@@ -197,6 +198,21 @@ async def _handle_slash(cmd: str, state: ReplState, console: Console) -> bool:
     return False
 
 
+def make_jsonl_emitter(path: Path):
+    """Return an async emitter that appends event dictionaries as JSONL."""
+    p = Path(path)
+    p.parent.mkdir(parents=True, exist_ok=True)
+
+    async def _emit(ev_dict: dict) -> None:
+        try:
+            with open(p, "a", encoding="utf-8") as f:
+                f.write(json.dumps(ev_dict, ensure_ascii=False) + "\n")
+        except OSError:
+            pass
+
+    return _emit
+
+
 async def run_repl(
     llm,
     mcp,
@@ -223,6 +239,7 @@ async def run_repl(
     e1_decompose_enabled: bool = True,  # E1 D7:kill-switch 透传 main.py → agent.run_turn
     checkpoint_service: object | None = None,  # E3 T7:由 main.py boot() 构造注入
     manifest: object | None = None,  # E3 T7:由 main.py 透传(可为 None)
+    emit_events: str | None = None,
 ) -> None:
     """Run the interactive REPL.
 
@@ -238,6 +255,8 @@ async def run_repl(
         raise ValueError(
             f"unknown default_mode: {default_mode!r} (expected one of {_VALID_MODES})"
         )
+
+    emitter = make_jsonl_emitter(Path(emit_events)) if emit_events else None
 
     console = Console()
     # Task 6 / spec 组件 9 开放问题 8:session_id 加 hex 后缀保证唯一(避免同一秒
@@ -516,6 +535,7 @@ async def run_repl(
                 reflection_engine=reflection_engine,              # E2 T2.3: 4 类 emit 注入
                 e1_decompose_enabled=e1_decompose_enabled,        # E1 D7: kill-switch 透传 → _e1_extra AND 守卫
                 tool_diff=state.cross_session_tools_diff,         # E3 D7 / F T2: cross-session tool diff 透传
+                event_emitter=emitter,
             )
             # Finding 7 fix:session breakdown buckets 必须基于当前 messages 重新计算
             # (turn_stats 已含 full history snapshot,加和会重复)。API fields 仍由
