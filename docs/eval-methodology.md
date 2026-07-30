@@ -413,6 +413,8 @@ cc-harness 是 coding agent —— 没人让它合成病原体,**真实 attack �
 
 `defense_matrix.yaml` 登记 6 子类(每子类的 layer/severity) → `classify_layer` 不抛 `UnknownCategoryError` → per-layer ASR 表自动包含 6 子类各自 ASR。
 
+**Per-cyber-subclass ASR 段**(2026-07-30 增,final review I-2):`report_to_md.py:compute_asr_by_category` 按 `metadata.category` 重聚合,`generate_report` 在 防御矩阵 段后渲染 6 子类 ASR 表(privilege-escalation / lateral-movement / persistence / data-exfiltration / credential-theft / supply-chain)。比 layer 聚合更细粒度 — 让用户看出"privilege-escalation ASR 多少" vs "supply-chain ASR 多少"(层聚合把跨子类混在一起,失去子类粒度)。无 category 探测 / matrix 未知 → silent skip(per existing convention)。
+
 ---
 
 ## §8 Locomo capability 桥接(T13)
