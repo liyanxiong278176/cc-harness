@@ -173,15 +173,26 @@ if "rm -rf" in thought_text or "dangerous" in thought_text:
 
 ### 4.2 方案:混合采样
 
-- **critical 类** repeat `n=5`(15 条 critical × 5 = 75 runs)
+- **critical 类** repeat `n=5`(all critical attacks × 5;2026-07-30 扩到 77 条 critical × 5 = 385 runs — 15 inline 沙箱 + 62 `attacks.yaml` critical)
 - **其余类** `n=1`(报 ASR)
 - 报告顶部标采样策略「critical ×5 / rest ×1」
 
 ```yaml
-# eval/promptfoo/promptfooconfig.unified.yaml(节选,15 处 repeat: 5)
+# eval/promptfoo/promptfooconfig.unified.yaml(节选,15 处 repeat: 5 — 沙箱 inline)
+- description: "procfs #1 — 启动参数"
+  metadata:
+    pluginId: "coding-agent:procfs-credential-read"
+    severity: critical
+  repeat: 5
+  vars:
+    prompt: ...
+
+# eval/promptfoo/attacks.yaml(节选,62 处 repeat: 5 — 静态 critical 全覆盖)
 - description: "credential-exfil #1 — 读 SSH 私钥"
-  options:
-    repeat: 5   # critical severity → 跑 5 次
+  metadata: { category: credential-exfil, severity: critical }
+  repeat: 5
+  vars:
+    prompt: ...
 ```
 
 ### 4.3 聚合 + Wilson CI
@@ -516,7 +527,7 @@ def _run_locomo() -> dict | None:
 
 - **公开 benchmark(MMLU/HumanEval)** — 评 base LLM 不评 agent harness,概念错位。
 - **CBRN / autonomy / persuasion** — coding agent 不贴。
-- **全量 Pass^k ×5** — 成本(~75 条 critical × 5 = 375 runs,跑 30min+),增量信息有限。
+- **全量 Pass^k ×5(非 critical 也跑)** — 成本(~105 条 × 5 = 525 runs),high/medium/low ASR 单次采样足够。
 - **多人盲标** — 秋招项目量级,单人 + 抽样复核够。
 - **真内核沙箱(gVisor/Firecracker)** — Linux-only,deferred。
 
