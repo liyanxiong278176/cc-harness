@@ -27,13 +27,13 @@ def _run(cmd: list[str], *, check: bool = True) -> None:
     subprocess.run([executable] + cmd[1:], cwd=str(EVAL_DIR), check=check)
 
 
-def _gen_md(json_paths: list[Path], out: Path) -> None:
+def _gen_md(json_paths: list[Path], out: Path, *, locomo_metrics: dict | None = None) -> None:
     from report_to_md import generate_report   # sibling module
     results_list = []
     for j in json_paths:
         d = json.loads(j.read_text(encoding="utf-8"))
         results_list.append((d.get("results") or {}).get("results") or [])
-    out.write_text(generate_report(results_list), encoding="utf-8")
+    out.write_text(generate_report(results_list, locomo_metrics=locomo_metrics), encoding="utf-8")
     print(f"wrote {out}", flush=True)
 
 
@@ -106,13 +106,30 @@ def _unified(per_cat: int | None, keep: bool) -> None:
             ["npx", "promptfoo", "redteam", "eval", "-c", str(rt), "-j", "1", "-o", str(j_redteam)],
             check=False,
         )
-        # 4. 合一份报告
-        _gen_md([j_eval, j_redteam], EVAL_DIR / "unified-report.md")
+        # 4. 合一份报告(含 locomo memory 段 — Task 13 桥接)
+        locomo_metrics = _run_locomo()
+        _gen_md([j_eval, j_redteam], EVAL_DIR / "unified-report.md", locomo_metrics=locomo_metrics)
     finally:
         rt.unlink(missing_ok=True)   # 中间产物,无论成败清理
 
     if not keep:
         shutil.rmtree(CACHE, ignore_errors=True)
+
+
+def _run_locomo() -> dict | None:
+    """locomo 5-key memory 跑批 — Task 13 桥接骨架。
+
+    降级原因:CLAUDE.md 写明 `cc_harness/memory/` 未 wired 进 ReAct 循环,
+    locomo runner 依赖 wired memory + 真 LLM + .env 配齐才能端到端跑。
+    实际 locomo 跑批留作 TODO,本次只接 render_locomo_section(纯函数)
+    + run_eval 接线骨架。`.env 配齐 + memory wired` 后启用。
+    """
+    # TODO: 需 .env 配齐 + memory wired (eval-v2 #14 locomo 桥接降级)
+    # 启用时:
+    #   1) `from pathlib import Path; from locomo.runner import main as locomo_main`
+    #   2) 调 locomo_main() 跑子集,产出 metrics + eval/locomo/locomo-report.html
+    #   3) 返回 dict,如 {"1_recall": {...}, ..., "5_consistency": {...}}
+    return None
 
 
 def main() -> int:

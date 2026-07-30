@@ -321,6 +321,24 @@ def render_regression_section(reg: dict) -> str:
     return "\n".join(lines) + "\n"
 
 
+def render_locomo_section(metrics: dict, html_link: str | None = None) -> str:
+    """locomo 5-key → markdown 段(摘要 + 链接 HTML 详情)。uncomputed → '-'。"""
+    def _v(key, field):
+        v = (metrics.get(key) or {}).get(field) if isinstance(metrics.get(key), dict) else None
+        return "-" if v is None else f"{v:.3f}" if isinstance(v, float) else str(v)
+    lines = ["## 记忆能力(locomo)",
+             f"- 1. 召回: n_eligible={_v('1_recall','n_eligible')} "
+             f"precision={_v('1_recall','precision')} recall={_v('1_recall','recall')}",
+             f"- 2. 时效性: n={_v('2_timeliness','n')} pass_rate={_v('2_timeliness','pass_rate')}",
+             f"- 3. 利用率: avg={_v('3_utilization','avg')} p50={_v('3_utilization','p50')} p90={_v('3_utilization','p90')}",
+             f"- 4. 压缩: total_compressed={_v('4_compaction','total_compressed_n')} "
+             f"avg_retain={_v('4_compaction','overall_avg_retain')}",
+             f"- 5. 一致性: n_groups={_v('5_consistency','n_groups')} drift_rate={_v('5_consistency','drift_rate')}"]
+    if html_link:
+        lines.append(f"\n📎 完整 locomo HTML 报告: `{html_link}`")
+    return "\n".join(lines)
+
+
 # 校准 / 回归 路径常量(generate_report 用)— 不存在 → 空段,不报错
 _CALIBRATION_YAML = (
     Path(__file__).resolve().parent.parent / "judges" / "calibration_set.yaml"
@@ -384,7 +402,7 @@ def _safe_load_regression(probes: list[dict]) -> dict:
         return {}
 
 
-def generate_report(results_list: list[list[dict]]) -> str:
+def generate_report(results_list: list[list[dict]], locomo_metrics: dict | None = None) -> str:
     probes = [r for results in results_list for r in results]
     fields = [extract_fields(r) for r in probes]
     passed = [f for f in fields if f["success"]]
@@ -506,6 +524,11 @@ def generate_report(results_list: list[list[dict]]) -> str:
     if regr:
         lines.append("")
         lines.append(regr.rstrip())
+    # locomo 记忆能力段(Task 13)— 末尾,仅当 locomo_metrics 提供时填充;降级默认 None
+    if locomo_metrics:
+        locomo_html = "eval/locomo/locomo-report.html"
+        lines.append("")
+        lines.append(render_locomo_section(locomo_metrics, html_link=locomo_html))
     return "\n".join(lines) + "\n"
 
 
