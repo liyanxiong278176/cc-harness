@@ -6,31 +6,38 @@ from unittest.mock import patch, MagicMock
 from eval.promptfoo.tools import generate_attacks
 
 
-# 动态类别(与静态 attacks.yaml 错开 —— 见 generate_attacks.CATEGORIES 注释)
+# 动态类别(eval-v2 #7 cyber 深化后扩展到 13 类 — 见 generate_attacks.CATEGORIES 注释)
+# 注:supply-chain 是 eval-v2 #7 后唯一与静态重叠的类别(扩深度而非扩广度,刻意保留)
 NEW_CATEGORIES = {
     "indirect-prompt-injection", "ssrf", "sql-injection",
     "data-exfiltration", "excessive-agency", "rbac",
     "persistence", "resource-exhaustion", "git-rce",
+    "privilege-escalation", "lateral-movement", "credential-theft",
+    "supply-chain",
 }
-# 静态 attacks.yaml 已覆盖的类别 —— 动态不应重复
+# 静态 attacks.yaml 已覆盖的类别 —— 动态不应重复(除 supply-chain 显式例外)
 STATIC_CATEGORIES = {
     "shell-injection", "prompt-extraction", "hijacking",
     "credential-exfil", "self-modification", "fs-overreach",
     "supply-chain", "gate-escape", "credential-sideways",
 }
+# eval-v2 #7 刻意的重叠:supply-chain 同时在 static 和 dynamic(扩深度而非扩广度)
+EXPLICIT_DYNAMIC_STATIC_OVERLAP = {"supply-chain"}
 
 
 def test_categories_dict_has_all_expected_keys():
-    """CATEGORIES must contain exactly the 9 dynamic categories."""
+    """CATEGORIES must contain exactly the 13 dynamic categories."""
     from eval.promptfoo.tools import generate_attacks
     assert set(generate_attacks.CATEGORIES.keys()) == NEW_CATEGORIES
 
 
-def test_dynamic_categories_do_not_overlap_static():
-    """动态类别必须和静态 attacks.yaml 错开,否则没扩大覆盖(只是重复手写集)。"""
+def test_dynamic_categories_overlap_is_only_explicit():
+    """动态类别只和静态在 EXPLICIT_DYNAMIC_STATIC_OVERLAP(eval-v2 #7 刻意保留)中重叠。"""
     from eval.promptfoo.tools import generate_attacks
     overlap = STATIC_CATEGORIES & set(generate_attacks.CATEGORIES.keys())
-    assert not overlap, f"动态类别和静态重叠,没扩大覆盖: {overlap}"
+    assert overlap == EXPLICIT_DYNAMIC_STATIC_OVERLAP, (
+        f"动态-静态重叠仅允许 {EXPLICIT_DYNAMIC_STATIC_OVERLAP},实际: {overlap}"
+    )
 
 
 def test_category_default_severity_has_all_categories():
@@ -242,14 +249,14 @@ def test_main_calls_generate_for_each_category_and_writes_yaml(tmp_path, monkeyp
             rc = generate_attacks.main()
 
     assert rc == 0
-    # generate_for_category called once per category (9 dynamic cats)
-    assert mock_gen.call_count == 9
+    # generate_for_category called once per category (13 dynamic cats — eval-v2 #7 后)
+    assert mock_gen.call_count == 13
     # dynamic_attacks.yaml was written
     out = tmp_path / "dynamic_attacks.yaml"
     assert out.exists()
     content = out.read_text(encoding="utf-8")
-    # 9 cats × 2 attacks = 18 total
-    assert content.count("description:") == 18
+    # 13 cats × 2 attacks = 26 total
+    assert content.count("description:") == 26
     # 新类别都在(static 错开)
     assert "ssrf" in content
     assert "rbac" in content
