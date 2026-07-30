@@ -144,6 +144,12 @@ A promptfoo-based red-team suite (LOCAL only, 2026-07-06 起退役 CI integratio
   - `report_to_md.py` — **single source of truth for classification + PR comment** (no JS/Python split). Run by CI's comment job. `classify_layer` + `compute_asr_by_layer` + `severity_gate()` 都在这。
   - `run_eval.py` — one-shot Python harness: `python tools/run_eval.py {security|redteam|all|unified} [--keep-json] [--per-cat N]`. 推荐 `unified`(LOCAL 一键跑完,2026-07-06 起取代 `security/redteam/all` 三个旧入口)。Wraps `npx promptfoo`, writes JSON to `.report-cache/` (deleted unless `--keep-json`), emits `*-report.md`(`unified-report.md` 为合并输出)。
 - **CI retired (2026-07-06)**:`.github/workflows/redteam.yml` 与 `.github/workflows/redteam-full.yml` 整体退场(`on: {}`,stub)。Actions free-tier 跑不起 full OWASP + coding-agent:all(~5-10h,job 360min 上限余量为 0),改成 LOCAL `npm run redteam-all` 跑。CI 历史上以 `redteam.yml` 3 jobs(eval → redteam → comment)串 + `severity_gate` 阻断合并;`run_eval.py unified` 单进程含所有 4 类 ASR (L2/L4/L5/L8)。CI 红队历史详见 git blame,re-enable 需重写一个 CI-only config(`numTests: 1` 提速 + 启 PROMPTFOO_API_KEY secret)。
+- **Eval-v2 (2026-07-28,14 task) 在原 red-team 上加了 5 个能力**(详见 `docs/eval-methodology.md`):
+  - **Trajectory + outcome 双覆盖**:`python main.py --emit-events <path>` 把 Thought/Action/Observation/Result 落 JSONL,`wrappers/cc_harness.py` 把步数/工具错误/borderline 摘要塞进 judge input,`report_to_md.py` 失败/通过表加 3 列。独立可视化:`python eval/promptfoo/tools/trajectory_to_html.py <dir> -o trajectory-report.html`(零依赖,不碰 web/src)。
+  - **Pass^k + Wilson CI**:`promptfooconfig.unified.yaml` 15 处 critical attack 加 `repeat: 5`,`report_to_md.py:wilson_ci + aggregate_repeats` 出 `hold^k / σ / 95%CI` 表(n=5 CI 仍宽,诚实呈现)。
+  - **Multi-source judge**:`promptfooconfig.unified.yaml` defaultTest 加第二源 MiMo(`openai:mimo-v2.5-pro` + `MIMO_API_KEY` 兜底 `OPENAI_API_KEY`),`report_to_md.py:judge_agreement` 算一致率 + Δ>0.3 标 `⚠ judge 分歧` 送人工。
+  - **Gold-set + κ + 回归**:`judges/calibration_set.yaml` 双区(50 baseline + pending),`tools/calibrate.py` 三件套 `cohen_kappa` / `collect_failures` / `regression_run` + `report_to_md.py` 末尾渲染校准+回归段。50 baseline 全 placeholder(`# TODO: 人工校准`),当前 κ=1.0 trivial;真实校准后才有判别力。
+  - **Cyber 6 子类 + Locomo 桥接**:`attacks.yaml` 加 cyber 6 子类各 ≥5(privilege-escalation / lateral-movement / persistence / data-exfiltration / credential-theft / supply-chain),`defense_matrix.yaml` 登记 6 子类 layer。Locomo memory 5-key(recall/timeliness/utilization/compaction/consistency)经 `render_locomo_section` 桥接到 `unified-report.md`;降级原因 = `cc_harness/memory/` 未 wired 进 ReAct,`run_eval.py:_run_locomo` 当前返 None(TODO)。
 
 ## Test conventions
 
