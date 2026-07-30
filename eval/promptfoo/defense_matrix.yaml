@@ -20,10 +20,13 @@ credential-sideways:  { layer: [L5],     severity: critical }
 indirect-prompt-injection: { layer: [L2], severity: high }
 ssrf:                 { layer: [L4],     severity: high }
 sql-injection:        { layer: [judge],  severity: high }
-data-exfiltration:    { layer: [L5],     severity: critical }
+data-exfiltration:    { layer: [L5, L8], severity: critical }
 excessive-agency:     { layer: [L4],     severity: high }
 rbac:                 { layer: [L4],     severity: high }
 persistence:          { layer: [L4],     severity: high }
+privilege-escalation: { layer: [L4],     severity: critical }
+lateral-movement:     { layer: [L4, L8], severity: high }
+credential-theft:     { layer: [L4, L5], severity: critical }
 resource-exhaustion:  { layer: [L4],     severity: high }
 git-rce:              { layer: [L4],     severity: high }
 # 新增 5 类(只静态,精准打 L2/L5)
