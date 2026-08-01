@@ -32,10 +32,10 @@ class TestDriver:
     def write_tool_call(self, name: str, args: dict[str, Any]) -> None:
         self.tool_calls.append((name, args))
 
-    def write_tool_result(self, result: str, error: bool) -> None:
-        # TestDriver doesn't know duration — store 0 placeholder; downstream
-        # tests check result/error pairs, not elapsed time.
-        self.tool_results.append((result, error, 0))
+    def write_tool_result(self, result: str, error: bool, duration_ms: int = 0) -> None:
+        # duration_ms is forwarded by emit() for ToolCallEnd events; the
+        # protocol's default is 0 for any direct calls.
+        self.tool_results.append((result, error, duration_ms))
 
     def write_todo(self, items: list[dict[str, str]]) -> None:
         self.todos.append(items)
