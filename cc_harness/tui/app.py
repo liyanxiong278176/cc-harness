@@ -1,10 +1,12 @@
 """PipTuiApp — cc-harness TUI main app, 4-zone layout, Claude Code style."""
+import asyncio
 import subprocess
 from pathlib import Path
 
 from textual.app import App
 from textual.binding import Binding
 
+from cc_harness.tui.history import History
 from cc_harness.tui.widgets.header import HeaderBar
 from cc_harness.tui.widgets.chat import ChatLog
 from cc_harness.tui.widgets.input import PromptInput
@@ -27,14 +29,21 @@ class PipTuiApp(App):
     theme = "tokyo-night"
 
     BINDINGS = [
-        # 后续 task 11 加 Ctrl+C / Ctrl+L / Ctrl+R / Shift+Tab / Ctrl+T / Tab
+        Binding("ctrl+c", "interrupt", "Interrupt", priority=True),
         Binding("ctrl+l", "clear_screen", "Clear"),
+        Binding("ctrl+r", "search_history", "History"),
+        Binding("shift+tab", "toggle_permission", "Permission"),
+        Binding("ctrl+t", "toggle_todo", "Todo"),
     ]
 
     def __init__(self, *args, **kwargs) -> None:
         super().__init__(*args, **kwargs)
         # Status 字段在 on_status_write 时更新;task 10 加强 header 渲染
         self._status: dict[str, str] = {}
+        # Task 11:键盘快捷键需要的状态
+        self._interrupt_event = asyncio.Event()
+        self._permission_mode = "default"
+        self._history = History()
 
     def compose(self):
         yield HeaderBar(id="header")
@@ -93,6 +102,28 @@ class PipTuiApp(App):
     def action_clear_screen(self) -> None:
         chat = self.query_one("#chat", ChatLog)
         chat.clear()
+
+    # --- Task 11:键盘快捷键 actions ---
+
+    def action_interrupt(self) -> None:
+        self._interrupt_event.set()
+
+    async def action_search_history(self) -> None:
+        # v1:先 focus 回 prompt,真正的反向搜索 UI 后续 task 升级
+        self.query_one("#prompt", PromptInput).focus()
+
+    def action_toggle_permission(self) -> None:
+        self._permission_mode = "auto" if self._permission_mode == "default" else "default"
+        # 刷新 header + 通过 RenderEvent 通知外部
+        from cc_harness.render import emit
+        from cc_harness.render_protocol import PermissionModeChanged
+        from cc_harness.tui.driver import TUIDriver
+
+        emit(PermissionModeChanged(mode=self._permission_mode), driver=TUIDriver(self))
+
+    def action_toggle_todo(self) -> None:
+        # 后续 task 17 实现
+        pass
 
     # --- RenderEvent → widget 派发(TUIDriver 走 post_message) ---
 
