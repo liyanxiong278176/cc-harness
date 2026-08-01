@@ -2,10 +2,31 @@
 from __future__ import annotations
 
 import asyncio
+from pathlib import Path
 from typing import Any
 
 from textual.message import Message
 from cc_harness.render_protocol import RenderDriver
+
+
+async def run_tui(*, cwd: str, mode: str = "coding") -> None:
+    """Initialize configuration and run the Textual TUI."""
+    del mode  # The app currently owns mode-specific behavior.
+    from cc_harness.config import ConfigError, load_config
+    from cc_harness.tui.app import PipTuiApp
+
+    root = Path(cwd)
+    try:
+        load_config(env_path=root / ".env", mcp_json_path=root / "mcp.json")
+    except ConfigError as exc:
+        app = PipTuiApp()
+        async with app.run_test() as pilot:
+            del pilot
+            app.query_one("#chat").write(f"[red]Config error: {exc}[/red]")
+        return
+
+    app = PipTuiApp()
+    await app.run_async()
 
 
 # --- Textual Message 子类,每个对应一种 write 方法 ---
