@@ -1,4 +1,7 @@
 """PipTuiApp — cc-harness TUI main app, 4-zone layout, Claude Code style."""
+import subprocess
+from pathlib import Path
+
 from textual.app import App
 from textual.binding import Binding
 
@@ -39,6 +42,54 @@ class PipTuiApp(App):
         yield PromptInput(id="prompt")
         yield FooterBar(id="footer")
 
+    async def on_mount(self) -> None:
+        # 启动时刷新一次 status(model/cwd/branch/mode/permission)
+        await self._refresh_status(
+            model=self._detect_model(),
+            cwd=str(Path.cwd()),
+            branch=self._detect_branch(),
+            mode="coding",
+            permission="default",
+        )
+
+    # --- Status / token refresh(task 10) ---
+
+    async def _refresh_status(
+        self,
+        *,
+        model: str,
+        cwd: str,
+        branch: str,
+        mode: str,
+        permission: str,
+    ) -> None:
+        header = self.query_one("#header", HeaderBar)
+        header.render_status(model, cwd, branch, mode, permission)
+
+    async def _refresh_footer(
+        self,
+        *,
+        input_tokens: int,
+        output_tokens: int,
+        cost: float,
+    ) -> None:
+        footer = self.query_one("#footer", FooterBar)
+        footer.render_tokens(input_tokens, output_tokens, cost)
+
+    def _detect_model(self) -> str:
+        # v1 写死;后续接 LLMClient.config
+        return "claude-opus-4"
+
+    def _detect_branch(self) -> str:
+        try:
+            return subprocess.check_output(
+                ["git", "rev-parse", "--abbrev-ref", "HEAD"],
+                cwd=str(Path.cwd()),
+                stderr=subprocess.DEVNULL,
+            ).decode().strip()
+        except Exception:
+            return "no-git"
+
     def action_clear_screen(self) -> None:
         chat = self.query_one("#chat", ChatLog)
         chat.clear()
@@ -69,10 +120,10 @@ class PipTuiApp(App):
         # Status 字段更新(后续 task 10 完整实现 header.render_status)
         self._status.update(message.fields)
 
-    def on_token_refresh(self, message: TokenRefresh) -> None:
-        footer = self.query_one("#footer", FooterBar)
-        footer.render_tokens(
-            in_tok=message.stats.input_tokens,
-            out_tok=message.stats.output_tokens,
-            cost=0.0,  # 后续 task 10 加 cost 计算
+    async def on_token_refresh(self, message: TokenRefresh) -> None:
+        # v1 cost = 0.0;后续 task 接 pricing model
+        await self._refresh_footer(
+            input_tokens=message.stats.input_tokens,
+            output_tokens=message.stats.output_tokens,
+            cost=0.0,
         )
