@@ -1,4 +1,5 @@
-"""PromptInput — bottom text area for user input; bindings added in later tasks."""
+"""PromptInput — bottom text area for user input; Enter submits, Shift+Enter newline."""
+from textual.message import Message
 from textual.widgets import TextArea
 
 from cc_harness.tui.completer import Completer
@@ -16,6 +17,13 @@ class PromptInput(TextArea):
         # 后续 task 11 加 Ctrl+C / Ctrl+L / Ctrl+R / Shift+Tab / Ctrl+T
         ("tab", "complete", "Complete @ or /"),
     ]
+
+    class Submitted(Message):
+        """Posted when user presses Enter (without Shift) to submit input."""
+
+        def __init__(self, text: str) -> None:
+            super().__init__()
+            self.text = text
 
     def __init__(self, cwd: str = ".", **kwargs) -> None:
         super().__init__(**kwargs)
@@ -40,3 +48,10 @@ class PromptInput(TextArea):
             if matches:
                 self.text = text[:i] + matches[0]
             return
+
+    async def on_key(self, event) -> None:
+        """Enter(无 Shift)→ post Submitted + 清空;Shift+Enter 走默认(换行)。"""
+        if event.key == "enter" and not event.shift:
+            event.prevent_default()
+            self.post_message(self.Submitted(self.text))
+            self.text = ""

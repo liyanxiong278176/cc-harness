@@ -158,3 +158,45 @@ class PipTuiApp(App):
             output_tokens=message.stats.output_tokens,
             cost=0.0,
         )
+
+    # --- Task 13:slash command dispatcher ---
+
+    async def _handle_slash_command(self, cmd: str) -> None:
+        """解析并分发 /开头的命令。未知命令写回 chat。"""
+        cmd = cmd.strip()
+        if not cmd.startswith("/"):
+            return
+        name = cmd.split()[0]
+        if name == "/help":
+            from cc_harness.tui.screens.help import HelpScreen
+            await self.push_screen(HelpScreen())
+        elif name == "/theme":
+            from cc_harness.tui.screens.theme import ThemeScreen
+            await self.push_screen(ThemeScreen())
+        elif name == "/resume":
+            from cc_harness.tui.screens.resume import ResumeScreen
+            # v1:从 history.json 读历史(后续 task 19 接 storage)
+            sessions = self._load_sessions()
+            await self.push_screen(ResumeScreen(sessions))
+        elif name == "/clear":
+            self.action_clear_screen()
+        elif name == "/exit":
+            self.exit()
+        else:
+            # 未知命令 — 显示在 chat
+            chat = self.query_one("#chat", ChatLog)
+            chat.write(f"[red]Unknown command: {name}[/red]")
+
+    def _load_sessions(self) -> list[dict]:
+        # v1 stub:后续 task 19 接 cc_harness/storage
+        return []
+
+    def on_prompt_input_submitted(self, message: PromptInput.Submitted) -> None:
+        """PromptInput 提交事件:slash 命令走 dispatcher,普通文本写 chat。"""
+        text = message.text
+        if text.startswith("/"):
+            self.run_worker(self._handle_slash_command(text))
+        else:
+            # 后续 task 14 接 run_turn
+            chat = self.query_one("#chat", ChatLog)
+            chat.write_user(text)
