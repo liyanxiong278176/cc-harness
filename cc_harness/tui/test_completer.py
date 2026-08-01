@@ -11,10 +11,11 @@ def test_completer_slash_commands():
     assert any(m.startswith("/theme") for m in matches)
 
 
-def test_completer_at_path():
-    c = Completer(cwd=str(Path.cwd()))
+def test_completer_at_path(tmp_path):
+    # 隔离 tmp_dir:不依赖 Path.cwd() 是否存在 CLAUDE.md
+    (tmp_path / "CLAUDE.md").write_text("test", encoding="utf-8")
+    c = Completer(cwd=str(tmp_path))
     matches = c.complete("@CLAUDE")
-    # 仓库根有 CLAUDE.md,应匹配
     assert any(m.endswith("CLAUDE.md") for m in matches)
 
 
