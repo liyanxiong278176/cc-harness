@@ -21,8 +21,7 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-dev = ["pytest>=8.0", "pytest-asyncio>=0.23", "pytest-cov>=5.0", "ruff>=0.6"]
-test = ["pytest-textual-snapshot>=0.4"]
+dev = ["pytest>=8.0", "pytest-asyncio>=0.23", "pytest-cov>=5.0", "ruff>=0.6", "pytest-textual-snapshot>=0.4"]
 dlp = ["presidio-analyzer>=2.2"]
 sandbox = ["opensandbox"]
 
