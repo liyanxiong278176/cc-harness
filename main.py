@@ -115,6 +115,14 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--no-resume", dest="no_resume_legacy", action="store_true",
                    help="[deprecated] Skip resume (use `resume` sub-command)")
 
+    # --- TUI default + --repl 调试入口(spec §6.2 / plan §6.2) ---
+    # 默认走 Textual TUI;--repl 切回 legacy REPL
+    # (--mode 已在上方定义,choices 含 coding/plan/design/chat)
+    p.add_argument("--repl", action="store_true",
+                   help="Use legacy REPL (default: Textual TUI)")
+    p.add_argument("--cwd", default=".",
+                   help="Working directory (default: current dir)")
+
     return p
 
 
@@ -126,7 +134,7 @@ def _parse_args() -> argparse.Namespace:
 def main() -> None:
     args = _parse_args()
     console = Console()
-    working_dir = Path.cwd()
+    working_dir = Path(getattr(args, "cwd", None) or ".")
 
     # --- Task 6 / spec 组件 8:CLI sub-command 分派 ---
     if args.command == "init":
@@ -152,6 +160,19 @@ def main() -> None:
         sys.exit(cmd_resume(args, working_dir))
 
     boot_start = time.monotonic()
+    if not getattr(args, "repl", False):
+        # 默认走 Textual TUI(spec §6.2 / plan §6.2)
+        # TUI 自己 load config + 启动 PipTuiApp;不进 REPL 的 heavy boot
+        # (LLMClient / MCPClient / memory extras / scheduler 等都按需在 TUI
+        # 内部 lazy 构造,避免冷启 ~3s+ 浪费在没有交互的进程上)。
+        from cc_harness.tui.driver import run_tui
+        asyncio.run(run_tui(
+            cwd=str(working_dir),
+            mode=getattr(args, "mode", "coding"),
+        ))
+        return
+
+    # --- legacy REPL 路径:--repl 时才走完整 boot ---
     try:
         cfg = load_config(
             env_path=PROJECT_ROOT / ".env",
