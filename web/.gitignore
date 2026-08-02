@@ -1,7 +1,0 @@
-node_modules/
-dist/
-
-# tsc -b artifacts (composite project emits these)
-*.tsbuildinfo
-vite.config.js
-vite.config.d.ts
