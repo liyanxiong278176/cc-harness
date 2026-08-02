@@ -44,6 +44,9 @@ class PipTuiApp(App):
         self._interrupt_event = asyncio.Event()
         self._permission_mode = "default"
         self._history = History()
+        # Task 14:run_turn 的 OpenAI 风格 messages 历史
+        # 真实 wiring 在 Task 15 接 cc_harness.agent.run_turn
+        self._messages: list[dict] = []
 
     def compose(self):
         yield HeaderBar(id="header")
@@ -192,11 +195,35 @@ class PipTuiApp(App):
         return []
 
     def on_prompt_input_submitted(self, message: PromptInput.Submitted) -> None:
-        """PromptInput 提交事件:slash 命令走 dispatcher,普通文本写 chat。"""
-        text = message.text
+        """PromptInput 提交事件:统一走 _handle_user_input 派发。"""
+        self.run_worker(self._handle_user_input(message.text))
+
+    # --- Task 14:用户输入入口 + run_turn stub ---
+
+    async def _handle_user_input(self, text: str) -> None:
+        """用户输入入口:slash 命令走 dispatcher,普通文本写 user message + 调 run_turn。
+
+        真实 run_turn wiring 在 Task 15 完成,本 task 只接 stub。
+        """
+        if not text.strip():
+            return
         if text.startswith("/"):
-            self.run_worker(self._handle_slash_command(text))
-        else:
-            # 后续 task 14 接 run_turn
-            chat = self.query_one("#chat", ChatLog)
-            chat.write_user(text)
+            await self._handle_slash_command(text)
+            return
+        chat = self.query_one("#chat", ChatLog)
+        chat.write_user(text)
+        # v1 stub:Task 15 接真 run_turn
+        await self._run_turn_stub(text)
+
+    async def _run_turn_stub(self, text: str) -> None:
+        """v1 stub:写一个 FinalText 测试 _handle_user_input 的 end-to-end 路径。
+
+        真实 run_turn wiring 在 Task 15 完成(届时会 append user message 到
+        self._messages,调 LLM,把 FinalText 走 emit 派回 driver)。
+        """
+        from cc_harness.render import emit
+        from cc_harness.render_protocol import FinalText
+        from cc_harness.tui.driver import TUIDriver
+
+        driver = TUIDriver(self)
+        emit(FinalText(text=f"(stub) echo: {text}"), driver=driver)
