@@ -43,6 +43,7 @@ async def test_todo_update_diff_only():
         )
         await pilot.pause()
         chat = app.query_one("#chat")
+        assert len(chat.lines) == 2
         text = "\n".join(str(line) for line in chat.lines)
         assert "[x] Read" in text
         assert "[ ] Parse" in text
