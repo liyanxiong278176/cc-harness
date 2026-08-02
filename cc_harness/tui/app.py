@@ -41,8 +41,12 @@ class PipTuiApp(App):
         Binding("ctrl+t", "toggle_todo", "Todo"),
     ]
 
-    def __init__(self, *args, **kwargs) -> None:
-        super().__init__(*args, **kwargs)
+    def __init__(self, *, llm=None, mcp=None, **kwargs) -> None:
+        super().__init__(**kwargs)
+        # Task 15 fix:接受 llm / mcp 实例,wiring 到 cc_harness.agent.run_turn(其
+        # 签名要求两参数为 positional required)。测试场景默认 None + guard。
+        self._llm = llm
+        self._mcp = mcp
         # Status 字段在 on_status_write 时更新;task 10 加强 header 渲染
         self._status: dict[str, str] = {}
         # Task 11:键盘快捷键需要的状态
@@ -209,7 +213,7 @@ class PipTuiApp(App):
         """用户输入入口:slash 命令走 dispatcher,普通文本写 user message + 调真 run_turn。
 
         Task 15 wiring:真实 run_turn 从 cc_harness.agent 拉,event_emitter 走
-        TUIDriver + _adapt_agent_event_to_render 把 AgentEvent 派发到 widget。
+        TUIDriver + _adapt_agent_event_to_render 把 agent dict event 派发到 widget。
         """
         # Lazy import TUIDriver(避免循环),run_turn 已在模块顶层导入(_run_turn)
         from cc_harness.tui.driver import TUIDriver
@@ -221,83 +225,54 @@ class PipTuiApp(App):
             return
         chat = self.query_one("#chat", ChatLog)
         chat.write_user(text)
+        # Task 15 fix round 1:repl.py 模式 — user message 进 messages 历史 BEFORE
+        # run_turn,这样 OpenAI 风格 messages 序列对得上下一轮 assistant 消息。
+        self._messages.append({"role": "user", "content": text})
         driver = TUIDriver(self)
 
-        async def _emit_via_driver(agent_event) -> None:
+        async def _emit_via_driver(agent_event: dict) -> None:
             _adapt_agent_event_to_render(agent_event, driver)
 
         try:
             await _run_turn(
                 self._messages,
+                self._llm,
+                self._mcp,
                 event_emitter=_emit_via_driver,
             )
         except Exception as e:
             chat.write(f"[red]Error: {e}[/red]")
 
 
-def _adapt_agent_event_to_render(agent_event, driver) -> None:
-    """Adapter:AgentEvent(来自 run_turn)→ RenderEvent + emit 给 driver。
+def _adapt_agent_event_to_render(agent_event: dict, driver) -> None:
+    """Adapter:dict event(来自 cc_harness.agent.run_turn)→ TUIDriver 派发。
 
-    agent_event 是 cc_harness.agent 内的 dataclass,字段命名约定:
-      - ThinkingChunk(delta=str)
-      - ThinkingDone(text=str)
-      - ToolCallStart(name=str, args=dict)
-      - ToolCallEnd(name=str, result=str, error=bool, duration_ms=int)
-      - FinalText(text=str)
-      - Usage(input_tokens, output_tokens, cached_tokens, reasoning_tokens)
-      - TodoUpdate(items=list)
-      - ModeChanged(mode=str)
-      - PermissionModeChanged(mode=str)
+    Real event dict shapes(from cc_harness/agent.py:run_turn):
+      - thought:    {type, text, ts, iteration}
+      - action:     {type, name, args, ts, iteration}
+      - observation:{type, text, is_error, duration_ms, iteration}
+      - result:     {type, text, ts}
+
+    Note:Task 15 前一版误用 `cls_name = agent_event.__class__.__name__` 做
+    dataclass 派发,但实际 run_turn 走的是 dict + `type` 字段(见 agent.py:
+    627 / 678 / 804 / 848 / 985 一系列 `_safe_emit({...})`)。本版 dispatch
+    改用 dict.get("type"),unknown event 走 `driver.write_status`。
     """
-    # Lazy import:run_turn / render 模块避免循环依赖(app → agent → ... → tui?)
-    from cc_harness.render import emit
-    from cc_harness.render_protocol import (
-        FinalText,
-        ToolCallStart,
-        ToolCallEnd,
-        TodoUpdate,
-        Usage,
-        ThinkingChunk,
-        ThinkingDone,
-        ModeChanged,
-        PermissionModeChanged,
-    )
-
-    cls_name = agent_event.__class__.__name__
-    if cls_name == "ThinkingChunk":
-        emit(ThinkingChunk(delta=agent_event.delta), driver=driver)
-    elif cls_name == "ThinkingDone":
-        emit(ThinkingDone(text=agent_event.text), driver=driver)
-    elif cls_name == "ToolCallStart":
-        emit(ToolCallStart(name=agent_event.name, args=agent_event.args), driver=driver)
-    elif cls_name == "ToolCallEnd":
-        emit(
-            ToolCallEnd(
-                name=agent_event.name,
-                result=agent_event.result,
-                error=agent_event.error,
-                duration_ms=agent_event.duration_ms,
-            ),
-            driver=driver,
+    t = agent_event.get("type")
+    if t == "thought":
+        driver.write_chunk(agent_event.get("text", ""))
+    elif t == "action":
+        driver.write_tool_call(
+            agent_event.get("name", ""),
+            agent_event.get("args", {}),
         )
-    elif cls_name == "FinalText":
-        emit(FinalText(text=agent_event.text), driver=driver)
-    elif cls_name == "Usage":
-        emit(
-            Usage(
-                input_tokens=agent_event.input_tokens,
-                output_tokens=agent_event.output_tokens,
-                cached_tokens=agent_event.cached_tokens,
-                reasoning_tokens=agent_event.reasoning_tokens,
-            ),
-            driver=driver,
+    elif t == "observation":
+        driver.write_tool_result(
+            agent_event.get("text", ""),
+            agent_event.get("is_error", False),
         )
-    elif cls_name == "TodoUpdate":
-        emit(TodoUpdate(items=agent_event.items), driver=driver)
-    elif cls_name == "ModeChanged":
-        emit(ModeChanged(mode=agent_event.mode), driver=driver)
-    elif cls_name == "PermissionModeChanged":
-        emit(PermissionModeChanged(mode=agent_event.mode), driver=driver)
+    elif t == "result":
+        driver.write(agent_event.get("text", ""))
     else:
-        # 未知事件类型:把 classname 写到 status 字段
-        driver.write_status(unknown_event=cls_name)
+        # 未知事件类型:把 type 字段写到 status 字段,便于调试
+        driver.write_status(unknown_event_type=t)
