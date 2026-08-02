@@ -130,3 +130,18 @@ class TUIDriver(RenderDriver):
 
     def refresh_token(self, stats: Any) -> None:
         self.app.post_message(TokenRefresh(stats))
+
+    # --- Task 16:HITL ask_user hook(L4 confirm 接入) ---
+
+    async def ask_user(self, question: str) -> str:
+        """HITL 异步询问题,阻塞直到 modal dismiss。
+
+        L4 权限引擎在 ask 场景调此方法 — push HITLScreen 到 app,
+        用 future 接 dismiss 回传的选择串(yes / always / no)。
+        """
+        # Lazy import — 避免 screens/hitl 顶层加载拖慢 TUI 启动
+        from cc_harness.tui.screens.hitl import HITLScreen
+
+        future: asyncio.Future[str] = asyncio.Future()
+        await self.app.push_screen(HITLScreen(question), future.set_result)
+        return await future
