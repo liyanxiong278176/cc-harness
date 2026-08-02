@@ -480,10 +480,11 @@ Expected: 列出所有 --serve / --port / run_serve / web 相关行
 
 ```python
 # main.py 改造
-# 1. 删除 import line 141: from cc_harness.web.app import run_serve
-# 2. 删除所有 "--serve" / "--port" argparse 行
-# 3. 删除 if args.serve: run_serve(...) 整段
-# 4. 删除 docstring / 注释里 --serve 相关说明
+# 1. 用 grep 找到所有 --serve / --port / run_serve / cc_harness.web 的出现位置
+# 2. 删除 import: from cc_harness.web.app import run_serve
+# 3. 删除所有 "--serve" / "--port" argparse 行(包括 _serve_help text)
+# 4. 删除 if args.serve: run_serve(...) 整段
+# 5. 删除 docstring / 注释里 --serve 相关说明
 
 # 改后 argparse:
 parser = argparse.ArgumentParser()
@@ -642,10 +643,10 @@ async def test_app_composes_four_widgets():
         assert prompt is not None
         assert footer is not None
 
-async def test_app_default_theme_is_dark():
+async def test_app_default_theme_is_tokyo_night():
     app = PipTuiApp()
     async with app.run_test(size=(120, 40)):
-        assert app.theme == \"textual-dark\"
+        assert app.theme == \"tokyo-night\"
 ```
 
 - [ ] **Step 2: 跑测试确认失败**
@@ -766,7 +767,7 @@ class PipTuiApp(App):
     \"\"\"cc-harness TUI 主应用,4-zone 布局,Claude Code 风格对齐。\"\"\"
 
     TITLE = \"cc-harness\"
-    THEME = \"textual-dark\"
+    THEME = \"tokyo-night\"
 
     BINDINGS = [
         # 后续 task 11 加 Ctrl+C / Ctrl+L / Ctrl+R / Shift+Tab / Ctrl+T / Tab
@@ -824,7 +825,9 @@ async def test_tui_driver_writes_text_via_message():
         emit(FinalText(text=\"hello\"), driver=driver)
         await pilot.pause()
         chat = app.query_one(\"#chat\")
-        assert \"hello\" in str(chat.lines)
+        # RichLog.lines 是 Strip 对象列表,转成可读字符串
+        rendered = \"\\n\".join(str(line) for line in chat.lines)
+        assert \"hello\" in rendered
 
 async def test_tui_driver_writes_chunk_accumulates():
     from cc_harness.tui.app import PipTuiApp
@@ -836,9 +839,9 @@ async def test_tui_driver_writes_chunk_accumulates():
         emit(ThinkingChunk(delta=\"b\"), driver=driver)
         emit(ThinkingChunk(delta=\"c\"), driver=driver)
         await pilot.pause()
-        # 累积应至少出现 abc 的一部分(节流可能只显示最后一次)
         chat = app.query_one(\"#chat\")
-        assert \"a\" in str(chat.lines) or \"abc\" in str(chat.lines)
+        rendered = \"\\n\".join(str(line) for line in chat.lines)
+        assert \"a\" in rendered or \"abc\" in rendered
 
 async def test_tui_driver_writes_tool_call():
     from cc_harness.tui.app import PipTuiApp
@@ -849,7 +852,8 @@ async def test_tui_driver_writes_tool_call():
         emit(ToolCallStart(name=\"run_command\", args={\"cmd\": \"ls\"}), driver=driver)
         await pilot.pause()
         chat = app.query_one(\"#chat\")
-        assert \"run_command\" in str(chat.lines)
+        rendered = \"\\n\".join(str(line) for line in chat.lines)
+        assert \"run_command\" in rendered
 ```
 
 - [ ] **Step 2: 跑测试确认失败**
@@ -1744,42 +1748,33 @@ git commit -m "feat(tui): slash commands dispatcher + /help / /theme / /resume m
 
 ---
 
-## Task 14: TUI 驱动 run_turn(event_emitter=TUIDriver)
+## Task 14: TUI 驱动 run_turn stub(event_emitter=TUIDriver)
+
+**注意**:本 task **只做 stub**,**不**接真实 `cc_harness.agent.run_turn`(留到 Task 15)。这里只验证 `_handle_user_input` 入口能 write user message + emit 一个 FinalText stub。
 
 **Files:**
 - Modify: `cc_harness/tui/app.py`
-- Modify: `cc_harness/tui/driver.py`
 - Test: `cc_harness/tui/test_integration.py`
 
 **Interfaces:**
-- Modifies: `PipTuiApp` — 收到用户非 slash 输入时,调 `run_turn(messages, event_emitter=tui_driver)`
+- Modifies: `PipTuiApp._handle_user_input(text)` — 调 `_run_turn_stub` (本 task),真实 run_turn 在 Task 15 接
 
 - [ ] **Step 1: 写 failing test**
 
 ```python
 # cc_harness/tui/test_integration.py
 from cc_harness.tui.app import PipTuiApp
-from cc_harness.render_test_driver import TestDriver
 
-async def test_user_input_triggers_run_turn_with_emitter():
-    \"\"\"用户输入(非 slash)触发 run_turn,event_emitter 是 TUIDriver。\"\"\"
-    # 这里没法直接测 run_turn(它要真 LLM),改为:
-    # 1. 注入 FakeLLM
-    # 2. 用户输入 hello
-    # 3. verify chat 收到 final_text
-    from cc_harness.llm import LLMClient
-    from cc_harness.mcp_client import MCPClient
-    from cc_harness.project.service import TodoService
+async def test_user_input_writes_user_message_and_stub_response():
+    \"\"\"用户输入(非 slash)→ user message 写进 chat + stub echo 写进 chat。\"\"\"
     app = PipTuiApp()
     async with app.run_test(size=(120, 40)) as pilot:
-        # 注入 fake 依赖
-        app._llm = None  # 后续 task 接 FakeLLM
         chat = app.query_one(\"#chat\")
-        # 直接调 _handle_user_input 跳过 input
         await app._handle_user_input(\"hello\")
         await pilot.pause()
-        # user message 应写进 chat
-        assert \"hello\" in str(chat.lines)
+        rendered = \"\\n\".join(str(line) for line in chat.lines)
+        assert \"hello\" in rendered
+        assert \"(stub) echo: hello\" in rendered
 ```
 
 - [ ] **Step 2: 跑测试确认失败**
@@ -1787,10 +1782,14 @@ async def test_user_input_triggers_run_turn_with_emitter():
 Run: `pytest cc_harness/tui/test_integration.py -v`
 Expected: 1 failed,AttributeError(`_handle_user_input` not found)
 
-- [ ] **Step 3: 实现 _handle_user_input**
+- [ ] **Step 3: 实现 _handle_user_input + stub**
 
 ```python
-# cc_harness/tui/app.py — _handle_user_input
+# cc_harness/tui/app.py — _handle_user_input + stub
+from cc_harness.tui.driver import TUIDriver
+from cc_harness.render import emit
+from cc_harness.render_protocol import FinalText
+
 class PipTuiApp(App):
     async def _handle_user_input(self, text: str) -> None:
         if not text.strip():
@@ -1798,17 +1797,17 @@ class PipTuiApp(App):
         if text.startswith(\"/\"):
             await self._handle_slash_command(text)
             return
-        # 写 user message
         chat = self.query_one(\"#chat\", ChatLog)
         chat.write_user(text)
-        # 调 run_turn(后续 task 接真 LLM;v1 stub)
+        # v1 stub:Task 15 接真 run_turn
         await self._run_turn_stub(text)
 
     async def _run_turn_stub(self, text: str) -> None:
-        \"\"\"v1 stub:调 cc_harness.agent.run_turn integration。\n        完整 agent wiring 后续 task。\"\"\"
+        \"\"\"v1 stub:写一个 FinalText 测试 _handle_user_input 的 end-to-end 路径。
+
+        真实 run_turn wiring 在 Task 15 完成。
+        \"\"\"
         driver = TUIDriver(self)
-        from cc_harness.render import emit
-        from cc_harness.render_protocol import FinalText, ToolCallStart, ToolCallEnd
         emit(FinalText(text=f\"(stub) echo: {text}\"), driver=driver)
 ```
 
@@ -1885,6 +1884,49 @@ Expected: 1 failed,ImportError
 # cc_harness/tui/app.py — _handle_user_input 改造
 from cc_harness.agent import run_turn as _run_turn
 from cc_harness.tui.driver import TUIDriver
+from cc_harness.render import emit
+from cc_harness.render_protocol import (
+    FinalText, ToolCallStart, ToolCallEnd, TodoUpdate, Usage,
+    ThinkingChunk, ThinkingDone, ModeChanged, PermissionModeChanged,
+)
+
+def _adapt_agent_event_to_render(agent_event, driver: TUIDriver) -> None:
+    """Adapter:AgentEvent (来自 run_turn) → RenderEvent + emit 给 driver。
+
+    agent_event 是 cc_harness.agent 内的 dataclass,字段命名约定:
+      - ThinkingChunk(delta=str)
+      - ThinkingDone(text=str)
+      - ToolCallStart(name=str, args=dict)
+      - ToolCallEnd(name=str, result=str, error=bool, duration_ms=int)
+      - FinalText(text=str)
+      - Usage(input_tokens, output_tokens, cached_tokens, reasoning_tokens)
+      - TodoUpdate(items=list)
+      - ModeChanged(mode=str)
+      - PermissionModeChanged(mode=str)
+    """
+    cls_name = agent_event.__class__.__name__
+    if cls_name == \"ThinkingChunk\":
+        emit(ThinkingChunk(delta=agent_event.delta), driver=driver)
+    elif cls_name == \"ThinkingDone\":
+        emit(ThinkingDone(text=agent_event.text), driver=driver)
+    elif cls_name == \"ToolCallStart\":
+        emit(ToolCallStart(name=agent_event.name, args=agent_event.args), driver=driver)
+    elif cls_name == \"ToolCallEnd\":
+        emit(ToolCallEnd(name=agent_event.name, result=agent_event.result, error=agent_event.error, duration_ms=agent_event.duration_ms), driver=driver)
+    elif cls_name == \"FinalText\":
+        emit(FinalText(text=agent_event.text), driver=driver)
+    elif cls_name == \"Usage\":
+        emit(Usage(input_tokens=agent_event.input_tokens, output_tokens=agent_event.output_tokens, cached_tokens=agent_event.cached_tokens, reasoning_tokens=agent_event.reasoning_tokens), driver=driver)
+    elif cls_name == \"TodoUpdate\":
+        emit(TodoUpdate(items=agent_event.items), driver=driver)
+    elif cls_name == \"ModeChanged\":
+        emit(ModeChanged(mode=agent_event.mode), driver=driver)
+    elif cls_name == \"PermissionModeChanged\":
+        emit(PermissionModeChanged(mode=agent_event.mode), driver=driver)
+    else:
+        # 未知事件类型:把 classname 写到 status 字段
+        driver.write_status(unknown_event=cls_name)
+
 
 class PipTuiApp(App):
     def __init__(self, *, llm=None, mcp=None, **kwargs) -> None:
@@ -1902,10 +1944,14 @@ class PipTuiApp(App):
         chat = self.query_one(\"#chat\", ChatLog)
         chat.write_user(text)
         driver = TUIDriver(self)
+
+        async def _emit_via_driver(agent_event) -> None:
+            _adapt_agent_event_to_render(agent_event, driver)
+
         try:
             await _run_turn(
                 self._messages,
-                event_emitter=lambda ev: driver.write_status(**{\"event\": ev.__class__.__name__}),
+                event_emitter=_emit_via_driver,
             )
         except Exception as e:
             chat.write(f\"[red]Error: {e}[/red]\")
@@ -1914,8 +1960,6 @@ class PipTuiApp(App):
         # 后续 task 接 TodoService + memory;v1 简易 self._messages
         return self._messages
 ```
-
-注:这里 lambda 把 event 翻译成 driver 调用,实际需要更细的映射(event 类型 → 对应 driver 方法)。后续 task 18 完善。
 
 - [ ] **Step 4: 跑测试确认通过**
 
@@ -2140,7 +2184,14 @@ git commit -m "feat(tui): Todo inline markdown real-time update"
 **Interfaces:**
 - Modifies: `PipTuiApp._handle_slash_command` — `/task add [--mode] <task>` / `/task cancel <id>` / `/task list` 调用 `cc_harness.cli.todo`
 
-- [ ] **Step 1: 写 failing test**
+- [ ] **Step 1: 验证 cmd_todo 支持 list / add / cancel**
+
+Run: `grep -n "def cmd_todo\|^def cmd_todo\|sub.*list\|sub.*add" cc_harness/cli/todo.py`
+Expected: 确认 `cmd_todo(sub, arg)` 函数签名 + 列出支持的 subcommand(`list` / `add` / `cancel` 至少 3 个)。
+
+如果 cmd_todo 不支持 `list`,**所有 step 停止**,去修 `cc_harness/cli/todo.py` 加 list 支持,在 ledger 标 `Task 18: parked — cmd_todo 缺 list,详见 <file>:<line>`,再做 step 2-5。
+
+- [ ] **Step 2: 写 failing test**
 
 ```python
 # cc_harness/tui/test_task_command.py
@@ -2155,12 +2206,12 @@ async def test_task_list_command():
         assert True
 ```
 
-- [ ] **Step 2: 跑测试确认失败**
+- [ ] **Step 3: 跑测试确认失败**
 
 Run: `pytest cc_harness/tui/test_task_command.py -v`
 Expected: 1 failed,NotImplementedError
 
-- [ ] **Step 3: 实现 /task 命令**
+- [ ] **Step 4: 实现 /task 命令**
 
 ```python
 # cc_harness/tui/app.py — _handle_slash_command 追加
@@ -2192,12 +2243,12 @@ class PipTuiApp(App):
                 chat.write(f\"[green]saved: {fact}[/green]\")
 ```
 
-- [ ] **Step 4: 跑测试确认通过**
+- [ ] **Step 5: 跑测试确认通过**
 
 Run: `pytest cc_harness/tui/test_task_command.py -v`
 Expected: 1 passed
 
-- [ ] **Step 5: commit**
+- [ ] **Step 6: commit**
 
 ```bash
 git add cc_harness/tui/app.py cc_harness/tui/test_task_command.py

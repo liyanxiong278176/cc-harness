@@ -15,9 +15,25 @@ import html
 import json
 from pathlib import Path
 
-from cc_harness.web.events import parse_jsonl_line
+from types import SimpleNamespace
 
 _PHASE_LABEL = {"thought": "思考", "action": "行动", "observation": "观察", "result": "结果"}
+
+
+def parse_jsonl_line(line: str) -> SimpleNamespace | None:
+    """解析一行 JSONL trajectory 事件为 SimpleNamespace(供 getattr 访问)。
+
+    Web 前端删除后,`cc_harness/web/events.py` 不再存在;`make_jsonl_emitter`
+    (`cc_harness/repl.py`) 直接 `json.dumps` 事件 dict,本工具读回 dict 后
+    包一层 namespace 保持调用点 (getattr) 不变。
+    """
+    line = line.strip()
+    if not line:
+        return None
+    try:
+        return SimpleNamespace(**json.loads(line))
+    except (ValueError, TypeError):
+        return None
 
 # 自包含 HTML 骨架(4 段配色 + borderline 边框)。dark theme,无外部资源。
 _HTML_HEAD = """<html><head><meta charset='utf-8'><title>Trajectory Report</title>

@@ -14,9 +14,10 @@ if TYPE_CHECKING:
 
 @dataclass
 class SessionMeta:
-    """Web session 元数据。Task 9 反转:从 cc_harness.web.sessions 搬过来,
-    避免 checkpoint.py → web.sessions 的反向依赖(checkpoint 需要 SessionMeta,
-    web.sessions 也要用,但 web → checkpoint 是单向)。"""
+    """Session 元数据(原 Web session,Task 19 删 web/ 后保留)。
+    历史上 Task 9 反转:从 cc_harness.web.sessions 搬过来,
+    避免 checkpoint.py → web.sessions 的反向依赖。
+    Web 删后 SessionMeta 仍在 checkpoint 里,供 memory 跨会话 checkpoint 使用。"""
     session_id: str
     cwd: Path
     mode: str

@@ -1,0 +1,182 @@
+"""TUIDriver:把 RenderEvent 派发到 Textual app 的 widget message。"""
+from __future__ import annotations
+
+import asyncio
+from pathlib import Path
+from typing import Any
+
+from textual.message import Message
+from cc_harness.render_protocol import RenderDriver
+
+
+async def run_tui(*, cwd: str, mode: str = "coding") -> None:
+    """Initialize configuration, construct LLM/MCP clients, and run the Textual TUI.
+
+    Mirrors the legacy REPL boot path (see main.py:175-194): load config →
+    construct LLMClient → construct MCPClient → await mcp.start() → inject
+    both into PipTuiApp. Config errors fail-fast at boot with a red banner
+    on the chat surface (no silent no-op app with broken wiring).
+    """
+    del mode  # The app currently owns mode-specific behavior.
+    from rich.console import Console
+    from cc_harness.config import ConfigError, load_config
+    from cc_harness.llm import LLMClient
+    from cc_harness.mcp_client import MCPClient
+    from cc_harness.tui.app import PipTuiApp
+
+    console = Console()
+    root = Path(cwd)
+    try:
+        cfg = load_config(env_path=root / ".env", mcp_json_path=root / "mcp.json")
+    except ConfigError as exc:
+        # Fail-fast: surface config error on the chat surface so the user
+        # sees why the agent cannot boot, rather than a silent AttributeError
+        # later when the LLM tries to call list_tools on a None mcp.
+        console.print(f"[red]config error: {exc}[/red]")
+        app = PipTuiApp()
+        async with app.run_test() as pilot:
+            del pilot
+            app.query_one("#chat").write(f"[red]Config error: {exc}[/red]")
+        return
+
+    llm = LLMClient(
+        api_key=cfg.openai_api_key,
+        model=cfg.openai_model,
+        base_url=cfg.openai_base_url,
+    )
+    mcp = MCPClient(cfg.mcp_servers)
+    try:
+        await mcp.start()
+    except Exception as exc:
+        console.print(f"[red]MCP startup failed: {exc}[/red]")
+        # Boot TUI anyway with llm wired (mcp=None → run_turn sees empty tools).
+        # Better than a silent AttributeError on the first user prompt.
+        mcp = None  # type: ignore[assignment]
+
+    app = PipTuiApp(llm=llm, mcp=mcp)
+    try:
+        await app.run_async()
+    finally:
+        if mcp is not None:
+            try:
+                await mcp.shutdown()
+            except Exception:
+                pass  # best-effort cleanup; don't mask the original error
+
+
+# --- Textual Message 子类,每个对应一种 write 方法 ---
+
+
+class ChatWrite(Message):
+    def __init__(self, text: str) -> None:
+        super().__init__()
+        self.text = text
+
+
+class TokenWrite(Message):
+    def __init__(self, token: str) -> None:
+        super().__init__()
+        self.token = token
+
+
+class ToolCallWrite(Message):
+    def __init__(self, name: str, args: dict[str, Any]) -> None:
+        super().__init__()
+        self.name = name
+        self.args = args
+
+
+class ToolResultWrite(Message):
+    def __init__(self, result: str, error: bool) -> None:
+        super().__init__()
+        self.result = result
+        self.error = error
+
+
+class TodoWrite(Message):
+    def __init__(self, items: list[dict[str, str]]) -> None:
+        super().__init__()
+        self.items = items
+
+
+class StatusWrite(Message):
+    def __init__(self, **fields: Any) -> None:
+        super().__init__()
+        self.fields = fields
+
+
+class TokenRefresh(Message):
+    def __init__(self, stats: Any) -> None:
+        super().__init__()
+        self.stats = stats
+
+
+# --- TUIDriver:实现 RenderDriver,通过 app.post_message 派发 ---
+
+
+class TUIDriver(RenderDriver):
+    """把 RenderEvent 派发到 PipTuiApp 的 widget 上。
+
+    chunk 走 50ms 节流:累计到一个窗口后一次性 post_message,
+    避免每个 token 都触发 widget 重绘。
+    """
+
+    # 50ms flush window:balance between 流畅度 and 重绘频率。
+    _FLUSH_SECONDS = 0.05
+
+    def __init__(self, app) -> None:
+        self.app = app
+        # 节流:累计 token,50ms 一次 flush
+        self._token_buffer: list[str] = []
+        self._flush_task: asyncio.Task | None = None
+
+    def write(self, text: str) -> None:
+        self.app.post_message(ChatWrite(text))
+
+    def write_chunk(self, token: str) -> None:
+        self._token_buffer.append(token)
+        if self._flush_task is None:
+            loop = asyncio.get_event_loop()
+            self._flush_task = loop.create_task(self._flush_after(self._FLUSH_SECONDS))
+
+    async def _flush_after(self, delay: float) -> None:
+        await asyncio.sleep(delay)
+        if self._token_buffer:
+            token = "".join(self._token_buffer)
+            self._token_buffer.clear()
+            self.app.post_message(TokenWrite(token))
+        self._flush_task = None
+
+    def write_tool_call(self, name: str, args: dict[str, Any]) -> None:
+        self.app.post_message(ToolCallWrite(name, args))
+
+    def write_tool_result(self, result: str, error: bool, duration_ms: int = 0) -> None:
+        # duration_ms is part of RenderDriver protocol; TUI side keeps the
+        # parameter for forward compatibility but ChatLog does not surface
+        # it today.
+        del duration_ms
+        self.app.post_message(ToolResultWrite(result, error))
+
+    def write_todo(self, items: list[dict[str, str]]) -> None:
+        self.app.post_message(TodoWrite(items))
+
+    def write_status(self, **fields: Any) -> None:
+        self.app.post_message(StatusWrite(**fields))
+
+    def refresh_token(self, stats: Any) -> None:
+        self.app.post_message(TokenRefresh(stats))
+
+    # --- Task 16:HITL ask_user hook(L4 confirm 接入) ---
+
+    async def ask_user(self, question: str) -> str:
+        """HITL 异步询问题,阻塞直到 modal dismiss。
+
+        L4 权限引擎在 ask 场景调此方法 — push HITLScreen 到 app,
+        用 future 接 dismiss 回传的选择串(yes / always / no)。
+        """
+        # Lazy import — 避免 screens/hitl 顶层加载拖慢 TUI 启动
+        from cc_harness.tui.screens.hitl import HITLScreen
+
+        future: asyncio.Future[str] = asyncio.Future()
+        await self.app.push_screen(HITLScreen(question), future.set_result)
+        return await future

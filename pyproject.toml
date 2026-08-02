@@ -16,10 +16,12 @@ dependencies = [
   "jsonschema>=4.21",
   "deepeval>=0.21",
   "langfuse>=2.0,<3",
+  "textual>=0.50,<1.0",
+  "textual-dev>=1.0",
 ]
 
 [project.optional-dependencies]
-dev = ["pytest>=8.0", "pytest-asyncio>=0.23", "pytest-cov>=5.0", "ruff>=0.6"]
+dev = ["pytest>=8.0", "pytest-asyncio>=0.23", "pytest-cov>=5.0", "ruff>=0.6", "pytest-textual-snapshot>=0.4"]
 dlp = ["presidio-analyzer>=2.2"]
 sandbox = ["opensandbox"]
 

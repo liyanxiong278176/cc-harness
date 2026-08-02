@@ -249,3 +249,54 @@ def print_cross_session_summary(
             f"  • 上次 fan-out 中断的 subagent:{len(in_progress_subagents)} 个已标 cancelled"
         )
     console.print("\n".join(lines), markup=False)
+
+
+# ---------------------------------------------------------------------------
+# emit() dispatcher — new public API.
+#  - All existing ``print_*`` functions above remain unchanged for the
+#    REPL/legacy path and existing tests.
+#  - ``emit(event, *, driver)`` is the TUI/REPL/Test entry point: a
+#    :class:`~cc_harness.render_protocol.RenderEvent` is forwarded to the
+#    matching ``RenderDriver`` method, with the ``ToolCallEnd.duration_ms``
+#    field threaded all the way through.
+# ---------------------------------------------------------------------------
+from cc_harness.render_protocol import (  # noqa: E402  (import after module code is intentional)
+    RenderDriver,
+    RenderEvent,
+    ThinkingChunk,
+    ThinkingDone,
+    ToolCallStart,
+    ToolCallEnd,
+    FinalText,
+    Usage,
+    TodoUpdate,
+    ModeChanged,
+    PermissionModeChanged,
+)
+
+
+def emit(event: RenderEvent, *, driver: RenderDriver) -> None:
+    """事件分发:RenderEvent → driver 对应方法。"""
+    if isinstance(event, ThinkingChunk):
+        driver.write_chunk(event.delta)
+    elif isinstance(event, ToolCallStart):
+        driver.write_tool_call(event.name, event.args)
+    elif isinstance(event, ToolCallEnd):
+        # duration_ms is part of the event payload even though the
+        # 4-phase legacy render drops it; TUIDriver and TestDriver both
+        # forward it.
+        driver.write_tool_result(event.result, event.error, event.duration_ms)
+    elif isinstance(event, FinalText):
+        driver.write(event.text)
+    elif isinstance(event, ThinkingDone):
+        driver.write(event.text)
+    elif isinstance(event, TodoUpdate):
+        driver.write_todo(event.items)
+    elif isinstance(event, Usage):
+        driver.refresh_token(event)
+    elif isinstance(event, ModeChanged):
+        driver.write_status(mode=event.mode)
+    elif isinstance(event, PermissionModeChanged):
+        driver.write_status(permission_mode=event.mode)
+    else:
+        raise TypeError(f"Unknown event type: {type(event)}")
