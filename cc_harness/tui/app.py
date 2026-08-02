@@ -21,6 +21,11 @@ from cc_harness.tui.driver import (
     TokenRefresh,
 )
 
+# Task 15:真实 run_turn 从 cc_harness.agent 拉。模块顶层导入,让
+# `patch("cc_harness.tui.app._run_turn", fake_run_turn)` 能命中(测试可见)。
+# agent.py 不依赖 cc_harness.tui(*),无循环风险。
+from cc_harness.agent import run_turn as _run_turn  # noqa: E402  (after tui imports is intentional)
+
 
 class PipTuiApp(App):
     """cc-harness TUI 主应用,4-zone 布局,Claude Code 风格对齐。"""
@@ -198,13 +203,17 @@ class PipTuiApp(App):
         """PromptInput 提交事件:统一走 _handle_user_input 派发。"""
         self.run_worker(self._handle_user_input(message.text))
 
-    # --- Task 14:用户输入入口 + run_turn stub ---
+    # --- Task 15:真实 run_turn 集成(从 cc_harness.agent.run_turn 拉 event_emitter) ---
 
     async def _handle_user_input(self, text: str) -> None:
-        """用户输入入口:slash 命令走 dispatcher,普通文本写 user message + 调 run_turn。
+        """用户输入入口:slash 命令走 dispatcher,普通文本写 user message + 调真 run_turn。
 
-        真实 run_turn wiring 在 Task 15 完成,本 task 只接 stub。
+        Task 15 wiring:真实 run_turn 从 cc_harness.agent 拉,event_emitter 走
+        TUIDriver + _adapt_agent_event_to_render 把 AgentEvent 派发到 widget。
         """
+        # Lazy import TUIDriver(避免循环),run_turn 已在模块顶层导入(_run_turn)
+        from cc_harness.tui.driver import TUIDriver
+
         if not text.strip():
             return
         if text.startswith("/"):
@@ -212,18 +221,83 @@ class PipTuiApp(App):
             return
         chat = self.query_one("#chat", ChatLog)
         chat.write_user(text)
-        # v1 stub:Task 15 接真 run_turn
-        await self._run_turn_stub(text)
-
-    async def _run_turn_stub(self, text: str) -> None:
-        """v1 stub:写一个 FinalText 测试 _handle_user_input 的 end-to-end 路径。
-
-        真实 run_turn wiring 在 Task 15 完成(届时会 append user message 到
-        self._messages,调 LLM,把 FinalText 走 emit 派回 driver)。
-        """
-        from cc_harness.render import emit
-        from cc_harness.render_protocol import FinalText
-        from cc_harness.tui.driver import TUIDriver
-
         driver = TUIDriver(self)
-        emit(FinalText(text=f"(stub) echo: {text}"), driver=driver)
+
+        async def _emit_via_driver(agent_event) -> None:
+            _adapt_agent_event_to_render(agent_event, driver)
+
+        try:
+            await _run_turn(
+                self._messages,
+                event_emitter=_emit_via_driver,
+            )
+        except Exception as e:
+            chat.write(f"[red]Error: {e}[/red]")
+
+
+def _adapt_agent_event_to_render(agent_event, driver) -> None:
+    """Adapter:AgentEvent(来自 run_turn)→ RenderEvent + emit 给 driver。
+
+    agent_event 是 cc_harness.agent 内的 dataclass,字段命名约定:
+      - ThinkingChunk(delta=str)
+      - ThinkingDone(text=str)
+      - ToolCallStart(name=str, args=dict)
+      - ToolCallEnd(name=str, result=str, error=bool, duration_ms=int)
+      - FinalText(text=str)
+      - Usage(input_tokens, output_tokens, cached_tokens, reasoning_tokens)
+      - TodoUpdate(items=list)
+      - ModeChanged(mode=str)
+      - PermissionModeChanged(mode=str)
+    """
+    # Lazy import:run_turn / render 模块避免循环依赖(app → agent → ... → tui?)
+    from cc_harness.render import emit
+    from cc_harness.render_protocol import (
+        FinalText,
+        ToolCallStart,
+        ToolCallEnd,
+        TodoUpdate,
+        Usage,
+        ThinkingChunk,
+        ThinkingDone,
+        ModeChanged,
+        PermissionModeChanged,
+    )
+
+    cls_name = agent_event.__class__.__name__
+    if cls_name == "ThinkingChunk":
+        emit(ThinkingChunk(delta=agent_event.delta), driver=driver)
+    elif cls_name == "ThinkingDone":
+        emit(ThinkingDone(text=agent_event.text), driver=driver)
+    elif cls_name == "ToolCallStart":
+        emit(ToolCallStart(name=agent_event.name, args=agent_event.args), driver=driver)
+    elif cls_name == "ToolCallEnd":
+        emit(
+            ToolCallEnd(
+                name=agent_event.name,
+                result=agent_event.result,
+                error=agent_event.error,
+                duration_ms=agent_event.duration_ms,
+            ),
+            driver=driver,
+        )
+    elif cls_name == "FinalText":
+        emit(FinalText(text=agent_event.text), driver=driver)
+    elif cls_name == "Usage":
+        emit(
+            Usage(
+                input_tokens=agent_event.input_tokens,
+                output_tokens=agent_event.output_tokens,
+                cached_tokens=agent_event.cached_tokens,
+                reasoning_tokens=agent_event.reasoning_tokens,
+            ),
+            driver=driver,
+        )
+    elif cls_name == "TodoUpdate":
+        emit(TodoUpdate(items=agent_event.items), driver=driver)
+    elif cls_name == "ModeChanged":
+        emit(ModeChanged(mode=agent_event.mode), driver=driver)
+    elif cls_name == "PermissionModeChanged":
+        emit(PermissionModeChanged(mode=agent_event.mode), driver=driver)
+    else:
+        # 未知事件类型:把 classname 写到 status 字段
+        driver.write_status(unknown_event=cls_name)
