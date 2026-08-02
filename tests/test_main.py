@@ -75,10 +75,15 @@ async def _async_noop(*a, **kw):
     return None
 
 
-def test_main_no_args_runs_repl(monkeypatch):
-    """`python main.py`(无参)→ REPL,不是 CLI 分派。"""
+def test_main_no_args_runs_tui(monkeypatch):
+    """`python main.py`(无参)→ TUI(默认入口,不是 REPL/CLI 分派)。
+
+    TUI transformation: default entry point is now the Textual TUI
+    (cc_harness.tui.driver.run_tui); legacy REPL is opt-in via `--repl`.
+    """
     main_mod = _load_main_module()
-    called = {"repl": False, "cli_init": False, "cli_todo": False, "cli_resume": False}
+    called = {"tui": False, "repl": False, "cli_init": False,
+              "cli_todo": False, "cli_resume": False}
 
     _stub_dependencies(monkeypatch, main_mod, called)
 
@@ -89,19 +94,28 @@ def test_main_no_args_runs_repl(monkeypatch):
     monkeypatch.setattr("cc_harness.cli.resume.cmd_resume",
                         lambda a, c: called.update(cli_resume=True) or 0)
 
+    async def _fake_run_tui(*a, **kw):
+        called["tui"] = True
+
+    monkeypatch.setattr(
+        "cc_harness.tui.driver.run_tui", _fake_run_tui,
+    )
+
     with patch.object(sys, "argv", ["main.py"]):
         main_mod.main()
 
-    assert called["repl"] is True
+    assert called["tui"] is True
+    assert called["repl"] is False
     assert called["cli_init"] is False
     assert called["cli_todo"] is False
     assert called["cli_resume"] is False
 
 
-def test_main_with_mode_flag_runs_repl(monkeypatch):
-    """`python main.py --mode coding` → REPL(原行为),不进 CLI。"""
+def test_main_with_mode_flag_runs_tui(monkeypatch):
+    """`python main.py --mode coding` → TUI(默认入口,mode 仍透传到 run_tui)。"""
     main_mod = _load_main_module()
-    called = {"repl": False, "cli_init": False, "cli_todo": False, "cli_resume": False}
+    called = {"tui": False, "repl": False, "cli_init": False,
+              "cli_todo": False, "cli_resume": False}
 
     _stub_dependencies(monkeypatch, main_mod, called)
 
@@ -112,10 +126,19 @@ def test_main_with_mode_flag_runs_repl(monkeypatch):
     monkeypatch.setattr("cc_harness.cli.resume.cmd_resume",
                         lambda a, c: called.update(cli_resume=True) or 0)
 
+    async def _fake_run_tui(*a, **kw):
+        called["tui"] = True
+        called["tui_kwargs"] = kw
+
+    monkeypatch.setattr(
+        "cc_harness.tui.driver.run_tui", _fake_run_tui,
+    )
+
     with patch.object(sys, "argv", ["main.py", "--mode", "coding"]):
         main_mod.main()
 
-    assert called["repl"] is True
+    assert called["tui"] is True
+    assert called["repl"] is False
     assert called["cli_init"] is False
     assert called["cli_todo"] is False
     assert called["cli_resume"] is False
@@ -222,7 +245,11 @@ def test_main_legacy_resume_flag(monkeypatch):
 def test_main_cli_dispatch_uses_current_working_directory(
     tmp_path, monkeypatch,
 ):
-    """CLI 子命令必须作用于调用者 cwd,不能固定写进 harness 源码目录。"""
+    """CLI 子命令必须作用于调用者 cwd,不能固定写进 harness 源码目录。
+
+    TUI transformation: 验证 CLI 分派路径,以及 default TUI 入口的 cwd
+    也来自启动目录(替代原 REPL cwd 测试)。
+    """
     cases = [
         (["main.py", "init", "--name", "smoke", "--no-prompt"], "cc_harness.cli.init.cmd_init"),
         (["main.py", "todo", "list"], "cc_harness.cli.todo.cmd_todo"),
@@ -245,17 +272,37 @@ def test_main_cli_dispatch_uses_current_working_directory(
         assert exc.value.code == 0
         assert called["cwd"] == tmp_path
 
+    # Default TUI 入口 cwd 也必须跟随调用者(原 REPL 测试改写到此处)
+    main_mod = _load_main_module()
+    tui_called = {"cwd": None}
 
-def test_main_repl_uses_current_working_directory(tmp_path, monkeypatch):
-    """REPL 的项目 cwd 来自启动目录;配置文件仍从 harness 安装目录加载。"""
+    async def _capture_tui(*args, **kwargs):
+        tui_called["cwd"] = Path(kwargs["cwd"])
+
+    monkeypatch.setattr(
+        "cc_harness.tui.driver.run_tui", _capture_tui,
+    )
+    with patch.object(sys, "argv", ["main.py"]):
+        main_mod.main()
+    assert tui_called["cwd"] == tmp_path
+
+
+def test_main_tui_uses_current_working_directory(tmp_path, monkeypatch):
+    """TUI 的项目 cwd 来自启动目录;配置文件走 harness 安装目录(同 REPL 约定)。
+
+    替代原 `test_main_repl_uses_current_working_directory` — TUI 已是
+    默认入口,REPL 的 `--repl` flag 路径单独测(见 test_main_repl_flag_*)。
+    """
     main_mod = _load_main_module()
     called = {"cwd": None}
     _stub_dependencies(monkeypatch, main_mod, called)
 
-    async def _capture_repl(*args, **kwargs):
+    async def _capture_tui(*args, **kwargs):
         called["cwd"] = Path(kwargs["cwd"])
 
-    monkeypatch.setattr(main_mod, "run_repl", _capture_repl)
+    monkeypatch.setattr(
+        "cc_harness.tui.driver.run_tui", _capture_tui,
+    )
     monkeypatch.chdir(tmp_path)
 
     with patch.object(sys, "argv", ["main.py"]):

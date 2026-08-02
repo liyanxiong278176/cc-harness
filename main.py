@@ -134,7 +134,10 @@ def _parse_args() -> argparse.Namespace:
 def main() -> None:
     args = _parse_args()
     console = Console()
-    working_dir = Path(getattr(args, "cwd", None) or ".")
+    # Resolve "." → absolute path so downstream (TUI/REPL/CLI) sees a
+    # concrete cwd; pytest's monkeypatch.chdir(tmp_path) only works if we
+    # don't pass a literal "." through.
+    working_dir = Path(getattr(args, "cwd", None) or ".").resolve()
 
     # --- Task 6 / spec 组件 8:CLI sub-command 分派 ---
     if args.command == "init":

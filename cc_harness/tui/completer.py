@@ -6,9 +6,9 @@ from pathlib import Path
 
 SLASH_COMMANDS = [
     "/help", "/exit", "/clear", "/context", "/memory",
-    "/save", "/config", "/tools", "/mcp", "/hitl",
+    "/config", "/tools", "/mcp", "/hitl",
     "/policy", "/audit", "/index", "/search", "/plan",
-    "/team", "/model", "/usage", "/skill", "/task",
+    "/team", "/model", "/usage", "/skill",
     "/snapshot", "/restore", "/theme", "/resume",
     "/reset", "/version",
 ]

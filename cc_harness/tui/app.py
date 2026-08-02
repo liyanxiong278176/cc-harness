@@ -134,8 +134,17 @@ class PipTuiApp(App):
         emit(PermissionModeChanged(mode=self._permission_mode), driver=TUIDriver(self))
 
     def action_toggle_todo(self) -> None:
-        # 后续 task 17 实现
-        pass
+        """Flip ChatLog._todo_visible — Ctrl+T 切换 todo 显示状态。
+
+        v1:仅记录 visibility flag + 在 chat 写一行状态反馈(用户能看见 toggle
+        生效)。Todo 数据仍通过 write_todo() 实时流到 ChatLog(由 Task 17 实现的
+        diff-only 块);后续 task 在 ChatLog 渲染层基于 _todo_visible 决定
+        是否显示 todo 行。
+        """
+        chat = self.query_one("#chat", ChatLog)
+        chat._todo_visible = not chat._todo_visible
+        state = "visible" if chat._todo_visible else "hidden"
+        chat.write(f"[dim]Todo block: {state}[/dim]")
 
     # --- RenderEvent → widget 派发(TUIDriver 走 post_message) ---
 
@@ -165,6 +174,9 @@ class PipTuiApp(App):
 
     async def on_token_refresh(self, message: TokenRefresh) -> None:
         # v1 cost = 0.0;后续 task 接 pricing model
+        # TODO(2026-07-30-tui-transformation):wire pricing model → TODO.md P2.
+        # 当前 hardcoded 0.0 满足 v1 UI 验证;真实 cost 走 model pricing table
+        # (per-1k-token rate × tokens)。
         await self._refresh_footer(
             input_tokens=message.stats.input_tokens,
             output_tokens=message.stats.output_tokens,

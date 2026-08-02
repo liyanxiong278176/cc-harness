@@ -10,23 +10,58 @@ from cc_harness.render_protocol import RenderDriver
 
 
 async def run_tui(*, cwd: str, mode: str = "coding") -> None:
-    """Initialize configuration and run the Textual TUI."""
+    """Initialize configuration, construct LLM/MCP clients, and run the Textual TUI.
+
+    Mirrors the legacy REPL boot path (see main.py:175-194): load config →
+    construct LLMClient → construct MCPClient → await mcp.start() → inject
+    both into PipTuiApp. Config errors fail-fast at boot with a red banner
+    on the chat surface (no silent no-op app with broken wiring).
+    """
     del mode  # The app currently owns mode-specific behavior.
+    from rich.console import Console
     from cc_harness.config import ConfigError, load_config
+    from cc_harness.llm import LLMClient
+    from cc_harness.mcp_client import MCPClient
     from cc_harness.tui.app import PipTuiApp
 
+    console = Console()
     root = Path(cwd)
     try:
-        load_config(env_path=root / ".env", mcp_json_path=root / "mcp.json")
+        cfg = load_config(env_path=root / ".env", mcp_json_path=root / "mcp.json")
     except ConfigError as exc:
+        # Fail-fast: surface config error on the chat surface so the user
+        # sees why the agent cannot boot, rather than a silent AttributeError
+        # later when the LLM tries to call list_tools on a None mcp.
+        console.print(f"[red]config error: {exc}[/red]")
         app = PipTuiApp()
         async with app.run_test() as pilot:
             del pilot
             app.query_one("#chat").write(f"[red]Config error: {exc}[/red]")
         return
 
-    app = PipTuiApp()
-    await app.run_async()
+    llm = LLMClient(
+        api_key=cfg.openai_api_key,
+        model=cfg.openai_model,
+        base_url=cfg.openai_base_url,
+    )
+    mcp = MCPClient(cfg.mcp_servers)
+    try:
+        await mcp.start()
+    except Exception as exc:
+        console.print(f"[red]MCP startup failed: {exc}[/red]")
+        # Boot TUI anyway with llm wired (mcp=None → run_turn sees empty tools).
+        # Better than a silent AttributeError on the first user prompt.
+        mcp = None  # type: ignore[assignment]
+
+    app = PipTuiApp(llm=llm, mcp=mcp)
+    try:
+        await app.run_async()
+    finally:
+        if mcp is not None:
+            try:
+                await mcp.shutdown()
+            except Exception:
+                pass  # best-effort cleanup; don't mask the original error
 
 
 # --- Textual Message 子类,每个对应一种 write 方法 ---

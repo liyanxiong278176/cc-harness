@@ -5,6 +5,11 @@ from textual.widgets import Header, OptionList
 from textual.widgets._option_list import Option
 
 
+# v1 历史存储尚未 wire 到 cc_harness.storage;显式告知用户而不是假装空列表。
+# 后续 task(19+)接 storage 后,这里会替换为真正的 session 列表。
+_HISTORY_PLACEHOLDER = "(history not yet wired in v1)"
+
+
 class ResumeScreen(ModalScreen):
     BINDINGS = [("escape", "dismiss", "Close")]
 
@@ -20,11 +25,17 @@ class ResumeScreen(ModalScreen):
             )
             for s in self.sessions
         ]
+        if not items:
+            items = [Option(_HISTORY_PLACEHOLDER, id="_placeholder", disabled=True)]
         yield Vertical(
             Header(),
-            OptionList(*items) if items else OptionList(Option("(no prior sessions)")),
+            OptionList(*items),
             id="resume-modal",
         )
 
     def on_option_list_option_selected(self, event: OptionList.OptionSelected) -> None:
+        # Placeholder entry is disabled — on_option_list_option_selected 仍可能触发,
+        # 但 id 以 "_" 开头,直接 dismiss None 不打开任何 session。
+        if event.option.id.startswith("_"):
+            return
         self.dismiss(event.option.id)

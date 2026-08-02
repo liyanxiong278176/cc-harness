@@ -23,6 +23,10 @@ class ChatLog(RichLog):
         self._todo_items: list[dict[str, str]] = []
         self._todo_line_idx: int | None = None
         self._todo_count: int = 0
+        # Ctrl+T toggle visibility flag — 默认 True(on mount, todos visible)。
+        # v1 仅记录状态;真正 hide/show 通过 toggle_todo_visibility 的消息路径
+        # 由后续 task 在 ChatLog 渲染层实现。
+        self._todo_visible: bool = True
 
     def write_user(self, text: str) -> None:
         self.write(f"\n[bold cyan]›[/bold cyan] {text}")
