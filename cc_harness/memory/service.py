@@ -90,14 +90,32 @@ class MemoryService:
                     det = ConflictDetector(self.decider._llm)
                     similar_for_conflict = await self.store.search_similar(conflict_embedding, k=5)
                     verdicts = await det.check(result_action_mem, similar_for_conflict)
+                    # 取 mem_id 时兼容 dataclass / dict / tuple 三种返回形态
+                    # (v 是 ConflictVerdict dataclass,但 result_action_mem 路径上
+                    # 历史上偶发被替换为 tuple,这里做 defensive 兜底)
+                    def _mem_id(m):
+                        if m is None: return None
+                        if hasattr(m, "id"): return m.id
+                        if isinstance(m, dict): return m.get("id")
+                        if isinstance(m, tuple):
+                            for x in m:
+                                if hasattr(x, "id"): return x.id
+                                if isinstance(x, dict) and "id" in x: return x["id"]
+                        return None
+                    new_id = _mem_id(result_action_mem)
                     for v in verdicts:
-                        if v.action == "delete_old":
-                            await self.store.delete(v.other_id)
-                        elif v.action == "delete_new":
-                            await self.store.delete(result_action_mem.id)
-                            return SaveResult(action="ROLLBACK",
-                                              error=f"conflict:{v.verdict}",
-                                              duration_ms=_ms(t0))
+                        try:
+                            action = getattr(v, "action", None) or (v.get("action") if isinstance(v, dict) else None)
+                            other_id = getattr(v, "other_id", None) or (v.get("other_id") if isinstance(v, dict) else None)
+                            if action == "delete_old" and other_id:
+                                await self.store.delete(other_id)
+                            elif action == "delete_new" and new_id:
+                                await self.store.delete(new_id)
+                                return SaveResult(action="ROLLBACK",
+                                                  error=f"conflict:{getattr(v, 'verdict', None) or (v.get('verdict') if isinstance(v, dict) else '?')}",
+                                                  duration_ms=_ms(t0))
+                        except Exception as e:
+                            logger.warning("conflict action failed (non-fatal): %s", e)
                 except Exception as e:
                     logger.warning("memory conflict check failed: %s", e)
 

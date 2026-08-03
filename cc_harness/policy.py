@@ -1,22 +1,28 @@
-"""Claude Code 式权限闸门:决策只有 allow / ask 两档,无 deny。
+"""权限闸门:hard-deny 先于 allowlist 和 allow / ask 决策。
 
 工具分级:
   allow — 工作区内 fs-read/list、git-read、context7 查文档
   ask   — run_command(任何 shell)、fs-write、工作区外 fs-read、网络工具、git-write、未知工具
+  deny  — 未显式授权的工作区外路径、敏感凭据路径
 
-"工作区外读 → ask" 是结构性判断(路径归属),不是敏感路径黑名单。
+工作区边界是不可询问的 hard-deny;额外目录只能由启动配置显式加入。
 会话 allowlist(进程内)记录用户选 "always" 的 (tool, 规范化键),命中则 allow。
 """
 from __future__ import annotations
+
 import os
+from collections.abc import Iterator
 from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path
+from urllib.parse import unquote, urlparse
+from urllib.request import url2pathname
 
 
 class Action(str, Enum):
     ALLOW = "allow"
     ASK = "ask"
+    DENY = "deny"
 
 
 @dataclass(frozen=True)
@@ -29,11 +35,27 @@ class Decision:
     def allow(self) -> bool:
         return self.action is Action.ALLOW
 
+    @property
+    def deny(self) -> bool:
+        return self.action is Action.DENY
+
 
 # --- 工具分级(按名字模式)---
 _FS_READ = ("read", "list", "search", "info", "stat", "grep", "glob")
 _FS_WRITE = ("write", "edit", "move", "rename", "delete", "remove", "create", "mkdir", "touch")
 _NET = ("fetch", "bing", "http", "url", "request", "curl", "wget")
+
+_PATH_KEYS = {
+    "path", "file_path", "filePath", "filename", "uri", "cwd",
+    "source", "destination", "src", "dst", "old_path", "new_path",
+}
+_PATH_LIST_KEYS = {"paths", "files"}
+_SENSITIVE_DIR_NAMES = {".ssh", ".aws", ".azure", ".gnupg", ".kube"}
+_SENSITIVE_FILE_NAMES = {
+    ".env", ".git-credentials", ".netrc", ".npmrc", ".pypirc",
+    "id_dsa", "id_ecdsa", "id_ed25519", "id_rsa",
+}
+_NON_SECRET_ENV_SUFFIXES = (".example", ".sample", ".template")
 
 
 def _classify(name: str) -> str:
@@ -70,6 +92,34 @@ def _extract_path(args: dict) -> str | None:
     return None
 
 
+def _path_from_value(key: str, value: str) -> str | None:
+    """Return a local path, ignoring non-file URIs in generic ``uri`` fields."""
+    if key != "uri":
+        return value
+    parsed = urlparse(value)
+    if parsed.scheme and parsed.scheme != "file":
+        return None
+    if parsed.scheme == "file":
+        path = unquote(parsed.path)
+        if parsed.netloc and parsed.netloc not in ("", "localhost"):
+            path = f"//{parsed.netloc}{path}"
+        return url2pathname(path)
+    return value
+
+
+def _extract_paths(args: dict) -> Iterator[str]:
+    """Yield every declared local path so secondary destinations cannot bypass policy."""
+    for key, value in args.items():
+        if key in _PATH_KEYS and isinstance(value, str) and value:
+            path = _path_from_value(key, value)
+            if path:
+                yield path
+        elif key in _PATH_LIST_KEYS and isinstance(value, list):
+            for item in value:
+                if isinstance(item, str) and item:
+                    yield item
+
+
 def _resolve(target: str, project_root: Path) -> Path:
     """展开 ~ / 环境变量 / 相对路径,返回绝对路径(不要求存在)。"""
     expanded = os.path.expandvars(os.path.expanduser(target))
@@ -90,6 +140,20 @@ def _is_outside(target: str, project_root: Path) -> bool:
     """
     root = project_root.resolve(strict=False)
     return not _resolve(target, root).is_relative_to(root)
+
+
+def _is_sensitive_path(path: Path) -> bool:
+    """Identify credential locations that models must access through a broker."""
+    lowered_parts = {part.lower() for part in path.parts}
+    if lowered_parts & _SENSITIVE_DIR_NAMES:
+        return True
+    name = path.name.lower()
+    if (
+        (name == ".env" or name.startswith(".env."))
+        and not name.endswith(_NON_SECRET_ENV_SUFFIXES)
+    ):
+        return True
+    return name in _SENSITIVE_FILE_NAMES
 
 
 class Allowlist:
@@ -119,30 +183,52 @@ class Allowlist:
 
 
 class PolicyEngine:
-    def __init__(self, project_root: Path, *, enabled: bool = True) -> None:
+    def __init__(
+        self,
+        project_root: Path,
+        *,
+        enabled: bool = True,
+        additional_roots: list[Path] | tuple[Path, ...] | None = None,
+    ) -> None:
         self.project_root = project_root.resolve(strict=False)
+        self.additional_roots = tuple(
+            Path(root).resolve(strict=False) for root in (additional_roots or ())
+        )
         self.enabled = enabled
         self.allowlist = Allowlist()
 
     def evaluate(self, tool_name: str, args: dict, ctx: dict) -> Decision:
-        if not self.enabled:
-            return Decision(Action.ALLOW, "policy_disabled", "闸门已关闭(policy.yaml enabled=false)")
         root = Path(ctx.get("project_root", self.project_root)).resolve(strict=False)
         cls = _classify(tool_name)
+        allowed_roots = (root, *self.additional_roots)
+
+        # Hard safety runs before every convenience control. Neither an allowlist
+        # entry nor enabled=false may approve an undeclared root or credential path.
+        for target in _extract_paths(args):
+            resolved = _resolve(target, root)
+            if not any(resolved.is_relative_to(allowed) for allowed in allowed_roots):
+                return Decision(
+                    Action.DENY,
+                    "path_outside_allowed_roots",
+                    f"拒绝访问未授权工作区外路径: {target}",
+                )
+            if _is_sensitive_path(resolved):
+                return Decision(
+                    Action.DENY,
+                    "sensitive_credential_path",
+                    f"拒绝直接访问敏感凭据路径: {target}",
+                )
+
+        if not self.enabled:
+            return Decision(Action.ALLOW, "policy_prompts_disabled", "普通权限询问已关闭")
 
         # allowlist 命中 → allow
         if self.allowlist.hits(tool_name, args, root):
             return Decision(Action.ALLOW, "allowlist", "会话 allowlist 命中")
 
-        # docs / git_read / fs_read / fs_other:默认 allow,但带 path 参数且
-        # 解析到工作区外 → ask。路径归属对所有带 path 的工具类统一生效,
-        # 避免 "mcp__context7__read_creds(path=~/.ssh)" / "mcp__git__show(path=~/.ssh)"
-        # 这类靠工具名子串误判成 docs/git_read 而绕过闸门。
+        # All declared paths passed hard safety above. Read-like tools can now
+        # be allowed without relying on tool-name classification for containment.
         if cls in ("docs", "git_read", "fs_read", "fs_other"):
-            target = _extract_path(args)
-            if target and _is_outside(target, root):
-                return Decision(Action.ASK, f"{cls}_outside_workspace",
-                                f"访问工作区外路径需确认: {target}")
             return Decision(Action.ALLOW, f"{cls}_allow", "")
 
         # shell / fs_write / network / git_write / unknown → ask

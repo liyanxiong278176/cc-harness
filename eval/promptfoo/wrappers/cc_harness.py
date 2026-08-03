@@ -31,6 +31,20 @@ import time
 from pathlib import Path
 from typing import Optional
 
+try:
+    from dotenv import load_dotenv
+    # 优先读 eval/promptfoo/.env(本地),缺则 fallback 到仓根 .env。
+    # wrapper 在 eval/promptfoo/wrappers/,仓根 = parents[3]
+    for _env_path in (
+        Path(__file__).resolve().parent.parent / ".env",
+        Path(__file__).resolve().parents[3] / ".env",
+    ):
+        if _env_path.exists():
+            load_dotenv(_env_path, override=False)
+            break
+except ImportError:
+    pass
+
 # This file lives at: <repo>/eval/promptfoo/wrappers/cc_harness.py
 # so the cc-harness root is 3 levels up. We search a few candidates
 # upward because promptfoo may invoke us from a context where parents[3]
@@ -243,7 +257,7 @@ async def _spawn_and_boot(mode: str, workdir, env: dict, boot_wait: float,
     last_err = ""
     for attempt in range(boot_retries + 1):
         try:
-            command = [PYTHON_BIN, "-u", str(MAIN_PY), "--mode", mode]
+            command = [PYTHON_BIN, "-u", str(MAIN_PY), "--mode", mode, "--repl"]
             if traj_path is not None:
                 command.extend(("--emit-events", str(traj_path)))
             proc = await asyncio.create_subprocess_exec(
@@ -304,6 +318,20 @@ async def _call_api_inner(prompt: str, options: dict, context: dict) -> dict:
         return {"output": "", "error": f"main.py not found at {MAIN_PY}. Searched: {searched}"}
 
     env = os.environ.copy()
+    # 防御层(2026-07-31):即使 module-level load_dotenv 没生效(被 promptfoo worker
+    # 在 import 时跳过或 path 计算错),这里也再 load 一次,确保 OPENAI_API_KEY
+    # 等关键变量被设上。
+    try:
+        from dotenv import load_dotenv as _ld
+        for _p in (
+            Path(__file__).resolve().parent.parent / ".env",
+            Path(__file__).resolve().parents[3] / ".env",
+        ):
+            if _p.exists():
+                _ld(_p, override=False)
+                break
+    except ImportError:
+        pass
     env["PYTHONIOENCODING"] = "utf-8"
     env["PYTHONUNBUFFERED"] = "1"
     # 红队双模式:allow → 注 AUTOCONFIRM=always(命令进沙箱);deny(默认)→ 不注。
@@ -323,27 +351,92 @@ async def _call_api_inner(prompt: str, options: dict, context: dict) -> dict:
             assert proc.stdin is not None
             proc.stdin.write((prompt + "\n").encode("utf-8"))
             await proc.stdin.drain()
+            # Windows ProactorEventLoop:drain 只清 StreamWriter 内部 buffer,
+            # 不一定 flush 到 OS pipe。REPL 的 input() 在子线程等数据,
+            # 加 100ms sleep 让 OS 真的把数据推过去。
+            await asyncio.sleep(0.1)
+            try:
+                proc.stdin.flush()  # type: ignore[attr-defined]
+            except (AttributeError, OSError):
+                pass
             proc.stdin.write(b"exit\n")
             await proc.stdin.drain()
+            await asyncio.sleep(0.1)
+            try:
+                proc.stdin.flush()  # type: ignore[attr-defined]
+            except (AttributeError, OSError):
+                pass
         except (BrokenPipeError, ConnectionResetError, OSError) as e:
             return await _err(proc, f"stdin write failed: {e}", b"")
 
-        # Phase 3: drain stdout until the process exits
+        # Phase 3: 流式 drain stdout,主动 watch 进程是否退出。
+        # 不再用 proc.communicate() —— Windows ProactorEventLoop 在 stdin pipe 关闭时
+        # 不一定正确触发 EOF,communicate() 会挂到 repl_timeout 才被 kill,白白浪费超时。
+        # 改用 chunk-read + returncode 探针:收到 EOF 或 process 已退出都立刻收尾。
+        stdout_chunks: list[bytes] = []
+        deadline = time.monotonic() + repl_timeout
         try:
-            stdout_bytes, _ = await asyncio.wait_for(
-                proc.communicate(),
-                timeout=repl_timeout,
-            )
+            while True:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise asyncio.TimeoutError
+                # 短超时读 chunk,避免进程卡住时整个挂死
+                try:
+                    chunk = await asyncio.wait_for(
+                        proc.stdout.read(4096), timeout=min(remaining, 5.0)
+                    )
+                except asyncio.TimeoutError:
+                    # 5s 没新数据 — 看进程是否还活着
+                    if proc.returncode is not None:
+                        break  # 进程已退出,不再等
+                    continue  # 进程还活着,继续等下一 chunk
+                if not chunk:
+                    break  # EOF,正常退出
+                stdout_chunks.append(chunk)
+                # REPL 自身 bug:打完 "shutting down" 后 rich console live widget
+                # 后台 task 还在跑,process 不真退出。检测到这个 marker 立即 kill,
+                # 省掉等到 repl_timeout 才能收尾。
+                if b"shutting down" in chunk:
+                    try:
+                        proc.kill()
+                    except ProcessLookupError:
+                        pass
+                    try:
+                        await asyncio.wait_for(proc.wait(), timeout=3)
+                    except Exception:
+                        pass
+                    break
+                if proc.returncode is not None:
+                    # 进程已退出,再 drain 一下残余 buffer
+                    try:
+                        tail = await asyncio.wait_for(proc.stdout.read(), timeout=2.0)
+                        if tail:
+                            stdout_chunks.append(tail)
+                    except Exception:
+                        pass
+                    break
+            stdout_bytes = b"".join(stdout_chunks)
+            try:
+                await asyncio.wait_for(proc.wait(), timeout=5)
+            except Exception:
+                pass
         except asyncio.TimeoutError:
             try:
                 proc.kill()
             except ProcessLookupError:
                 pass
+            tail = b""
             try:
-                stdout_bytes, _ = await asyncio.wait_for(proc.communicate(), timeout=5)
+                tail_stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=5)
+                tail = tail_stdout or b""
             except Exception:
-                stdout_bytes = b""
-            return await _err(proc, f"agent did not complete within {repl_timeout}s (repl_timeout)", stdout_bytes)
+                pass
+            stdout_bytes = b"".join(stdout_chunks) + tail
+            return await _err(
+                proc,
+                f"agent did not complete within {repl_timeout}s (repl_timeout)",
+                stdout_bytes,
+            )
 
         text = stdout_bytes.decode("utf-8", errors="replace") if stdout_bytes else ""
 

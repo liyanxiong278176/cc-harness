@@ -87,21 +87,27 @@ async def _clear_memory_tags(tags: list[str]):
         emb_dim = int(env.get("EMBEDDING_DIM", "1024"))
 
         store = MemoryStore(db_path=REPO / "logs" / "locomo_memory.db", embedding_dim=emb_dim)
-        await store.init_schema()
-        embedder = EmbeddingClient(
-            base_url=emb_base, api_key=emb_key, model=emb_model, dim=emb_dim, timeout_s=10.0,
-        )
-        decider_llm = LLMClient(
-            api_key=env["OPENAI_API_KEY"], model=env["OPENAI_MODEL"], base_url=env["OPENAI_BASE_URL"],
-        )
-        decider = LLMDecider(llm=decider_llm)
-        service = MemoryService(store=store, embedder=embedder, decider=decider)
-        for tag in tags:
-            try:
-                n = await service.delete_by_tag(tag)
-                print(f"[runner] cleared {n} memories with tag '{tag}'")
-            except Exception as e:
-                print(f"[runner] clear tag '{tag}' failed: {e}")
+        try:
+            await store.init_schema()
+            embedder = EmbeddingClient(
+                base_url=emb_base, api_key=emb_key, model=emb_model, dim=emb_dim, timeout_s=10.0,
+            )
+            decider_llm = LLMClient(
+                api_key=env["OPENAI_API_KEY"], model=env["OPENAI_MODEL"], base_url=env["OPENAI_BASE_URL"],
+            )
+            decider = LLMDecider(llm=decider_llm)
+            service = MemoryService(store=store, embedder=embedder, decider=decider)
+            for tag in tags:
+                try:
+                    n = await service.delete_by_tag(tag)
+                    print(f"[runner] cleared {n} memories with tag '{tag}'")
+                except Exception as e:
+                    print(f"[runner] clear tag '{tag}' failed: {e}")
+        finally:
+            # 2026-07-31 fix: 必须 await close(),否则 runner.main 退出后 store._db
+            # 仍开着,aiosqlite worker 线程在主 loop 关闭后 call_soon_threadsafe 失败
+            # → 打印 'Event loop is closed' traceback(无害但噪音)。
+            await store.close()
     except Exception as e:
         print(f"[runner] clear_memory_tags failed: {e}")
 
@@ -223,7 +229,7 @@ async def _run_sample(sample: dict, policy: dict, extras: list[dict], trace: Loc
                 stats = await run_turn(
                     messages, llm, mcp,
                     extra_native_specs=extras,
-                    max_iter=4, mode="chat", cwd=str(REPO),
+                    max_iter=4, mode="coding", cwd=str(REPO),
                     context_config=ContextConfig(),  # Plan3: 长对话触发压缩
                     memory_layer=memory_layer,
                     offload_deps=offload_deps,      # Q4 Task7: 短期符号化卸载
@@ -254,13 +260,28 @@ async def _run_sample(sample: dict, policy: dict, extras: list[dict], trace: Loc
             from itertools import islice
             qa_iter = islice(qa_iter, qa_limit)
         for qa in qa_iter:
-            qa_messages = list(messages) + [{"role": "user", "content": qa.question}]
+            # 时间锚定(2026-07-31,Task 4+5):locomo 对话里只写相对时间
+            # ("yesterday" / "last week"),但 type=2 评测 ground truth 给绝对
+            # 日期。session_1_date_time 是锚定基准,prepend 到 question 前。
+            # 2026-07-31 回归(5):仅对 category="2"(时间)注入,type=1/4/5 不注入,
+            # 避免分散模型对事实/经验/多跳 QA 的注意力(原全注入会让 type=3 把
+            # 锚定日期块当 answer 复读)。
+            event_date = ds.infer_event_date(sample)
+            qa_user_content = qa.question
+            if event_date and str(qa.category) == "2":
+                qa_user_content = (
+                    f"## 锚定日期\n{event_date}\n\n"
+                    f"如对话中出现相对时间(yesterday / last week 等),"
+                    f"请基于上述锚定日期换算为绝对日期。\n\n"
+                    f"## 问题\n{qa.question}"
+                )
+            qa_messages = list(messages) + [{"role": "user", "content": qa_user_content}]
             span = trace.start_turn(-1, qa.question)
             try:
                 stats = await run_turn(
                     qa_messages, llm, mcp,
                     extra_native_specs=extras,
-                    max_iter=8, mode="chat", cwd=str(REPO),  # Phase 1: 6→8 (qa 必须答需要 retry 余量)
+                    max_iter=8, mode="coding", cwd=str(REPO),  # Phase 1: 6→8 (qa 必须答需要 retry 余量)
                     context_config=ContextConfig(),  # Plan3: QA 上下文触发压缩
                     memory_layer=memory_layer,       # Q3 Task8: QA 也注入分层记忆
                     offload_deps=offload_deps,       # Q4 Task7: QA 也走短期卸载

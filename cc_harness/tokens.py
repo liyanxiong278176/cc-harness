@@ -57,9 +57,17 @@ class TokenCounter:
             raise ValueError(f"unknown tiktoken encoding: {encoding_name!r}") from e
         self._encoding_name = encoding_name
 
-    def count_text(self, text: str | None) -> int:
+    def count_text(self, text: Any) -> int:
         if not text:
             return 0
+        if isinstance(text, list):
+            text = "\n".join(
+                str(part.get("text", ""))
+                for part in text
+                if isinstance(part, dict) and part.get("type") == "text"
+            )
+        elif not isinstance(text, str):
+            text = str(text)
         return len(self._enc.encode(text))
 
     def categorize(

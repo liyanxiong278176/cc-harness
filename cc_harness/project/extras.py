@@ -45,6 +45,7 @@ def inject_todo_tools(
     service: TodoService, session_id: str, cwd: str = "",
     last_turn_text: str = "",
     dispatch_subagent_runner=None,  # D1 Task 5 新增
+    progress_cb=None,
 ) -> list[dict]:
     """Return `extra_native_specs` entries for all 9 todo tools(8 + dispatch_subagent)。
 
@@ -67,6 +68,7 @@ def inject_todo_tools(
         "last_turn_text": last_turn_text,
         "dispatch_subagent_runner": dispatch_subagent_runner,  # D1 Task 5 新增
     }
+    dispatch_deps = {**deps, "progress_cb": progress_cb}
     return [
         {"spec": TODO_LIST_SPEC,     "handler": todo_list_handler,     "deps": deps},
         {"spec": TODO_GET_SPEC,      "handler": todo_get_handler,      "deps": deps},
@@ -76,7 +78,7 @@ def inject_todo_tools(
         {"spec": TODO_RESOLVE_SPEC,  "handler": todo_resolve_handler,  "deps": deps},
         {"spec": TODO_VALIDATE_SPEC, "handler": todo_validate_handler, "deps": deps},
         {"spec": TODO_TOPOSORT_SPEC, "handler": todo_toposort_handler, "deps": deps},  # B 阶段 Task 3
-        {"spec": TODO_DISPATCH_SUBAGENT_SPEC, "handler": dispatch_subagent_handler, "deps": deps},  # D1 Task 5:第 9 个 entry(runner 由 deps 注入)
+        {"spec": TODO_DISPATCH_SUBAGENT_SPEC, "handler": dispatch_subagent_handler, "deps": dispatch_deps},  # D1 Task 5:第 9 个 entry(runner 由 deps 注入)
     ]
 
 

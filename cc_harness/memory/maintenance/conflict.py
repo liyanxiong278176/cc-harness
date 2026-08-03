@@ -21,16 +21,37 @@ class ConflictDetector:
         self._llm = llm
 
     async def check(self, new_mem, similar: list) -> list[ConflictVerdict]:
-        """similar: list[Memory]。返回 0-N 个 verdict。LLM 失败返空。"""
+        """similar: list[tuple[Memory, float]] (来自 store.search_similar)。
+        返回 0-N 个 verdict。LLM 失败返空。"""
         if not similar or self._llm is None:
             return []
-        items = [{"id": m.id, "text": m.text} for m in similar]
+        # 解 (Memory, score) tuple;defensive 兜 tuple / dict / Memory 三种形态
+        def _mem_obj(x):
+            if hasattr(x, "id") and hasattr(x, "text"):
+                return x
+            if isinstance(x, tuple):
+                for item in x:
+                    if hasattr(item, "id") and hasattr(item, "text"):
+                        return item
+                    if isinstance(item, dict) and "id" in item and "text" in item:
+                        return item
+            if isinstance(x, dict) and "id" in x and "text" in x:
+                return x
+            return None
+        items = []
+        for raw in similar:
+            m = _mem_obj(raw)
+            if m is not None:
+                items.append({"id": m.id, "text": m.text})
+        new_obj = _mem_obj(new_mem)
+        if new_obj is None:
+            return []
         prompt = (
             "Compare the new memory to each existing. For each, classify as "
             "contradicts/supersedes/elaborates/unrelated and pick action "
             "delete_old/delete_new/merge/noop. "
             "Reply JSON {\"verdicts\": [{\"other_id\": \"...\", \"verdict\": \"...\", \"action\": \"...\"}, ...]}\n\n"
-            f"NEW: {json.dumps({'id': new_mem.id, 'text': new_mem.text}, ensure_ascii=False)}\n"
+            f"NEW: {json.dumps({'id': new_obj.id, 'text': new_obj.text}, ensure_ascii=False)}\n"
             f"EXISTING: {json.dumps(items, ensure_ascii=False)}"
         )
         try:

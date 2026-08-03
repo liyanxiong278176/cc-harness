@@ -84,7 +84,7 @@ class CompactionStats:
 def _count_msg_tokens(message: dict, counter: TokenCounter) -> int:
     """Approximate token count of a single message (content + tool_calls json)."""
     content = message.get("content")
-    total = counter.count_text(content if isinstance(content, str) else "")
+    total = counter.count_text(content)
     for tc in (message.get("tool_calls") or []):
         total += counter.count_text(json.dumps(tc, ensure_ascii=False))
     return total

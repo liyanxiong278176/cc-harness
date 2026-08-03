@@ -1,5 +1,8 @@
 # TUI Transformation Design
 
+> **Superseded:** This full-screen Textual design is superseded by
+> `docs/specs/2026-08-02-inline-terminal-session-design.md`.
+
 **Status**: 草案 v1
 **Date**: 2026-07-30
 **Author**: brainstorm with user

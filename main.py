@@ -372,4 +372,8 @@ def main() -> None:
 
 
 if __name__ == "__main__":
-    main()
+    # The installed command and source script share the same package
+    # entrypoint. ``main()`` above remains importable for legacy integration
+    # tests and third-party callers during the migration window.
+    from cc_harness.entrypoint import main as _package_main
+    _package_main()

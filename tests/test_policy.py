@@ -1,7 +1,6 @@
 from pathlib import Path
 
-from cc_harness.policy import PolicyEngine, Action
-
+from cc_harness.policy import Action, PolicyEngine
 
 ROOT = Path("C:/proj")  # 测试用绝对根
 
@@ -24,23 +23,23 @@ def test_fs_read_inside_workspace_is_allow():
     assert d.action is Action.ALLOW
 
 
-def test_fs_read_outside_workspace_is_ask():
+def test_fs_read_outside_workspace_is_deny():
     d = _engine().evaluate(
         "mcp__filesystem__read_file",
         {"path": str(Path.home() / ".ssh/id_rsa")},
         {"project_root": ROOT},
     )
-    assert d.action is Action.ASK
+    assert d.action is Action.DENY
     assert "工作区外" in d.reason or "outside" in d.reason.lower()
 
 
-def test_fs_read_traversal_escape_is_ask():
+def test_fs_read_traversal_escape_is_deny():
     d = _engine().evaluate(
         "mcp__filesystem__read_file",
         {"path": str(ROOT / "src/../../.ssh/id_rsa")},
         {"project_root": ROOT},
     )
-    assert d.action is Action.ASK
+    assert d.action is Action.DENY
 
 
 def test_fs_write_inside_workspace_is_ask():
@@ -81,16 +80,16 @@ def test_allowlist_miss_still_ask():
     assert d.action is Action.ASK
 
 
-# --- 分类绕过加固:docs/git_read 带工作区外 path → ask ---
+# --- 分类绕过加固:docs/git_read 带工作区外 path → deny ---
 
-def test_docs_tool_with_outside_path_is_ask():
+def test_docs_tool_with_outside_path_is_deny():
     """mcp__context7__read_creds(path=~/.ssh/id_rsa) 不能因子串命中 docs 而绕过。"""
     d = _engine().evaluate(
         "mcp__context7__read_creds",
         {"path": str(Path.home() / ".ssh/id_rsa")},
         {"project_root": ROOT},
     )
-    assert d.action is Action.ASK
+    assert d.action is Action.DENY
 
 
 def test_docs_tool_without_path_still_allow():
@@ -103,17 +102,119 @@ def test_docs_tool_without_path_still_allow():
     assert d.action is Action.ALLOW
 
 
-def test_git_read_with_outside_path_is_ask():
+def test_git_read_with_outside_path_is_deny():
     """mcp__git__show(path=~/.ssh/id_rsa) 不能因 git_read 而绕过。"""
     d = _engine().evaluate(
         "mcp__git__show",
         {"path": str(Path.home() / ".ssh/id_rsa")},
         {"project_root": ROOT},
     )
-    assert d.action is Action.ASK
+    assert d.action is Action.DENY
 
 
 def test_git_read_without_path_still_allow():
     """正常 git read(无 path)仍 allow。"""
     d = _engine().evaluate("mcp__git__log", {"ref": "HEAD"}, {"project_root": ROOT})
+    assert d.action is Action.ALLOW
+
+
+# --- hard-deny ordering and scope ---
+
+def test_allowlist_cannot_bypass_outside_path_deny():
+    eng = _engine()
+    args = {"path": str(Path.home() / "notes.txt")}
+    eng.allowlist.add("mcp__filesystem__read_file", args, ROOT)
+
+    d = eng.evaluate("mcp__filesystem__read_file", args, {"project_root": ROOT})
+
+    assert d.action is Action.DENY
+    assert d.rule_id == "path_outside_allowed_roots"
+
+
+def test_disabled_prompts_cannot_bypass_outside_path_deny():
+    eng = PolicyEngine(project_root=ROOT, enabled=False)
+
+    d = eng.evaluate(
+        "mcp__filesystem__read_file",
+        {"path": str(Path.home() / "notes.txt")},
+        {"project_root": ROOT},
+    )
+
+    assert d.action is Action.DENY
+
+
+def test_additional_root_is_explicitly_allowed():
+    extra = Path.home() / "shared-source"
+    eng = PolicyEngine(project_root=ROOT, additional_roots=[extra])
+
+    d = eng.evaluate(
+        "mcp__filesystem__read_file",
+        {"path": str(extra / "module.py")},
+        {"project_root": ROOT},
+    )
+
+    assert d.action is Action.ALLOW
+
+
+def test_sensitive_credential_inside_workspace_is_deny():
+    d = _engine().evaluate(
+        "mcp__filesystem__read_file",
+        {"path": str(ROOT / ".env")},
+        {"project_root": ROOT},
+    )
+
+    assert d.action is Action.DENY
+    assert d.rule_id == "sensitive_credential_path"
+
+
+def test_env_example_is_not_treated_as_credential():
+    d = _engine().evaluate(
+        "mcp__filesystem__read_file",
+        {"path": str(ROOT / ".env.example")},
+        {"project_root": ROOT},
+    )
+
+    assert d.action is Action.ALLOW
+
+
+def test_similarly_prefixed_environment_file_is_not_treated_as_credential():
+    d = _engine().evaluate(
+        "mcp__filesystem__read_file",
+        {"path": str(ROOT / ".environment")},
+        {"project_root": ROOT},
+    )
+
+    assert d.action is Action.ALLOW
+
+
+def test_secondary_destination_path_is_checked():
+    d = _engine().evaluate(
+        "mcp__filesystem__move_file",
+        {
+            "source": str(ROOT / "inside.txt"),
+            "destination": str(Path.home() / "outside.txt"),
+        },
+        {"project_root": ROOT},
+    )
+
+    assert d.action is Action.DENY
+
+
+def test_non_file_uri_is_not_treated_as_local_path():
+    d = _engine().evaluate(
+        "mcp__context7__query-docs",
+        {"uri": "https://example.test/docs"},
+        {"project_root": ROOT},
+    )
+
+    assert d.action is Action.ALLOW
+
+
+def test_windows_file_uri_inside_workspace_is_allow():
+    d = _engine().evaluate(
+        "mcp__filesystem__read_file",
+        {"uri": (ROOT / "src/a.py").as_uri()},
+        {"project_root": ROOT},
+    )
+
     assert d.action is Action.ALLOW

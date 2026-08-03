@@ -829,6 +829,67 @@ async def test_run_command_credential_exfil_asked_and_denied(tmp_path, monkeypat
 
 
 @pytest.mark.asyncio
+async def test_hard_deny_never_calls_confirm_handler(tmp_path):
+    """A permission mode that says yes cannot approve an outside-root DENY."""
+    from cc_harness import agent as agent_mod
+    from cc_harness.mcp_client import ToolResult
+    from cc_harness.policy import PolicyEngine
+
+    outside = tmp_path.parent / "outside.txt"
+    fs_tool = {"type": "function", "function": {
+        "name": "mcp__filesystem__read_file",
+        "description": "read",
+        "parameters": {
+            "type": "object",
+            "properties": {"path": {"type": "string"}},
+            "required": ["path"],
+        },
+    }}
+    pending = [PendingToolCall(
+        index=0,
+        id="c1",
+        name="mcp__filesystem__read_file",
+        arguments_json=json.dumps({"path": str(outside)}),
+    )]
+    llm = FakeLLM(responses=[
+        [FakeStreamEvent(kind="done", content="", pending=pending,
+                         finish_reason="tool_calls")],
+        [FakeStreamEvent(kind="done", content="拒绝完成", pending=[],
+                         finish_reason="stop")],
+    ])
+    mcp = FakeMCP(
+        tools_spec=[fs_tool],
+        results={"mcp__filesystem__read_file": ToolResult.success("secret")},
+        calls=[],
+    )
+    confirm_calls = []
+
+    async def always_yes(tool, args, reason):
+        confirm_calls.append((tool, args, reason))
+        return "yes"
+
+    messages = [{"role": "user", "content": "read outside"}]
+    await agent_mod.run_turn(
+        messages,
+        llm,
+        mcp,
+        mode="coding",
+        cwd=str(tmp_path),
+        max_iter=5,
+        policy=PolicyEngine(project_root=tmp_path),
+        confirm_handler=always_yes,
+    )
+
+    assert confirm_calls == []
+    assert mcp.calls == []
+    denied = [m for m in messages if m.get("role") == "tool"]
+    assert denied and "hard-deny" in denied[-1]["content"]
+    audit = (tmp_path / "logs" / "policy.jsonl").read_text(encoding="utf-8")
+    assert '"decision": "deny"' in audit
+    assert '"outcome": "hard_denied"' in audit
+
+
+@pytest.mark.asyncio
 async def test_fs_read_inside_workspace_executes(tmp_path):
     """工作区内 read_file → allow → 真派发 mcp.call_tool。"""
     from cc_harness import agent as agent_mod

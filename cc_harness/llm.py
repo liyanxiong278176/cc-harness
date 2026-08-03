@@ -7,6 +7,21 @@ from openai import AsyncOpenAI
 from cc_harness.tokens import UsageRecord
 
 
+class ImageUnsupportedError(RuntimeError):
+    """The configured OpenAI-compatible provider rejected image message parts."""
+
+
+def _contains_image(messages: list[dict]) -> bool:
+    return any(
+        isinstance(message.get("content"), list)
+        and any(
+            isinstance(part, dict) and part.get("type") == "image_url"
+            for part in message["content"]
+        )
+        for message in messages
+    )
+
+
 # --- Data contracts ---
 
 @dataclass
@@ -104,8 +119,17 @@ class LLMClient:
     NB: `model` is per-call, NOT a constructor arg of AsyncOpenAI.
     """
 
-    def __init__(self, api_key: str, model: str, base_url: str | None) -> None:
+    def __init__(
+        self,
+        api_key: str,
+        model: str,
+        base_url: str | None,
+        *,
+        reasoning_effort: str | None = None,
+    ) -> None:
         self.model = model
+        self.reasoning_effort = reasoning_effort
+        self.reasoning_effort_supported: bool | None = None
         self._client = AsyncOpenAI(api_key=api_key, base_url=base_url)
 
     async def chat(
@@ -117,6 +141,8 @@ class LLMClient:
         message (content + pending tool_calls + finish_reason)."""
         kwargs: dict[str, Any] = {"model": self.model, "messages": messages, "stream": True}
         kwargs["stream_options"] = {"include_usage": True}
+        if self.reasoning_effort and self.reasoning_effort_supported is not False:
+            kwargs["reasoning_effort"] = self.reasoning_effort
         if tools:
             kwargs["tools"] = tools
 
@@ -126,7 +152,39 @@ class LLMClient:
         finish_reason: str | None = None
         usage: UsageRecord | None = None
 
-        async for chunk in await self._client.chat.completions.create(**kwargs):
+        try:
+            stream = await self._client.chat.completions.create(**kwargs)
+        except Exception as exc:
+            # OpenAI-compatible providers vary in support for reasoning_effort.
+            # Retry once without it only when the provider rejected that field.
+            message = str(exc).lower()
+            rejected_effort = (
+                "reasoning_effort" in kwargs
+                and any(term in message for term in ("reasoning_effort", "unknown field", "extra inputs"))
+            )
+            rejected_image = _contains_image(messages) and any(
+                term in message
+                for term in (
+                    "image_url",
+                    "image input",
+                    "vision not supported",
+                    "multimodal not supported",
+                )
+            )
+            if rejected_image:
+                raise ImageUnsupportedError(
+                    f"current provider/model '{self.model}' does not support image attachments"
+                ) from exc
+            if not rejected_effort:
+                raise
+            self.reasoning_effort_supported = False
+            kwargs.pop("reasoning_effort", None)
+            stream = await self._client.chat.completions.create(**kwargs)
+        else:
+            if "reasoning_effort" in kwargs:
+                self.reasoning_effort_supported = True
+
+        async for chunk in stream:
             chunk_usage = getattr(chunk, "usage", None)
             if chunk_usage is not None:
                 usage = UsageRecord.from_api(chunk_usage)

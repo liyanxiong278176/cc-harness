@@ -63,7 +63,9 @@ class CheckpointService:
         UPSERT checkpoint + INSERT messages。"""
         assert self.store._db is not None
         extra = extra or {}
-        await self.store._db.execute("BEGIN")
+        # 同 capture.py:用 SAVEPOINT 代替 BEGIN,防嵌套事务报
+        # "cannot start a transaction within a transaction"
+        await self.store._db.execute("SAVEPOINT checkpoint_sp")
         try:
             # Task 9: session_checkpoint FK → web_session(id),先 UPSERT parent。
             # 用 INSERT OR IGNORE 避免覆盖 WebSessionStore 维护的 cwd/mode/last_active_at;
@@ -103,10 +105,14 @@ class CheckpointService:
                     "VALUES (?, ?, ?, ?, ?)",
                     (session_id, idx, msg.get("role", ""), json.dumps(msg), now),
                 )
+            await self.store._db.execute("RELEASE SAVEPOINT checkpoint_sp")
         except BaseException:
-            await self.store._db.rollback()
+            try:
+                await self.store._db.execute("ROLLBACK TO SAVEPOINT checkpoint_sp")
+                await self.store._db.execute("RELEASE SAVEPOINT checkpoint_sp")
+            except Exception:
+                pass
             raise
-        await self.store._db.commit()
 
     async def load_latest(self, project_root: Path) -> CheckpointRecord | None:
         """查最近 1 个 checkpoint(按 ended_at DESC)。按 project_root 过滤。"""

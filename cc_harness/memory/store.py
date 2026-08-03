@@ -58,6 +58,16 @@ class MemoryStore:
         await self._db.enable_load_extension(False)
         # F T4 D2: PRAGMA foreign_keys = ON, 启用 ON DELETE CASCADE(spec D2 防 orphan)
         await self._db.execute("PRAGMA foreign_keys = ON")
+        # 2026-07-30: WAL 模式 + synchronous=NORMAL,防 kill -9 残留把 DB
+        # 弄成 "database disk image is malformed" 的硬坏。
+        # WAL 把写放到 .wal 边文件,commit 时 checkpoint 进主 DB,
+        # 崩溃时只丢 .wal,主 DB 始终一致。in-memory 不开(没意义且不支持)。
+        if str(self.db_path) != ":memory:":
+            try:
+                await self._db.execute("PRAGMA journal_mode = WAL")
+                await self._db.execute("PRAGMA synchronous = NORMAL")
+            except Exception:
+                pass
         # Phase 4: 探测 FTS5 编译(connect 时若 FTS5 不可用则降级 vector-only)
         self._has_fts5 = await self._probe_fts5()
         await self._db.execute("""

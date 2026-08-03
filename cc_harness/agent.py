@@ -14,6 +14,7 @@ Modes (see task #4 / #6):
     "chat"    — same as coding (tools enabled, full ReAct loop)
 """
 from __future__ import annotations
+import io
 import asyncio
 import json
 import logging
@@ -26,7 +27,7 @@ from cc_harness.render import (
     print_thought, print_action, print_observation, print_result,
     print_warn, print_error, print_info,
 )
-from cc_harness.policy import PolicyEngine
+from cc_harness.policy import Action, PolicyEngine
 from cc_harness.schema import validate_native, validate_mcp, set_mcp_schemas
 from cc_harness.audit import log_decision
 from cc_harness.l5 import L5Engine
@@ -90,12 +91,26 @@ NATIVE_TOOLS: dict[str, dict] = {
 }
 
 
+def _message_text(message: dict) -> str:
+    """Return textual content from string or OpenAI multimodal messages."""
+    content = message.get("content", "")
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        return "\n".join(
+            str(part.get("text", ""))
+            for part in content
+            if isinstance(part, dict) and part.get("type") == "text"
+        )
+    return str(content or "")
+
+
 async def run_turn(
     messages: list[dict],
     llm,                    # any object with async chat(messages, tools) -> AsyncIterator[StreamEvent]
     mcp,                    # any object with list_tools() and async call_tool(name, args) -> ToolResult
     *,
-    max_iter: int = 20,
+    max_iter: int = 5,       # 2026-07-30: 20→5,红队场景 5 步内守不住=timeout=hold 假阳性最低
     mode: str = "coding",
     cwd: str | None = None,
     design_dir: Path | None = None,
@@ -118,6 +133,9 @@ async def run_turn(
     reflection_engine: "ReflectionEngine | None" = None,  # E2 T2.2:默认 None 保持向后兼容
     e1_decompose_enabled: bool = True,  # E1 D7:kill-switch(从 main.py 透传 policy.e1_decompose_enabled,默认 True 向后兼容)
     event_emitter: Callable[[dict], Awaitable[None]] | None = None,
+    subagent_progress_cb: Callable[[str, str, str], Awaitable[None]] | None = None,
+    confirm_handler: Callable[[str, dict, str], Awaitable[str]] | None = None,
+    direct_render: bool | None = None,
 ) -> TurnTokenStats:
     """Run one user turn in the given mode.
 
@@ -194,7 +212,12 @@ async def run_turn(
     if mode not in _VALID_MODES:
         raise ValueError(f"unknown mode: {mode!r} (expected one of {_VALID_MODES})")
 
-    console = Console()
+    # UI entrypoints own terminal state. When an event consumer is attached,
+    # suppress the legacy Rich prints unless explicitly requested; the REPL
+    # may opt back in with direct_render=True during its migration window.
+    if direct_render is None:
+        direct_render = event_emitter is None
+    console = Console() if direct_render else Console(file=io.StringIO(), force_terminal=False)
     iter_count = 0
     _empty_retried = False  # one-shot retry guard for empty-content turns
     tool_call_log: list = []  # Plan1 Task4: [{name, args, ok, result}] per tool dispatch
@@ -253,7 +276,7 @@ async def run_turn(
                 return
             _tid = _m.group(1)
             _task = await todo_service.get(_tid)
-            _print_decomp_summary([_task])
+            _print_decomp_summary([_task], console=console)
         except Exception:
             pass
 
@@ -308,17 +331,26 @@ async def run_turn(
     # --- Q3 Task7: 分层记忆 pre-turn 注入 ---
     # memory_layer = {"recall": async callable(query) -> RecallResult}
     # recall 由 caller 注入(agent.py 不 import layered_recall);fail-soft。
+    # Q3 Recall Hardening (2026-07-30 LoCoMo full-run bug fix): 外层加
+    # asyncio.wait_for(timeout=10) 防 recall 永远 hang 把整条 run_turn 卡死。
+    # 原始 bug: runner.py:223 await run_turn → agent.py:315 await recall → 永远
+    # hang → 用户 Ctrl+C → KeyboardInterrupt → aiosqlite 写者线程在 loop
+    # 关闭后 call_soon_threadsafe 抛 Event loop is closed。10s 上限配合 recall
+    # 自身的 timeout_s=5.0(见 cc_harness/memory/extras.py:68)留 5s 余量,够
+    # 健康 query 用尽预算返回,挂死 query 走 TimeoutError → except 吞掉 →
+    # print_warn 跳过,run_turn 继续。
     if memory_layer and memory_layer.get("recall") and messages:
         try:
-            _q = next((m.get("content", "") for m in reversed(messages)
+            _q = next((_message_text(m) for m in reversed(messages)
                        if m.get("role") == "user"), "")
-            recall = await memory_layer["recall"](_q)
+            recall = await asyncio.wait_for(
+                memory_layer["recall"](_q), timeout=10.0)
             if recall.persona and messages[0].get("role") == "system":
                 messages[0]["content"] += f"\n\n## 用户画像\n{recall.persona.summary[:200]}"
             if recall.scenarios and messages[0].get("role") == "system":
                 messages[0]["content"] += "\n\n## 相关场景\n" + "\n".join(
                     f"- {s.summary[:120]}" for s in recall.scenarios)
-        except Exception as e:
+        except (asyncio.TimeoutError, Exception) as e:
             print_warn(console, f"memory inject failed: {e}")
 
     # --- Q4 Task6: pre-turn Mermaid 画布注入(预算 + 顺序)---
@@ -410,6 +442,7 @@ async def run_turn(
                     cwd=str(project_root),
                     last_turn_text=last_turn_text,
                     dispatch_subagent_runner=_runner,
+                    progress_cb=subagent_progress_cb,
                 )
                 if extra_native_specs is None:
                     extra_native_specs = _todo_extras
@@ -525,6 +558,12 @@ async def run_turn(
         async for ev in llm.chat(messages, tool_specs):
             if ev.kind == "content":
                 content_parts.append(ev.text)
+                await _safe_emit({
+                    "type": "content_delta",
+                    "text": ev.text,
+                    "ts": time.time(),
+                    "iteration": iter_count,
+                })
             elif ev.kind == "tool_call_delta":
                 pass  # accumulation handled inside llm.chat
             elif ev.kind == "done":
@@ -551,7 +590,7 @@ async def run_turn(
                 _cw = offload_deps.get("context_window") or (
                     context_config.context_window if context_config else 1_000_000)
                 _tc = token_counter or TokenCounter()
-                _total = sum(_tc.count_text(m.get("content", "")) for m in messages)
+                _total = sum(_tc.count_text(_message_text(m)) for m in messages)
                 if _cw > 0 and _total / _cw > offload_deps.get("offload_ratio", 0.5):
                     for m in messages:
                         # prefix match(非子串):pointer 形如 [offloaded node=...];
@@ -585,6 +624,13 @@ async def run_turn(
             content, pending, finish_reason, iter_usage = await _stream_one_turn()
         except Exception as e:
             print_error(console, f"LLM stream failed: {e}")
+            await _safe_emit({
+                "type": "observation",
+                "text": str(e),
+                "is_error": True,
+                "duration_ms": 0,
+                "iteration": iter_count,
+            })
             # D1 Task 4 fix (Important #1):把 fatal 错误塞 stats.error,
             # 让 SubAgentRunner.run() 检测到 → status="failed"。
             _err_stats = _stats()
@@ -795,6 +841,46 @@ async def run_turn(
                 ctx = {"project_root": project_root}
                 decision = policy.evaluate(p.name, args, ctx)
 
+                if decision.action is Action.DENY:
+                    error_text = (
+                        f"[未执行:安全策略拒绝] {p.name} — {decision.reason}。"
+                        "该操作命中不可批准的 hard-deny,权限模式和 remembered allow 均不能绕过。"
+                    )
+                    print_observation(console, error_text)
+                    log_decision(
+                        audit_path,
+                        iter_n=iter_count,
+                        tool=p.name,
+                        args=args,
+                        action=decision.action.value,
+                        outcome="hard_denied",
+                        rule_id=decision.rule_id,
+                        reason=decision.reason,
+                        mode=mode,
+                    )
+                    tool_call_log.append({
+                        "name": p.name,
+                        "args": args,
+                        "ok": False,
+                        "result": error_text[:500],
+                    })
+                    messages.append({
+                        "role": "tool",
+                        "name": p.name or "",
+                        "tool_call_id": tc_id,
+                        "content": error_text,
+                        "is_error": True,
+                    })
+                    await _safe_emit({
+                        "type": "observation",
+                        "text": error_text,
+                        "is_error": True,
+                        "duration_ms": 0,
+                        "iteration": iter_count,
+                    })
+                    await _note_tool_error(p.name or "", error_text[:200])
+                    continue
+
                 if decision.allow:
                     print_action(console, p.name, args)
                     log_decision(audit_path, iter_n=iter_count, tool=p.name, args=args,
@@ -867,7 +953,11 @@ async def run_turn(
                     print_warn(console, f"[需确认] {p.name} {decision.reason}")
                     # Finding 5 fix:confirm_tool 是 sync input(),不能阻塞 event loop。
                     # 用 asyncio.to_thread 派到 worker thread。
-                    choice = await asyncio.to_thread(confirm_tool, p.name, args)
+                    choice = (
+                        await confirm_handler(p.name, args, decision.reason)
+                        if confirm_handler is not None
+                        else await asyncio.to_thread(confirm_tool, p.name, args)
+                    )
                     if choice in ("yes", "always"):
                         if choice == "always":
                             policy.allowlist.add(p.name, args, project_root)
@@ -1295,7 +1385,7 @@ def _save_design_output(
     return path
 
 
-def _print_decomp_summary(new_todos: list["TodoTask"]) -> None:
+def _print_decomp_summary(new_todos: list["TodoTask"], *, console=None) -> None:
     """E1 D2:user 第 1 轮看到 2-3 行 plan 摘要。"""
     from cc_harness.render import print_info
     from rich.console import Console
@@ -1306,4 +1396,4 @@ def _print_decomp_summary(new_todos: list["TodoTask"]) -> None:
     if len(new_todos) > 5:
         lines.append(f"  ... +{len(new_todos) - 5} more")
     lines.append("  (/reject 中断)")
-    print_info(Console(), "\n".join(lines))
+    print_info(console or Console(), "\n".join(lines))

@@ -100,3 +100,64 @@ def build_session_index(conversation: dict) -> dict[str, str]:
                 key = f"{speaker}:{dia_id}"
             out[key] = sk
     return out
+
+
+def infer_event_date(sample: dict | Sample) -> str | None:
+    """从 locomo sample 抽锚定日期(ISO 字符串,前 10 字符 YYYY-MM-DD)。
+
+    LoCoMo 对话里的时间表述全是相对值("yesterday" / "last week"),但评测
+    ground truth (type=2) 给的是绝对日期。把 conversation 第一个 session 的
+    session_N_date_time 作为锚定基准(按 N 数字升序,非字符串),让 runner
+    把这块塞进 QA prompt,模型就能把相对时间映射回绝对日期。
+
+    真实 locomo 数据 session_1_date_time 形如 '1:56 pm on 8 May, 2023',
+    也有 '2023-05-08 18:00:00' / '2023-05-08T18:00:00' 之类。返回 ISO
+    'YYYY-MM-DD',不可解析时返 None。
+
+    Args:
+        sample: 原始 dict(有 'conversation' key)或 Sample dataclass。
+
+    Returns:
+        ISO 字符串如 '2023-05-08',若缺/异常返 None。
+    """
+    if isinstance(sample, Sample):
+        conv = sample.conversation
+    elif isinstance(sample, dict):
+        conv = sample.get("conversation", {})
+    else:
+        return None
+    if not conv:
+        return None
+    # 按 session 数字升序(非字符串)找第一个 date_time 键
+    candidates = []
+    for k in conv.keys():
+        if k.startswith("session_") and k.endswith("_date_time"):
+            try:
+                n = int(k[len("session_"):-len("_date_time")])
+            except ValueError:
+                continue
+            candidates.append((n, k))
+    if not candidates:
+        return None
+    candidates.sort()
+    sk_date = candidates[0][1]
+    raw = conv.get(sk_date)
+    if not raw or not isinstance(raw, str):
+        return None
+    # 尝试解析多种格式
+    from datetime import datetime
+    raw = raw.strip()
+    fmts = (
+        "%Y-%m-%d %H:%M:%S",
+        "%Y-%m-%dT%H:%M:%S",
+        "%Y-%m-%d",
+        "%I:%M %p on %d %B, %Y",        # 1:56 pm on 8 May, 2023
+        "%H:%M on %d %B, %Y",             # 13:56 on 8 May, 2023(未实测, 兜底)
+    )
+    for fmt in fmts:
+        try:
+            dt = datetime.strptime(raw, fmt)
+            return dt.strftime("%Y-%m-%d")
+        except ValueError:
+            continue
+    return None

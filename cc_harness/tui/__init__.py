@@ -1,3 +1,5 @@
-"""TUI 替换 Web UI,基于 Textual,Claude Code 风格对齐。"""
+"""Deprecated import bridge for the pre-0.2 Textual package."""
 
-__version__ = "0.1.0"
+from cc_harness.tui.driver import run_tui
+
+__all__ = ["run_tui"]

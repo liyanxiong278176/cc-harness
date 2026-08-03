@@ -29,6 +29,11 @@ eval/locomo/.checkpoint.json
 eval/result/.judge-cache/
 # cc-harness:exclude per-task markdown descriptions (live in yaml main index)
 .cc-harness/todos/*.md
+.cc-harness/sessions.db
+.cc-harness/sessions.db-shm
+.cc-harness/sessions.db-wal
+.cc-harness/session-attachments/
+.cc-harness/input-history
 # cc-harness:keep directory tracked even when empty
 
 # Local ad-hoc logs / debug dumps (do not commit)

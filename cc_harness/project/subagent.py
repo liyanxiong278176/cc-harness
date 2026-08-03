@@ -404,6 +404,7 @@ class SubAgentRunner:
                         policy=self.policy,
                         l5=self.l5,
                         system_prompt=system_prompt,
+                        direct_render=False,
                     ),
                     timeout=timeout,
                 )

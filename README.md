@@ -1,104 +1,114 @@
 # cc-harness
 
-Terminal coding agent with MCP tools. ReAct loop driven by an OpenAI-compatible
-LLM (DeepSeek by default), 4-tier context compaction, and rich tool support
-via the Model Context Protocol.
+一个在当前终端中运行的 coding agent。界面采用与 Claude Code 相同类型的
+inline terminal session：启动卡片、对话与工具活动都写入终端滚动区，退出后
+仍可查看，不会切换到 Textual 全屏应用。
 
-> **Status (2026-08-02):** TUI 已是默认入口(`python main.py` 直接走 TUI)。
-> 21 个 `cc_harness/tui/test_*.py` 测试全 pass,legacy REPL 入口用 `--repl` flag 切回。
-> Boot 流程:`main.py` 加载 config → 构造 `LLMClient` + `MCPClient` → 注入 `PipTuiApp`
-> (同 legacy REPL 的 boot 路径)。
+## 安装与启动
 
-## 启动
+要求 Python 3.11+，推荐使用 `uv`：
 
-### TUI(默认)
+```powershell
+uv tool install --editable .
+cc-harness
+```
 
-```bash
+开发时也可直接运行：
+
+```powershell
 python main.py
 ```
 
-启动 TUI,默认 Tokyo Night 主题,4 区布局(Header / ChatLog / PromptInput / Footer)。
+首次运行且没有模型配置时，会提示填写 OpenAI-compatible API Base URL、模型和
+API key，并保存到 `~/.cc-harness/.env`。配置优先级为：进程环境变量 > 项目
+`.env` > 用户 `~/.cc-harness/.env`。MCP 配置按用户级、项目级顺序合并，项目
+同名配置覆盖用户配置。
 
-Boot 流程:`main.py` 加载 `.env` + `mcp.json` → 构造 `LLMClient(api_key, model, base_url)`
-→ 构造 `MCPClient(cfg.mcp_servers)` → `await mcp.start()` → 把 `llm` + `mcp` 注入
-`PipTuiApp`。Config 错误 fail-fast(在 TUI 启动前报错,不进 silent no-op app)。
+## 常用启动方式
 
-### REPL(legacy,调试用)
-
-```bash
-python main.py --repl
+```powershell
+cc-harness                         # 在当前目录开始新会话
+cc-harness -c                      # 继续当前目录最近的会话
+cc-harness -r                      # 选择当前目录的历史会话
+cc-harness -r SESSION_ID           # 继续指定会话
+cc-harness --cwd D:\work\project   # 指定工作目录
+cc-harness --add-dir D:\shared     # 增加允许访问的目录，可重复
+cc-harness -p "summarize this repo" # 非交互打印模式
 ```
 
-切回 legacy REPL 入口(原 `cc_harness/repl.py:run_repl`,用于对比调试
-TUI 路径)。Boot 流程与 TUI 一致 + 额外构造 memory / reflection / drift /
-sandbox pre-warm。
+管道输入会自动使用无 ANSI 的打印模式：
 
-### 快捷键
-
-| 快捷键 | 行为 |
-|---|---|
-| Enter | 提交输入 |
-| Shift+Enter | 换行 |
-| Tab | 补全 / 或 @ |
-| ↑ / ↓ | 历史 |
-| Ctrl+R | 反向搜历史 |
-| Ctrl+C | 中断 LLM 流 |
-| Ctrl+L | 清屏 |
-| Shift+Tab | 切换权限模式 |
-| Ctrl+T | 切换 todo 显示 |
-
-实现: `cc_harness/tui/app.py` (`BINDINGS` + `action_*` 派发)。
-
-### Slash 命令
-
-`/help` `/theme` `/resume` `/model` `/clear` `/exit` `/memory` `/usage` `/policy` `/audit` `/config` `/tools` `/mcp` `/hitl` `/plan` `/team` `/snapshot` `/restore` `/search` `/index` `/skill` `/context`
-
-完整命令见 `/help` 弹窗。补全源: `cc_harness/tui/completer.py:SLASH_COMMANDS`
-(24 个,含上列 22 + `/reset` + `/version`)。
-
-## Architecture (data flow)
-
-```
-main.py                                  # 默认 → TUI; --repl → legacy REPL
-  ├── [default] cc_harness/tui/driver.py:run_tui(cwd, mode)
-  │     └── PipTuiApp (Textual App)
-  │           ├── HeaderBar        # model / cwd / branch / mode / permission
-  │           ├── ChatLog          # RichLog + markup, 4-phase 思考/行动/观察/结果
-  │           ├── PromptInput      # TextArea, Tab 补全 / 提交 Submitted 消息
-  │           └── FooterBar        # input/output tokens + cost
-  │                 ↑
-  │           TUIDriver (RenderDriver) → post_message 派发到 widget
-  │                 ↑
-  │           cc_harness.agent.run_turn event_emitter
-  │
-  └── [--repl] cc_harness/repl.py:run_repl()       # sticky mode (coding/plan/design)
-        └── run_turn()  [agent.py]                  # ReAct loop
-              ├── context.py:maybe_compact          # 4-tier cascade
-              ├── llm.py / mcp_client.py            # providers
-              └── tokens.py:TokenCounter            # 6-bucket token tracking
+```powershell
+"explain this error" | cc-harness
 ```
 
-Boot 路径共享:`main.py` 加载 config → 构造 `LLMClient` + `MCPClient` → 注入
-对应入口(`PipTuiApp` 或 `run_repl`)。
+## 交互
 
-## Test summary (2026-08-02)
+- 启动页采用 Claude Code classic inline shell 的双栏结构，但使用 cc-harness 自有名称、版本、更新记录，以及从用户参考图提取的彩色遮脸月薪喵像素形象；窄于 80 列时自动改为上下布局。
+- `Enter` 提交；`Alt+Enter`、`Ctrl+J` 或行尾 `\` 插入换行。超过 800 字符或 2 行的粘贴会折叠为可展开标记，不会自动提交。
+- `Shift+Tab` 在 `default`、`auto-edit`、`bypass-prompts` 之间切换。
+- `Ctrl+O` 查看完整对话与工具活动；`Ctrl+S` 暂存/恢复草稿；`Ctrl+L` 清屏重绘。
+- `Alt+P` 选择模型；`Alt+T` 切换推理强度；`Alt+V` 从剪贴板附加图片。
+- `Ctrl+C` 取消当前请求或清空当前输入；`Ctrl+D` 或 `/exit` 保存并退出。
+- 连按两次 `Esc` 会清空并暂存当前草稿；空输入时打开对话检查点恢复选择。
+- 输入 `@path` 可附加文本、目录索引或 PNG/JPEG/WebP/静态 GIF 图片。
 
-- `tests/`: **1453 passed, 1 skipped**(PTY POSIX)
-- `cc_harness/tui/test_*.py`: **21 passed**
-- **Total: 1474 passed, 1 skipped, 0 failed**
+光标和输入内容实际位于上下边框之间。无背景状态区域紧贴输入框下边框并每 0.5 秒动态刷新，不会固定到终端窗口底部。第一行按实际存在的数据依次显示模型、项目与 Git、会话名、会话时长和自定义短语；第二行显示真实上下文占用；第三行显示当前权限模式，并仅在 agent 服务可用时显示 agents 提示。可在用户级 `~/.cc-harness/settings.json` 或项目级 `.cc-harness/settings.json` 定制，项目配置覆盖用户配置：
 
-运行:
-
-```bash
-PYTHONIOENCODING=utf-8 python -m pytest tests/ cc_harness/tui/test_*.py \
-  -W ignore::pytest.PytestUnhandledThreadExceptionWarning
+```json
+{
+  "ui": {
+    "custom_line": "🛩️  冲鸭",
+    "show_project": true,
+    "show_git": true,
+    "show_duration": true,
+    "show_session_name": true,
+    "startup_blank_rows": 3
+  }
+}
 ```
 
-## Out of scope (don't add unless asked)
+可用 slash 命令只展示已经接通的能力：
 
-- Multi-LLM backend switching (locked to OpenAI-compatible)
-- Kernel sandbox (gVisor / Firecracker) — out of scope
-- Wiring `cc_harness/memory/` into the live agent — package exists but
-  not yet imported by the ReAct loop
-- Concurrent tool calls (serial only)
-- SubAgent / Agent Team (PDF 阶段 4-5, not started)
+```text
+/help /init /release-notes /status /clear /resume /exit
+/coding /plan /design /chat /mode
+/model /effort /permissions /verbose
+/context /compact /tools /mcp
+```
+
+`/init` 在当前目录创建 `CC-HARNESS.md` 项目指令文件；`/release-notes` 显示内置版本记录。若文件已经存在，`/init` 不会覆盖。
+
+## 会话与安全
+
+每个启动目录拥有独立的 `.cc-harness/sessions.db`。可恢复记录包含经处理的完整
+对话、工具调用和结果，但不保存模型的原始推理草稿。图片会复制到该会话的私有
+附件目录，删除会话时一并删除。旧版 `logs/memory.db` 只读导入，不修改原库。
+
+附件默认限于启动目录及 `--add-dir`。`.git`、`.venv`、`node_modules`、常见密钥
+文件和不支持的二进制文件会被拒绝。`bypass-prompts` 仅跳过普通确认，不绕过
+路径边界、sandbox、敏感信息与 hard-deny 规则。
+
+## 架构
+
+```text
+cc-harness / python main.py
+  -> entrypoint.py
+  -> SessionRuntime              # 配置、模型、MCP、策略、memory、session
+  -> InlineTerminalApp           # prompt_toolkit 输入与队列
+  -> TerminalRenderer            # Rich 输出到当前终端滚动区
+  -> agent.run_turn              # 单一结构化事件流
+```
+
+Textual 不再是运行时依赖。兼容模块 `cc_harness.tui.driver` 只负责把旧调用方桥接到
+新的 inline terminal session。
+
+## 测试
+
+```powershell
+python -m pytest tests -q
+python -m ruff check cc_harness tests
+```
+
+产品决策与边界见 [CONTEXT.md](CONTEXT.md)、[设计说明](docs/specs/2026-08-02-claude-code-classic-ui-parity-design.md)
+和 [ADR](docs/adr/)。

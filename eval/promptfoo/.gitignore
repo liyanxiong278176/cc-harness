@@ -7,6 +7,9 @@ __pycache__/
 # Generated each run by tools/generate_attacks.py
 dynamic_attacks.yaml
 
+# LLM parse-failure debug dumps from generate_attacks.py (_dump_parse_failure)
+llm_parse_error_*.txt
+
 # Generated each run by tools/run_eval.py redteam (intermediate, deleted after eval)
 redteam.yaml
 

@@ -5,7 +5,7 @@ from enum import Enum
 from pathlib import Path
 from typing import Literal, TYPE_CHECKING
 
-from dotenv import load_dotenv
+from dotenv import dotenv_values, load_dotenv
 from pydantic import BaseModel, model_validator
 
 if TYPE_CHECKING:
@@ -84,6 +84,78 @@ def load_config(env_path: Path, mcp_json_path: Path) -> AppConfig:
         openai_base_url=base_url,
         openai_model=model,
         mcp_servers=servers,
+    )
+
+
+def load_layered_config(
+    project_root: Path,
+    *,
+    user_root: Path | None = None,
+    environ: dict[str, str] | None = None,
+) -> AppConfig:
+    """Load installable CLI configuration without mutating ``os.environ``.
+
+    Precedence for model values is process environment, project ``.env``,
+    then user ``~/.cc-harness/.env``. MCP servers are merged user-first and
+    project-last so a project can override a same-named user server. Missing
+    MCP files are valid and mean no configured MCP servers.
+    """
+    project_root = Path(project_root).resolve()
+    user_root = Path(user_root or (Path.home() / ".cc-harness")).resolve()
+    process_env = dict(os.environ if environ is None else environ)
+    user_env = {
+        k: str(v) for k, v in dotenv_values(user_root / ".env").items()
+        if v is not None
+    }
+    project_env = {
+        k: str(v) for k, v in dotenv_values(project_root / ".env").items()
+        if v is not None
+    }
+
+    def value(name: str) -> str | None:
+        return process_env.get(name) or project_env.get(name) or user_env.get(name)
+
+    api_key = value("OPENAI_API_KEY")
+    base_url = value("OPENAI_BASE_URL")
+    model = value("OPENAI_MODEL")
+    missing = [
+        name for name, val in (
+            ("OPENAI_API_KEY", api_key),
+            ("OPENAI_BASE_URL", base_url),
+            ("OPENAI_MODEL", model),
+        ) if not val
+    ]
+    if missing:
+        raise ConfigError("missing model configuration: " + ", ".join(missing))
+
+    merged_servers: dict[str, dict] = {}
+    for path in (user_root / "mcp.json", project_root / "mcp.json"):
+        if not path.is_file():
+            continue
+        try:
+            raw = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as exc:
+            raise ConfigError(f"invalid MCP config at {path}: {exc}") from exc
+        servers = raw.get("mcpServers", {})
+        if not isinstance(servers, dict):
+            raise ConfigError(f"invalid MCP config at {path}: mcpServers must be an object")
+        merged_servers.update(servers)
+
+    try:
+        parsed_servers = {
+            name: MCPServerConfig(**server)
+            for name, server in merged_servers.items()
+        }
+    except Exception as exc:
+        if isinstance(exc, ConfigError):
+            raise
+        raise ConfigError(f"invalid MCP server configuration: {exc}") from exc
+
+    return AppConfig(
+        openai_api_key=api_key,
+        openai_base_url=base_url,
+        openai_model=model,
+        mcp_servers=parsed_servers,
     )
 
 

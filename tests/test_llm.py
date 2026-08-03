@@ -2,7 +2,7 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
-from cc_harness.llm import LLMClient, PendingToolCall, accumulate_delta
+from cc_harness.llm import ImageUnsupportedError, LLMClient, PendingToolCall, accumulate_delta
 
 def test_pending_tool_call_index_optional():
     p = PendingToolCall()
@@ -195,3 +195,21 @@ async def test_chat_content_preferred_over_reasoning_when_both_present():
             final = ev
     assert final is not None
     assert final.content == "ANSWER"
+
+
+@pytest.mark.asyncio
+async def test_chat_reports_provider_without_image_support_clearly():
+    client = LLMClient(api_key="sk-test", model="text-only-model", base_url=None)
+    mock = MagicMock()
+    mock.chat.completions.create = AsyncMock(
+        side_effect=RuntimeError("unknown variant `image_url`, expected `text`")
+    )
+    client._client = mock
+    messages = [{"role": "user", "content": [
+        {"type": "text", "text": "inspect"},
+        {"type": "image_url", "image_url": {"url": "data:image/png;base64,eA=="}},
+    ]}]
+
+    with pytest.raises(ImageUnsupportedError, match="does not support image attachments"):
+        async for _event in client.chat(messages, tools=[]):
+            pass

@@ -27,7 +27,10 @@ async def capture(store, session_id: str, messages: list[dict], turn_idx: int) -
     from cc_harness.memory.extract import extract_dates, extract_entities, extract_keywords
 
     assert store._db is not None
-    await store._db.execute("BEGIN")
+    # 防嵌套事务:aiosqlite 在 autocommit 模式下,显式 BEGIN 在已开事务的
+    # 连接上会报 "cannot start a transaction within a transaction"。
+    # 用 SAVEPOINT 代替 BEGIN —— SAVEPOINT 天然支持嵌套,出错只回滚本段。
+    await store._db.execute("SAVEPOINT capture_sp")
     try:
         await store._db.execute(
             "DELETE FROM conversation WHERE session_id=? AND turn_idx=?",
@@ -48,7 +51,11 @@ async def capture(store, session_id: str, messages: list[dict], turn_idx: int) -
                 "INSERT INTO conversation(session_id,turn_idx,role,content,ts,"
                 "dates,entities,keywords) VALUES(?,?,?,?,?,?,?,?)",
                 (session_id, turn_idx, role, text, ts, dates, entities, keywords))
+        await store._db.execute("RELEASE SAVEPOINT capture_sp")
     except BaseException:
-        await store._db.rollback()
+        try:
+            await store._db.execute("ROLLBACK TO SAVEPOINT capture_sp")
+            await store._db.execute("RELEASE SAVEPOINT capture_sp")
+        except Exception:
+            pass
         raise
-    await store._db.commit()
