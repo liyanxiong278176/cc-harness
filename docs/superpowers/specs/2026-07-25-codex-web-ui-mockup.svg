@@ -1,0 +1,214 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1440 900" font-family="ui-sans-serif, system-ui, -apple-system, 'Segoe UI', sans-serif">
+  <!-- ===== Window chrome ===== -->
+  <rect x="0" y="0" width="1440" height="900" fill="#f8fafc"/>
+  <!-- Top bar -->
+  <rect x="0" y="0" width="1440" height="44" fill="#ffffff" stroke="#e2e8f0"/>
+  <circle cx="20" cy="22" r="6" fill="#fb7185"/>
+  <circle cx="40" cy="22" r="6" fill="#fbbf24"/>
+  <circle cx="60" cy="22" r="6" fill="#4ade80"/>
+  <text x="80" y="28" font-size="13" fill="#0f172a" font-weight="600">cc-harness · Web UI</text>
+  <text x="220" y="28" font-size="12" fill="#64748b">http://127.0.0.1:8765  ·  v1  ·  3 sessions</text>
+  <rect x="1280" y="10" width="140" height="24" rx="4" fill="#eff6ff"/>
+  <text x="1349" y="26" font-size="12" fill="#1d4ed8" text-anchor="middle">[coding]</text>
+
+  <!-- ===== Left rail: SessionList ===== -->
+  <rect x="0" y="44" width="260" height="856" fill="#ffffff" stroke="#e2e8f0"/>
+  <text x="16" y="76" font-size="11" font-weight="700" fill="#475569" letter-spacing="0.06em">SESSIONS · 3 active</text>
+  <rect x="12" y="86" width="236" height="36" rx="6" fill="#2563eb"/>
+  <text x="28" y="109" font-size="13" fill="#ffffff" font-weight="600">+ New Session</text>
+
+  <!-- Session item: active -->
+  <rect x="12" y="134" width="236" height="56" rx="6" fill="#eff6ff" stroke="#93c5fd"/>
+  <text x="28" y="156" font-size="13" font-weight="600" fill="#0f172a">cc-harness</text>
+  <text x="28" y="174" font-size="11" fill="#475569">D:\agent_learning\cc-harness</text>
+  <text x="240" y="156" font-size="11" fill="#1d4ed8" text-anchor="end">[coding]</text>
+  <circle cx="234" cy="174" r="3" fill="#22c55e"/>
+
+  <!-- Session item: idle -->
+  <rect x="12" y="198" width="236" height="48" rx="6" fill="#ffffff" stroke="#e2e8f0"/>
+  <text x="28" y="218" font-size="13" fill="#0f172a">web-experiment</text>
+  <text x="28" y="234" font-size="11" fill="#475569">D:\projects\web-experiment</text>
+  <text x="240" y="218" font-size="11" fill="#7c3aed" text-anchor="end">[plan]</text>
+
+  <!-- Session item: idle -->
+  <rect x="12" y="254" width="236" height="48" rx="6" fill="#ffffff" stroke="#e2e8f0"/>
+  <text x="28" y="274" font-size="13" fill="#0f172a">docs-rewrite</text>
+  <text x="28" y="290" font-size="11" fill="#475569">D:\work\docs-rewrite</text>
+  <text x="240" y="274" font-size="11" fill="#0f766e" text-anchor="end">[design]</text>
+
+  <line x1="12" y1="324" x2="248" y2="324" stroke="#e2e8f0"/>
+  <text x="16" y="346" font-size="11" font-weight="700" fill="#475569" letter-spacing="0.06em">CROSS-SESSION MEMORY</text>
+  <text x="16" y="368" font-size="11" fill="#64748b">L1: 47 memories</text>
+  <text x="16" y="386" font-size="11" fill="#64748b">L2 reflections (24h): 3</text>
+  <text x="16" y="404" font-size="11" fill="#64748b">drift detector: armed</text>
+
+  <line x1="12" y1="430" x2="248" y2="430" stroke="#e2e8f0"/>
+  <text x="16" y="452" font-size="11" font-weight="700" fill="#475569" letter-spacing="0.06em">POLICY</text>
+  <text x="16" y="474" font-size="11" fill="#64748b">L2: heuristic + DeepSeek judge</text>
+  <text x="16" y="492" font-size="11" fill="#64748b">L4: ask (per-tool)</text>
+  <text x="16" y="510" font-size="11" fill="#64748b">L5: Presidio + key regex</text>
+  <text x="16" y="528" font-size="11" fill="#64748b">L8: sandbox (OpenSandbox)</text>
+
+  <!-- ===== Center: Chat (4-phase ReAct stream) ===== -->
+  <rect x="260" y="44" width="760" height="856" fill="#ffffff"/>
+  <line x1="260" y1="84" x2="1020" y2="84" stroke="#e2e8f0"/>
+  <text x="280" y="74" font-size="12" fill="#0f172a" font-weight="600">cc-harness · turn 3 / 12</text>
+  <text x="760" y="74" font-size="11" fill="#64748b" text-anchor="middle">· 2.4k tokens in · 1.1k out · L4 prompt below</text>
+  <text x="1010" y="74" font-size="11" fill="#ef4444" text-anchor="end">⏹ interrupt</text>
+
+  <!-- User message -->
+  <rect x="280" y="100" width="720" height="50" rx="8" fill="#dbeafe"/>
+  <text x="296" y="120" font-size="11" font-weight="700" fill="#1e3a8a">YOU · turn 3</text>
+  <text x="296" y="140" font-size="13" fill="#0f172a">把 cc_harness/web/app.py 的 lifespan 钩子接上 restore_from_checkpoint,</text>
+  <text x="296" y="156" font-size="13" fill="#0f172a">重启后 session 应该能从 SQLite 恢复。</text>
+
+  <!-- Iteration 1 -->
+  <text x="280" y="180" font-size="10" fill="#94a3b8" letter-spacing="0.04em">— ITERATION 1 —</text>
+  <rect x="280" y="190" width="720" height="44" rx="6" fill="#f1f5f9"/>
+  <text x="296" y="208" font-size="12" fill="#475569" font-style="italic">思考:</text>
+  <text x="336" y="208" font-size="12" fill="#0f172a" font-style="italic">用户希望重启后 session 自动恢复。先查 CheckpointService 是否有</text>
+  <text x="296" y="226" font-size="12" fill="#0f172a" font-style="italic">load 接口,再决定 SessionManager 怎么调。</text>
+  <rect x="280" y="242" width="720" height="32" rx="6" fill="#fef3c7"/>
+  <text x="296" y="262" font-size="12" fill="#92400e" font-weight="600">行动:</text>
+  <text x="340" y="262" font-size="12" fill="#0f172a" font-family="ui-monospace, monospace">mcp__fs__read_file</text>
+  <text x="540" y="262" font-size="12" fill="#475569" font-family="ui-monospace, monospace">{path:"cc_harness/memory/checkpoint.py"}</text>
+  <rect x="280" y="282" width="720" height="46" rx="6" fill="#dcfce7"/>
+  <text x="296" y="302" font-size="12" fill="#166534" font-weight="600">观察:</text>
+  <text x="338" y="302" font-size="12" fill="#0f172a" font-family="ui-monospace, monospace">[1 file · 312 lines · returncode=0 · 12ms]</text>
+  <text x="338" y="320" font-size="11" fill="#475569">class CheckpointService: def save(...); def load(session_id) -> CheckpointRecord</text>
+
+  <!-- Iteration 2 — L4 prompt -->
+  <text x="280" y="350" font-size="10" fill="#94a3b8" letter-spacing="0.04em">— ITERATION 2 —</text>
+  <rect x="280" y="360" width="720" height="40" rx="6" fill="#f1f5f9"/>
+  <text x="296" y="378" font-size="12" fill="#475569" font-style="italic">思考:CheckpointService.load 已存在。需要补一个 restore_sessions()</text>
+  <text x="296" y="394" font-size="12" fill="#0f172a" font-style="italic">遍历 list_active,rebuild ReplState,再 spawn task。</text>
+  <rect x="280" y="408" width="720" height="32" rx="6" fill="#fef3c7"/>
+  <text x="296" y="428" font-size="12" fill="#92400e" font-weight="600">行动:</text>
+  <text x="340" y="428" font-size="12" fill="#0f172a" font-family="ui-monospace, monospace">run_command</text>
+  <text x="500" y="428" font-size="12" fill="#475569" font-family="ui-monospace, monospace">{command:"grep -n 'load' cc_harness/memory/checkpoint.py"}</text>
+
+  <!-- L4 ask decision bar -->
+  <rect x="280" y="450" width="720" height="64" rx="8" fill="#fffbeb" stroke="#f59e0b" stroke-width="2"/>
+  <text x="296" y="476" font-size="12" font-weight="700" fill="#92400e">⚠ L4 ASK · run_command</text>
+  <text x="296" y="494" font-size="12" fill="#0f172a" font-family="ui-monospace, monospace">grep -n 'load' cc_harness/memory/checkpoint.py</text>
+  <text x="296" y="510" font-size="10" fill="#92400e">ask_id: ask-7b3a · 30s timeout</text>
+  <rect x="828" y="468" width="56" height="32" rx="6" fill="#16a34a"/>
+  <text x="856" y="488" font-size="12" fill="#ffffff" text-anchor="middle" font-weight="600">Yes</text>
+  <rect x="888" y="468" width="64" height="32" rx="6" fill="#2563eb"/>
+  <text x="920" y="488" font-size="12" fill="#ffffff" text-anchor="middle" font-weight="600">Always</text>
+  <rect x="956" y="468" width="48" height="32" rx="6" fill="#dc2626"/>
+  <text x="980" y="488" font-size="12" fill="#ffffff" text-anchor="middle" font-weight="600">No</text>
+
+  <!-- Iteration 2 continued (after user clicks Always) -->
+  <rect x="280" y="528" width="720" height="32" rx="6" fill="#dcfce7"/>
+  <text x="296" y="548" font-size="12" fill="#166534" font-weight="600">观察:</text>
+  <text x="338" y="548" font-size="12" fill="#0f172a" font-family="ui-monospace, monospace">[stdout: "def load(self, session_id) -> CheckpointRecord|None" · 18ms]</text>
+
+  <!-- Iteration 3 -->
+  <text x="280" y="582" font-size="10" fill="#94a3b8" letter-spacing="0.04em">— ITERATION 3 —</text>
+  <rect x="280" y="592" width="720" height="40" rx="6" fill="#f1f5f9"/>
+  <text x="296" y="610" font-size="12" fill="#475569" font-style="italic">思考:load 签名 OK。restore_sessions 写到 web/sessions.py:</text>
+  <text x="296" y="626" font-size="12" fill="#0f172a" font-style="italic">遍历 web_session.status='active',调 cs.load(id),rebuild state,spawn task。</text>
+  <rect x="280" y="640" width="720" height="40" rx="6" fill="#ede9fe" stroke="#7c3aed" stroke-width="1.5"/>
+  <text x="296" y="660" font-size="13" fill="#5b21b6" font-weight="700">结果:</text>
+  <text x="346" y="660" font-size="13" fill="#0f172a" font-weight="600">restore_from_checkpoint 在 SessionManager 加完,FastAPI lifespan</text>
+  <text x="296" y="678" font-size="13" fill="#0f172a" font-weight="600">启动时调一次即可。建议放 lifespan shutdown 钩子前面。</text>
+
+  <!-- Done event badge -->
+  <rect x="280" y="700" width="720" height="28" rx="14" fill="#ecfdf5" stroke="#10b981"/>
+  <text x="296" y="718" font-size="11" fill="#047857" font-weight="600">✓ done · turn 3 · 4.2s · 5 events · 1 file_changed</text>
+
+  <!-- Compaction notification -->
+  <rect x="280" y="740" width="720" height="36" rx="8" fill="#eff6ff" stroke="#3b82f6"/>
+  <text x="296" y="762" font-size="11" font-weight="700" fill="#1d4ed8">↻ Tier-1 compaction · 38→12 messages · saved 18k tokens</text>
+
+  <!-- Input box -->
+  <rect x="280" y="800" width="720" height="80" rx="10" fill="#ffffff" stroke="#cbd5e1" stroke-width="2"/>
+  <text x="296" y="828" font-size="13" fill="#94a3b8">继续:把 lifespan 钩子具体代码补到 web/app.py…</text>
+  <rect x="888" y="836" width="100" height="36" rx="6" fill="#2563eb"/>
+  <text x="938" y="860" font-size="13" fill="#ffffff" text-anchor="middle" font-weight="600">发送 ⏎</text>
+  <text x="280" y="894" font-size="10" fill="#64748b">/plan /design /coding /chat · ↑↓ history · Tab autocomplete</text>
+
+  <!-- ===== Right rail: FileTree + Monaco + Terminal tabs ===== -->
+  <rect x="1020" y="44" width="420" height="856" fill="#ffffff" stroke="#e2e8f0"/>
+  <!-- Tabs -->
+  <rect x="1020" y="44" width="210" height="40" fill="#ffffff" stroke="#e2e8f0"/>
+  <text x="1125" y="69" font-size="12" font-weight="700" fill="#0f172a" text-anchor="middle">Files</text>
+  <rect x="1230" y="44" width="210" height="40" fill="#f1f5f9" stroke="#e2e8f0"/>
+  <text x="1335" y="69" font-size="12" fill="#64748b" text-anchor="middle">Terminal</text>
+
+  <!-- FileTree -->
+  <text x="1040" y="108" font-size="11" font-weight="700" fill="#475569" letter-spacing="0.06em">D:\agent_learning\cc-harness</text>
+  <text x="1042" y="130" font-size="12" fill="#0f172a">▼ cc_harness/</text>
+  <text x="1062" y="150" font-size="12" fill="#0f172a">▼ web/</text>
+  <text x="1082" y="170" font-size="12" fill="#0f172a">📄 __init__.py</text>
+  <text x="1082" y="188" font-size="12" fill="#0f172a">📄 app.py</text>
+  <rect x="1078" y="180" width="320" height="16" fill="#fef3c7"/>
+  <text x="1082" y="190" font-size="12" fill="#0f172a" font-weight="700">📄 app.py</text>
+  <text x="1082" y="206" font-size="12" fill="#0f172a">📄 boot.py</text>
+  <text x="1082" y="224" font-size="12" fill="#0f172a">📄 events.py</text>
+  <text x="1082" y="242" font-size="12" fill="#0f172a">📄 sessions.py</text>
+  <text x="1082" y="260" font-size="12" fill="#0f172a">📄 emitter.py</text>
+  <text x="1082" y="278" font-size="12" fill="#0f172a">📄 pty.py</text>
+  <text x="1062" y="296" font-size="12" fill="#0f172a">▼ routes/</text>
+  <text x="1042" y="316" font-size="12" fill="#0f172a">▶ docs/</text>
+  <text x="1042" y="334" font-size="12" fill="#0f172a">▶ tests/</text>
+  <text x="1042" y="352" font-size="12" fill="#0f172a">▶ main.py</text>
+  <text x="1042" y="370" font-size="12" fill="#0f172a">▶ pyproject.toml</text>
+
+  <!-- Monaco preview pane -->
+  <rect x="1040" y="394" width="384" height="240" rx="8" fill="#1e293b"/>
+  <rect x="1040" y="394" width="56" height="20" fill="#0f172a"/>
+  <text x="1068" y="408" font-size="10" fill="#cbd5e1" text-anchor="middle">python</text>
+  <text x="1108" y="408" font-size="10" fill="#64748b">cc_harness/web/app.py</text>
+  <text x="1056" y="430" font-size="11" fill="#94a3b8" font-family="ui-monospace, monospace">1</text>
+  <text x="1080" y="430" font-size="11" fill="#e2e8f0" font-family="ui-monospace, monospace">from contextlib import asynccontextmanager</text>
+  <text x="1056" y="450" font-size="11" fill="#94a3b8" font-family="ui-monospace, monospace">2</text>
+  <text x="1080" y="450" font-size="11" fill="#e2e8f0" font-family="ui-monospace, monospace">from fastapi import FastAPI</text>
+  <text x="1056" y="470" font-size="11" fill="#94a3b8" font-family="ui-monospace, monospace">3</text>
+  <text x="1080" y="470" font-size="11" fill="#e2e8f0" font-family="ui-monospace, monospace">from cc_harness.web.boot import build_runtime</text>
+  <text x="1056" y="490" font-size="11" fill="#94a3b8" font-family="ui-monospace, monospace">4</text>
+  <text x="1080" y="490" font-size="11" fill="#e2e8f0" font-family="ui-monospace, monospace">from cc_harness.web.sessions import SessionManager</text>
+  <text x="1056" y="510" font-size="11" fill="#94a3b8" font-family="ui-monospace, monospace">5</text>
+  <text x="1080" y="510" font-size="11" fill="#e2e8f0" font-family="ui-monospace, monospace"></text>
+  <text x="1056" y="530" font-size="11" fill="#94a3b8" font-family="ui-monospace, monospace">6</text>
+  <text x="1080" y="530" font-size="11" fill="#60a5fa" font-family="ui-monospace, monospace">def run_serve(host, port, static_dir):</text>
+  <text x="1056" y="550" font-size="11" fill="#94a3b8" font-family="ui-monospace, monospace">7</text>
+  <text x="1080" y="550" font-size="11" fill="#e2e8f0" font-family="ui-monospace, monospace">    async def _setup():</text>
+  <text x="1056" y="570" font-size="11" fill="#94a3b8" font-family="ui-monospace, monospace">8</text>
+  <text x="1080" y="570" font-size="11" fill="#c084fc" font-family="ui-monospace, monospace">        rt</text>
+  <text x="1100" y="570" font-size="11" fill="#e2e8f0" font-family="ui-monospace, monospace"> = </text>
+  <text x="1124" y="570" font-size="11" fill="#fbbf24" font-family="ui-monospace, monospace">await</text>
+  <text x="1156" y="570" font-size="11" fill="#e2e8f0" font-family="ui-monospace, monospace"> build_runtime(...)</text>
+  <rect x="1056" y="576" width="368" height="16" fill="#7c3aed" opacity="0.15"/>
+  <text x="1056" y="590" font-size="11" fill="#94a3b8" font-family="ui-monospace, monospace">9</text>
+  <text x="1080" y="590" font-size="11" fill="#e2e8f0" font-family="ui-monospace, monospace">        sm = SessionManager(llm=rt.llm, ...)</text>
+  <text x="1056" y="610" font-size="11" fill="#94a3b8" font-family="ui-monospace, monospace">10</text>
+  <text x="1080" y="610" font-size="11" fill="#fb7185" font-family="ui-monospace, monospace">        await</text>
+  <text x="1112" y="610" font-size="11" fill="#e2e8f0" font-family="ui-monospace, monospace"> sm.restore_from_checkpoint()    # ← LLM changed</text>
+
+  <!-- File change toast -->
+  <rect x="1056" y="646" width="360" height="32" rx="6" fill="#fef9c3" stroke="#eab308"/>
+  <text x="1072" y="666" font-size="11" fill="#854d0e" font-weight="600">📝 file_changed · cc_harness/web/app.py · diff +12/-2</text>
+
+  <!-- Bottom: token + ctx usage gauge -->
+  <rect x="1040" y="700" width="384" height="80" rx="8" fill="#f8fafc" stroke="#e2e8f0"/>
+  <text x="1056" y="722" font-size="11" font-weight="700" fill="#475569" letter-spacing="0.06em">CONTEXT WINDOW</text>
+  <rect x="1056" y="730" width="352" height="10" rx="5" fill="#e2e8f0"/>
+  <rect x="1056" y="730" width="106" height="10" rx="5" fill="#2563eb"/>
+  <text x="1056" y="758" font-size="11" fill="#0f172a" font-weight="600">30%</text>
+  <text x="1090" y="758" font-size="11" fill="#64748b">24k / 80k tokens</text>
+  <text x="1418" y="758" font-size="11" fill="#16a34a" text-anchor="end">↻ next compaction @ 75%</text>
+  <text x="1056" y="774" font-size="10" fill="#94a3b8">mcp: filesystem · playwright · fetch · git</text>
+
+  <!-- ===== Bottom-left: connection + status pill ===== -->
+  <rect x="16" y="844" width="228" height="36" rx="18" fill="#ecfdf5" stroke="#10b981"/>
+  <circle cx="32" cy="862" r="4" fill="#10b981"/>
+  <text x="44" y="866" font-size="11" fill="#065f46" font-weight="600">WS connected · v1 · 5 events/s</text>
+
+  <!-- ===== Floating: L5 redacted toast (top-right) ===== -->
+  <rect x="1192" y="50" width="232" height="48" rx="8" fill="#fef2f2" stroke="#dc2626" stroke-width="2"/>
+  <circle cx="1208" cy="74" r="6" fill="#dc2626"/>
+  <text x="1222" y="72" font-size="11" font-weight="700" fill="#7f1d1d">L5 redaction</text>
+  <text x="1222" y="88" font-size="10" fill="#7f1d1d">OpenAI key 命中 · [REDACTED]</text>
+</svg>
