@@ -71,8 +71,9 @@ def test_build_executor_sandbox():
     assert isinstance(ex, SandboxExecutor)
 
 
-def test_build_executor_disabled_forces_native():
+def test_build_executor_disabled_does_not_select_native():
+    from cc_harness.sandbox import SandboxExecutor
     """enabled=False → 即使 backend=sandbox 也强制 native(紧急回退 / kill-switch)。"""
     ex = build_executor(ExecutorConfig(enabled=False, backend=ExecutorBackend.SANDBOX),
                         project_root=Path("/tmp"))
-    assert isinstance(ex, NativeExecutor)
+    assert isinstance(ex, SandboxExecutor)

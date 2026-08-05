@@ -7,6 +7,16 @@ import sys
 from cc_harness.tools import run_command
 
 
+@pytest.fixture(autouse=True)
+def _explicit_native_executor(tmp_path):
+    from cc_harness import tools
+    from cc_harness.config import ExecutorBackend, ExecutorConfig
+
+    tools.init_session_executor(ExecutorConfig(backend=ExecutorBackend.NATIVE), tmp_path)
+    yield
+    tools.reset_session_executor()
+
+
 @pytest.mark.skipif(
     sys.platform == "win32" or os.name != "posix",
     reason="PTY requires POSIX",
@@ -46,3 +56,24 @@ async def test_pty_false_dict_path_unchanged():
     )
     assert result.is_error is False
     assert "dict-form-no-pty" in result.llm_text
+
+
+async def test_pty_refuses_host_shell_when_sandbox_selected(tmp_path):
+    from cc_harness import tools
+    from cc_harness.config import ExecutorConfig
+
+    tools.init_session_executor(ExecutorConfig(), tmp_path)
+    chunks: list[bytes] = []
+
+    async def writer(data: bytes):
+        chunks.append(data)
+
+    rc = await run_command(
+        "echo should-not-run",
+        use_pty=True,
+        pty_writer=writer,
+        cwd=str(tmp_path),
+    )
+
+    assert rc == 126
+    assert b"explicit native backend" in b"".join(chunks)

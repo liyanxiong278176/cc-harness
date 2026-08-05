@@ -2,20 +2,28 @@
 
 会话级 lazy create sandbox(首次 run 建,后续复用);commands.run 收
 stdout/stderr/exit → ToolResult(格式同 NativeExecutor)。
-通信错(create / commands.run 抛异常)经 _with_retry 重试 3 次(1s/2s/4s
-指数退避);全败抛 SandboxUnavailableError 让调用方(tools.py)降级 native。
+通信错(create / commands.run 抛异常)经 _with_retry 尝试 3 次(重试前等待 1s/2s);
+全败抛 SandboxUnavailableError，调用方 fail closed，不降级到 native。
 命令结果(exit≠0)是正常返回,不重试。
 """
 from __future__ import annotations
 
 import asyncio
+import inspect
+import ipaddress
 import json
+import logging
+import socket
 import time
 from datetime import timedelta
 from pathlib import Path
 
 from cc_harness.config import SandboxConfig
+from cc_harness.credential_broker import CredentialBroker, CredentialBrokerError
 from cc_harness.mcp_client import ToolResult
+from cc_harness.sandbox_workspace import WorkspaceMaskPlan, discover_mask_targets
+
+log = logging.getLogger(__name__)
 
 # OpenSandbox SDK(lazy import:无 [sandbox] extra 时模块加载不崩,调用时报错)。
 # 真 SDK 签名锁定(opensandbox 0.1.13,inspect.signature 核实,非 WebSearch):
@@ -27,8 +35,14 @@ from cc_harness.mcp_client import ToolResult
 # 时模块加载 + 单元测试(仅 mock Sandbox.create,Volume/Host 仍走 stub)不崩。
 try:
     from opensandbox import Sandbox
-    from opensandbox.models.sandboxes import Volume, Host
     from opensandbox.config.connection import ConnectionConfig
+    from opensandbox.models.sandboxes import (
+        CredentialProxyConfig,
+        Host,
+        NetworkPolicy,
+        NetworkRule,
+        Volume,
+    )
     _HAS_SANDBOX_SDK = True
 except ImportError:  # 无 [sandbox] extra(CI / 基础安装)
     Sandbox = None
@@ -58,9 +72,47 @@ except ImportError:  # 无 [sandbox] extra(CI / 基础安装)
             return (f"Volume(name={self.name}, host={self.host}, "
                     f"mount_path={self.mount_path}, read_only={self.read_only})")
 
+    class NetworkRule:
+        def __init__(self, *, action: str, target: str) -> None:
+            self.action = action
+            self.target = target
+
+    class NetworkPolicy:
+        def __init__(self, *, default_action: str, egress: list[NetworkRule]) -> None:
+            self.default_action = default_action
+            self.egress = egress
+
+    class CredentialProxyConfig:
+        def __init__(self, *, enabled: bool) -> None:
+            self.enabled = enabled
+
 
 class SandboxUnavailableError(RuntimeError):
-    """沙箱层连败 3 次;调用方(run_command 包装处)应降级 NativeExecutor。"""
+    """The sandbox could not execute a command after bounded retries."""
+
+
+def _resolve_egress_target(target: str) -> set[ipaddress.IPv4Address | ipaddress.IPv6Address]:
+    hostname = target.removeprefix("*.")
+    try:
+        answers = socket.getaddrinfo(hostname, 443, type=socket.SOCK_STREAM)
+    except socket.gaierror as exc:
+        raise SandboxUnavailableError(f"sandbox egress DNS preflight failed for {hostname}") from exc
+    addresses = {ipaddress.ip_address(answer[4][0]) for answer in answers}
+    if not addresses:
+        raise SandboxUnavailableError(f"sandbox egress DNS returned no addresses for {hostname}")
+    unsafe = sorted(str(address) for address in addresses if not address.is_global)
+    if unsafe:
+        raise SandboxUnavailableError(
+            f"sandbox egress target {hostname} resolved to non-public address(es): "
+            + ", ".join(unsafe)
+        )
+    return addresses
+
+
+async def _validate_egress_targets(targets: list[str]) -> None:
+    """Fail closed when an allowed domain currently resolves outside public IP space."""
+    for target in targets:
+        await asyncio.to_thread(_resolve_egress_target, target)
 
 
 async def _with_retry(coro_factory, attempts: int = 3):
@@ -111,12 +163,72 @@ class SandboxExecutor:
         self.cfg = cfg
         self.project_root = Path(project_root).resolve()
         self._sandbox = None     # lazy create,会话级复用
+        self._mask_plan: WorkspaceMaskPlan | None = None
+        self._credential_broker = CredentialBroker(cfg, self.project_root)
+
+    def _network_policy(self) -> NetworkPolicy:
+        return NetworkPolicy(
+            default_action="deny",
+            egress=[
+                NetworkRule(action="allow", target=target)
+                for target in self.cfg.egress_allow
+            ],
+        )
+
+    async def _destroy_sandbox(self) -> None:
+        sandbox = self._sandbox
+        self._sandbox = None
+        if sandbox is None:
+            return
+        try:
+            await sandbox.kill()
+        finally:
+            close = getattr(sandbox, "close", None)
+            if close is not None:
+                close_result = close()
+                if inspect.isawaitable(close_result):
+                    await close_result
+
+    async def _refresh_workspace_masks(self) -> None:
+        targets = discover_mask_targets(self.project_root)
+        signature = tuple((target.relative_path.as_posix(), target.is_dir) for target in targets)
+        if self._mask_plan is not None and self._mask_plan.signature == signature:
+            return
+        await self._destroy_sandbox()
+        reusable_root = None
+        if self._mask_plan is not None:
+            reusable_root = self._mask_plan.root
+            self._mask_plan.cleanup()
+        self._mask_plan = WorkspaceMaskPlan.create(targets, root=reusable_root)
+
+    def _volumes(self) -> list[Volume]:
+        volumes = [
+            Volume(
+                name="workspace",
+                host=Host(path=str(self.project_root)),
+                mountPath="/workspace",
+                readOnly=True,
+            )
+        ]
+        if self._mask_plan is None:
+            return volumes
+        for index, target in enumerate(self._mask_plan.targets):
+            volumes.append(
+                Volume(
+                    name=f"credential-mask-{index}",
+                    host=Host(path=str(self._mask_plan.host_path(target))),
+                    mountPath=f"/workspace/{target.relative_path.as_posix()}",
+                    readOnly=True,
+                )
+            )
+        return volumes
 
     async def _ensure_sandbox(self):
         if self._sandbox is not None:
             return self._sandbox
         if Sandbox is None:
             raise RuntimeError("opensandbox SDK 未装(pip install -e '.[sandbox]')")
+        await _validate_egress_targets(self.cfg.egress_allow)
         # Gap 1 修复:确保 opensandbox-server 在跑(复用 external / 自动起 owned / 无 Docker 返 None)。
         # ensure_server 内部已轮询 ready_timeout 等 server 起,故放 _with_retry 外(不重试 server lifecycle);
         # 仅 Sandbox.create 通信步进 _with_retry。state None → SandboxUnavailableError 触发既有降级链。
@@ -125,10 +237,16 @@ class SandboxExecutor:
         # allowed_host_paths=[project_root]:server 0.2.1 空 allowed_host_paths = DENY-ALL
         # (与 config 注释矛盾)→ 下方 Volume(host=Host(path=project_root)) mount 报
         # HOST_PATH_NOT_ALLOWED。_fork_server 生成 config 时写入项目根前缀解锁。
+        allowed_host_paths = [str(self.project_root)]
+        if self._mask_plan is not None:
+            allowed_host_paths.append(str(self._mask_plan.root))
         state = await ensure_server(
             host=self.cfg.server_host,
             port=self.cfg.server_port,
-            allowed_host_paths=[str(self.project_root)],
+            allowed_host_paths=allowed_host_paths,
+            config_path=self.cfg.server_config_path,
+            pids_limit=self.cfg.pids_limit,
+            require_external_attestation=self.cfg.require_external_attestation,
         )
         if state is None:
             # Docker 没装/server 起不来 → 直接走降级(run() 的 except SandboxUnavailableError 接住)。
@@ -144,24 +262,28 @@ class SandboxExecutor:
         # 项目根 RO mount:fs 工具改动实时反映(读一致)。
         cc = (ConnectionConfig(domain=f"{self.cfg.server_host}:{self.cfg.server_port}")
               if ConnectionConfig is not None else None)
-        self._sandbox = await _with_retry(lambda: Sandbox.create(
+        candidate = await _with_retry(lambda: Sandbox.create(
             self.cfg.image,
-            volumes=[
-                Volume(name="workspace",
-                       host=Host(path=str(self.project_root)),
-                       mountPath="/workspace",
-                       readOnly=True),
-            ],
+            volumes=self._volumes(),
             # 不传 env=:host(Windows)env(PATH/SYSTEMROOT)注入 Linux 沙箱会破坏容器。
             # 沙箱用容器默认 env;凭证后续走 Credential Vault(Task 12 增强),非 host env。
             # 不传 timeout=(sandbox lifetime,默认 600s):cfg.timeout_s(120s)过短,
             # Windows volume mount 慢 → sandbox 在 health check 期间过期。
             ready_timeout=timedelta(seconds=self.cfg.timeout_s),  # 等 ready:Windows mount 慢,默认 30s 不够
             connection_config=cc,
-            # TODO(Gap 2 增强):resource={"cpu": str(self.cfg.cpu), "memory": f"{self.cfg.memory_mb}Mi"},
-            #                    network_policy=<NetworkPolicy from egress_allow>,
-            #                    credential_proxy=<Vault>
+            resource={"cpu": str(self.cfg.cpu), "memory": f"{self.cfg.memory_mb}Mi"},
+            network_policy=self._network_policy(),
+            credential_proxy=(
+                CredentialProxyConfig(enabled=True) if self.cfg.vault else None
+            ),
         ))
+        self._sandbox = candidate
+        if self.cfg.vault:
+            try:
+                await self._credential_broker.provision(candidate)
+            except CredentialBrokerError as exc:
+                await self._destroy_sandbox()
+                raise SandboxUnavailableError(str(exc)) from None
         return self._sandbox
 
     async def run(self, args: dict, *, cwd: Path) -> ToolResult:
@@ -173,8 +295,21 @@ class SandboxExecutor:
                 llm="[Tool Error] 'command' must be a non-empty string",
             )
         try:
+            await self._refresh_workspace_masks()
             sb = await self._ensure_sandbox()    # 内含 retry,3 次后抛 SandboxUnavailableError
-            execution = await _with_retry(lambda: sb.commands.run(command))
+            execution = await asyncio.wait_for(
+                _with_retry(lambda: sb.commands.run(command)),
+                timeout=self.cfg.timeout_s,
+            )
+        except TimeoutError:
+            await self.kill()
+            return ToolResult.error(
+                display=f"sandbox timeout after {self.cfg.timeout_s}s; sandbox destroyed",
+                llm=(
+                    f"[Tool Error] sandbox timeout after {self.cfg.timeout_s}s; "
+                    "the sandbox was destroyed"
+                ),
+            )
         except SandboxUnavailableError as e:
             # 降级前落审计(action/reason/retries → logs/sandbox.jsonl),再上抛让调用方降级 native。
             _audit_fallback(project_root=self.project_root, reason=str(e), retries=3)
@@ -194,11 +329,21 @@ class SandboxExecutor:
             )
         return ToolResult.success(stdout if stdout else "(no output)")
 
-    async def kill(self):
+    async def kill(self) -> bool:
         """会话结束清理。"""
-        if self._sandbox is not None:
+        destroyed = True
+        if self._sandbox is not None and self.cfg.vault:
             try:
-                await self._sandbox.kill()
-            except Exception:
-                pass
-            self._sandbox = None
+                await self._credential_broker.revoke(self._sandbox)
+            except CredentialBrokerError:
+                destroyed = False
+                log.warning("credential vault revocation failed; destroying sandbox", exc_info=True)
+        try:
+            await self._destroy_sandbox()
+        except Exception:
+            destroyed = False
+            log.warning("sandbox teardown failed", exc_info=True)
+        if self._mask_plan is not None:
+            self._mask_plan.cleanup()
+            self._mask_plan = None
+        return destroyed

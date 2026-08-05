@@ -50,7 +50,7 @@ _PATH_KEYS = {
     "source", "destination", "src", "dst", "old_path", "new_path",
 }
 _PATH_LIST_KEYS = {"paths", "files"}
-_SENSITIVE_DIR_NAMES = {".ssh", ".aws", ".azure", ".gnupg", ".kube"}
+_SENSITIVE_DIR_NAMES = {".ssh", ".aws", ".azure", ".cc-harness", ".gnupg", ".kube"}
 _SENSITIVE_FILE_NAMES = {
     ".env", ".git-credentials", ".netrc", ".npmrc", ".pypirc",
     "id_dsa", "id_ecdsa", "id_ed25519", "id_rsa",
@@ -62,6 +62,10 @@ def _classify(name: str) -> str:
     n = name.lower()
     if n == "run_command":
         return "shell"
+    if n in ("read", "glob", "grep"):
+        return "fs_read"
+    if n in ("edit", "write"):
+        return "fs_write"
     if n == "memory_save":
         return "fs_write"
     if n == "memory_recall":
@@ -142,12 +146,14 @@ def _is_outside(target: str, project_root: Path) -> bool:
     return not _resolve(target, root).is_relative_to(root)
 
 
-def _is_sensitive_path(path: Path) -> bool:
+def is_sensitive_path(path: Path) -> bool:
     """Identify credential locations that models must access through a broker."""
     lowered_parts = {part.lower() for part in path.parts}
     if lowered_parts & _SENSITIVE_DIR_NAMES:
         return True
     name = path.name.lower()
+    if ".git" in lowered_parts and name in {"config", "config.worktree"}:
+        return True
     if (
         (name == ".env" or name.startswith(".env."))
         and not name.endswith(_NON_SECRET_ENV_SUFFIXES)
@@ -212,7 +218,7 @@ class PolicyEngine:
                     "path_outside_allowed_roots",
                     f"拒绝访问未授权工作区外路径: {target}",
                 )
-            if _is_sensitive_path(resolved):
+            if is_sensitive_path(resolved):
                 return Decision(
                     Action.DENY,
                     "sensitive_credential_path",

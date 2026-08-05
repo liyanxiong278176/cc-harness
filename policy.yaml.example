@@ -9,18 +9,20 @@ l5:
   keys_on: true          # Layer A 密钥正则(零依赖):false=不扫密钥
   pii_on: true           # Layer B Presidio PII(需 pip install -e '.[dlp]'):false=不扫 PII
 executor:
-  enabled: true            # 总开关:false=强制 native(紧急回退现状)
-  backend: native          # native(现状)| sandbox(OpenSandbox 隔离)
+  enabled: true            # 兼容字段;false 不会隐式选择宿主执行
+  backend: sandbox         # sandbox(默认,fail closed)|native(显式宿主执行)
   sandbox:
-    server_host: 127.0.0.1   # 用 127.0.0.1 非 localhost(Windows localhost→IPv6 ::1 连不上)
-    server_port: 8000
-    image: cc-harness-runtime:local
-    timeout_s: 120
-    cpu: 2
-    memory_mb: 2048
-    egress_allow: [api.deepseek.com, api.siliconflow.cn, pypi.org, github.com]
-    vault: true            # Credential Vault(失败退化 strip_secrets)
-    fallback_on_error: native   # native(降级)| hard(报错不降级,红队 allow 模式)
-            # hard:沙箱挂了命令不执行(防 L8 失真 + 防降级泄露 CI secret)。
-            # 红队 allow 模式 wrapper 自动注 hard(绑死);手动测沙箱也可 policy 设 hard。
-            # env CC_HARNESS_SANDBOX_FALLBACK=hard 覆盖(优先级高于本字段)。
+      server_host: 127.0.0.1   # 用 127.0.0.1 非 localhost(Windows localhost→IPv6 ::1 连不上)
+      server_port: 8000
+      server_config_path: null # 复用外部 server 时必须指向其实际 TOML 配置
+      require_external_attestation: true
+      image: cc-harness-runtime:local
+      timeout_s: 120
+      cpu: 2
+      memory_mb: 2048
+      pids_limit: 256
+      egress_allow: [api.deepseek.com, api.siliconflow.cn, pypi.org, github.com]
+      vault: false           # 默认关闭;仅在凭据代理已配置并验证时显式开启
+      vault_credentials: []  # 仅写 {name, env_var};不要在策略中写秘密值
+      vault_bindings: []     # {name, credential, hosts, auth_type, schemes, methods, paths}
+      fallback_on_error: hard    # 兼容字段;运行时始终 fail closed,不会自动降级宿主执行

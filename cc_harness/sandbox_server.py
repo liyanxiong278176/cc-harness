@@ -8,22 +8,41 @@
 ⚠️ Windows:host 必须用 127.0.0.1(localhost→IPv6 ::1 连不上绑 IPv4 的 server)。
 """
 from __future__ import annotations
+
 import asyncio
+import hashlib
+import importlib.metadata
+import json
+import logging
 import os
+import re
 import signal
 import subprocess
 import sys
+import tomllib
+import urllib.error
+import urllib.request
 from dataclasses import dataclass
 from pathlib import Path
 
-
 # 我们起的 server 子进程(退出时 shutdown_owned 整组 kill)。external 的不动。
 _OWNED_PROC: list = [None]
+_TRUSTED_ENDPOINTS: dict[tuple[str, int], ServerState] = {}
+log = logging.getLogger(__name__)
 
 
 @dataclass
 class ServerState:
     owned: bool          # True = 我们起的(退出要 kill);False = external(复用)
+    config_digest: str | None = None
+    server_version: str | None = None
+    runtime: str | None = None
+    egress_mode: str | None = None
+    attested: bool = False
+
+
+class ServerAttestationError(RuntimeError):
+    """A reachable external server could not prove the required controls."""
 
 
 async def ping(host: str, port: int, timeout: float = 1.0) -> bool:
@@ -36,6 +55,91 @@ async def ping(host: str, port: int, timeout: float = 1.0) -> bool:
         return True
     except (ConnectionRefusedError, asyncio.TimeoutError, OSError):
         return False
+
+
+def _health_request(host: str, port: int, timeout: float) -> bool:
+    try:
+        with urllib.request.urlopen(f"http://{host}:{port}/health", timeout=timeout) as response:
+            payload = json.loads(response.read().decode("utf-8"))
+        return response.status == 200 and payload == {"status": "healthy"}
+    except (OSError, ValueError, urllib.error.URLError):
+        return False
+
+
+async def health(host: str, port: int, timeout: float = 2.0) -> bool:
+    """Verify the OpenSandbox HTTP health contract, not merely an occupied TCP port."""
+    return await asyncio.to_thread(_health_request, host, port, timeout)
+
+
+def _path_is_allowed(path: str, allowed_prefixes: list[str]) -> bool:
+    candidate = Path(path).expanduser().resolve()
+    for prefix in allowed_prefixes:
+        allowed = Path(prefix).expanduser().resolve()
+        if candidate == allowed or allowed in candidate.parents:
+            return True
+    return False
+
+
+def attest_server_config(
+    config_path: Path,
+    *,
+    host: str,
+    port: int,
+    required_host_paths: list[str],
+    max_pids: int,
+) -> ServerState:
+    """Validate a local, operator-supplied external-server configuration."""
+    path = Path(config_path).expanduser().resolve()
+    try:
+        raw = path.read_bytes()
+        config = tomllib.loads(raw.decode("utf-8"))
+    except (OSError, UnicodeDecodeError, tomllib.TOMLDecodeError) as exc:
+        raise ServerAttestationError(f"cannot read external server config: {exc}") from exc
+
+    server = config.get("server") or {}
+    runtime = config.get("runtime") or {}
+    egress = config.get("egress") or {}
+    storage = config.get("storage") or {}
+    docker = config.get("docker") or {}
+    failures: list[str] = []
+    if str(server.get("host", "127.0.0.1")) != host:
+        failures.append("server.host mismatch")
+    if int(server.get("port", 8080)) != port:
+        failures.append("server.port mismatch")
+    runtime_type = str(runtime.get("type", "docker"))
+    if runtime_type not in {"docker", "kubernetes"}:
+        failures.append(f"unsupported runtime.type={runtime_type!r}")
+    if egress.get("mode") != "dns+nft":
+        failures.append("egress.mode must be 'dns+nft'")
+    allowed = [str(item) for item in storage.get("allowed_host_paths", [])]
+    for required in required_host_paths:
+        if not _path_is_allowed(required, allowed):
+            failures.append(f"host path is not allowlisted: {required}")
+    if runtime_type == "docker":
+        pids_limit = docker.get("pids_limit")
+        if not isinstance(pids_limit, int) or not 1 <= pids_limit <= max_pids:
+            failures.append(f"docker.pids_limit must be between 1 and {max_pids}")
+        if docker.get("no_new_privileges", True) is not True:
+            failures.append("docker.no_new_privileges must be true")
+        cap_drop = {str(item) for item in docker.get("drop_capabilities", [])}
+        for capability in ("NET_ADMIN", "SYS_ADMIN", "SYS_MODULE", "SYS_PTRACE"):
+            if capability not in cap_drop:
+                failures.append(f"docker.drop_capabilities must include {capability}")
+    if failures:
+        raise ServerAttestationError("; ".join(failures))
+
+    try:
+        version = importlib.metadata.version("opensandbox-server")
+    except importlib.metadata.PackageNotFoundError:
+        version = None
+    return ServerState(
+        owned=False,
+        config_digest=f"sha256:{hashlib.sha256(raw).hexdigest()}",
+        server_version=version,
+        runtime=runtime_type,
+        egress_mode="dns+nft",
+        attested=True,
+    )
 
 
 def _docker_available() -> bool:
@@ -110,12 +214,72 @@ def _set_allowed_host_paths(config_path: Path, paths: list[str]) -> None:
     """
     txt = config_path.read_text(encoding="utf-8")
     toml_paths = ", ".join(f'"{p.replace(chr(92), chr(92) * 2)}"' for p in paths)
-    txt = txt.replace("allowed_host_paths = []", f"allowed_host_paths = [{toml_paths}]")
+    replacement = f"allowed_host_paths = [{toml_paths}]"
+    txt = re.sub(
+        r"(?m)^allowed_host_paths\s*=.*$",
+        lambda _match: replacement,
+        txt,
+        count=1,
+    )
+    config_path.write_text(txt, encoding="utf-8")
+
+
+def _set_egress_mode(config_path: Path) -> None:
+    """Require DNS plus nftables enforcement for owned sandbox servers."""
+    txt = config_path.read_text(encoding="utf-8")
+    section_match = re.search(
+        r"(?ms)^\[egress\][^\n]*\n.*?(?=^\[|\Z)",
+        txt,
+    )
+    if section_match is None:
+        txt += '\n[egress]\nimage = "opensandbox/egress:v1.1.4"\nmode = "dns+nft"\n'
+    else:
+        section = section_match.group(0)
+        section, replacements = re.subn(
+            r'(?m)^(mode\s*=\s*)"[^"]+"',
+            r'\1"dns+nft"',
+            section,
+            count=1,
+        )
+        if replacements == 0:
+            section = section.rstrip("\n") + '\nmode = "dns+nft"\n'
+        txt = txt[:section_match.start()] + section + txt[section_match.end():]
+    config_path.write_text(txt, encoding="utf-8")
+
+
+def _set_docker_security(config_path: Path, pids_limit: int) -> None:
+    """Pin process and privilege controls instead of relying on server defaults."""
+    txt = config_path.read_text(encoding="utf-8")
+    section_match = re.search(r"(?ms)^\[docker\][^\n]*\n.*?(?=^\[|\Z)", txt)
+    required = {
+        "pids_limit": str(pids_limit),
+        "no_new_privileges": "true",
+        "drop_capabilities": (
+            '["AUDIT_WRITE", "MKNOD", "NET_ADMIN", "NET_RAW", "SYS_ADMIN", '
+            '"SYS_MODULE", "SYS_PTRACE", "SYS_TIME", "SYS_TTY_CONFIG"]'
+        ),
+    }
+    if section_match is None:
+        section = "\n[docker]\n" + "".join(f"{k} = {v}\n" for k, v in required.items())
+        txt += section
+    else:
+        section = section_match.group(0)
+        for key, value in required.items():
+            section, count = re.subn(
+                rf"(?m)^({re.escape(key)}\s*=\s*).*$",
+                lambda match, replacement=value: match.group(1) + replacement,
+                section,
+                count=1,
+            )
+            if count == 0:
+                section = section.rstrip("\n") + f"\n{key} = {value}\n"
+        txt = txt[:section_match.start()] + section + txt[section_match.end():]
     config_path.write_text(txt, encoding="utf-8")
 
 
 async def _fork_server(port: int, host: str, config_path: Path,
-                       allowed_host_paths: list[str] | None = None):
+                       allowed_host_paths: list[str] | None = None,
+                       pids_limit: int = 256):
     """fork opensandbox-server(console script)子进程。
 
     config_path 指定 toml(含 port/host);不存在则 init-config --example docker 生成
@@ -134,10 +298,12 @@ async def _fork_server(port: int, host: str, config_path: Path,
             [str(_server_cli()), "init-config", str(config_path), "--example", "docker"],
             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False,
         )
-        if config_path.exists():
-            _set_config_port(config_path, port)              # 8080 → port
-            if allowed_host_paths:                            # server 0.2.1:空=拒绝
-                _set_allowed_host_paths(config_path, allowed_host_paths)
+    if config_path.exists():
+        _set_config_port(config_path, port)
+        if allowed_host_paths:
+            _set_allowed_host_paths(config_path, allowed_host_paths)
+        _set_egress_mode(config_path)
+        _set_docker_security(config_path, pids_limit)
     env = {**os.environ, "OPENSANDBOX_INSECURE_SERVER": "YES"}  # api_key 空 → insecure ack
     return await asyncio.create_subprocess_exec(
         str(_server_cli()), "--config", str(config_path),
@@ -151,7 +317,9 @@ async def _fork_server(port: int, host: str, config_path: Path,
 async def ensure_server(port: int, host: str = "127.0.0.1",
                         ready_timeout: float = 30.0,
                         config_path: Path | None = None,
-                        allowed_host_paths: list[str] | None = None) -> ServerState | None:
+                        allowed_host_paths: list[str] | None = None,
+                        pids_limit: int = 256,
+                        require_external_attestation: bool = True) -> ServerState | None:
     """确保 server 在跑。复用 / 自动起 / Docker 不可用返回 None。
 
     host 默认 127.0.0.1(非 localhost):Windows localhost 解析到 IPv6 ::1,
@@ -160,12 +328,33 @@ async def ensure_server(port: int, host: str = "127.0.0.1",
     config_path 默认 ~/.cc-harness-sandbox.toml;allowed_host_paths 非空时透传给
     _fork_server → _set_allowed_host_paths(server 0.2.1 空=拒绝所有 host mount)。
     """
+    endpoint = (host, port)
     if await ping(host, port):
-        return ServerState(owned=False)
+        trusted = _TRUSTED_ENDPOINTS.get(endpoint)
+        if trusted is not None:
+            return trusted
+        if not await health(host, port):
+            raise ServerAttestationError("reachable port is not an OpenSandbox health endpoint")
+        if require_external_attestation:
+            if config_path is None:
+                raise ServerAttestationError(
+                    "external OpenSandbox server requires server_config_path attestation"
+                )
+            state = attest_server_config(
+                config_path,
+                host=host,
+                port=port,
+                required_host_paths=allowed_host_paths or [],
+                max_pids=pids_limit,
+            )
+        else:
+            state = ServerState(owned=False, attested=False)
+        _TRUSTED_ENDPOINTS[endpoint] = state
+        return state
     if not _docker_available():
         return None
     config_path = config_path or (Path.home() / ".cc-harness-sandbox.toml")
-    proc = await _fork_server(port, host, config_path, allowed_host_paths)
+    proc = await _fork_server(port, host, config_path, allowed_host_paths, pids_limit)
     loop = asyncio.get_running_loop()
     deadline = loop.time() + ready_timeout
     while loop.time() < deadline:
@@ -173,7 +362,22 @@ async def ensure_server(port: int, host: str = "127.0.0.1",
             if _OWNED_PROC[0] is not None:
                 _kill_proc_tree(_OWNED_PROC[0])
             _OWNED_PROC[0] = proc
-            return ServerState(owned=True)
+            attested = attest_server_config(
+                config_path,
+                host=host,
+                port=port,
+                required_host_paths=allowed_host_paths or [],
+                max_pids=pids_limit,
+            )
+            state = ServerState(**{**attested.__dict__, "owned": True})
+            _TRUSTED_ENDPOINTS[endpoint] = state
+            return state
+        if isinstance(proc.returncode, int):
+            if proc.stderr is not None:
+                stderr = (await proc.stderr.read()).decode(errors="replace").strip()
+                if stderr:
+                    log.warning("opensandbox-server exited during startup: %s", stderr)
+            return None
         await asyncio.sleep(0.5)
     _kill_proc_tree(proc)
     return None
@@ -190,3 +394,6 @@ async def shutdown_owned() -> None:
     except Exception:
         pass
     _OWNED_PROC[0] = None
+    for endpoint, state in list(_TRUSTED_ENDPOINTS.items()):
+        if state.owned:
+            _TRUSTED_ENDPOINTS.pop(endpoint, None)

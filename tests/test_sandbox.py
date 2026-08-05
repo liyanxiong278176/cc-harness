@@ -1,5 +1,7 @@
-import pytest
+from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
+
+import pytest
 
 
 @pytest.fixture(autouse=True)
@@ -16,6 +18,33 @@ def _mock_ensure_server(monkeypatch):
     # 在 CALL 时执行,读取的是 sandbox_server 模块的当前 ensure_server 属性 → monkeypatch 模块属性即生效。
     import cc_harness.sandbox_server as ss
     monkeypatch.setattr(ss, "ensure_server", _fake_ensure)
+    monkeypatch.setattr(
+        "cc_harness.sandbox._validate_egress_targets",
+        AsyncMock(return_value=None),
+    )
+
+
+def test_egress_dns_preflight_rejects_private_resolution(monkeypatch):
+    from cc_harness.sandbox import SandboxUnavailableError, _resolve_egress_target
+
+    monkeypatch.setattr(
+        "cc_harness.sandbox.socket.getaddrinfo",
+        lambda *args, **kwargs: [(2, 1, 6, "", ("192.168.65.2", 443))],
+    )
+
+    with pytest.raises(SandboxUnavailableError, match="non-public address"):
+        _resolve_egress_target("allowed.example")
+
+
+def test_egress_dns_preflight_accepts_only_public_resolution(monkeypatch):
+    from cc_harness.sandbox import _resolve_egress_target
+
+    monkeypatch.setattr(
+        "cc_harness.sandbox.socket.getaddrinfo",
+        lambda *args, **kwargs: [(2, 1, 6, "", ("1.1.1.1", 443))],
+    )
+
+    assert {str(item) for item in _resolve_egress_target("allowed.example")} == {"1.1.1.1"}
 
 
 @pytest.mark.asyncio
@@ -59,6 +88,32 @@ async def test_run_nonzero_exit_returns_error_toolresult(tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_command_timeout_destroys_sandbox(tmp_path, monkeypatch):
+    from cc_harness.config import SandboxConfig
+    from cc_harness.sandbox import SandboxExecutor
+
+    fake_sandbox = MagicMock()
+    fake_sandbox.commands.run = AsyncMock()
+    fake_sandbox.kill = AsyncMock()
+
+    async def force_timeout(coro, *, timeout):
+        assert timeout == 120
+        coro.close()
+        raise TimeoutError
+
+    monkeypatch.setattr("cc_harness.sandbox.asyncio.wait_for", force_timeout)
+    with patch("cc_harness.sandbox.Sandbox") as sdk:
+        sdk.create = AsyncMock(return_value=fake_sandbox)
+        executor = SandboxExecutor(SandboxConfig(), project_root=tmp_path)
+        result = await executor.run({"command": "sleep forever"}, cwd=tmp_path)
+
+    assert result.is_error
+    assert "timeout" in result.llm_text
+    fake_sandbox.kill.assert_awaited_once()
+    assert executor._sandbox is None
+
+
+@pytest.mark.asyncio
 async def test_ensure_sandbox_passes_mount(tmp_path, monkeypatch):
     """Sandbox.create 收到项目根 RO volume mount(volumes=,真 SDK 签名)。"""
     from cc_harness.sandbox import SandboxExecutor, _HAS_SANDBOX_SDK
@@ -95,6 +150,206 @@ async def test_ensure_sandbox_passes_mount(tmp_path, monkeypatch):
     # 但 mock create 仍接受 None);不写死成必传以避免 CI 假红。
     if _HAS_SANDBOX_SDK:
         assert captured.get("connection_config") is not None, "SDK 装好时 connection_config 必传"
+
+
+@pytest.mark.asyncio
+async def test_create_receives_resource_and_default_deny_network_policy(tmp_path):
+    from cc_harness.config import SandboxConfig
+    from cc_harness.sandbox import SandboxExecutor
+
+    captured = {}
+    fake_execution = MagicMock(
+        exit_code=0,
+        logs=MagicMock(stdout=[MagicMock(text="ok")], stderr=[]),
+    )
+    fake_sandbox = MagicMock(kill=AsyncMock())
+    fake_sandbox.commands.run = AsyncMock(return_value=fake_execution)
+    fake_sandbox.credential_vault.create = AsyncMock(
+        return_value=MagicMock(revision=1)
+    )
+
+    async def fake_create(*args, **kwargs):
+        captured.update(kwargs)
+        return fake_sandbox
+
+    config = SandboxConfig(
+        cpu=4,
+        memory_mb=4096,
+        egress_allow=["api.deepseek.com", "*.example.com"],
+    )
+    with patch("cc_harness.sandbox.Sandbox") as sdk:
+        sdk.create = fake_create
+        executor = SandboxExecutor(config, project_root=tmp_path)
+        await executor.run({"command": "true"}, cwd=tmp_path)
+
+    assert captured["resource"] == {"cpu": "4", "memory": "4096Mi"}
+    policy = captured["network_policy"]
+    assert policy.default_action == "deny"
+    assert [(rule.action, rule.target) for rule in policy.egress] == [
+        ("allow", "api.deepseek.com"),
+        ("allow", "*.example.com"),
+    ]
+    assert captured["credential_proxy"] is None
+
+
+@pytest.mark.asyncio
+async def test_credential_proxy_requires_explicit_vault_opt_in(tmp_path):
+    from cc_harness.config import SandboxConfig
+    from cc_harness.sandbox import SandboxExecutor
+
+    captured = {}
+    fake_execution = MagicMock(
+        exit_code=0,
+        logs=MagicMock(stdout=[MagicMock(text="ok")], stderr=[]),
+    )
+    fake_sandbox = MagicMock(kill=AsyncMock())
+    fake_sandbox.commands.run = AsyncMock(return_value=fake_execution)
+    fake_sandbox.credential_vault.create = AsyncMock(
+        return_value=MagicMock(revision=1)
+    )
+
+    async def fake_create(*args, **kwargs):
+        captured.update(kwargs)
+        return fake_sandbox
+
+    config = SandboxConfig(
+        vault=True,
+        vault_credentials=[{"name": "api", "env_var": "TEST_VAULT_TOKEN"}],
+        vault_bindings=[{
+            "name": "api-binding",
+            "credential": "api",
+            "hosts": ["api.deepseek.com"],
+        }],
+    )
+    with (
+        patch.dict("os.environ", {"TEST_VAULT_TOKEN": "synthetic-secret"}),
+        patch("cc_harness.sandbox.Sandbox") as sdk,
+    ):
+        sdk.create = fake_create
+        executor = SandboxExecutor(config, project_root=tmp_path)
+        await executor.run({"command": "true"}, cwd=tmp_path)
+
+    assert captured["credential_proxy"].enabled is True
+
+
+@pytest.mark.asyncio
+async def test_credential_broker_failure_destroys_sandbox_and_fails_closed(tmp_path):
+    from cc_harness.config import SandboxConfig
+    from cc_harness.sandbox import SandboxExecutor, SandboxUnavailableError
+
+    secret = "provider-must-not-leak-this"
+    fake_sandbox = MagicMock(kill=AsyncMock())
+    fake_sandbox.credential_vault.create = AsyncMock(side_effect=RuntimeError(secret))
+    config = SandboxConfig(
+        vault=True,
+        vault_credentials=[{"name": "api", "env_var": "TEST_VAULT_TOKEN"}],
+        vault_bindings=[{
+            "name": "api-binding",
+            "credential": "api",
+            "hosts": ["api.deepseek.com"],
+        }],
+    )
+    with (
+        patch.dict("os.environ", {"TEST_VAULT_TOKEN": secret}),
+        patch("cc_harness.sandbox.Sandbox") as sdk,
+    ):
+        sdk.create = AsyncMock(return_value=fake_sandbox)
+        executor = SandboxExecutor(config, project_root=tmp_path)
+        with pytest.raises(SandboxUnavailableError, match="provisioning failed") as caught:
+            await executor.run({"command": "true"}, cwd=tmp_path)
+
+    assert secret not in str(caught.value)
+    fake_sandbox.kill.assert_awaited_once()
+    assert executor._sandbox is None
+
+
+@pytest.mark.asyncio
+async def test_workspace_secret_is_overlaid_with_empty_read_only_mask(tmp_path):
+    from cc_harness.config import SandboxConfig
+    from cc_harness.sandbox import SandboxExecutor
+
+    secret = "sk-must-not-reach-sandbox"
+    (tmp_path / ".env").write_text(f"API_KEY={secret}", encoding="utf-8")
+    captured = {}
+    fake_execution = MagicMock(
+        exit_code=0,
+        logs=MagicMock(stdout=[MagicMock(text="ok")], stderr=[]),
+    )
+    fake_sandbox = MagicMock(kill=AsyncMock())
+    fake_sandbox.commands.run = AsyncMock(return_value=fake_execution)
+
+    async def fake_create(*args, **kwargs):
+        captured.update(kwargs)
+        return fake_sandbox
+
+    with patch("cc_harness.sandbox.Sandbox") as sdk:
+        sdk.create = fake_create
+        executor = SandboxExecutor(SandboxConfig(), project_root=tmp_path)
+        await executor.run({"command": "true"}, cwd=tmp_path)
+
+    mask = next(
+        volume for volume in captured["volumes"]
+        if volume.mount_path == "/workspace/.env"
+    )
+    mask_path = Path(mask.host.path)
+    assert mask.read_only is True
+    assert mask_path.read_bytes() == b""
+    assert secret not in mask_path.read_text(encoding="utf-8")
+
+
+@pytest.mark.asyncio
+async def test_new_workspace_secret_recreates_sandbox(tmp_path):
+    from cc_harness.config import SandboxConfig
+    from cc_harness.sandbox import SandboxExecutor
+
+    sandboxes = []
+
+    async def fake_create(*args, **kwargs):
+        execution = MagicMock(
+            exit_code=0,
+            logs=MagicMock(stdout=[MagicMock(text="ok")], stderr=[]),
+        )
+        sandbox = MagicMock(kill=AsyncMock())
+        sandbox.commands.run = AsyncMock(return_value=execution)
+        sandboxes.append(sandbox)
+        return sandbox
+
+    with patch("cc_harness.sandbox.Sandbox") as sdk:
+        sdk.create = fake_create
+        executor = SandboxExecutor(SandboxConfig(), project_root=tmp_path)
+        await executor.run({"command": "true"}, cwd=tmp_path)
+        first_mask_root = executor._mask_plan.root
+        (tmp_path / ".env").write_text("TOKEN=new-secret", encoding="utf-8")
+        await executor.run({"command": "true"}, cwd=tmp_path)
+
+    assert len(sandboxes) == 2
+    sandboxes[0].kill.assert_awaited_once()
+    assert executor._mask_plan.root == first_mask_root
+
+
+@pytest.mark.asyncio
+async def test_kill_removes_workspace_mask_root(tmp_path):
+    from cc_harness.config import SandboxConfig
+    from cc_harness.sandbox import SandboxExecutor
+
+    (tmp_path / ".env").write_text("TOKEN=secret", encoding="utf-8")
+    fake_execution = MagicMock(
+        exit_code=0,
+        logs=MagicMock(stdout=[MagicMock(text="ok")], stderr=[]),
+    )
+    fake_sandbox = MagicMock(kill=AsyncMock())
+    fake_sandbox.commands.run = AsyncMock(return_value=fake_execution)
+
+    with patch("cc_harness.sandbox.Sandbox") as sdk:
+        sdk.create = AsyncMock(return_value=fake_sandbox)
+        executor = SandboxExecutor(SandboxConfig(), project_root=tmp_path)
+        await executor.run({"command": "true"}, cwd=tmp_path)
+        mask_root = executor._mask_plan.root
+        assert mask_root.exists()
+        await executor.kill()
+
+    assert not mask_root.exists()
+    assert executor._mask_plan is None
 
 
 @pytest.mark.asyncio
@@ -232,8 +487,9 @@ async def test_kill_clears_sandbox_even_if_kill_raises(tmp_path):
         SDK.create = AsyncMock(return_value=fake_sandbox)
         ex = SandboxExecutor(SandboxConfig(), project_root=tmp_path)
         await ex.run({"command": "x"}, cwd=tmp_path)
-        await ex.kill()   # 不抛(kill 异常被吞)
+        destroyed = await ex.kill()   # 不抛,但通过返回值暴露清理失败
     assert ex._sandbox is None
+    assert destroyed is False
 
 
 def test_audit_fallback_writes_jsonl(tmp_path):

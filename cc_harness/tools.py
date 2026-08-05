@@ -1,12 +1,12 @@
 """Dangerous-command detection + user confirmation prompt + built-in tools."""
 from __future__ import annotations
+
 import os
 import re
-import sys
+from collections.abc import Awaitable, Callable
 from pathlib import Path
-from typing import Awaitable, Callable, Optional
 
-from cc_harness.config import ExecutorConfig, ExecutorBackend
+from cc_harness.config import ExecutorConfig
 from cc_harness.executor import Executor, NativeExecutor, build_executor
 from cc_harness.mcp_client import ToolResult
 
@@ -100,17 +100,20 @@ RUN_COMMAND_TIMEOUT_S = 30
 # --- Session-level executor singleton (Task 9) ---
 # 会话级复用:sandbox 容器跨命令复用,避免每条命令 cold-start。
 # repl 启动调 init_session_executor,repl 退出调 shutdown_session_executor。
-_session_executor: Optional[Executor] = None
-# 会话级 config(Phase 1 hard 模式):run_command 降级分支读 cfg.sandbox.fallback_on_error
-# 决定降级 / 报错。None = repl 外 lazy 路径(无 config → 现状降级)。
-_session_executor_config: Optional[ExecutorConfig] = None
+_session_executor: Executor | None = None
+# Retained so status surfaces can report the selected backend.
+_session_executor_config: ExecutorConfig | None = None
+
+
+class ExecutorNotInitializedError(RuntimeError):
+    """Raised when no session executor was explicitly selected."""
 
 
 def init_session_executor(config: ExecutorConfig, project_root: str | Path) -> None:
     """repl 启动调:按 config.backend 建会话级 executor(native 或 sandbox)。
 
     project_root 锁执行 cwd;sandbox 在容器内 mount 该根为只读。
-    存 config 供 run_command 降级分支读 fallback_on_error(hard 模式)。
+    Store config for status and diagnostics.
     """
     global _session_executor, _session_executor_config
     _session_executor = build_executor(config, Path(project_root))
@@ -118,21 +121,16 @@ def init_session_executor(config: ExecutorConfig, project_root: str | Path) -> N
 
 
 def get_session_executor() -> Executor:
-    """run_command 取;未 init(repl 外,如测试/脚本)lazy 兜底 NativeExecutor。
-
-    lazy 路径读 RUN_COMMAND_TIMEOUT_S AT CALL TIME(与历史行为一致,允许测试
-    monkeypatch 该常量)。project_root 默认当前目录(repl 外调用语义)。
-    """
-    global _session_executor
+    """Return the explicitly initialized executor or fail closed."""
     if _session_executor is None:
-        _session_executor = NativeExecutor(
-            project_root=Path("."), timeout_s=RUN_COMMAND_TIMEOUT_S,
+        raise ExecutorNotInitializedError(
+            "session executor is not initialized; command was not executed"
         )
     return _session_executor
 
 
 def reset_session_executor() -> None:
-    """测试隔离:清空单例,使下次 get 重新 lazy-init。"""
+    """Clear session executor state for test and lifecycle isolation."""
     global _session_executor, _session_executor_config
     _session_executor = None
     _session_executor_config = None
@@ -161,11 +159,6 @@ async def shutdown_session_executor() -> None:
     _session_executor = None
 
 
-def _native_fallback(cwd: str) -> NativeExecutor:
-    """sandbox 降级用的 native executor(隔离 cwd = per-call cwd)。"""
-    return NativeExecutor(project_root=Path(cwd), timeout_s=RUN_COMMAND_TIMEOUT_S)
-
-
 async def run_command(
     args: dict | str,
     *,
@@ -181,6 +174,17 @@ async def run_command(
     PTY interface and returns the subprocess exit code.
     """
     if use_pty:
+        try:
+            executor = get_session_executor()
+        except ExecutorNotInitializedError as exc:
+            if pty_writer is not None:
+                await pty_writer(f"[Tool Error] {exc}\n".encode())
+            return 126
+        if not isinstance(executor, NativeExecutor):
+            message = "PTY host execution requires the explicit native backend"
+            if pty_writer is not None:
+                await pty_writer(f"[Tool Error] {message}\n".encode())
+            return 126
         if os.name != "posix":
             raise NotImplementedError("PTY only supported on POSIX")
         import asyncio
@@ -196,7 +200,8 @@ async def run_command(
             proc = await asyncio.create_subprocess_exec(
                 "/bin/bash", "-c", command,
                 stdin=slave_fd, stdout=slave_fd, stderr=slave_fd,
-                cwd=str(cwd),
+                cwd=str(executor.project_root),
+                env=executor._build_env(),
             )
             os.close(slave_fd)
             slave_fd = -1
@@ -246,21 +251,17 @@ async def run_command(
     from cc_harness.sandbox import SandboxUnavailableError
     try:
         result = await get_session_executor().run(args, cwd=Path(cwd))
-    except SandboxUnavailableError:
-        # hard 模式:沙箱挂了不降级 → 返错(命令未执行)。
-        cfg = _session_executor_config
-        hard = (cfg is not None
-                and cfg.backend == ExecutorBackend.SANDBOX
-                and cfg.sandbox.fallback_on_error == "hard")
-        if hard:
-            result = ToolResult.error(
-                display="sandbox unavailable (hard mode — no native fallback)",
-                llm="[Tool Error] 沙箱不可用且 fallback_on_error=hard,命令未执行"
-                    "(防降级失真 + 防 secret 经降级路径外传)",
-            )
-        else:
-            print("[warn] 沙箱不可用,降级 native 执行(非隔离模式)", file=sys.stderr)
-            result = await _native_fallback(cwd).run(args, cwd=Path(cwd))
+    except ExecutorNotInitializedError as exc:
+        result = ToolResult.error(
+            display="executor not initialized; command was not executed",
+            llm=f"[Tool Error] {exc}",
+        )
+    except SandboxUnavailableError as exc:
+        result = ToolResult.error(
+            display="sandbox unavailable; command was not executed",
+            llm=("[Tool Error] sandbox unavailable; command was not executed and host fallback "
+                 f"is disabled: {exc}"),
+        )
     if scalar_command:
         return 0 if not result.is_error else 1
     return result
@@ -273,8 +274,8 @@ RUN_COMMAND_SPEC = {
     "function": {
         "name": "run_command",
         "description": (
-            "Execute a shell command on the local machine and return its stdout. "
-            "The command runs in the project root with a 30s timeout. "
+            "Execute a shell command through the configured session executor and return stdout. "
+            "The command runs in the project root with a bounded timeout. "
             "Dangerous commands (rm -rf, format, drop database, etc.) require "
             "user confirmation. Use this for running scripts, git commands, "
             "listing files, etc."

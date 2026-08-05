@@ -1,0 +1,91 @@
+name: sandbox conformance
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "31 19 * * 3"
+
+permissions:
+  contents: read
+
+jobs:
+  linux-docker:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      - uses: astral-sh/setup-uv@v6
+      - name: Install locked sandbox runtime
+        run: uv sync --extra sandbox
+      - name: Run real sandbox probes
+        run: uv run python scripts/run_sandbox_conformance.py
+      - name: Preserve conformance evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: sandbox-conformance-${{ github.run_id }}
+          if-no-files-found: error
+          retention-days: 30
+          path: eval/result/sandbox-conformance/
+
+  windows-docker:
+    if: ${{ vars.SANDBOX_WINDOWS_RUNNER == 'enabled' }}
+    runs-on: [self-hosted, windows, sandbox-conformance]
+    timeout-minutes: 45
+
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      - uses: astral-sh/setup-uv@v6
+      - name: Install locked sandbox runtime
+        run: uv sync --extra sandbox
+      - name: Run real sandbox probes
+        run: uv run python scripts/run_sandbox_conformance.py
+      - name: Preserve conformance evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: sandbox-conformance-windows-${{ github.run_id }}
+          if-no-files-found: error
+          retention-days: 30
+          path: eval/result/sandbox-conformance/
+
+  release-readiness:
+    if: always()
+    needs: [linux-docker, windows-docker]
+    runs-on: ubuntu-latest
+    permissions:
+      actions: read
+      contents: read
+
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      - uses: astral-sh/setup-uv@v6
+      - run: uv sync
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: sandbox-conformance-*
+          path: collected-sandbox-evidence
+          merge-multiple: true
+      - name: Evaluate release readiness without promoting claims
+        run: >-
+          uv run python scripts/check_sandbox_release_gate.py
+          --evidence-dir collected-sandbox-evidence
+          --output collected-sandbox-evidence/release-gate.json
+          --report-only
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: sandbox-release-readiness-${{ github.run_id }}
+          if-no-files-found: error
+          retention-days: 30
+          path: collected-sandbox-evidence/release-gate.json

@@ -1,5 +1,7 @@
 from pathlib import Path
 
+import pytest
+
 from cc_harness.policy import Action, PolicyEngine
 
 ROOT = Path("C:/proj")  # 测试用绝对根
@@ -160,6 +162,18 @@ def test_sensitive_credential_inside_workspace_is_deny():
     d = _engine().evaluate(
         "mcp__filesystem__read_file",
         {"path": str(ROOT / ".env")},
+        {"project_root": ROOT},
+    )
+
+    assert d.action is Action.DENY
+    assert d.rule_id == "sensitive_credential_path"
+
+
+@pytest.mark.parametrize("relative_path", [".cc-harness/session.json", ".git/config"])
+def test_internal_credential_stores_inside_workspace_are_deny(relative_path):
+    d = _engine().evaluate(
+        "mcp__filesystem__read_file",
+        {"path": str(ROOT / relative_path)},
         {"project_root": ROOT},
     )
 

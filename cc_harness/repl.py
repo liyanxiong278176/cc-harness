@@ -634,6 +634,14 @@ async def run_repl(
                 await drift_detector._drain(timeout_s=5.0)
             except Exception as e:
                 print_warn(console, f"drift_detector _drain failed: {e}")
+        from cc_harness.memory.extras import close_memory_deps
+
+        await close_memory_deps(state.mem_deps)
+        if l2_client is not None:
+            try:
+                await l2_client.close()
+            except Exception as e:
+                print_warn(console, f"L2 client close failed: {e}")
         # 主循环退出(正常 exit / EOF / Ctrl-C / 异常)→ shutdown 会话级 executor。
         # async,非 atexit;sandbox 时 kill 容器 + shutdown_owned_server,best-effort。
         await shutdown_session_executor()

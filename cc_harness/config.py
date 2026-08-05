@@ -1,12 +1,14 @@
+import ipaddress
 import json
 import logging
 import os
+import re
 from enum import Enum
 from pathlib import Path
-from typing import Literal, TYPE_CHECKING
+from typing import TYPE_CHECKING, Literal
 
 from dotenv import dotenv_values, load_dotenv
-from pydantic import BaseModel, model_validator
+from pydantic import BaseModel, Field, field_validator, model_validator
 
 if TYPE_CHECKING:
     # Runtime import would be circular (memory.config re-exports load_memory_config).
@@ -223,67 +225,119 @@ class ExecutorBackend(str, Enum):
     SANDBOX = "sandbox"
 
 
-class SandboxConfig(BaseModel):
-    """沙箱执行器配置(policy.yaml 的 executor.sandbox 段)。
+class SandboxVaultCredential(BaseModel):
+    name: str = Field(min_length=1, pattern=r"^[a-zA-Z0-9_.-]+$")
+    env_var: str = Field(min_length=1, pattern=r"^[A-Z_][A-Z0-9_]*$")
 
-    RESERVED(deferred — SDK 锁定时消费):cpu / memory_mb / egress_allow / vault 四字段
-    解析但暂未传入 Sandbox.create。真 SDK kwargs 是 resource= / network_policy= /
-    credential_proxy=(Task 12 WebSearch 发现锁定);当前 _ensure_sandbox 的 create kwargs
-    仍是 placeholder(mounts=/workdir=)。server_host / server_port 已在 Gap 1 后生效(经
-    ensure_server + ConnectionConfig domain)。timeout_s 同样已消费。
-    """
+
+class SandboxVaultBinding(BaseModel):
+    name: str = Field(min_length=1, pattern=r"^[a-zA-Z0-9_.-]+$")
+    credential: str = Field(min_length=1)
+    hosts: list[str] = Field(min_length=1)
+    auth_type: Literal["bearer", "apiKey"] = "bearer"
+    header_name: str | None = None
+    schemes: list[Literal["https", "http"]] = ["https"]
+    methods: list[str] | None = None
+    paths: list[str] | None = None
+
+    @model_validator(mode="after")
+    def _validate_auth(self) -> "SandboxVaultBinding":
+        if self.auth_type == "apiKey" and not self.header_name:
+            raise ValueError("apiKey vault bindings require header_name")
+        if self.auth_type == "bearer" and self.header_name is not None:
+            raise ValueError("bearer vault bindings cannot set header_name")
+        return self
+
+
+class SandboxConfig(BaseModel):
+    """Sandbox executor settings enforced through OpenSandbox 0.1.15."""
     server_host: str = "127.0.0.1"   # 用 127.0.0.1 非 localhost(Windows IPv6 ::1 连不上绑 127.0.0.1 的 server)
     server_port: int = 8000
+    server_config_path: Path | None = None
+    require_external_attestation: bool = True
     image: str = "cc-harness-runtime:local"
-    timeout_s: int = 120          # 沙箱命令超时(比 native 30s 长,含容器开销)
-    cpu: int = 2                  # RESERVED → SDK resource=(Task 12 锁定)
-    memory_mb: int = 2048         # RESERVED → SDK resource=(Task 12 锁定)
+    timeout_s: int = Field(default=120, ge=1, le=3600)
+    cpu: int = Field(default=2, ge=1, le=64)
+    memory_mb: int = Field(default=2048, ge=128, le=131072)
+    pids_limit: int = Field(default=256, ge=32, le=4096)
     egress_allow: list[str] = ["api.deepseek.com", "api.siliconflow.cn",
-                               "pypi.org", "github.com"]   # RESERVED → SDK network_policy=
-    vault: bool = True            # RESERVED → SDK credential_proxy=(Credential Vault;失败退化 strip_secrets)
-    # hard 模式(报错不降级,红队严格测)Plan 2 红队适配时实现;当前仅 native 降级生效
-    # (tools.run_command 无条件 catch SandboxUnavailableError → 降级,不读本字段)。
-    fallback_on_error: str = "native"   # native(降级) | hard(报错)
+                               "pypi.org", "github.com"]
+    vault: bool = False
+    vault_credentials: list[SandboxVaultCredential] = []
+    vault_bindings: list[SandboxVaultBinding] = []
+    # Compatibility field for old policy files. Runtime fallback is always hard;
+    # explicit host execution uses executor.backend=native instead.
+    fallback_on_error: str = "hard"
 
     model_config = {"extra": "ignore"}
 
+    @field_validator("egress_allow")
+    @classmethod
+    def _validate_egress_allow(cls, values: list[str]) -> list[str]:
+        normalized: list[str] = []
+        for raw in values:
+            value = raw.strip().lower().rstrip(".")
+            candidate = value.removeprefix("*.")
+            if (
+                not candidate
+                or "://" in value
+                or "/" in value
+                or ":" in value
+                or value == "*"
+                or candidate == "localhost"
+            ):
+                raise ValueError(f"invalid sandbox egress domain: {raw!r}")
+            try:
+                ipaddress.ip_address(candidate)
+            except ValueError:
+                pass
+            else:
+                raise ValueError(f"sandbox egress rules must use domains, not IPs: {raw!r}")
+            labels = candidate.split(".")
+            if len(labels) < 2 or any(
+                not re.fullmatch(r"[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?", label)
+                for label in labels
+            ):
+                raise ValueError(f"invalid sandbox egress domain: {raw!r}")
+            if value not in normalized:
+                normalized.append(value)
+        return normalized
+
     @model_validator(mode="after")
-    def _warn_unwired_reserved_fields(self) -> "SandboxConfig":
-        reserved_defaults = {
-            "cpu": 2,
-            "memory_mb": 2048,
-            "egress_allow": [
-                "api.deepseek.com", "api.siliconflow.cn", "pypi.org", "github.com",
-            ],
-            "vault": True,
-        }
-        changed = [
-            name for name, default in reserved_defaults.items()
-            if getattr(self, name) != default
-        ]
-        if changed:
-            log.warning(
-                "Sandbox reserved fields are not wired and will be ignored: %s",
-                ", ".join(changed),
-            )
+    def _validate_vault(self) -> "SandboxConfig":
+        if not self.vault and (self.vault_credentials or self.vault_bindings):
+            raise ValueError("vault credentials and bindings require vault=true")
+        if self.vault and (not self.vault_credentials or not self.vault_bindings):
+            raise ValueError("vault=true requires credentials and bindings")
+        credential_names = [item.name for item in self.vault_credentials]
+        binding_names = [item.name for item in self.vault_bindings]
+        if len(credential_names) != len(set(credential_names)):
+            raise ValueError("vault credential names must be unique")
+        if len(binding_names) != len(set(binding_names)):
+            raise ValueError("vault binding names must be unique")
+        known = set(credential_names)
+        for binding in self.vault_bindings:
+            if binding.credential not in known:
+                raise ValueError(
+                    f"vault binding {binding.name!r} references unknown credential"
+                )
         return self
 
 
 class ExecutorConfig(BaseModel):
-    """执行后端配置。缺省 native(现状);sandbox 启用 OpenSandbox。"""
-    enabled: bool = True          # 总开关:false = 强制 native(紧急回退)
-    backend: ExecutorBackend = ExecutorBackend.NATIVE
+    """Execution backend config; sandbox is the fail-closed default."""
+    enabled: bool = True          # compatibility only; false cannot select host execution
+    backend: ExecutorBackend = ExecutorBackend.SANDBOX
     sandbox: SandboxConfig = SandboxConfig()
 
     model_config = {"extra": "ignore"}
 
 
 def load_executor_config(path: Path) -> ExecutorConfig:
-    """读 policy.yaml 的 `executor:` 段;文件/段缺失→默认(native)。
+    """Read executor config; missing configuration defaults to sandbox.
 
-    env CC_HARNESS_SANDBOX_FALLBACK=hard|native 覆盖 sandbox.fallback_on_error
-    (红队 allow 模式 wrapper 注,绑死:测沙箱时沙箱挂了不降级 → 防 L8 失真 +
-    防 CI secret 经降级路径泄露)。hard 优先级高于 policy.yaml。
+    ``CC_HARNESS_EXECUTOR_BACKEND=native`` is an explicit host-execution opt-in.
+    The legacy fallback setting is accepted but normalized to fail-closed.
     """
     if not path.exists():
         cfg = ExecutorConfig()
@@ -292,10 +346,12 @@ def load_executor_config(path: Path) -> ExecutorConfig:
         raw = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
         cfg = ExecutorConfig(**(raw.get("executor") or {}))
     fallback_env = os.getenv("CC_HARNESS_SANDBOX_FALLBACK", "").strip().lower()
-    if fallback_env in ("hard", "native"):
-        cfg.sandbox.fallback_on_error = fallback_env
-    # env override backend(allow 红队强制 sandbox:CI 无 policy.yaml 时默认 native,
-    # allow 模式不强制 sandbox → 命令进 NativeExecutor 在宿主跑 → L8 假数据 + 真泄露)。
+    if fallback_env == "native" or cfg.sandbox.fallback_on_error == "native":
+        log.warning(
+            "sandbox native fallback is retired; use executor.backend=native "
+            "for explicit host execution"
+        )
+    cfg.sandbox.fallback_on_error = "hard"
     backend_env = os.getenv("CC_HARNESS_EXECUTOR_BACKEND", "").strip().lower()
     if backend_env in ("sandbox", "native"):
         cfg.backend = ExecutorBackend(backend_env)

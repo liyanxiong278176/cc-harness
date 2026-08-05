@@ -2,9 +2,9 @@ import subprocess
 import sys
 import tomllib
 from pathlib import Path
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
-from unittest.mock import patch, AsyncMock, MagicMock
 
 
 @pytest.fixture(autouse=True)
@@ -12,6 +12,7 @@ def _reset_owned_proc():
     yield
     from cc_harness import sandbox_server as ss
     ss._OWNED_PROC[0] = None
+    ss._TRUSTED_ENDPOINTS.clear()
 
 
 @pytest.mark.asyncio
@@ -39,9 +40,10 @@ async def test_ensure_server_reuses_existing(monkeypatch):
     """server 已在跑 → 复用,不 fork,标记 external。"""
     from cc_harness import sandbox_server as ss
     monkeypatch.setattr(ss, "ping", AsyncMock(return_value=True))
+    monkeypatch.setattr(ss, "health", AsyncMock(return_value=True))
     fork = MagicMock()
     monkeypatch.setattr(ss, "_fork_server", fork)
-    state = await ss.ensure_server(port=8000)
+    state = await ss.ensure_server(port=8000, require_external_attestation=False)
     assert state.owned is False
     fork.assert_not_called()
 
@@ -54,6 +56,11 @@ async def test_ensure_server_starts_when_absent(monkeypatch):
     monkeypatch.setattr(ss, "_docker_available", MagicMock(return_value=True))
     # _fork_server 在 impl 里被 await,故用 AsyncMock(plan 原文 MagicMock 不可 await)
     monkeypatch.setattr(ss, "_fork_server", AsyncMock())
+    monkeypatch.setattr(
+        ss,
+        "attest_server_config",
+        MagicMock(return_value=ss.ServerState(owned=False, attested=True)),
+    )
     state = await ss.ensure_server(port=8000)
     assert state.owned is True
 
@@ -116,4 +123,144 @@ def test_set_allowed_host_paths_toml_round_trip(tmp_path):
     data = tomllib.loads(config.read_text(encoding="utf-8"))
     assert data["server"]["port"] == 8000
     assert data["storage"]["allowed_host_paths"] == [raw_path]
+
+
+def test_set_egress_mode_upgrades_existing_dns_mode(tmp_path):
+    from cc_harness.sandbox_server import _set_egress_mode
+
+    config = tmp_path / "server.toml"
+    config.write_text(
+        '[server]\nport = 8000\n\n[egress]\nimage = "egress:test"\nmode = "dns"\n',
+        encoding="utf-8",
+    )
+
+    _set_egress_mode(config)
+
+    data = tomllib.loads(config.read_text(encoding="utf-8"))
+    assert data["egress"]["image"] == "egress:test"
+    assert data["egress"]["mode"] == "dns+nft"
+
+
+def test_set_egress_mode_adds_missing_section(tmp_path):
+    from cc_harness.sandbox_server import _set_egress_mode
+
+    config = tmp_path / "server.toml"
+    config.write_text('[server]\nport = 8000\n', encoding="utf-8")
+
+    _set_egress_mode(config)
+
+    data = tomllib.loads(config.read_text(encoding="utf-8"))
+    assert data["egress"] == {
+        "image": "opensandbox/egress:v1.1.4",
+        "mode": "dns+nft",
+    }
+
+
+def test_set_egress_mode_adds_mode_only_inside_existing_section(tmp_path):
+    from cc_harness.sandbox_server import _set_egress_mode
+
+    config = tmp_path / "server.toml"
+    config.write_text(
+        '[egress]\nimage = "egress:test"\n\n[unrelated]\nmode = "keep-me"\n',
+        encoding="utf-8",
+    )
+
+    _set_egress_mode(config)
+
+    data = tomllib.loads(config.read_text(encoding="utf-8"))
+    assert data["egress"]["mode"] == "dns+nft"
+    assert data["unrelated"]["mode"] == "keep-me"
+
+
+def _write_attested_config(path: Path, root: Path, *, egress_mode: str = "dns+nft") -> None:
+    normalized = str(root).replace("\\", "\\\\")
+    path.write_text(
+        f'''[server]\nhost = "127.0.0.1"\nport = 8000\n\n'''
+        f'''[runtime]\ntype = "docker"\n\n'''
+        f'''[egress]\nmode = "{egress_mode}"\n\n'''
+        f'''[storage]\nallowed_host_paths = ["{normalized}"]\n\n'''
+        '''[docker]\npids_limit = 256\nno_new_privileges = true\n'''
+        '''drop_capabilities = ["NET_ADMIN", "SYS_ADMIN", "SYS_MODULE", "SYS_PTRACE"]\n''',
+        encoding="utf-8",
+    )
+
+
+def test_attest_server_config_accepts_required_security_controls(tmp_path):
+    from cc_harness.sandbox_server import attest_server_config
+
+    config = tmp_path / "external.toml"
+    _write_attested_config(config, tmp_path)
+
+    state = attest_server_config(
+        config,
+        host="127.0.0.1",
+        port=8000,
+        required_host_paths=[str(tmp_path / "project")],
+        max_pids=256,
+    )
+
+    assert state.attested is True
+    assert state.egress_mode == "dns+nft"
+    assert state.config_digest.startswith("sha256:")
+
+
+@pytest.mark.parametrize(
+    ("mutate", "expected"),
+    [
+        (lambda text: text.replace('mode = "dns+nft"', 'mode = "dns"'), "egress.mode"),
+        (lambda text: text.replace("pids_limit = 256", "pids_limit = 4096"), "pids_limit"),
+        (
+            lambda text: text.replace(
+                'drop_capabilities = ["NET_ADMIN", "SYS_ADMIN", "SYS_MODULE", "SYS_PTRACE"]',
+                'drop_capabilities = ["NET_ADMIN"]',
+            ),
+            "drop_capabilities",
+        ),
+    ],
+)
+def test_attest_server_config_rejects_security_mismatch(tmp_path, mutate, expected):
+    from cc_harness.sandbox_server import ServerAttestationError, attest_server_config
+
+    config = tmp_path / "external.toml"
+    _write_attested_config(config, tmp_path)
+    config.write_text(mutate(config.read_text(encoding="utf-8")), encoding="utf-8")
+
+    with pytest.raises(ServerAttestationError, match=expected):
+        attest_server_config(
+            config,
+            host="127.0.0.1",
+            port=8000,
+            required_host_paths=[str(tmp_path / "project")],
+            max_pids=256,
+        )
+
+
+@pytest.mark.asyncio
+async def test_external_server_without_attestation_fails_closed(monkeypatch):
+    from cc_harness import sandbox_server as ss
+
+    monkeypatch.setattr(ss, "ping", AsyncMock(return_value=True))
+    monkeypatch.setattr(ss, "health", AsyncMock(return_value=True))
+
+    with pytest.raises(ss.ServerAttestationError, match="server_config_path"):
+        await ss.ensure_server(port=8000)
+
+
+def test_set_docker_security_pins_pid_and_privilege_controls(tmp_path):
+    from cc_harness.sandbox_server import _set_docker_security
+
+    config = tmp_path / "server.toml"
+    config.write_text(
+        "[docker]\npids_limit = 4096\nno_new_privileges = false\n",
+        encoding="utf-8",
+    )
+
+    _set_docker_security(config, 128)
+
+    data = tomllib.loads(config.read_text(encoding="utf-8"))
+    assert data["docker"]["pids_limit"] == 128
+    assert data["docker"]["no_new_privileges"] is True
+    assert {"NET_ADMIN", "SYS_ADMIN", "SYS_MODULE", "SYS_PTRACE"}.issubset(
+        data["docker"]["drop_capabilities"]
+    )
 

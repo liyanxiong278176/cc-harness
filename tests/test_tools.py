@@ -57,9 +57,19 @@ def test_fork_bomb_caught():
 
 # --- run_command: built-in tool ---
 
+
+def _init_native(root, *, timeout_s=None):
+    from cc_harness import tools
+    from cc_harness.config import ExecutorBackend, ExecutorConfig
+
+    tools.init_session_executor(ExecutorConfig(backend=ExecutorBackend.NATIVE), root)
+    if timeout_s is not None:
+        tools.get_session_executor().timeout_s = timeout_s
+
 def test_run_command_happy_path(tmp_path):
     """A simple echo-style command returns its stdout."""
     import asyncio
+    _init_native(tmp_path)
     result = asyncio.run(run_command(
         {"command": "echo hello"},
         cwd=str(tmp_path),
@@ -77,11 +87,13 @@ def test_run_command_respects_cwd(tmp_path):
     """
     import asyncio
     from cc_harness import tools
-    from cc_harness.config import ExecutorConfig
+    from cc_harness.config import ExecutorBackend, ExecutorConfig
     sub = tmp_path / "subdir"
     sub.mkdir()
     (sub / "marker.txt").write_text("HERE", encoding="utf-8")
-    tools.init_session_executor(ExecutorConfig(), str(sub))
+    tools.init_session_executor(
+        ExecutorConfig(backend=ExecutorBackend.NATIVE), str(sub),
+    )
     result = asyncio.run(run_command(
         {"command": "type marker.txt"} if _is_windows() else {"command": "cat marker.txt"},
         cwd=str(sub),
@@ -89,8 +101,9 @@ def test_run_command_respects_cwd(tmp_path):
     assert "HERE" in result.llm_text
 
 
-def test_run_command_nonzero_exit_returns_error():
+def test_run_command_nonzero_exit_returns_error(tmp_path):
     import asyncio
+    _init_native(tmp_path)
     result = asyncio.run(run_command(
         {"command": "exit 7"},
         cwd=".",
@@ -99,28 +112,31 @@ def test_run_command_nonzero_exit_returns_error():
     assert "7" in result.llm_text or "exit" in result.llm_text.lower()
 
 
-def test_run_command_empty_command_returns_error():
+def test_run_command_empty_command_returns_error(tmp_path):
     import asyncio
+    _init_native(tmp_path)
     for empty in ("", "   "):
         result = asyncio.run(run_command({"command": empty}, cwd="."))
         assert result.is_error is True
         assert "non-empty" in result.llm_text or "must be" in result.llm_text
 
 
-def test_run_command_non_string_command_returns_error():
+def test_run_command_non_string_command_returns_error(tmp_path):
     import asyncio
+    _init_native(tmp_path)
     result = asyncio.run(run_command({"command": 123}, cwd="."))
     assert result.is_error is True
     assert "string" in result.llm_text
 
 
-def test_run_command_timeout(monkeypatch):
+def test_run_command_timeout(monkeypatch, tmp_path):
     """A command that exceeds the timeout returns a timeout error."""
     import asyncio
     from cc_harness import tools as tools_mod
 
     # Patch the timeout to something tiny so the test is fast.
     monkeypatch.setattr(tools_mod, "RUN_COMMAND_TIMEOUT_S", 0.5)
+    _init_native(tmp_path, timeout_s=0.5)
 
     result = asyncio.run(run_command(
         # On Windows, `timeout` is not a builtin. Use Python's sleep instead.
@@ -130,6 +146,18 @@ def test_run_command_timeout(monkeypatch):
     ))
     assert result.is_error is True
     assert "timeout" in result.llm_text.lower()
+
+
+@pytest.mark.asyncio
+async def test_run_command_without_initialized_executor_fails_closed(tmp_path):
+    from cc_harness import tools
+
+    tools.reset_session_executor()
+    result = await tools.run_command({"command": "echo should-not-run"}, cwd=str(tmp_path))
+
+    assert result.is_error
+    assert "not initialized" in result.llm_text
+    assert "not executed" in result.llm_text
 
 
 # --- run_command: spec shape (for OpenAI function-calling) ---
@@ -234,19 +262,16 @@ def test_init_then_get_returns_same(monkeypatch, tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_run_falls_back_to_native_on_sandbox_unavailable(monkeypatch, tmp_path):
-    """sandbox 连败 → run 内部降级 native(用户无感,警告)。"""
+async def test_run_fails_closed_when_sandbox_unavailable(monkeypatch, tmp_path):
+    """A sandbox outage must never dispatch the command on the host."""
     from cc_harness import tools
     from cc_harness.sandbox import SandboxUnavailableError
     sb = MagicMock()
     sb.run = AsyncMock(side_effect=SandboxUnavailableError("down"))
-    native = MagicMock()
-    native.run = AsyncMock(return_value=MagicMock(llm_text="fallback", error=False))
     monkeypatch.setattr(tools, "get_session_executor", lambda: sb)
-    monkeypatch.setattr(tools, "_native_fallback",
-                        lambda cwd: native)
     result = await tools.run_command({"command": "echo"}, cwd=str(tmp_path))
-    assert "fallback" in result.llm_text
+    assert result.is_error
+    assert "not executed" in result.llm_text
 
 
 @pytest.mark.asyncio
@@ -267,16 +292,9 @@ async def test_run_command_hard_mode_no_fallback(monkeypatch, tmp_path):
     sb.run = AsyncMock(side_effect=SandboxUnavailableError("down"))
     monkeypatch.setattr(tools, "get_session_executor", lambda: sb)
 
-    native_called = []
-    native = MagicMock()
-    native.run = AsyncMock(return_value=MagicMock(llm_text="SHOULD-NOT-HAPPEN", error=False))
-    monkeypatch.setattr(tools, "_native_fallback",
-                        lambda cwd: native_called.append(cwd) or native)
-
     result = await tools.run_command({"command": "echo"}, cwd=str(tmp_path))
     assert result.is_error
-    assert "hard" in result.llm_text or "未执行" in result.llm_text
-    assert not native_called, "hard 模式不应降级 native"
+    assert "not executed" in result.llm_text
 
 
 @pytest.mark.asyncio

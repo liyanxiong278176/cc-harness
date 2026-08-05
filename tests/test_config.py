@@ -1,14 +1,21 @@
 import json
-import logging
 import subprocess
 import sys
 from pathlib import Path
 
 import pytest
+from pydantic import ValidationError
 
-from cc_harness.config import (AppConfig, MCPServerConfig, ConfigError, load_config,
-                                ExecutorConfig, ExecutorBackend, SandboxConfig,
-                                load_executor_config)
+from cc_harness.config import (
+    AppConfig,
+    ConfigError,
+    ExecutorBackend,
+    ExecutorConfig,
+    MCPServerConfig,
+    SandboxConfig,
+    load_config,
+    load_executor_config,
+)
 
 
 def test_stdio_server_config():
@@ -219,10 +226,11 @@ def test_load_l5_config_missing_file_returns_defaults(tmp_path):
     assert c.keys_on is True and c.pii_on is True
 
 
-def test_executor_config_defaults_native():
+def test_executor_config_defaults_sandbox_fail_closed():
     cfg = ExecutorConfig()
     assert cfg.enabled is True
-    assert cfg.backend is ExecutorBackend.NATIVE   # 缺省 native(降级安全)
+    assert cfg.backend is ExecutorBackend.SANDBOX
+    assert cfg.sandbox.fallback_on_error == "hard"
     assert cfg.sandbox.server_port == 8000
 
 
@@ -243,23 +251,90 @@ def test_load_executor_config_reads_yaml(tmp_path):
 
 def test_load_executor_config_missing_file_returns_default():
     cfg = load_executor_config(Path("/nonexistent/policy.yaml"))
-    assert cfg.backend is ExecutorBackend.NATIVE   # 无文件 = native(现状)
+    assert cfg.backend is ExecutorBackend.SANDBOX
 
 
-def test_sandbox_reserved_nondefaults_warn_while_unwired(caplog):
-    with caplog.at_level(logging.WARNING, logger="cc_harness.config"):
-        SandboxConfig(cpu=4, memory_mb=4096, egress_allow=["example.com"], vault=False)
+def test_sandbox_security_defaults():
+    cfg = SandboxConfig()
 
-    warning = "\n".join(record.getMessage() for record in caplog.records)
-    for field in ("cpu", "memory_mb", "egress_allow", "vault"):
-        assert field in warning
-    assert "not wired" in warning
+    assert cfg.cpu == 2
+    assert cfg.memory_mb == 2048
+    assert cfg.vault is False
+    assert cfg.pids_limit == 256
+    assert cfg.require_external_attestation is True
 
 
-def test_sandbox_reserved_defaults_do_not_warn(caplog):
-    with caplog.at_level(logging.WARNING, logger="cc_harness.config"):
-        SandboxConfig()
-    assert not caplog.records
+def test_vault_requires_complete_named_credential_bindings():
+    with pytest.raises(Exception, match="requires credentials and bindings"):
+        SandboxConfig(vault=True)
+
+    with pytest.raises(Exception, match="unknown credential"):
+        SandboxConfig(
+            vault=True,
+            vault_credentials=[{"name": "known", "env_var": "KNOWN_TOKEN"}],
+            vault_bindings=[{
+                "name": "binding",
+                "credential": "missing",
+                "hosts": ["api.deepseek.com"],
+            }],
+        )
+
+
+def test_api_key_vault_binding_requires_header_name():
+    with pytest.raises(Exception, match="header_name"):
+        SandboxConfig(
+            vault=True,
+            vault_credentials=[{"name": "api", "env_var": "API_TOKEN"}],
+            vault_bindings=[{
+                "name": "binding",
+                "credential": "api",
+                "hosts": ["api.deepseek.com"],
+                "auth_type": "apiKey",
+            }],
+        )
+
+
+def test_sandbox_egress_domains_are_normalized_and_deduplicated():
+    cfg = SandboxConfig(
+        egress_allow=[" API.DeepSeek.COM. ", "api.deepseek.com", "*.Example.COM."],
+    )
+
+    assert cfg.egress_allow == ["api.deepseek.com", "*.example.com"]
+
+
+@pytest.mark.parametrize(
+    "target",
+    [
+        "https://example.com",
+        "example.com/path",
+        "example.com:443",
+        "*",
+        "localhost",
+        "127.0.0.1",
+        "[::1]",
+        "not_a_domain",
+        "-bad.example",
+    ],
+)
+def test_sandbox_rejects_unsafe_egress_targets(target):
+    with pytest.raises(Exception, match="sandbox egress"):
+        SandboxConfig(egress_allow=[target])
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("cpu", 0),
+        ("cpu", 65),
+        ("memory_mb", 127),
+        ("memory_mb", 131073),
+        ("timeout_s", 0),
+        ("timeout_s", 3601),
+    ],
+)
+def test_sandbox_rejects_out_of_range_resource_settings(field, value):
+    with pytest.raises(ValidationError):
+        SandboxConfig(**{field: value})
 
 
 def test_load_executor_config_env_override_fallback(monkeypatch):
@@ -271,14 +346,14 @@ def test_load_executor_config_env_override_fallback(monkeypatch):
 
     monkeypatch.setenv("CC_HARNESS_SANDBOX_FALLBACK", "native")
     cfg2 = load_executor_config(Path("/nonexistent/policy.yaml"))
-    assert cfg2.sandbox.fallback_on_error == "native"
+    assert cfg2.sandbox.fallback_on_error == "hard"
 
 
 def test_load_executor_config_env_override_ignores_garbage(monkeypatch):
-    """非法 env 值 → 不 override(保留默认 native,fail-safe)。"""
+    """Invalid fallback values retain the fail-closed default."""
     monkeypatch.setenv("CC_HARNESS_SANDBOX_FALLBACK", "maybe")
     cfg = load_executor_config(Path("/nonexistent/policy.yaml"))
-    assert cfg.sandbox.fallback_on_error == "native"
+    assert cfg.sandbox.fallback_on_error == "hard"
 
 
 def test_load_executor_config_env_override_backend(monkeypatch):
@@ -294,7 +369,7 @@ def test_load_executor_config_env_override_backend(monkeypatch):
 
     monkeypatch.setenv("CC_HARNESS_EXECUTOR_BACKEND", "maybe")
     cfg3 = load_executor_config(Path("/nonexistent/policy.yaml"))
-    assert cfg3.backend is ExecutorBackend.NATIVE   # 非法 → 默认 fail-safe
+    assert cfg3.backend is ExecutorBackend.SANDBOX
 
 
 # --- ContextConfig (Plan3 Task2) ---

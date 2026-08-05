@@ -89,7 +89,8 @@ def build_executor(cfg, project_root: Path) -> Executor:
     (无 [sandbox] extra 的环境也能 import executor.py)。
     """
     from cc_harness.config import ExecutorBackend
-    if not cfg.enabled or cfg.backend is ExecutorBackend.NATIVE:
+    # Legacy ``enabled=false`` must not silently select host execution.
+    if cfg.backend is ExecutorBackend.NATIVE:
         return NativeExecutor(project_root=project_root)
     from cc_harness.sandbox import SandboxExecutor
     return SandboxExecutor(cfg.sandbox, project_root=project_root)
