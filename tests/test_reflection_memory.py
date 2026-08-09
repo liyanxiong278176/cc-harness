@@ -11,12 +11,21 @@ import pytest
 from unittest.mock import MagicMock, AsyncMock
 
 
-@pytest.mark.asyncio
-async def test_store_search_reflections_filters_by_source(tmp_path):
-    """search_reflections 只返 source='reflection' 的 Memory,且按时间倒序。"""
+@pytest.fixture
+async def store(tmp_path):
     from cc_harness.memory.store import MemoryStore
-    store = MemoryStore(tmp_path / "mem.db", embedding_dim=4)
-    await store.init_schema()
+
+    value = MemoryStore(tmp_path / "mem.db", embedding_dim=4)
+    await value.init_schema()
+    try:
+        yield value
+    finally:
+        await value.close()
+
+
+@pytest.mark.asyncio
+async def test_store_search_reflections_filters_by_source(store):
+    """search_reflections 只返 source='reflection' 的 Memory,且按时间倒序。"""
     emb = [0.1, 0.2, 0.3, 0.4]
     # 加 3 条:llm / pipeline / reflection
     await store.add("普通记忆", emb, "llm", session_id="s1")
@@ -33,11 +42,8 @@ async def test_store_search_reflections_filters_by_source(tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_store_search_reflections_respects_lookback(tmp_path):
+async def test_store_search_reflections_respects_lookback(store):
     """lookback_h 内的才返,外的不返。"""
-    from cc_harness.memory.store import MemoryStore
-    store = MemoryStore(tmp_path / "mem.db", embedding_dim=4)
-    await store.init_schema()
     emb = [0.1, 0.2, 0.3, 0.4]
     await store.add("老反思", emb, "reflection", session_id="s1")
     # 把 created_at 改到 100h 前
@@ -100,13 +106,10 @@ async def test_decider_no_recent_reflections_works():
 
 
 @pytest.mark.asyncio
-async def test_service_save_injects_recent_reflections_to_decider(tmp_path):
+async def test_service_save_injects_recent_reflections_to_decider(store):
     """MemoryService.save 调 decider 前召 search_reflections 并注入。"""
-    from cc_harness.memory.store import MemoryStore
     from cc_harness.memory.service import MemoryService
 
-    store = MemoryStore(tmp_path / "mem.db", embedding_dim=4)
-    await store.init_schema()
     # 预存 1 条反思
     await store.add("已有反思", [0.1, 0.2, 0.3, 0.4], "reflection", session_id="s1")
     # Fake embedder + decider

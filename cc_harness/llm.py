@@ -1,7 +1,11 @@
 """OpenAI-compatible LLM client with native tool_calls streaming."""
+
 from __future__ import annotations
+
+from collections.abc import AsyncIterator
 from dataclasses import dataclass, field
-from typing import Any, AsyncIterator, Literal
+from typing import Any, Literal
+
 from openai import AsyncOpenAI
 
 from cc_harness.tokens import UsageRecord
@@ -24,9 +28,11 @@ def _contains_image(messages: list[dict]) -> bool:
 
 # --- Data contracts ---
 
+
 @dataclass
 class PendingToolCall:
     """One tool_call accumulated from OpenAI's stream delta."""
+
     index: int | None = None
     id: str | None = None
     name: str | None = None
@@ -36,16 +42,18 @@ class PendingToolCall:
 @dataclass
 class StreamEvent:
     """One event yielded by LLMClient.chat()."""
+
     kind: Literal["content", "tool_call_delta", "done"]
     text: str = ""
     tool_call: PendingToolCall | None = None
     finish_reason: str | None = None
     pending: list[PendingToolCall] = field(default_factory=list)
     content: str = ""
-    usage: "UsageRecord | None" = None
+    usage: UsageRecord | None = None
 
 
 # --- Delta accumulator ---
+
 
 def accumulate_delta(
     pending: list[PendingToolCall],
@@ -113,6 +121,7 @@ def accumulate_delta(
 
 # --- LLMClient ---
 
+
 class LLMClient:
     """Thin async wrapper around AsyncOpenAI for streaming chat + tools.
 
@@ -128,9 +137,18 @@ class LLMClient:
         reasoning_effort: str | None = None,
     ) -> None:
         self.model = model
+        self.resolved_model: str | None = None
         self.reasoning_effort = reasoning_effort
         self.reasoning_effort_supported: bool | None = None
         self._client = AsyncOpenAI(api_key=api_key, base_url=base_url)
+        self._closed = False
+
+    async def aclose(self) -> None:
+        """Close the provider HTTP client owned by this wrapper."""
+        if self._closed:
+            return
+        self._closed = True
+        await self._client.close()
 
     async def chat(
         self,
@@ -158,9 +176,8 @@ class LLMClient:
             # OpenAI-compatible providers vary in support for reasoning_effort.
             # Retry once without it only when the provider rejected that field.
             message = str(exc).lower()
-            rejected_effort = (
-                "reasoning_effort" in kwargs
-                and any(term in message for term in ("reasoning_effort", "unknown field", "extra inputs"))
+            rejected_effort = "reasoning_effort" in kwargs and any(
+                term in message for term in ("reasoning_effort", "unknown field", "extra inputs")
             )
             rejected_image = _contains_image(messages) and any(
                 term in message
@@ -185,6 +202,9 @@ class LLMClient:
                 self.reasoning_effort_supported = True
 
         async for chunk in stream:
+            reported_model = getattr(chunk, "model", None)
+            if isinstance(reported_model, str) and reported_model:
+                self.resolved_model = reported_model
             chunk_usage = getattr(chunk, "usage", None)
             if chunk_usage is not None:
                 usage = UsageRecord.from_api(chunk_usage)
@@ -208,7 +228,11 @@ class LLMClient:
                 for tc in delta.tool_calls:
                     index = getattr(tc, "index", None)
                     tc_id = getattr(tc, "id", None)
-                    tc_name = getattr(tc, "name", None) or getattr(tc, "function", None) and getattr(tc.function, "name", None)
+                    tc_name = (
+                        getattr(tc, "name", None)
+                        or getattr(tc, "function", None)
+                        and getattr(tc.function, "name", None)
+                    )
                     tc_args = ""
                     fn = getattr(tc, "function", None)
                     if fn is not None:

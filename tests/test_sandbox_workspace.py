@@ -23,6 +23,19 @@ def test_discover_masks_workspace_credentials_but_not_templates(tmp_path):
     assert ".env.example" not in paths
 
 
+def test_sensitive_ancestor_does_not_mask_entire_workspace(tmp_path):
+    root = tmp_path / ".cc-harness" / "eval" / "workspaces" / "trial"
+    (root / "app").mkdir(parents=True)
+    (root / "app" / "config.py").write_text("VALUE = 1\n", encoding="utf-8")
+    (root / ".env").write_text("TOKEN=secret\n", encoding="utf-8")
+
+    targets = discover_mask_targets(root)
+
+    assert [(item.relative_path.as_posix(), item.is_dir) for item in targets] == [
+        (".env", False),
+    ]
+
+
 def test_mask_plan_contains_only_empty_overlays(tmp_path):
     secret = "sk-do-not-copy"
     (tmp_path / ".env").write_text(secret, encoding="utf-8")

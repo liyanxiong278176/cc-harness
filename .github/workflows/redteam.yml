@@ -1,31 +1,67 @@
-name: cc-harness security eval
+name: cc-harness weekly security eval
 
-# ⚠️ RETIRED 2026-07-06 ⚠️
-#
-# 红队已从 CI 改成本地:LOCAL 一键命令 `npm run redteam-all`(或 `python tools/run_eval.py unified`)。
-# 原因:
-#   - Actions free-tier 跑不起完整 unified config(OWASP 全 4 类 + coding-agent:all 13 件 + mcp,
-#     串行 ~5-10h,远大于 360min 单 job 上限;并发 boot 又崩 2 核 runner)
-#   - 之前尝试 `coding-agent:core` (5 件) 缩短 ~252min,贴上限零余量(cold-start 70min)
-#   - 安全测试需要本地按需跑 + 人工 review LONG output,不适合 PR gate
-#
-# 本文件保留为 git history 档案,所有 jobs 已 stub。删 4 个老 config 详见 commit `c99539b` 之后。
-#
-# 恢复 CI 集成需要:
-#   1. 重新设计一个 CI-only subset config(numTests: 1,排除展开过大的 `harmful`/MCP 多 sub-plugin 类)
-#   2. 拆分多个并行 job(每个 ~120 probe,total ~10 min 串 / ~3 min 并)
-#   3. 重写此 yml 的 jobs 块
+on:
+  schedule:
+    - cron: "17 18 * * 5"
+  workflow_dispatch:
 
-on: []   # 不再触发。push / PR / schedule / dispatch 都关闭
 concurrency:
-  group: security-RETIRED
+  group: security-${{ github.ref }}
   cancel-in-progress: true
 
 jobs:
-  retired-2026-07-06:
-    name: Redteam 集成已 deprecated,见文件 header
+  redteam-subset:
+    name: Promptfoo red-team subset / deepseek-v4-flash
     runs-on: ubuntu-latest
+    timeout-minutes: 120
+    env:
+      OPENAI_API_KEY: ${{ secrets.DEEPSEEK_API_KEY }}
+      OPENAI_BASE_URL: https://api.deepseek.com/v1
+      OPENAI_MODEL: deepseek-v4-flash
+      CC_HARNESS_RUN_REAL_LLM: "1"
+      PYTHONIOENCODING: utf-8
+
     steps:
-      - run: |
-          echo "⚠️ 红队已 retired,改本地跑 \`npm run redteam-all\`"
-          echo "本 yml 保留为 git history 档案,详见 header 注释"
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: eval/promptfoo/package-lock.json
+      - name: Require DeepSeek credentials
+        if: env.OPENAI_API_KEY == ''
+        run: |
+          echo "DEEPSEEK_API_KEY is required for the scheduled red-team gate"
+          exit 1
+      - name: Install harness and Promptfoo
+        run: |
+          python -m pip install -e .
+          npm ci --prefix eval/promptfoo
+      - name: Generate bounded attacks
+        working-directory: eval/promptfoo
+        run: >-
+          npx promptfoo redteam generate
+          -c promptfooconfig.ci.yaml
+          -o redteam.ci.yaml
+          --strict
+      - name: Evaluate bounded attacks
+        working-directory: eval/promptfoo
+        run: >-
+          npx promptfoo redteam eval
+          -c redteam.ci.yaml
+          -j 1
+          -o redteam.ci.json
+      - name: Preserve raw framework evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: promptfoo-redteam-${{ github.run_id }}
+          if-no-files-found: error
+          retention-days: 30
+          path: |
+            eval/promptfoo/redteam.ci.yaml
+            eval/promptfoo/redteam.ci.json

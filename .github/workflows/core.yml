@@ -1,0 +1,46 @@
+name: cc-harness trusted core
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: core-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: Python 3.11 / ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+      - name: Install
+        run: python -m pip install -e ".[dev]"
+      - name: Trusted-core lint gate
+        run: >-
+          python -m ruff check
+          cc_harness/fact_store.py
+          cc_harness/native_tools.py
+          cc_harness/sandbox_capabilities.py
+          cc_harness/schema.py
+          tests/test_fact_store.py
+          tests/test_native_tools.py
+          tests/test_sandbox_capabilities.py
+      - name: Full Python Ruff regression gate
+        run: python scripts/check_ruff_baseline.py
+      - name: Test
+        env:
+          CC_HARNESS_RUN_REAL_LLM: "0"
+        run: python -m pytest

@@ -99,6 +99,56 @@ async def test_routes_normal_tool_call_executes_and_backfills(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_final_allowed_model_call_executes_pending_tools_before_stopping():
+    from cc_harness import agent as agent_mod
+    from cc_harness.mcp_client import ToolResult
+
+    fs_tool = {
+        "type": "function",
+        "function": {
+            "name": "mcp__fs__read",
+            "description": "r",
+            "parameters": {"type": "object", "properties": {"p": {"type": "string"}}},
+        },
+    }
+    pending = [
+        PendingToolCall(
+            index=0,
+            id="last-call",
+            name="mcp__fs__read",
+            arguments_json='{"p":"a.py"}',
+        )
+    ]
+    llm = FakeLLM(
+        responses=[
+            [
+                FakeStreamEvent(
+                    kind="done",
+                    content="reading",
+                    pending=pending,
+                    finish_reason="tool_calls",
+                )
+            ]
+        ]
+    )
+    mcp = FakeMCP(
+        tools_spec=[fs_tool],
+        results={"mcp__fs__read": ToolResult.success("file contents")},
+        calls=[],
+    )
+    messages = [{"role": "user", "content": "read a.py"}]
+
+    await agent_mod.run_turn(messages, llm, mcp, max_iter=1)
+
+    assert llm.call_count == 1
+    assert mcp.calls == [("mcp__fs__read", {"p": "a.py"})]
+    assert messages[1]["tool_calls"][0]["id"] == "last-call"
+    assert messages[2]["role"] == "tool"
+    assert "file contents" in messages[2]["content"]
+    assert "最后一批工具已执行" in messages[3]["content"]
+
+
+@pytest.mark.asyncio
 async def test_routes_final_answer_when_no_tool_calls(monkeypatch):
     from cc_harness import agent as agent_mod
     llm = FakeLLM(responses=[[
@@ -219,7 +269,7 @@ async def test_pending_tool_call_name_missing_backfills_error(monkeypatch, capfd
 
 
 @pytest.mark.asyncio
-async def test_max_iter_reached_with_pending_drops_tool_calls(monkeypatch):
+async def test_max_iter_reached_executes_final_pending_tool_calls(monkeypatch):
     from cc_harness import agent as agent_mod
     from cc_harness.mcp_client import ToolResult
 
@@ -242,10 +292,8 @@ async def test_max_iter_reached_with_pending_drops_tool_calls(monkeypatch):
 
     messages = [{"role": "user", "content": "loop"}]
     await agent_mod.run_turn(messages, llm, mcp, max_iter=20)
-    # Spec: on iter==20 with has_tool_calls=True, the agent MUST:
-    #   (1) drop pending tool_calls (no tool_calls on the final assistant message)
-    #   (2) NOT append any role:tool backfill after the final assistant
-    #   (3) emit a gentle fallback text instead
+    # The model-call budget is exhausted after call 20, but tool calls already
+    # returned by that response still execute before the agent emits fallback.
     final = messages[-1]
     assert final["role"] == "assistant"
     assert "tool_calls" not in final, "final assistant must not have tool_calls"
@@ -259,10 +307,61 @@ async def test_max_iter_reached_with_pending_drops_tool_calls(monkeypatch):
         m["role"] == "tool" for m in messages[final_assistant_idx + 1:]
     ), "no role:tool backfill after the final assistant message"
 
-    # The total number of assistant-with-tool_calls messages should be < 20
-    # (one fewer than max_iter because the final turn drops them)
+    # Every allowed model response produced one tool call and all 20 execute.
     tool_call_msgs = [m for m in messages if m.get("role") == "assistant" and "tool_calls" in m]
-    assert len(tool_call_msgs) < 20
+    assert len(tool_call_msgs) == 20
+    assert len(mcp.calls) == 20
+
+
+@pytest.mark.asyncio
+async def test_unbounded_iterations_continue_past_default_limit():
+    from cc_harness import agent as agent_mod
+    from cc_harness.mcp_client import ToolResult
+
+    fs_tool = {
+        "type": "function",
+        "function": {
+            "name": "mcp__fs__read",
+            "description": "r",
+            "parameters": {"type": "object"},
+        },
+    }
+    responses = []
+    for index in range(21):
+        pending = [
+            PendingToolCall(
+                index=0,
+                id=f"c{index}",
+                name="mcp__fs__read",
+                arguments_json="{}",
+            )
+        ]
+        responses.append(
+            [
+                FakeStreamEvent(
+                    kind="done",
+                    content=f"thought {index}",
+                    pending=pending,
+                    finish_reason="tool_calls",
+                )
+            ]
+        )
+    responses.append(
+        [FakeStreamEvent(kind="done", content="finished", pending=[], finish_reason="stop")]
+    )
+    llm = FakeLLM(responses=responses)
+    mcp = FakeMCP(
+        tools_spec=[fs_tool],
+        results={"mcp__fs__read": ToolResult.success("x")},
+        calls=[],
+    )
+    messages = [{"role": "user", "content": "loop until finished"}]
+
+    await agent_mod.run_turn(messages, llm, mcp, max_iter=None)
+
+    assert llm.call_count == 22
+    assert len(mcp.calls) == 21
+    assert messages[-1] == {"role": "assistant", "content": "finished"}
 
 
 @pytest.mark.asyncio
@@ -692,7 +791,13 @@ async def test_run_turn_returns_turn_token_stats_with_api_usage(monkeypatch):
     """run_turn should return TurnTokenStats populated from API usage."""
     from cc_harness import agent as agent_mod
 
-    usage = UsageRecord(prompt_tokens=100, completion_tokens=50, total_tokens=150)
+    usage = UsageRecord(
+        prompt_tokens=100,
+        completion_tokens=50,
+        total_tokens=150,
+        cache_read_prompt_tokens=60,
+        cache_creation_prompt_tokens=10,
+    )
     events = [[
         FakeStreamEvent(
             kind="done", content="hi", pending=[], finish_reason="stop",
@@ -707,6 +812,9 @@ async def test_run_turn_returns_turn_token_stats_with_api_usage(monkeypatch):
     assert isinstance(stats, TurnTokenStats)
     assert stats.api_total_tokens == 150
     assert stats.api_prompt_tokens == 100
+    assert stats.api_uncached_prompt_tokens == 30
+    assert stats.api_cache_read_prompt_tokens == 60
+    assert stats.api_cache_creation_prompt_tokens == 10
     assert stats.api_completion_tokens == 50
     assert stats.iter_count == 1
     assert stats.api_reported is True
@@ -822,8 +930,10 @@ async def test_run_command_credential_exfil_asked_and_denied(tmp_path, monkeypat
     # run_command 被拒:tool 消息含「用户拒绝」
     tool_msgs = [m for m in messages if m.get("role") == "tool"]
     assert tool_msgs and "用户拒绝" in tool_msgs[-1]["content"]
-    # 审计落 tmp_path/logs/policy.jsonl
-    audit = (tmp_path / "logs" / "policy.jsonl").read_text(encoding="utf-8")
+    # Internal audit evidence must not pollute the agent's searchable workspace.
+    audit = (tmp_path / ".cc-harness" / "logs" / "policy.jsonl").read_text(
+        encoding="utf-8"
+    )
     assert '"decision": "ask"' in audit
     assert '"outcome": "denied"' in audit
 
@@ -884,7 +994,9 @@ async def test_hard_deny_never_calls_confirm_handler(tmp_path):
     assert mcp.calls == []
     denied = [m for m in messages if m.get("role") == "tool"]
     assert denied and "hard-deny" in denied[-1]["content"]
-    audit = (tmp_path / "logs" / "policy.jsonl").read_text(encoding="utf-8")
+    audit = (tmp_path / ".cc-harness" / "logs" / "policy.jsonl").read_text(
+        encoding="utf-8"
+    )
     assert '"decision": "deny"' in audit
     assert '"outcome": "hard_denied"' in audit
 
@@ -919,7 +1031,9 @@ async def test_fs_read_inside_workspace_executes(tmp_path):
     assert mcp.calls == [("mcp__fs__read", {"path": str(inside)})]
     tool_msgs = [m for m in messages if m.get("role") == "tool"]
     assert tool_msgs and "FILE CONTENTS" in tool_msgs[-1]["content"]
-    audit = (tmp_path / "logs" / "policy.jsonl").read_text(encoding="utf-8")
+    audit = (tmp_path / ".cc-harness" / "logs" / "policy.jsonl").read_text(
+        encoding="utf-8"
+    )
     assert '"decision": "allow"' in audit
     assert '"outcome": "executed"' in audit
 
@@ -1060,7 +1174,7 @@ async def test_l5_redact_audited_without_plaintext(tmp_path):
     await agent_mod.run_turn(messages, llm, FakeMCP(tools_spec=[], results={}, calls=[]),
                              mode="plan", cwd=str(tmp_path), max_iter=5,
                              policy=PolicyEngine(project_root=tmp_path), l5=eng)
-    logf = tmp_path / "logs" / "l5.jsonl"
+    logf = tmp_path / ".cc-harness" / "logs" / "l5.jsonl"
     assert logf.exists()
     lines = logf.read_text(encoding="utf-8").strip().splitlines()
     entry = _json.loads(lines[-1])
@@ -1287,6 +1401,25 @@ def test_refresh_system_prompt_skips_e1_hint_after_iter_zero():
         extra_ctx={"e1_decompose_hint": False, "iter_count": 3},
     )
     assert "## 分解契约" not in messages[0]["content"]
+
+
+def test_refresh_system_prompt_omits_todo_completion_gate_when_unavailable():
+    from cc_harness.agent import _refresh_system_prompt
+
+    messages = [{"role": "system", "content": "old system"}]
+    _refresh_system_prompt(
+        messages,
+        cwd="/tmp",
+        mode="coding",
+        extra_ctx={
+            "todo_available": False,
+            "subagent_available": False,
+            "visible_thought_required": False,
+        },
+    )
+
+    assert "todo_completion_gate" not in messages[0]["content"]
+    assert "dispatch_subagent" not in messages[0]["content"]
 
 
 # --- E1 Task 7: _print_decomp_summary 函数 ---

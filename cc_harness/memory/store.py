@@ -29,6 +29,11 @@ class Memory:
     source: str   # 'llm' | 'pipeline'
     layer: str = "L1"
     session_id: str | None = None
+    project_scope: str | None = None
+    validity: str = "active"
+    version: int = 1
+    supersedes_id: str | None = None
+    tombstoned_at: float | None = None
 
 
 def _vec_to_blob(vec: list[float]) -> bytes:
@@ -42,9 +47,12 @@ def _blob_to_vec(blob: bytes) -> list[float]:
 class MemoryStore:
     """Pure CRUD: add / update / delete / get / list_all / search_similar / count / close."""
 
-    def __init__(self, db_path: Path, embedding_dim: int):
+    def __init__(
+        self, db_path: Path, embedding_dim: int, project_scope: str | None = None
+    ):
         self.db_path = db_path
         self.embedding_dim = embedding_dim
+        self.project_scope = project_scope
         self._db: aiosqlite.Connection | None = None
 
     async def init_schema(self) -> None:
@@ -128,10 +136,26 @@ class MemoryStore:
             dates TEXT NOT NULL DEFAULT '',
             entities TEXT NOT NULL DEFAULT '',
             keywords TEXT NOT NULL DEFAULT ''
+            ,message_idx INTEGER
+            ,content_digest TEXT
         )""")
         await self._db.execute(
             "CREATE INDEX IF NOT EXISTS idx_conv_session ON conversation(session_id, turn_idx)"
         )
+        await self._db.execute("""
+            CREATE TABLE IF NOT EXISTS memory_pipeline_job (
+                id TEXT PRIMARY KEY,
+                session_id TEXT NOT NULL,
+                turn_idx INTEGER NOT NULL,
+                payload_json TEXT NOT NULL,
+                status TEXT NOT NULL,
+                attempts INTEGER NOT NULL DEFAULT 0,
+                last_error TEXT,
+                created_at REAL NOT NULL,
+                updated_at REAL NOT NULL,
+                UNIQUE(session_id, turn_idx)
+            )
+        """)
         # Task 9: web_session (parent of session_checkpoint, FK cascade 方向
         # session_checkpoint → web_session。brief DDL 字面是 web_session.id → session_checkpoint,
         # 但这会让 test 1 (先 upsert web_session 再存 checkpoint) FK 违反;且 cascade 方向反向。
@@ -194,6 +218,12 @@ class MemoryStore:
             ("last_recalled_at", "ALTER TABLE memories ADD COLUMN last_recalled_at REAL"),
             ("cluster_id", "ALTER TABLE memories ADD COLUMN cluster_id TEXT"),
             ("merged_from", "ALTER TABLE memories ADD COLUMN merged_from TEXT"),
+            ("project_scope", "ALTER TABLE memories ADD COLUMN project_scope TEXT"),
+            ("validity", "ALTER TABLE memories ADD COLUMN validity TEXT DEFAULT 'active'"),
+            ("version", "ALTER TABLE memories ADD COLUMN version INTEGER DEFAULT 1"),
+            ("supersedes_id", "ALTER TABLE memories ADD COLUMN supersedes_id TEXT"),
+            ("tombstoned_at", "ALTER TABLE memories ADD COLUMN tombstoned_at REAL"),
+            ("provenance_json", "ALTER TABLE memories ADD COLUMN provenance_json TEXT DEFAULT '{}'"),
         ]:
             if col not in m_cols:
                 await self._db.execute(ddl)
@@ -203,6 +233,18 @@ class MemoryStore:
                 await self._db.execute(
                     f"ALTER TABLE conversation ADD COLUMN {col} TEXT NOT NULL DEFAULT ''"
                 )
+        if "message_idx" not in c_cols:
+            await self._db.execute(
+                "ALTER TABLE conversation ADD COLUMN message_idx INTEGER"
+            )
+        if "content_digest" not in c_cols:
+            await self._db.execute(
+                "ALTER TABLE conversation ADD COLUMN content_digest TEXT"
+            )
+        await self._db.execute(
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_conv_message_event "
+            "ON conversation(session_id, message_idx) WHERE message_idx IS NOT NULL"
+        )
         # E3 T1: 旧库可能缺 session_checkpoint / session_message(2026-07-24 前)
         s_tables = {r[0] for r in (await (await self._db.execute(
             "SELECT name FROM sqlite_master WHERE type='table'"
@@ -287,7 +329,9 @@ class MemoryStore:
         await self._db.commit()
 
     async def add(self, text: str, embedding: list[float], source: str,
-                  session_id: str | None = None, layer: str = "L1") -> Memory:
+                  session_id: str | None = None, layer: str = "L1",
+                  *, version: int = 1, supersedes_id: str | None = None,
+                  provenance_json: str = "{}") -> Memory:
         assert self._db is not None, "init_schema first"
         if len(embedding) != self.embedding_dim:
             raise ValueError(f"embedding dim {len(embedding)} != configured {self.embedding_dim}")
@@ -300,12 +344,18 @@ class MemoryStore:
             source=source,
             layer=layer,
             session_id=session_id,
+            project_scope=self.project_scope,
+            version=version,
+            supersedes_id=supersedes_id,
         )
         blob = _vec_to_blob(embedding)
         await self._db.execute(
-            "INSERT INTO memories (id, text, embedding, created_at, updated_at, source, layer, session_id) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-            (mem.id, mem.text, blob, mem.created_at, mem.updated_at, mem.source, mem.layer, mem.session_id),
+            "INSERT INTO memories (id, text, embedding, created_at, updated_at, source, layer, "
+            "session_id, project_scope, validity, version, supersedes_id, provenance_json) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'active', ?, ?, ?)",
+            (mem.id, mem.text, blob, mem.created_at, mem.updated_at, mem.source,
+             mem.layer, mem.session_id, mem.project_scope, version, supersedes_id,
+             provenance_json),
         )
         await self._db.execute(
             "INSERT INTO vec_memories (id, embedding) VALUES (?, ?)",
@@ -341,7 +391,11 @@ class MemoryStore:
     async def delete(self, id: str) -> bool:
         assert self._db is not None
         try:
-            cur = await self._db.execute("DELETE FROM memories WHERE id=?", (id,))
+            cur = await self._db.execute(
+                "UPDATE memories SET validity='tombstoned', tombstoned_at=?, updated_at=? "
+                "WHERE id=? AND validity='active'",
+                (time.time(), time.time(), id),
+            )
             await self._db.execute("DELETE FROM vec_memories WHERE id=?", (id,))
             await self._db.commit()
         except Exception:
@@ -349,10 +403,41 @@ class MemoryStore:
             raise
         return cur.rowcount > 0
 
+    async def supersede(
+        self, id: str, text: str, embedding: list[float], *, source: str | None = None,
+        session_id: str | None = None, provenance_json: str = "{}",
+    ) -> Memory:
+        """Create a new active version and retain the prior row for provenance."""
+        old = await self.get(id)
+        if old is None or old.validity != "active":
+            raise KeyError(f"active memory not found: {id}")
+        assert self._db is not None
+        await self._db.execute(
+            "UPDATE memories SET validity='superseded', updated_at=? WHERE id=?",
+            (time.time(), id),
+        )
+        await self._db.execute("DELETE FROM vec_memories WHERE id=?", (id,))
+        try:
+            new = await self.add(
+                text,
+                embedding,
+                source or old.source,
+                session_id=session_id if session_id is not None else old.session_id,
+                layer=old.layer,
+                version=old.version + 1,
+                supersedes_id=old.id,
+                provenance_json=provenance_json,
+            )
+        except Exception:
+            await self._db.rollback()
+            raise
+        return new
+
     async def get(self, id: str) -> Memory | None:
         assert self._db is not None
         cur = await self._db.execute(
-            "SELECT id, text, embedding, created_at, updated_at, source, layer, session_id "
+            "SELECT id, text, embedding, created_at, updated_at, source, layer, session_id, "
+            "project_scope, validity, version, supersedes_id, tombstoned_at "
             "FROM memories WHERE id=?",
             (id,),
         )
@@ -362,15 +447,19 @@ class MemoryStore:
         return Memory(
             id=row[0], text=row[1], embedding=_blob_to_vec(row[2]),
             created_at=row[3], updated_at=row[4], source=row[5],
-            layer=row[6], session_id=row[7],
+            layer=row[6], session_id=row[7], project_scope=row[8], validity=row[9],
+            version=row[10], supersedes_id=row[11], tombstoned_at=row[12],
         )
 
     async def list_all(self, limit: int = 100) -> list[Memory]:
         assert self._db is not None
+        scope_sql = " AND (project_scope=? OR project_scope IS NULL)" if self.project_scope else ""
+        params = ([self.project_scope] if self.project_scope else []) + [limit]
         cur = await self._db.execute(
             "SELECT id, text, embedding, created_at, updated_at, source, layer, session_id "
-            "FROM memories ORDER BY updated_at DESC LIMIT ?",
-            (limit,),
+            f"FROM memories WHERE validity='active'{scope_sql} "
+            "ORDER BY updated_at DESC LIMIT ?",
+            params,
         )
         rows = await cur.fetchall()
         return [
@@ -390,7 +479,7 @@ class MemoryStore:
         cur = await self._db.execute(
             "SELECT id, distance FROM vec_memories "
             "WHERE embedding MATCH ? ORDER BY distance LIMIT ?",
-            (blob, k),
+            (blob, k * 4),
         )
         rows = await cur.fetchall()
         if not rows:
@@ -398,10 +487,12 @@ class MemoryStore:
         ids = [r[0] for r in rows]
         distances = [r[1] for r in rows]
         placeholders = ",".join("?" * len(ids))
+        scope_sql = " AND (project_scope=? OR project_scope IS NULL)" if self.project_scope else ""
+        params = list(ids) + ([self.project_scope] if self.project_scope else [])
         mem_cur = await self._db.execute(
             f"SELECT id, text, embedding, created_at, updated_at, source, layer, session_id "
-            f"FROM memories WHERE id IN ({placeholders})",
-            ids,
+            f"FROM memories WHERE validity='active' AND id IN ({placeholders}){scope_sql}",
+            params,
         )
         mem_rows = await mem_cur.fetchall()
         mem_by_id = {
@@ -410,11 +501,15 @@ class MemoryStore:
                          layer=r[6], session_id=r[7])
             for r in mem_rows
         }
-        return [(mem_by_id[i], d) for i, d in zip(ids, distances) if i in mem_by_id]
+        return [(mem_by_id[i], d) for i, d in zip(ids, distances) if i in mem_by_id][:k]
 
     async def count(self) -> int:
         assert self._db is not None
-        cur = await self._db.execute("SELECT COUNT(*) FROM memories")
+        scope_sql = " AND (project_scope=? OR project_scope IS NULL)" if self.project_scope else ""
+        cur = await self._db.execute(
+            f"SELECT COUNT(*) FROM memories WHERE validity='active'{scope_sql}",
+            (self.project_scope,) if self.project_scope else (),
+        )
         row = await cur.fetchone()
         return row[0] if row else 0
 
@@ -450,7 +545,7 @@ class MemoryStore:
             cur = await self._db.execute(
                 "SELECT rowid, bm25(memories_fts) FROM memories_fts "
                 "WHERE memories_fts MATCH ? ORDER BY bm25(memories_fts) LIMIT ?",
-                (query, k),
+                (query, k * 4),
             )
             rows = await cur.fetchall()
             if not rows:
@@ -458,10 +553,12 @@ class MemoryStore:
             rowids = [r[0] for r in rows]
             scores = [r[1] for r in rows]
             placeholders = ",".join("?" * len(rowids))
+            scope_sql = " AND (project_scope=? OR project_scope IS NULL)" if self.project_scope else ""
+            params = list(rowids) + ([self.project_scope] if self.project_scope else [])
             mem_cur = await self._db.execute(
                 f"SELECT id, text, embedding, created_at, updated_at, source, layer, session_id, rowid "
-                f"FROM memories WHERE rowid IN ({placeholders})",
-                rowids,
+                f"FROM memories WHERE validity='active' AND rowid IN ({placeholders}){scope_sql}",
+                params,
             )
             mem_rows = await mem_cur.fetchall()
             mem_by_rowid = {
@@ -470,7 +567,7 @@ class MemoryStore:
                             layer=r[6], session_id=r[7])
                 for r in mem_rows
             }
-            return [(mem_by_rowid[i], s) for i, s in zip(rowids, scores) if i in mem_by_rowid]
+            return [(mem_by_rowid[i], s) for i, s in zip(rowids, scores) if i in mem_by_rowid][:k]
         except Exception as e:
             logger.warning("search_fts failed, returning []: %s", e)
             return []

@@ -1,4 +1,4 @@
-"""决策审计:每次 PolicyEngine 决策落一行 JSON 到 <root>/logs/policy.jsonl。
+"""决策审计:每次 PolicyEngine 决策落一行 JSON 到 <root>/.cc-harness/logs/policy.jsonl。
 
 写失败只 warn 不阻塞(可用性优先)。路径由调用方传入(钉到项目根,不随 CWD 漂移)。
 """

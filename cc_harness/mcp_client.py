@@ -118,9 +118,9 @@ class MCPClient:
                     timeout=init_timeout_s,
                 )
             else:  # http
-                from mcp.client.streamable_http import streamablehttp_client
+                from mcp.client.streamable_http import streamable_http_client
                 url = cfg.url  # type: ignore[assignment]
-                cm = streamablehttp_client(url)
+                cm = streamable_http_client(url)
                 read, write, _ = await asyncio.wait_for(
                     local.enter_async_context(cm),
                     timeout=init_timeout_s,

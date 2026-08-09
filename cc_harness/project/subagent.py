@@ -25,7 +25,7 @@ import asyncio
 import logging
 import re
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import TYPE_CHECKING, Literal
 
 from cc_harness.project.tools import ToolResult
@@ -298,13 +298,14 @@ class SubAgentRunner:
         *,
         current_depth: int = 0,
         project_root: str = "",
-        max_iter: int = 20,
+        max_iter: int | None = 20,
         policy: PolicyEngine,
         l5: "L5Engine | None" = None,  # D1 Task 4 fix:subagent 继承主 agent 的 L5 引擎
         # E2 T3.2:反思引擎注入(失败类 status 触发 emit subagent_failed)
         reflection_engine: "ReflectionEngine | None" = None,
         session_id: str | None = None,
         turn_idx: int | None = None,
+        loop_control_config=None,
     ):
         self.llm = llm
         self.mcp = mcp
@@ -317,6 +318,11 @@ class SubAgentRunner:
         self.reflection_engine = reflection_engine
         self.session_id = session_id
         self.turn_idx = turn_idx
+        if loop_control_config is None:
+            from cc_harness.loop_control import LoopControlConfig
+
+            loop_control_config = LoopControlConfig()
+        self.loop_control_config = loop_control_config
 
     async def run(
         self,
@@ -374,6 +380,7 @@ class SubAgentRunner:
             max_iter=self.max_iter,
             policy=self.policy,
             l5=self.l5,
+            loop_control_config=self.loop_control_config,
         )
         extras = inject_todo_tools(
             self.todo_service, session_id, cwd=self.project_root,
@@ -393,6 +400,21 @@ class SubAgentRunner:
         # 参数 vs 兜底未分类 — error 字段带 type name 便于审计/log triage。
         # E2 T3.2:失败类 status 走单点 emit — 用局部 result + 末尾 try/finally 统一处理。
         result_obj: SubAgentResult | None = None
+        from cc_harness.loop_control import CompletionContract
+
+        required_paths = tuple(_extract_file_refs("\n".join(criteria)))
+        subagent_loop_config = replace(
+            self.loop_control_config,
+            completion_contract=CompletionContract(
+                required_paths=required_paths,
+                require_verification_after_code_changes=(
+                    self.loop_control_config.completion_contract.require_verification_after_code_changes
+                ),
+                require_session_todos_complete=False,
+                max_rechecks=self.loop_control_config.completion_contract.max_rechecks,
+            ),
+        )
+        subagent_session_id = f"{session_id}.sub.{task_id}.depth-{self.current_depth + 1}"
         try:
             try:
                 stats = await asyncio.wait_for(
@@ -405,6 +427,8 @@ class SubAgentRunner:
                         l5=self.l5,
                         system_prompt=system_prompt,
                         direct_render=False,
+                        session_id=subagent_session_id,
+                        loop_control_config=subagent_loop_config,
                     ),
                     timeout=timeout,
                 )
@@ -483,7 +507,11 @@ class SubAgentRunner:
                 except Exception:
                     final_status = "unknown"
                 iter_used = sum(1 for m in messages if m.get("role") == "assistant")
-                if iter_used >= self.max_iter and final_status not in ("done", "blocked"):
+                if (
+                    self.max_iter is not None
+                    and iter_used >= self.max_iter
+                    and final_status not in ("done", "blocked")
+                ):
                     result_obj = SubAgentResult(
                         task_id=task_id, title=title, status="incomplete",
                         error=f"max_iter={self.max_iter} 耗尽, todo 未 done/blocked",
@@ -553,7 +581,8 @@ class SubAgentRunner:
 
 def get_default_runner(
     llm, mcp, todo_service,
-    *, project_root: str, max_iter: int, policy: PolicyEngine,
+    *, project_root: str, max_iter: int | None, policy: PolicyEngine,
+    loop_control_config=None,
     l5: "L5Engine | None" = None,  # D1 Task 4 fix:透传主 agent L5
 ) -> SubAgentRunner:
     """构造主 agent 调用的 runner(depth=0)。
@@ -570,6 +599,7 @@ def get_default_runner(
         max_iter=max_iter,
         policy=policy,
         l5=l5,
+        loop_control_config=loop_control_config,
     )
 
 

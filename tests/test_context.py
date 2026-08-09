@@ -814,3 +814,78 @@ async def test_maybe_compact_tier3_drops_message_count_and_tokens():
     assert stats.after_tokens < stats.before_tokens, (
         f"after_tokens {stats.after_tokens} should be < before_tokens {stats.before_tokens}"
     )
+
+
+@pytest.mark.asyncio
+async def test_context_projection_preserves_originals_and_versions_summary(tmp_path):
+    from copy import deepcopy
+
+    from cc_harness.context import ContextProjection
+    from cc_harness.tokens import SUMMARY_MARKER_KEY, TokenCounter
+
+    source = [
+        {"role": "system", "content": "system"},
+        *[
+            {"role": "tool", "name": "read", "content": "old line\n" * 30}
+            for _ in range(8)
+        ],
+        {"role": "user", "content": "current requirement"},
+    ]
+    original = deepcopy(source)
+    config = _cfg(
+        context_window=200,
+        tier1_threshold=0.1,
+        tier2_threshold=0.2,
+        tier3_threshold=0.3,
+        protect_zone_tokens=5,
+    )
+    projection = ContextProjection(source, artifact_dir=tmp_path)
+
+    stats = await projection.compact(
+        source, None, TokenCounter(), config, FakeLLM(content="stable summary")
+    )
+
+    assert source == original
+    assert stats.summarized is True
+    assert stats.summary_version == 1
+    summary = next(m for m in projection.messages if m.get(SUMMARY_MARKER_KEY))
+    assert summary["_compaction_source_count"] == len(source)
+    assert summary["_compaction_source_digest"].startswith("sha256:")
+    assert (tmp_path / "summary-v0001.json").is_file()
+
+
+@pytest.mark.asyncio
+async def test_context_projection_restores_latest_projection_and_increments_version(tmp_path):
+    from cc_harness.context import ContextProjection
+    from cc_harness.tokens import TokenCounter
+
+    source = [
+        {"role": "system", "content": "system"},
+        *[{"role": "tool", "name": "read", "content": "old line\n" * 30} for _ in range(8)],
+        {"role": "user", "content": "current requirement"},
+    ]
+    config = _cfg(
+        context_window=200,
+        tier1_threshold=0.1,
+        tier2_threshold=0.2,
+        tier3_threshold=0.3,
+        protect_zone_tokens=5,
+    )
+    first = ContextProjection(source, artifact_dir=tmp_path)
+    stats1 = await first.compact(
+        source, None, TokenCounter(), config, FakeLLM(content="summary one")
+    )
+    assert stats1.summary_version == 1
+
+    source.append({"role": "assistant", "content": "new delta " * 100})
+    source.append({"role": "user", "content": "next requirement"})
+    restored = ContextProjection(source, artifact_dir=tmp_path)
+    assert restored.summary_version == 1
+    assert any(m.get("_compaction_summary") for m in restored.messages)
+
+    stats2 = await restored.compact(
+        source, None, TokenCounter(), config, FakeLLM(content="summary two")
+    )
+    assert stats2.summary_version == 2
+    assert (tmp_path / "summary-v0001.json").is_file()
+    assert (tmp_path / "summary-v0002.json").is_file()

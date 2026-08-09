@@ -37,8 +37,8 @@ pytestmark = pytest.mark.skipif(
 
 @pytest.mark.asyncio
 async def test_end_to_end_echo():
-    from cc_harness.sandbox import SandboxExecutor
     from cc_harness.config import SandboxConfig
+    from cc_harness.sandbox import SandboxExecutor
     from cc_harness.sandbox_server import _docker_available, shutdown_owned
 
     if not _docker_available():
@@ -49,7 +49,11 @@ async def test_end_to_end_echo():
         # SandboxExecutor._ensure_sandbox 自己 ensure_server(带 allowed=[project_root])。
         # 这里不另调 ensure_server —— 否则无 allowed 的 fork 先起 server,_ensure_sandbox
         # ping 复用它(allowed=[]),create volume 报 HOST_PATH_NOT_ALLOWED。
-        ex = SandboxExecutor(SandboxConfig(server_port=PORT), project_root=tmp)
+        server_config = tmp.parent / f"cc-harness-sandbox-{PORT}.toml"
+        ex = SandboxExecutor(
+            SandboxConfig(server_port=PORT, server_config_path=server_config),
+            project_root=tmp,
+        )
         r = await ex.run({"command": "echo integration-ok"}, cwd=Path("."))
         assert r.is_error is False
         assert "integration-ok" in r.llm_text

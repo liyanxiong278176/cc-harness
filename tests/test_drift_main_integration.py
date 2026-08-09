@@ -30,7 +30,10 @@ from cc_harness.memory.store import Memory, MemoryStore
 async def store(tmp_path: Path) -> MemoryStore:
     s = MemoryStore(tmp_path / "mem.db", embedding_dim=4)
     await s.init_schema()
-    return s
+    try:
+        yield s
+    finally:
+        await s.close()
 
 
 @pytest.fixture

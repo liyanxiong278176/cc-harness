@@ -14,32 +14,53 @@ Modes (see task #4 / #6):
     "chat"    — same as coding (tools enabled, full ReAct loop)
 """
 from __future__ import annotations
-import io
+
 import asyncio
+import io
 import json
 import logging
 import re
 import time
 from pathlib import Path
 from typing import TYPE_CHECKING, Awaitable, Callable
+
 from rich.console import Console
-from cc_harness.render import (
-    print_thought, print_action, print_observation, print_result,
-    print_warn, print_error, print_info,
-)
-from cc_harness.policy import Action, PolicyEngine
-from cc_harness.schema import validate_native, validate_mcp, set_mcp_schemas
+
 from cc_harness.audit import log_decision
-from cc_harness.l5 import L5Engine
-from cc_harness.tools import confirm_tool, run_command, RUN_COMMAND_SPEC
-from cc_harness.tokens import TokenCounter, TurnTokenStats, UsageRecord
 from cc_harness.config import ContextConfig
+from cc_harness.l5 import L5Engine
+from cc_harness.loop_control import (
+    ActionJournal,
+    CompletionVerifier,
+    LoopControlConfig,
+    ScheduledCall,
+    StallController,
+    ToolErrorKind,
+    ToolScheduler,
+    WorkingState,
+    action_signature,
+)
+from cc_harness.mcp_client import ToolResult
+from cc_harness.native_tools import NATIVE_FILE_TOOLS
+from cc_harness.policy import Action, PolicyEngine
 from cc_harness.reflection.events import (  # E2 T2.2:反思事件工厂
-    max_iter_reached,
     empty_turn_loop,
+    max_iter_reached,
     tool_error_burst,
     tool_retry_burst,
 )
+from cc_harness.render import (
+    print_action,
+    print_error,
+    print_info,
+    print_observation,
+    print_result,
+    print_thought,
+    print_warn,
+)
+from cc_harness.schema import set_mcp_schemas, validate_mcp, validate_native
+from cc_harness.tokens import TokenCounter, TurnTokenStats, UsageRecord
+from cc_harness.tools import RUN_COMMAND_SPEC, confirm_tool, run_command
 
 if TYPE_CHECKING:
     from cc_harness.project.models import TodoTask
@@ -88,6 +109,7 @@ NATIVE_TOOLS: dict[str, dict] = {
         "spec": RUN_COMMAND_SPEC,
         "handler": run_command,
     },
+    **NATIVE_FILE_TOOLS,
 }
 
 
@@ -110,7 +132,7 @@ async def run_turn(
     llm,                    # any object with async chat(messages, tools) -> AsyncIterator[StreamEvent]
     mcp,                    # any object with list_tools() and async call_tool(name, args) -> ToolResult
     *,
-    max_iter: int = 5,       # 2026-07-30: 20→5,红队场景 5 步内守不住=timeout=hold 假阳性最低
+    max_iter: int | None = 20,
     mode: str = "coding",
     cwd: str | None = None,
     design_dir: Path | None = None,
@@ -132,10 +154,14 @@ async def run_turn(
     last_turn_text: str = "",  # D1 Task 7:C 阶段 todo_update 完成门 acceptance 校验用
     reflection_engine: "ReflectionEngine | None" = None,  # E2 T2.2:默认 None 保持向后兼容
     e1_decompose_enabled: bool = True,  # E1 D7:kill-switch(从 main.py 透传 policy.e1_decompose_enabled,默认 True 向后兼容)
+    prompt_capabilities: dict[str, bool] | None = None,
     event_emitter: Callable[[dict], Awaitable[None]] | None = None,
     subagent_progress_cb: Callable[[str, str, str], Awaitable[None]] | None = None,
     confirm_handler: Callable[[str, dict, str], Awaitable[str]] | None = None,
     direct_render: bool | None = None,
+    loop_control_config: LoopControlConfig | None = None,
+    context_artifact_dir: Path | None = None,
+    context_projection=None,
 ) -> TurnTokenStats:
     """Run one user turn in the given mode.
 
@@ -292,6 +318,13 @@ async def run_turn(
         else:
             messages.insert(0, {"role": "system", "content": system_prompt})
     elif cwd is not None:
+        _prompt_capabilities = {
+            "todo_available": True,
+            "subagent_available": True,
+            "visible_thought_required": True,
+        }
+        if prompt_capabilities:
+            _prompt_capabilities.update(prompt_capabilities)
         # E2 T2.2: 把 reflection_engine.get_last_neg_reflection() 注入 extra_ctx,
         # 让 SECTION_POOL 拼装把反思段加到 system prompt 末尾(只走 extra_ctx,绝不
         # 走 messages 之外的旁路)。reflection_engine=None 时 key 不出现 = 不渲染。
@@ -305,8 +338,14 @@ async def run_turn(
         # run_turn 局部变量,同作用域闭包可见。policy 关掉 → flag 永远 False →
         # section 不渲染(T1 test_decomposition_hint_skips_when_kill_switch_off 覆盖)。
         _e1_extra = {
-            "e1_decompose_hint": (iter_count == 0) and e1_decompose_enabled,
+            "e1_decompose_hint": (
+                (iter_count == 0)
+                and e1_decompose_enabled
+                and _prompt_capabilities["todo_available"]
+                and _prompt_capabilities["subagent_available"]
+            ),
             "iter_count": iter_count,
+            **_prompt_capabilities,
         }
         # Phase 1 Q1 uplift: qa_context → render qa_intro section
         if qa_context and qa_context.get("q_type") is not None:
@@ -345,12 +384,37 @@ async def run_turn(
                        if m.get("role") == "user"), "")
             recall = await asyncio.wait_for(
                 memory_layer["recall"](_q), timeout=10.0)
+            if recall.atoms and messages[0].get("role") == "system":
+                atom_lines = []
+                for item in recall.atoms:
+                    memory = item[0] if isinstance(item, tuple) else item
+                    text = getattr(memory, "text", "")
+                    if text:
+                        atom_lines.append(f"- {text[:240]}")
+                if atom_lines:
+                    messages[0]["content"] += (
+                        "\n\n## Relevant memory facts\n" + "\n".join(atom_lines)
+                    )
+            await _safe_emit({
+                "type": "capability_activation",
+                "capability": "memory",
+                "stage": "recall",
+                "persona": recall.persona is not None,
+                "scenario_count": len(recall.scenarios),
+                "atom_count": len(recall.atoms),
+            })
             if recall.persona and messages[0].get("role") == "system":
                 messages[0]["content"] += f"\n\n## 用户画像\n{recall.persona.summary[:200]}"
             if recall.scenarios and messages[0].get("role") == "system":
                 messages[0]["content"] += "\n\n## 相关场景\n" + "\n".join(
                     f"- {s.summary[:120]}" for s in recall.scenarios)
         except (asyncio.TimeoutError, Exception) as e:
+            await _safe_emit({
+                "type": "capability_activation",
+                "capability": "memory",
+                "stage": "recall",
+                "error": f"{type(e).__name__}: {e}",
+            })
             print_warn(console, f"memory inject failed: {e}")
 
     # --- Q4 Task6: pre-turn Mermaid 画布注入(预算 + 顺序)---
@@ -383,6 +447,33 @@ async def run_turn(
 
     # --- L4 policy gate setup ---
     project_root = Path(cwd or ".").resolve()
+    # ``None`` preserves the historical direct-call contract. Production
+    # entrypoints pass an enabled config explicitly.
+    _loop_cfg = loop_control_config or LoopControlConfig(enabled=False)
+    _working_state = WorkingState.new(project_root)
+    _journal: ActionJournal | None = None
+    _completion_verifier: CompletionVerifier | None = None
+    _stall_controller: StallController | None = None
+    _completion_rechecks = 0
+    if _loop_cfg.enabled:
+        _completion_verifier = CompletionVerifier(_loop_cfg.completion_contract)
+        _stall_controller = StallController(_loop_cfg.stall_repeat_threshold)
+        if _loop_cfg.action_journal:
+            _safe_session = re.sub(r"[^A-Za-z0-9_.-]+", "_", session_id or "default")
+            _journal = ActionJournal(
+                project_root / ".cc-harness" / "action-journal" / f"{_safe_session}.jsonl",
+                session_id=session_id or "default",
+            )
+            _working_state = _journal.recover_state(project_root)
+            _interrupted = _journal.incomplete_actions()
+            if _interrupted and messages and messages[0].get("role") == "system":
+                messages[0]["content"] += (
+                    "\n\n<loop_recovery>\n"
+                    "The prior process stopped during these actions: "
+                    + ", ".join(_interrupted)
+                    + ". Inspect current workspace state before repeating a mutating action.\n"
+                    "</loop_recovery>"
+                )
     if policy is None:
         policy = PolicyEngine(project_root=project_root)
     # Inject MCP schemas so schema.validate_mcp can check MCP tool args.
@@ -398,8 +489,8 @@ async def run_turn(
         })
     except Exception:
         pass
-    audit_path = project_root / "logs" / "policy.jsonl"
-    l5_audit_path = project_root / "logs" / "l5.jsonl"
+    audit_path = project_root / ".cc-harness" / "logs" / "policy.jsonl"
+    l5_audit_path = project_root / ".cc-harness" / "logs" / "l5.jsonl"
 
     def _redact(text: str, stage: str) -> str:
         """L5 脱敏 + 审计。stage ∈ {'thought','result'}。engine=None/非 str/空 → 原文直通。
@@ -428,14 +519,15 @@ async def run_turn(
         # 跳过 auto-build,继续走默认路径,不崩主循环。
         if todo_service is not None:
             try:
-                from cc_harness.project.subagent import get_default_runner
                 from cc_harness.project.extras import inject_todo_tools
+                from cc_harness.project.subagent import get_default_runner
                 _runner = get_default_runner(
                     llm, mcp, todo_service,
                     project_root=str(project_root),
                     max_iter=max_iter,
                     policy=policy,
                     l5=l5,
+                    loop_control_config=_loop_cfg,
                 )
                 _todo_extras = inject_todo_tools(
                     todo_service, session_id,
@@ -484,6 +576,192 @@ async def run_turn(
             h_kwargs = {"cwd": str(project_root), **extra_entry.get("deps", {})}
             return await extra_entry["handler"](args, **h_kwargs)
         return await mcp.call_tool(p.name, args)
+
+    def _append_journal(
+        *, kind: str, action_id: str, tool: str, args: dict, outcome: dict,
+    ) -> None:
+        if _journal is None:
+            return
+        try:
+            _journal.append(
+                kind=kind,
+                action_id=action_id,
+                tool=tool,
+                args=args,
+                outcome=outcome,
+                state=_working_state,
+            )
+        except Exception as exc:  # noqa: BLE001 - journal failure cannot break the agent
+            _logger.warning("action journal append failed: %s", exc)
+
+    async def _dispatch_controlled(p, args: dict, action_id: str) -> ToolResult:
+        """Dispatch with deterministic retry, state tracking, and journaling."""
+        _action_signature = action_signature(p.name, args)
+        if (
+            _loop_cfg.enabled
+            and _loop_cfg.stall_detection
+            and _stall_controller is not None
+            and _stall_controller.should_block(_action_signature)
+        ):
+            result = ToolResult.error(
+                display="repeated stalled action blocked",
+                llm=(
+                    "[Loop Controller] Repeated stalled action blocked. "
+                    "State a new hypothesis and choose a different action."
+                ),
+            )
+            fingerprint = _working_state.observe(
+                p.name,
+                args,
+                is_error=True,
+                result_text=result.llm_text,
+                error_kind=ToolErrorKind.EXECUTION,
+            )
+            _append_journal(
+                kind="tool_blocked",
+                action_id=action_id,
+                tool=p.name,
+                args=args,
+                outcome={"reason": "stalled_action", "result_hash": fingerprint},
+            )
+            await _safe_emit({
+                "type": "loop_stall_blocked",
+                "name": p.name,
+                "args": args,
+                "iteration": iter_count,
+                "ts": time.time(),
+            })
+            return result
+        _append_journal(
+            kind="tool_started", action_id=action_id, tool=p.name, args=args, outcome={},
+        )
+        attempt = 0
+        final_kind: ToolErrorKind | None = None
+        while True:
+            attempt += 1
+            try:
+                result = await _dispatch(p, args, project_root)
+            except Exception as exc:  # noqa: BLE001 - tool boundary normalizes plugin failures
+                result = ToolResult.error(
+                    display=f"raised: {exc}",
+                    llm=f"[Tool Error] dispatch 异常: {type(exc).__name__}: {exc}",
+                )
+                decision = _loop_cfg.recovery_policy.decide(
+                    result.llm_text, attempt=attempt, exception=exc,
+                )
+            else:
+                decision = _loop_cfg.recovery_policy.decide(
+                    result.llm_text, attempt=attempt,
+                ) if result.is_error else None
+
+            if (
+                _loop_cfg.enabled
+                and _loop_cfg.error_recovery
+                and decision is not None
+                and decision.retry
+            ):
+                _append_journal(
+                    kind="tool_retry",
+                    action_id=action_id,
+                    tool=p.name,
+                    args=args,
+                    outcome={"attempt": attempt, "kind": decision.kind.value},
+                )
+                await _safe_emit({
+                    "type": "retrying",
+                    "attempt": attempt + 1,
+                    "max_attempts": _loop_cfg.recovery_policy.max_transient_retries + 1,
+                    "delay_seconds": _loop_cfg.recovery_policy.retry_delay_seconds,
+                    "reason": decision.kind.value,
+                    "iteration": iter_count,
+                    "ts": time.time(),
+                })
+                if _loop_cfg.recovery_policy.retry_delay_seconds > 0:
+                    await asyncio.sleep(_loop_cfg.recovery_policy.retry_delay_seconds)
+                continue
+
+            if decision is not None:
+                final_kind = decision.kind
+                if _loop_cfg.enabled and _loop_cfg.error_recovery:
+                    result = ToolResult.error(
+                        display=result.display_text,
+                        llm=(
+                            f"{result.llm_text}\n"
+                            f"[Recovery: {decision.kind.value}] {decision.instruction}"
+                        ),
+                    )
+            break
+
+        fingerprint = _working_state.observe(
+            p.name,
+            args,
+            is_error=result.is_error,
+            result_text=result.llm_text,
+            error_kind=final_kind,
+        )
+        if _loop_cfg.enabled and _loop_cfg.stall_detection and _stall_controller is not None:
+            stall = _stall_controller.observe(
+                fingerprint, action_signature=_action_signature,
+            )
+            if stall.stalled:
+                result.llm_text += f"\n[Loop Controller] {stall.instruction}"
+                await _safe_emit({
+                    "type": "loop_stall",
+                    "repeated": stall.repeated,
+                    "instruction": stall.instruction,
+                    "iteration": iter_count,
+                    "ts": time.time(),
+                })
+        _append_journal(
+            kind="tool_finished",
+            action_id=action_id,
+            tool=p.name,
+            args=args,
+            outcome={
+                "ok": not result.is_error,
+                "attempts": attempt,
+                "error_kind": final_kind.value if final_kind else None,
+                "result_hash": fingerprint,
+            },
+        )
+        await _safe_emit({
+            "type": "working_state",
+            "state": _working_state.to_dict(),
+            "iteration": iter_count,
+            "ts": time.time(),
+        })
+        return result
+
+    def _prepare_parallel_read_batch() -> list[tuple[int, object, dict, object]] | None:
+        if not (
+            _loop_cfg.enabled
+            and _loop_cfg.parallel_read_tools
+            and len(pending) > 1
+        ):
+            return None
+        prepared: list[tuple[int, object, dict, object]] = []
+        scheduled: list[ScheduledCall] = []
+        for index, call in enumerate(pending):
+            if call.name is None:
+                return None
+            try:
+                parsed = json.loads(call.arguments_json) if call.arguments_json else {}
+            except json.JSONDecodeError:
+                return None
+            if not isinstance(parsed, dict):
+                return None
+            ok, _ = validate_native(call.name, parsed)
+            if not ok:
+                return None
+            decision = policy.evaluate(call.name, parsed, {"project_root": project_root})
+            if not decision.allow:
+                return None
+            prepared.append((index, call, parsed, decision))
+            scheduled.append(ScheduledCall(index, call.name, parsed))
+        batches = ToolScheduler().plan(scheduled)
+        if len(batches) != 1 or not batches[0].parallel:
+            return None
+        return prepared
 
     async def _maybe_offload_content(result_text: str, tool_name: str,
                                      tool_args: dict) -> str:
@@ -536,6 +814,13 @@ async def run_turn(
             summary=cats["summary"],
             tool_definitions=cats["tool_definitions"],
             api_prompt_tokens=sum(u.prompt_tokens for u in iter_usages),
+            api_uncached_prompt_tokens=sum(u.uncached_prompt_tokens for u in iter_usages),
+            api_cache_read_prompt_tokens=sum(
+                u.cache_read_prompt_tokens for u in iter_usages
+            ),
+            api_cache_creation_prompt_tokens=sum(
+                u.cache_creation_prompt_tokens for u in iter_usages
+            ),
             api_completion_tokens=sum(u.completion_tokens for u in iter_usages),
             api_total_tokens=sum(u.total_tokens for u in iter_usages),
             iter_count=len(iter_usages),
@@ -544,7 +829,9 @@ async def run_turn(
             compaction=last_compaction,
         )
 
-    async def _stream_one_turn() -> tuple[str, list, str | None, UsageRecord | None]:
+    async def _stream_one_turn(
+        model_messages: list[dict],
+    ) -> tuple[str, list, str | None, UsageRecord | None]:
         """Stream exactly one LLM turn. Returns (content, pending, finish_reason, usage).
 
         Buffers content (no real-time printing) because the routing decision —
@@ -555,27 +842,39 @@ async def run_turn(
         pending: list = []
         finish_reason: str | None = None
         usage: UsageRecord | None = None
-        async for ev in llm.chat(messages, tool_specs):
-            if ev.kind == "content":
-                content_parts.append(ev.text)
-                await _safe_emit({
-                    "type": "content_delta",
-                    "text": ev.text,
-                    "ts": time.time(),
-                    "iteration": iter_count,
-                })
-            elif ev.kind == "tool_call_delta":
-                pass  # accumulation handled inside llm.chat
-            elif ev.kind == "done":
-                finish_reason = ev.finish_reason
-                pending = ev.pending
-                usage = ev.usage
-                # Prefer the consolidated content on the done event if set;
-                # fall back to the streamed parts we collected above.
-                content_parts = [ev.content] if ev.content else content_parts
+        stream = llm.chat(model_messages, tool_specs)
+        try:
+            async for ev in stream:
+                if ev.kind == "content":
+                    content_parts.append(ev.text)
+                    await _safe_emit({
+                        "type": "content_delta",
+                        "text": ev.text,
+                        "ts": time.time(),
+                        "iteration": iter_count,
+                    })
+                elif ev.kind == "tool_call_delta":
+                    pass  # accumulation handled inside llm.chat
+                elif ev.kind == "done":
+                    finish_reason = ev.finish_reason
+                    pending = ev.pending
+                    usage = ev.usage
+                    # Prefer the consolidated content on the done event if set;
+                    # fall back to the streamed parts we collected above.
+                    content_parts = [ev.content] if ev.content else content_parts
+        finally:
+            close_stream = getattr(stream, "aclose", None)
+            if close_stream is not None:
+                await close_stream()
         return "".join(content_parts), pending, finish_reason, usage
 
-    while iter_count < max_iter:
+    from cc_harness.context import ContextProjection
+
+    _context_projection = context_projection or ContextProjection(
+        messages, artifact_dir=context_artifact_dir
+    )
+
+    while max_iter is None or iter_count < max_iter:
         iter_count += 1
         iter_usage: UsageRecord | None = None   # usage for this iter (set on done)
 
@@ -590,9 +889,11 @@ async def run_turn(
                 _cw = offload_deps.get("context_window") or (
                     context_config.context_window if context_config else 1_000_000)
                 _tc = token_counter or TokenCounter()
-                _total = sum(_tc.count_text(_message_text(m)) for m in messages)
+                _context_projection.sync(messages)
+                _projected = _context_projection.messages
+                _total = sum(_tc.count_text(_message_text(m)) for m in _projected)
                 if _cw > 0 and _total / _cw > offload_deps.get("offload_ratio", 0.5):
-                    for m in messages:
+                    for m in _projected:
                         # prefix match(非子串):pointer 形如 [offloaded node=...];
                         # 子串 "offloaded" 会误跳含该字面的 legit 大 result(源码/log)。
                         _content = m.get("content") or ""
@@ -613,15 +914,31 @@ async def run_turn(
         # Plan3: maybe compact context before LLM call (all modes). Catches own
         # errors (returns stats.error) so compaction never kills the ReAct loop.
         if context_config and context_config.enabled:
-            from cc_harness.context import maybe_compact
             _counter = token_counter or TokenCounter()
-            last_compaction = await maybe_compact(
+            last_compaction = await _context_projection.compact(
                 messages, tool_specs, _counter, context_config, llm
             )
+            await _safe_emit({
+                "type": "capability_activation",
+                "capability": "context",
+                "phase": "projection",
+                "tier": last_compaction.tier.name.lower(),
+                "error": last_compaction.error,
+                "artifact": last_compaction.artifact_path,
+                "summary_version": last_compaction.summary_version,
+                "ratio_before": last_compaction.ratio_before,
+                "ratio_after": last_compaction.ratio_after,
+            })
+            if last_compaction.error and context_config.fail_closed:
+                _err_stats = _stats()
+                _err_stats.error = f"context projection failed: {last_compaction.error}"
+                return _err_stats
 
         # 1. Stream one LLM turn (buffered — see _stream_one_turn).
         try:
-            content, pending, finish_reason, iter_usage = await _stream_one_turn()
+            content, pending, finish_reason, iter_usage = await _stream_one_turn(
+                _context_projection.messages
+            )
         except Exception as e:
             print_error(console, f"LLM stream failed: {e}")
             await _safe_emit({
@@ -645,38 +962,6 @@ async def run_turn(
 
         if has_tool_calls and mode in ("coding", "chat"):
             # Coding mode: full ReAct loop with tool execution.
-            if iter_count >= max_iter:
-                # Max-iter guard: drop the tool_calls, fall back to final.
-                # E2 T2.2 Step 3b:emit max_iter_reached 事件(fail-soft,不阻塞 turn)
-                if reflection_engine is not None:
-                    try:
-                        await reflection_engine.emit(
-                            max_iter_reached(
-                                session_id=session_id or "default",
-                                turn_idx=iter_count,
-                                iter_used=iter_count,
-                                last_content=content or "",
-                            )
-                        )
-                    except Exception:
-                        pass
-                print_warn(console, "max iterations reached with pending tool calls, forcing stop")
-                if content:
-                    content = _redact(content, "result")
-                    messages.append({"role": "assistant", "content": content})
-                    print_result(console, content)
-                else:
-                    fallback = "达到最大迭代次数,任务未完成。"
-                    messages.append({"role": "assistant", "content": fallback})
-                    print_result(console, fallback)
-                # Task 3:emit result(max_iter+content/fallback 兜底路径,ReAct 终止)
-                await _safe_emit({
-                    "type": "result",
-                    "text": content or fallback,
-                    "ts": time.time(),
-                })
-                return _stats()
-
             # 3. Build assistant message (with tool_calls; content may be None)
             if content:
                 content = _redact(content, "thought")
@@ -727,7 +1012,93 @@ async def run_turn(
                     "iteration": iter_count,
                 })
 
-            # 4. Execute each tool with 行动 + 观察 labels
+            # 4. Execute independent native reads concurrently. MCP calls and
+            # all mutations remain serial because their side effects are not
+            # provably independent.
+            _parallel_reads = _prepare_parallel_read_batch()
+            if _parallel_reads is not None:
+                for index, p, args, decision in _parallel_reads:
+                    print_action(console, p.name, args)
+                    log_decision(
+                        audit_path,
+                        iter_n=iter_count,
+                        tool=p.name,
+                        args=args,
+                        action=decision.action.value,
+                        outcome="executed_parallel_read",
+                        rule_id=decision.rule_id,
+                        reason=decision.reason,
+                        mode=mode,
+                    )
+                    await _safe_emit({
+                        "type": "action",
+                        "name": p.name,
+                        "args": args,
+                        "ts": time.time(),
+                        "iteration": iter_count,
+                        "parallel": True,
+                    })
+
+                async def _timed_parallel_read(index, p, args, call_ids=tc_ids):
+                    started = time.time()
+                    result = await _dispatch_controlled(p, args, call_ids[index])
+                    return index, p, args, result, int((time.time() - started) * 1000)
+
+                _parallel_outcomes = await asyncio.gather(*(
+                    _timed_parallel_read(index, p, args)
+                    for index, p, args, _decision in _parallel_reads
+                ))
+                for index, p, args, result, duration_ms in sorted(_parallel_outcomes):
+                    _is_err = bool(getattr(result, "is_error", False))
+                    tool_call_log.append({
+                        "name": p.name,
+                        "args": args,
+                        "ok": not _is_err,
+                        "result": str(result.llm_text)[:500],
+                    })
+                    print_observation(console, result.llm_text)
+                    _tool_content = await _maybe_offload_content(result.llm_text, p.name, args)
+                    await _safe_emit({
+                        "type": "observation",
+                        "text": result.llm_text,
+                        "is_error": _is_err,
+                        "duration_ms": duration_ms,
+                        "iteration": iter_count,
+                        "parallel": True,
+                    })
+                    messages.append({
+                        "role": "tool",
+                        "name": p.name,
+                        "tool_call_id": tc_ids[index],
+                        "content": _tool_content,
+                        "is_error": _is_err,
+                    })
+                    if _is_err:
+                        await _note_tool_error(p.name, str(result.llm_text)[:200])
+
+                if max_iter is not None and iter_count >= max_iter:
+                    if reflection_engine is not None:
+                        try:
+                            await reflection_engine.emit(
+                                max_iter_reached(
+                                    session_id=session_id or "default",
+                                    turn_idx=iter_count,
+                                    iter_used=iter_count,
+                                    last_content=content or "",
+                                )
+                            )
+                        except Exception as exc:  # noqa: BLE001 - reflection is best-effort
+                            _logger.debug("max-iteration reflection emit failed: %s", exc)
+                    fallback = "Reached the model-call limit after executing pending tools; the task may be incomplete."
+                    print_warn(console, "max iterations reached after executing pending tool calls")
+                    messages.append({"role": "assistant", "content": fallback})
+                    print_result(console, fallback)
+                    await _safe_emit({"type": "result", "text": fallback, "ts": time.time()})
+                    return _stats()
+                continue
+
+            # Serial path for mutations, permission prompts, invalid calls,
+            # and tools whose read-only behavior is not locally guaranteed.
             for i, p in enumerate(pending):
                 tc_id = tc_ids[i]
                 if p.name is None:
@@ -899,7 +1270,7 @@ async def run_turn(
                     # (使用同一个 tc_id),然后 continue,本 turn 其余 tool 继续。
                     _dispatch_t0 = time.time()
                     try:
-                        result = await _dispatch(p, args, project_root)
+                        result = await _dispatch_controlled(p, args, tc_id)
                         _dispatch_t1 = time.time()
                     except Exception as dispatch_err:
                         _dispatch_t1 = time.time()
@@ -924,7 +1295,7 @@ async def run_turn(
                         })
                         await _note_tool_error(p.name, err_text[:200])
                         continue
-                    tool_call_log.append({"name": p.name, "args": args, "ok": True,
+                    tool_call_log.append({"name": p.name, "args": args, "ok": not result.is_error,
                                           "result": str(result.llm_text)[:500]})
                     print_observation(console, result.llm_text)
                     _tool_content = await _maybe_offload_content(
@@ -975,7 +1346,7 @@ async def run_turn(
                         })
                         _dispatch_t0 = time.time()
                         try:
-                            result = await _dispatch(p, args, project_root)
+                            result = await _dispatch_controlled(p, args, tc_id)
                             _dispatch_t1 = time.time()
                         except Exception as dispatch_err:
                             _dispatch_t1 = time.time()
@@ -1000,7 +1371,7 @@ async def run_turn(
                             })
                             await _note_tool_error(p.name, err_text[:200])
                             continue
-                        tool_call_log.append({"name": p.name, "args": args, "ok": True,
+                        tool_call_log.append({"name": p.name, "args": args, "ok": not result.is_error,
                                               "result": str(result.llm_text)[:500]})
                         print_observation(console, result.llm_text)
                         _tool_content = await _maybe_offload_content(
@@ -1055,6 +1426,32 @@ async def run_turn(
                         })
                         await _note_tool_error(p.name or "", error_text)
 
+            # A model-call budget limits model calls, not execution of tool
+            # calls already returned by the final allowed model response.
+            if max_iter is not None and iter_count >= max_iter:
+                if reflection_engine is not None:
+                    try:
+                        await reflection_engine.emit(
+                            max_iter_reached(
+                                session_id=session_id or "default",
+                                turn_idx=iter_count,
+                                iter_used=iter_count,
+                                last_content=content or "",
+                            )
+                        )
+                    except Exception:
+                        pass
+                fallback = "达到最大迭代次数；最后一批工具已执行，任务可能未完成。"
+                print_warn(console, "max iterations reached after executing pending tool calls")
+                messages.append({"role": "assistant", "content": fallback})
+                print_result(console, fallback)
+                await _safe_emit({
+                    "type": "result",
+                    "text": fallback,
+                    "ts": time.time(),
+                })
+                return _stats()
+
             # 5. Continue the loop — feed tool results back to LLM
             continue
 
@@ -1066,6 +1463,57 @@ async def run_turn(
             print_warn(console, f"mode={mode}: dropping {len(pending)} unexpected tool call(s)")
 
         if content:
+            if (
+                mode == "coding"
+                and _loop_cfg.enabled
+                and _loop_cfg.completion_verification
+                and _completion_verifier is not None
+            ):
+                _completion_report = await _completion_verifier.verify(
+                    _working_state,
+                    todo_service=todo_service,
+                    session_id=session_id,
+                )
+                if not _completion_report.passed:
+                    _completion_rechecks += 1
+                    _feedback = _completion_report.feedback()
+                    await _safe_emit({
+                        "type": "completion_rejected",
+                        "issues": list(_completion_report.issues),
+                        "attempt": _completion_rechecks,
+                        "iteration": iter_count,
+                        "ts": time.time(),
+                    })
+                    _append_journal(
+                        kind="completion_rejected",
+                        action_id=f"completion-{iter_count}-{_completion_rechecks}",
+                        tool="",
+                        args={},
+                        outcome={"issues": list(_completion_report.issues)},
+                    )
+                    _can_recheck = (
+                        _completion_rechecks <= _loop_cfg.completion_contract.max_rechecks
+                        and (max_iter is None or iter_count < max_iter)
+                    )
+                    if _can_recheck:
+                        _candidate = _redact(content, "result")
+                        messages.append({"role": "assistant", "content": _candidate})
+                        messages.append({"role": "user", "content": _feedback})
+                        print_warn(console, "candidate completion rejected by loop verifier")
+                        continue
+
+                    _candidate = _redact(content, "result")
+                    content = (
+                        "Task stopped without verified completion.\n"
+                        + "\n".join(f"- {issue}" for issue in _completion_report.issues)
+                        + "\n\nModel candidate:\n"
+                        + _candidate
+                    )
+                    messages.append({"role": "assistant", "content": content})
+                    print_result(console, content)
+                    _failed_stats = _stats()
+                    _failed_stats.error = "completion_verification_failed"
+                    return _failed_stats
             # Final. Print "结果:" + the FULL content as the LLM's answer.
             content = _redact(content, "result")
             messages.append({"role": "assistant", "content": content})
@@ -1116,10 +1564,8 @@ async def run_turn(
             })
             return _stats()
 
-    # 6. max_iter reached (safety net — the inner has_tool_calls branch above
-    # already handles this case and returns early, so this only runs if the
-    # LLM never returned has_tool_calls=True but somehow the loop also never
-    # appended an assistant message and never returned).
+    # 6. Defensive safety net. Normal tool-call exhaustion returns from the
+    # post-dispatch budget guard above.
     print_warn(console, "max iterations reached")
     if content:
         content = _redact(content, "result")
@@ -1182,6 +1628,19 @@ def _refresh_system_prompt(messages: list[dict], cwd: str, mode: str,
     末尾 strip 后 re-append。plan/design 不注入(无 todo_update 语义)。
     """
     from cc_harness.prompts import build_system_prompt
+    prompt_capabilities = {
+        "todo_available": True,
+        "subagent_available": True,
+        "visible_thought_required": True,
+    }
+    if extra_ctx:
+        prompt_capabilities.update(
+            {
+                key: bool(extra_ctx[key])
+                for key in prompt_capabilities
+                if key in extra_ctx
+            }
+        )
     if extra_ctx:
         from cc_harness.prompts import PromptComposer
         ctx = {"cwd": cwd, **extra_ctx}
@@ -1196,6 +1655,7 @@ def _refresh_system_prompt(messages: list[dict], cwd: str, mode: str,
     # --- Task 6: append resume_task block (idempotent, append-only) ---
     if (
         mode == "coding"
+        and prompt_capabilities["todo_available"]
         and resume_task is not None
         and messages
         and messages[0].get("role") == "system"
@@ -1239,6 +1699,7 @@ def _refresh_system_prompt(messages: list[dict], cwd: str, mode: str,
     # 幂等。空 / None → 不注入段(向后兼容)。
     if (
         mode == "coding"
+        and prompt_capabilities["todo_available"]
         and todo_hints
         and messages
         and messages[0].get("role") == "system"
@@ -1264,7 +1725,12 @@ def _refresh_system_prompt(messages: list[dict], cwd: str, mode: str,
     # 完成门互补 —— 这里是预防性告知,Task 3 是强制兜底)。与 <todo_hints> /
     # <resume_task> 并列,同 idempotent 模式(re.sub strip 旧块 anchored to
     # end + append 新块)。coding mode only(plan/design 无 todo_update)。
-    if mode == "coding" and messages and messages[0].get("role") == "system":
+    if (
+        mode == "coding"
+        and prompt_capabilities["todo_available"]
+        and messages
+        and messages[0].get("role") == "system"
+    ):
         old = messages[0]["content"]
         # Strip prior <todo_completion_gate>...</todo_completion_gate> block if
         # present (anchored to end of string to avoid removing in-line
@@ -1286,7 +1752,11 @@ def _refresh_system_prompt(messages: list[dict], cwd: str, mode: str,
 
     # D1: <subagent_hints> 注入(coding mode + HTN parent 已创建)
     new = _strip_subagent_hints(messages[0]["content"])
-    if mode == "coding" and _has_recent_htn_parent_create(messages):
+    if (
+        mode == "coding"
+        and prompt_capabilities["subagent_available"]
+        and _has_recent_htn_parent_create(messages)
+    ):
         new = new.rstrip() + "\n\n" + SUBAGENT_HINTS_BLOCK.strip() + "\n"
     messages[0]["content"] = new
 
@@ -1387,8 +1857,9 @@ def _save_design_output(
 
 def _print_decomp_summary(new_todos: list["TodoTask"], *, console=None) -> None:
     """E1 D2:user 第 1 轮看到 2-3 行 plan 摘要。"""
-    from cc_harness.render import print_info
     from rich.console import Console
+
+    from cc_harness.render import print_info
     lines = [f"📋 计划:分解为 {len(new_todos)} 个 sub-task"]
     for i, t in enumerate(new_todos[:5], 1):
         crit = t.acceptance_criteria[0] if t.acceptance_criteria else "(无)"

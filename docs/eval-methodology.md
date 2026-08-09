@@ -1,5 +1,8 @@
 # cc-harness 安全评估方法论
 
+> **Superseded:** 本文记录 Eval v2 的历史方法。当前 Claude Code 对标评测以
+> `docs/eval/claude-code-parity-matrix.md` 和 Eval v3 为准；本文中的能力接线状态不代表当前实现。
+
 > 2026-07-30 · 关联:`docs/superpowers/specs/2026-07-28-eval-v2-design.md`(design spec)· `.superpowers/sdd/2026-07-28-eval-v2/progress.md`(task ledger)
 
 ## §1 评估方法论框架

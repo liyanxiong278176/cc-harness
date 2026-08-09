@@ -1,5 +1,7 @@
 """memory/extras.py 共享 helper 单测。"""
 import asyncio
+from types import SimpleNamespace
+from unittest.mock import AsyncMock
 
 
 def test_build_memory_extras_returns_extras_when_deps_ok(monkeypatch, tmp_path):
@@ -10,7 +12,7 @@ def test_build_memory_extras_returns_extras_when_deps_ok(monkeypatch, tmp_path):
     monkeypatch.setattr("cc_harness.memory.store.MemoryStore.init_schema", _noop_init)
     env = {"OPENAI_API_KEY": "k", "OPENAI_BASE_URL": "u", "OPENAI_MODEL": "m",
            "EMBEDDING_BASE_URL": "u", "EMBEDDING_API_KEY": "k", "EMBEDDING_MODEL": "bge"}
-    from cc_harness.memory.extras import build_memory_extras
+    from cc_harness.memory.extras import build_memory_extras, close_memory_deps
     extras, deps = asyncio.run(build_memory_extras(env, tmp_path / "mem.db"))
     # Q3 建 2 个 memory_* tool;Q4 起 extras 也含 read_ref(offload 锭就绪时)。
     # 用 >= 2 + 名字 in 检查,既守住 Q3 intent,又容纳 Q4+ 新增 tool。
@@ -19,6 +21,7 @@ def test_build_memory_extras_returns_extras_when_deps_ok(monkeypatch, tmp_path):
     assert "memory_recall" in names and "memory_save" in names
     assert deps is not None
     assert "service" in deps and "retriever" in deps
+    asyncio.run(close_memory_deps(deps))
 
 
 def test_build_memory_extras_fail_soft_on_missing_env(monkeypatch, tmp_path):
@@ -28,3 +31,26 @@ def test_build_memory_extras_fail_soft_on_missing_env(monkeypatch, tmp_path):
     extras, deps = asyncio.run(build_memory_extras(env, tmp_path / "mem.db"))
     assert extras == []
     assert deps is None
+
+
+def test_close_memory_deps_is_idempotent_and_continues_after_failure(caplog):
+    from cc_harness.memory.extras import close_memory_deps
+
+    embedder = SimpleNamespace(aclose=AsyncMock(side_effect=RuntimeError("http close failed")))
+    decider_llm = SimpleNamespace(aclose=AsyncMock())
+    store = SimpleNamespace(close=AsyncMock())
+    deps = {
+        "service": SimpleNamespace(
+            embedder=embedder,
+            decider=SimpleNamespace(_llm=decider_llm),
+        ),
+        "store": store,
+    }
+
+    asyncio.run(close_memory_deps(deps))
+    asyncio.run(close_memory_deps(deps))
+
+    embedder.aclose.assert_awaited_once()
+    decider_llm.aclose.assert_awaited_once()
+    store.close.assert_awaited_once()
+    assert "http close failed" in caplog.text

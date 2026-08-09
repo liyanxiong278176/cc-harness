@@ -118,6 +118,7 @@ def init_session_executor(config: ExecutorConfig, project_root: str | Path) -> N
     global _session_executor, _session_executor_config
     _session_executor = build_executor(config, Path(project_root))
     _session_executor_config = config
+    _surface_shell_metadata(_session_executor)
 
 
 def get_session_executor() -> Executor:
@@ -286,8 +287,8 @@ RUN_COMMAND_SPEC = {
                 "command": {
                     "type": "string",
                     "description": (
-                        "The shell command to execute. Passed to the system "
-                        "shell (sh -c on Unix, cmd /c on Windows)."
+                        "The shell command to execute. The active session replaces this text "
+                        "with its exact platform and command dialect before model use."
                     ),
                 },
             },
@@ -295,3 +296,25 @@ RUN_COMMAND_SPEC = {
         },
     },
 }
+
+
+def _surface_shell_metadata(executor: Executor) -> None:
+    profile = getattr(executor, "shell_profile", None)
+    if profile is None:
+        description = (
+            "The command to execute in the configured sandbox's POSIX shell. "
+            "Use POSIX shell syntax."
+        )
+    else:
+        examples = (
+            " Prefer Get-ChildItem and Get-Content for listing and reading files."
+            if profile.dialect == "powershell"
+            else ""
+        )
+        description = (
+            f"The command to execute with {profile.name} on {profile.platform}. "
+            f"Use the {profile.dialect} command dialect.{examples}"
+        )
+    RUN_COMMAND_SPEC["function"]["parameters"]["properties"]["command"][
+        "description"
+    ] = description

@@ -11,6 +11,10 @@ def test_config_has_two_graders():
     rubrics = [a for a in asserts if a.get("type") == "llm-rubric"]
     # 主 + 第二源 至少 2 个 llm-rubric
     assert len(rubrics) >= 2
-    providers = {str(r.get("provider") or r.get("vars", {}).get("judge_provider", "")) for r in rubrics}
+    providers = [
+        str(r.get("provider") or r.get("vars", {}).get("judge_provider", ""))
+        for r in rubrics
+    ]
+    assert all("deepseek-v4-flash" in provider for provider in providers)
     # 至少区分出两个 judge 源
     assert len(providers) >= 2

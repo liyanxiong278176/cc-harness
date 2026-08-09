@@ -212,13 +212,19 @@ class PolicyEngine:
         # entry nor enabled=false may approve an undeclared root or credential path.
         for target in _extract_paths(args):
             resolved = _resolve(target, root)
-            if not any(resolved.is_relative_to(allowed) for allowed in allowed_roots):
+            containing_root = next(
+                (allowed for allowed in allowed_roots if resolved.is_relative_to(allowed)),
+                None,
+            )
+            if containing_root is None:
                 return Decision(
                     Action.DENY,
                     "path_outside_allowed_roots",
                     f"拒绝访问未授权工作区外路径: {target}",
                 )
-            if is_sensitive_path(resolved):
+            # Ancestors of an explicitly authorized root are not addressable by
+            # the model. Only credential locations inside that root are sensitive.
+            if is_sensitive_path(resolved.relative_to(containing_root)):
                 return Decision(
                     Action.DENY,
                     "sensitive_credential_path",

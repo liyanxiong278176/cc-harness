@@ -81,8 +81,9 @@ def collect_failures(
     calibration_schema.validate_entry 一致;外加 metadata(category/source)。
     """
     cs = load_calibration_set(calibration_yaml)
-    existing = {e.get("prompt") for e in cs["baseline"] + cs["pending"]}
-    static_texts = [e["prompt"] for e in cs["baseline"] + cs["pending"]]
+    calibration_entries = cs["baseline"] + cs["candidates"] + cs["pending"]
+    existing = {e.get("prompt") for e in calibration_entries}
+    static_texts = [e["prompt"] for e in calibration_entries]
 
     data = json.loads(Path(results_json).read_text(encoding="utf-8"))
     raw = (data.get("results") or {}).get("results") or []

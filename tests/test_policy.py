@@ -169,6 +169,34 @@ def test_sensitive_credential_inside_workspace_is_deny():
     assert d.rule_id == "sensitive_credential_path"
 
 
+def test_sensitive_ancestor_of_workspace_does_not_block_normal_source(tmp_path):
+    root = tmp_path / ".cc-harness" / "eval" / "workspaces" / "trial"
+    root.mkdir(parents=True)
+    engine = PolicyEngine(project_root=root)
+
+    for relative_path in (
+        "app/config.py",
+        "app/retry.py",
+        "app/runtime.py",
+        "app/__init__.py",
+        "tests/test_runtime.py",
+    ):
+        decision = engine.evaluate(
+            "Read",
+            {"file_path": relative_path},
+            {"project_root": root},
+        )
+        assert decision.action is Action.ALLOW, relative_path
+
+    credential = engine.evaluate(
+        "Read",
+        {"file_path": ".cc-harness/session.json"},
+        {"project_root": root},
+    )
+    assert credential.action is Action.DENY
+    assert credential.rule_id == "sensitive_credential_path"
+
+
 @pytest.mark.parametrize("relative_path", [".cc-harness/session.json", ".git/config"])
 def test_internal_credential_stores_inside_workspace_are_deny(relative_path):
     d = _engine().evaluate(

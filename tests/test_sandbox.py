@@ -497,7 +497,9 @@ def test_audit_fallback_writes_jsonl(tmp_path):
     import json
     from cc_harness.sandbox import _audit_fallback
     _audit_fallback(project_root=tmp_path, reason="conn down", retries=3)
-    log = (tmp_path / "logs" / "sandbox.jsonl").read_text(encoding="utf-8").strip()
+    log = (
+        tmp_path / ".cc-harness" / "logs" / "sandbox.jsonl"
+    ).read_text(encoding="utf-8").strip()
     rec = json.loads(log)
     assert rec["action"] == "fallback_after_retry"
     assert rec["reason"] == "conn down"

@@ -59,6 +59,7 @@ eval/result/conv-*.trace.jsonl
 eval/result/locomo-*/
 eval/result/locomo-*.json
 eval/result/promptfoo-result/
+eval/result/parity-*/
 /img/
 
 # cc-harness ad-hoc session/test memory DB
@@ -68,3 +69,18 @@ cc_harness/memory/*.db
 /eval/promptfoo/.cc_env.sh
 /eval/promptfoo/promptfoo.txt
 /eval/img/
+.playwright-mcp
+
+# Local benchmark evidence, downloaded datasets, and pinned upstream checkouts.
+/eval/result/
+/eval/cc_only/data/
+/eval/cc_only/upstream/
+
+# Local agent/runtime state and tool caches.
+/.cc-harness/
+/.codegraph/
+/.deepeval/
+/.superpowers/brainstorm/
+/logs/reflection.jsonl
+/logs/*.db-shm
+/logs/*.db-wal

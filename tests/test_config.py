@@ -372,6 +372,25 @@ def test_load_executor_config_env_override_backend(monkeypatch):
     assert cfg3.backend is ExecutorBackend.SANDBOX
 
 
+def test_load_executor_config_accepts_owned_sandbox_coordinates(monkeypatch, tmp_path):
+    config_path = tmp_path / "server.toml"
+    monkeypatch.setenv("CC_HARNESS_SANDBOX_SERVER_PORT", "18765")
+    monkeypatch.setenv("CC_HARNESS_SANDBOX_SERVER_CONFIG_PATH", str(config_path))
+
+    cfg = load_executor_config(tmp_path / "missing-policy.yaml")
+
+    assert cfg.sandbox.server_port == 18765
+    assert cfg.sandbox.server_config_path == config_path.resolve()
+
+
+@pytest.mark.parametrize("value", ["not-a-port", "0", "65536"])
+def test_load_executor_config_rejects_invalid_sandbox_port(monkeypatch, tmp_path, value):
+    monkeypatch.setenv("CC_HARNESS_SANDBOX_SERVER_PORT", value)
+
+    with pytest.raises(ValueError, match="CC_HARNESS_SANDBOX_SERVER_PORT"):
+        load_executor_config(tmp_path / "missing-policy.yaml")
+
+
 # --- ContextConfig (Plan3 Task2) ---
 
 
@@ -423,3 +442,21 @@ def test_context_config_env_override(monkeypatch):
     from cc_harness.config import load_context_config
     c = load_context_config()
     assert c.context_window == 128000
+
+
+def test_context_window_comes_from_verified_model_registry(monkeypatch):
+    from cc_harness.config import load_context_config
+
+    monkeypatch.delenv("CONTEXT_WINDOW", raising=False)
+    config = load_context_config(model="deepseek-v4-flash", require_known=True)
+    assert config.context_window == 128_000
+    assert config.context_window_verified is True
+    assert config.context_window_source == "cc-harness-registry-v1"
+
+
+def test_specialist_context_rejects_unknown_model_window(monkeypatch):
+    from cc_harness.config import ConfigError, load_context_config
+
+    monkeypatch.delenv("CONTEXT_WINDOW", raising=False)
+    with pytest.raises(ConfigError, match="unknown context window"):
+        load_context_config(model="unknown-model", require_known=True)

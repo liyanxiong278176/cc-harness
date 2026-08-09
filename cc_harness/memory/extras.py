@@ -3,11 +3,54 @@
 Used by both locomo runner (eval) and repl (production). Caller owns the
 inject_memory_tools gate (kill-switch) and db_path (isolation).
 """
+
 from __future__ import annotations
+
+import inspect
+import logging
 from pathlib import Path
 
 
-async def build_memory_extras(env: dict, db_path: Path) -> tuple[list[dict], dict | None]:
+logger = logging.getLogger(__name__)
+
+
+async def _close_components(*components) -> None:
+    seen: set[int] = set()
+    for component in components:
+        if component is None or id(component) in seen:
+            continue
+        seen.add(id(component))
+        close = getattr(component, "aclose", None) or getattr(component, "close", None)
+        if close is None:
+            continue
+        try:
+            result = close()
+            if inspect.isawaitable(result):
+                await result
+        except Exception as exc:  # noqa: BLE001 - shutdown must continue through all resources
+            logger.warning("memory component close failed for %s: %s", type(component).__name__, exc)
+
+
+async def close_memory_deps(deps: dict | None) -> None:
+    """Close all resources owned by a stack returned from build_memory_extras."""
+    if not deps:
+        return
+    if deps.get("_resources_closed"):
+        return
+    deps["_resources_closed"] = True
+    service = deps.get("service")
+    await _close_components(
+        deps.get("worker"),
+        getattr(service, "embedder", None),
+        getattr(getattr(service, "decider", None), "_llm", None),
+        deps.get("store"),
+    )
+
+
+async def build_memory_extras(
+    env: dict, db_path: Path, *, include_offload: bool = True,
+    memory_config=None, project_scope: str | None = None,
+) -> tuple[list[dict], dict | None]:
     """Return (extras, deps). extras: [{spec, handler, deps}].
 
     async because MemoryStore.init_schema() is async (store.py:44).
@@ -19,6 +62,9 @@ async def build_memory_extras(env: dict, db_path: Path) -> tuple[list[dict], dic
     closure/read_ref_spec + config 字段(threshold/offload_ratio/context_window 等)。
     Q4 init hiccup 不破 Q3 —— offload 段失败仅缺 offload key/extras 不加 read_ref。
     """
+    store = None
+    embedder = None
+    decider_llm = None
     try:
         from cc_harness.memory.store import MemoryStore
         from cc_harness.memory.embedding import EmbeddingClient
@@ -41,32 +87,52 @@ async def build_memory_extras(env: dict, db_path: Path) -> tuple[list[dict], dic
         emb_model = env.get("EMBEDDING_MODEL", "BAAI/bge-m3")
         emb_dim = int(env.get("EMBEDDING_DIM", "1024"))
 
-        store = MemoryStore(db_path=db_path, embedding_dim=emb_dim)
+        store = MemoryStore(
+            db_path=db_path, embedding_dim=emb_dim, project_scope=project_scope
+        )
         await store.init_schema()
         embedder = EmbeddingClient(
-            base_url=emb_base, api_key=emb_key, model=emb_model, dim=emb_dim, timeout_s=10.0,
+            base_url=emb_base, api_key=emb_key, model=emb_model, dim=emb_dim,
+            timeout_s=(memory_config.embed_timeout_s if memory_config else 10.0),
         )
         decider_llm = LLMClient(
             api_key=env["OPENAI_API_KEY"], model=env["OPENAI_MODEL"], base_url=env["OPENAI_BASE_URL"],
         )
         decider = LLMDecider(llm=decider_llm)
         service = MemoryService(store=store, embedder=embedder, decider=decider)
-        retriever = MemoryRetriever(store=store, embedder=embedder)
+        retriever = MemoryRetriever(
+            store=store,
+            embedder=embedder,
+            top_k=(memory_config.retriever_top_k if memory_config else 5),
+            token_budget=(memory_config.injection_token_budget if memory_config else 800),
+        )
     except Exception as e:
+        await _close_components(embedder, decider_llm, store)
         print(f"[memory] service init failed: {e}; running without memory tools")
         return [], None
 
     # --- Q3 Task7: pipeline + 分层 recall callable(closure 绑定 retriever /
     # persona_path / scenarios_dir)。persona_path/scenarios_dir 必须先赋值
     # 再定义 _recall,否则 closure 引用会 NameError。 ---
-    pipeline = MemoryPipeline(llm=decider_llm, service=service)
+    pipeline = MemoryPipeline(
+        llm=decider_llm,
+        service=service,
+        threshold=(memory_config.pipeline_threshold if memory_config else 0.55),
+        recent_turns=(memory_config.pipeline_recent_turns if memory_config else 10),
+        max_delta_tokens=(memory_config.pipeline_max_delta_tokens if memory_config else 4000),
+    )
     persona_path = db_path.parent / "persona.md"
     scenarios_dir = db_path.parent / "scenarios"
 
     async def _recall(q, **kw):
         return await layered_recall(
             retriever, persona_path, scenarios_dir, q,
-            top_k=kw.get("top_k", 5), timeout_s=kw.get("timeout_s", 5.0),
+            top_k=kw.get(
+                "top_k", memory_config.recall_top_k if memory_config else 5
+            ),
+            timeout_s=kw.get(
+                "timeout_s", memory_config.recall_timeout_s if memory_config else 5.0
+            ),
         )
 
     extras: list[dict] = [
@@ -78,6 +144,9 @@ async def build_memory_extras(env: dict, db_path: Path) -> tuple[list[dict], dic
         "recall": _recall, "store": store,
         "persona_path": persona_path, "scenarios_dir": scenarios_dir,
     }
+
+    if not include_offload:
+        return extras, deps
 
     # --- Q4 Task4:offload 锭(refs/canvas/closures/read_ref tool)。
     # 独立 try —— offload init hiccup(import 失败 / config 异常 / 目录建失败)

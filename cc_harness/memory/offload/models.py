@@ -23,3 +23,5 @@ class OffloadResult:
     summary: str
     refs_path: str
     pointer_msg: str
+    content_digest: str = ""
+    size_bytes: int = 0

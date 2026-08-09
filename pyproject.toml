@@ -26,6 +26,7 @@ dependencies = [
 dev = ["pytest>=8.0", "pytest-asyncio>=0.23", "pytest-cov>=5.0", "ruff==0.16.1"]
 dlp = ["presidio-analyzer>=2.2"]
 sandbox = ["opensandbox==0.1.15", "opensandbox-server==0.2.2"]
+benchmarks = ["agentdojo==0.1.35"]
 
 [build-system]
 requires = ["hatchling"]
@@ -50,3 +51,4 @@ markers = [
 [tool.ruff]
 line-length = 100
 target-version = "py311"
+extend-exclude = ["eval/result"]

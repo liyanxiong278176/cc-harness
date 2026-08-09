@@ -42,6 +42,21 @@ entrypoints.
 7. A task is successful only when its acceptance criteria have evidence tied to the relevant
    code snapshot. Safety, recovery and data-loss regressions block release.
 
+The nine-area design review completed on 2026-08-03 further fixes these boundaries:
+
+- The agent loop is budget-driven. A high configurable step cap is insurance, not the normal
+  stopping rule, and benchmark profiles do not alter production behavior.
+- All file mutations compile to one conditional mutation plan. Read returns a content hash;
+  Edit and replacement Write reject stale content and commit atomically.
+- Offload remains a first-class advantage, but refs become immutable content-addressed artifacts
+  and the Mermaid graph becomes a session/branch projection over events.
+- Skills, hooks, plugins and MCP remain untrusted extensions. Installation, activation and scoped
+  authorization are separate operations.
+- Subagents receive persisted task specifications, smaller independent budgets and least-privilege
+  capabilities. Parallel writers use isolated worktrees.
+- Parity evidence uses development, regression and frozen holdout sets. All same-model comparisons
+  use `deepseek-v4-flash` and record the concrete server-returned model version.
+
 ## Security ordering
 
 Every tool request follows this order:
@@ -68,3 +83,8 @@ separate user-selected runtime mode and remains subject to hard-deny and audit r
   remain authoritative.
 - Durable agent teams, local extensions, web tools, LSP and IDE clients build on the stable
   runtime rather than introducing separate agent loops.
+- Rewind directly restores the active state of the same user-visible session. Internally it appends
+  a rewind fact and moves the active projection head; only explicit branch commands create a new
+  session identity.
+- Runtime state moves out of the source tree into a project-isolated user data store. Existing
+  project-local databases remain readable until a verified migration succeeds.

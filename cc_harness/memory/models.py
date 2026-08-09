@@ -10,6 +10,8 @@ class Scenario:
     summary: str
     session_id: str
     md_path: str
+    version: int = 1
+    created_at: float = 0.0
 
 
 @dataclass
@@ -18,6 +20,8 @@ class Persona:
     summary: str
     scenario_ids: list[str]
     md_path: str
+    version: int = 1
+    created_at: float = 0.0
 
 
 @dataclass

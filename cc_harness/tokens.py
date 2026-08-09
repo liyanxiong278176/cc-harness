@@ -7,6 +7,7 @@ Provides:
 - `SessionTokenStats`: cross-turn session totals.
 """
 from __future__ import annotations
+
 import json
 from dataclasses import dataclass, field
 from typing import Any
@@ -23,22 +24,47 @@ class UsageRecord:
     prompt_tokens: int
     completion_tokens: int
     total_tokens: int
+    cache_read_prompt_tokens: int = 0
+    cache_creation_prompt_tokens: int = 0
 
-    @classmethod
-    def from_api(cls, usage: Any) -> "UsageRecord | None":
-        if usage is None:
-            return None
-        return cls(
-            prompt_tokens=int(getattr(usage, "prompt_tokens", 0) or 0),
-            completion_tokens=int(getattr(usage, "completion_tokens", 0) or 0),
-            total_tokens=int(getattr(usage, "total_tokens", 0) or 0),
+    @property
+    def uncached_prompt_tokens(self) -> int:
+        return max(
+            0,
+            self.prompt_tokens
+            - self.cache_read_prompt_tokens
+            - self.cache_creation_prompt_tokens,
         )
 
-    def __add__(self, other: "UsageRecord") -> "UsageRecord":
+    @classmethod
+    def from_api(cls, usage: Any) -> UsageRecord | None:
+        if usage is None:
+            return None
+        prompt_tokens = int(getattr(usage, "prompt_tokens", 0) or 0)
+        details = getattr(usage, "prompt_tokens_details", None)
+        cache_read = int(getattr(details, "cached_tokens", 0) or 0)
+        cache_creation = int(getattr(details, "cache_write_tokens", 0) or 0)
+        cache_read = min(prompt_tokens, max(0, cache_read))
+        cache_creation = min(prompt_tokens - cache_read, max(0, cache_creation))
+        return cls(
+            prompt_tokens=prompt_tokens,
+            completion_tokens=int(getattr(usage, "completion_tokens", 0) or 0),
+            total_tokens=int(getattr(usage, "total_tokens", 0) or 0),
+            cache_read_prompt_tokens=cache_read,
+            cache_creation_prompt_tokens=cache_creation,
+        )
+
+    def __add__(self, other: UsageRecord) -> UsageRecord:
         return UsageRecord(
             prompt_tokens=self.prompt_tokens + other.prompt_tokens,
             completion_tokens=self.completion_tokens + other.completion_tokens,
             total_tokens=self.total_tokens + other.total_tokens,
+            cache_read_prompt_tokens=(
+                self.cache_read_prompt_tokens + other.cache_read_prompt_tokens
+            ),
+            cache_creation_prompt_tokens=(
+                self.cache_creation_prompt_tokens + other.cache_creation_prompt_tokens
+            ),
         )
 
 
@@ -133,10 +159,14 @@ class TurnTokenStats:
     tool_definitions: int = 0
     # API-reported (sum across iters in this turn)
     api_prompt_tokens: int = 0
+    api_uncached_prompt_tokens: int = 0
+    api_cache_read_prompt_tokens: int = 0
+    api_cache_creation_prompt_tokens: int = 0
     api_completion_tokens: int = 0
     api_total_tokens: int = 0
     # Metadata
     iter_count: int = 0
+    auxiliary_model_calls: int = 0
     api_reported: bool = False
     tool_call_log: list = field(default_factory=list)  # [{name, args, ok, result}], Plan1 收集
     compaction: Any = None  # Plan3: CompactionStats obj (context.py) or None
@@ -171,9 +201,13 @@ class SessionTokenStats:
     summary: int = 0
     tool_definitions: int = 0
     api_prompt_tokens: int = 0
+    api_uncached_prompt_tokens: int = 0
+    api_cache_read_prompt_tokens: int = 0
+    api_cache_creation_prompt_tokens: int = 0
     api_completion_tokens: int = 0
     api_total_tokens: int = 0
     iters_total: int = 0
+    auxiliary_model_calls: int = 0
     turns_with_usage: int = 0
 
     @property
@@ -232,8 +266,12 @@ class SessionTokenStats:
             self.tool_definitions += turn.tool_definitions
         # API fields are per-LLM-call totals and always add.
         self.api_prompt_tokens += turn.api_prompt_tokens
+        self.api_uncached_prompt_tokens += turn.api_uncached_prompt_tokens
+        self.api_cache_read_prompt_tokens += turn.api_cache_read_prompt_tokens
+        self.api_cache_creation_prompt_tokens += turn.api_cache_creation_prompt_tokens
         self.api_completion_tokens += turn.api_completion_tokens
         self.api_total_tokens += turn.api_total_tokens
         self.iters_total += turn.iter_count
+        self.auxiliary_model_calls += turn.auxiliary_model_calls
         if turn.api_reported:
             self.turns_with_usage += 1

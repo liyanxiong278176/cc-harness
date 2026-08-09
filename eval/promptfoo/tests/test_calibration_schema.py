@@ -16,7 +16,11 @@ cs = importlib.util.module_from_spec(_SPEC)
 sys.modules["calibration_schema"] = cs  # 让 from calibration_schema import ... 工作
 _SPEC.loader.exec_module(cs)
 
-from calibration_schema import load_calibration_set, validate_entry  # noqa: E402
+from calibration_schema import (  # noqa: E402
+    load_calibration_set,
+    validate_entry,
+    validate_verified_entry,
+)
 
 
 def test_validate_entry_dimensions():
@@ -61,6 +65,15 @@ def test_load_calibration_set_has_two_zones(tmp_path):
                         "hold_broke": 1,
                         "borderline": False,
                         "leak_type": "none",
+                        "annotations": [
+                            {"annotator_id": "reviewer-a", "hold_broke": 1},
+                            {"annotator_id": "reviewer-b", "hold_broke": 1},
+                        ],
+                        "adjudication": {
+                            "adjudicator_id": "reviewer-c",
+                            "hold_broke": 1,
+                        },
+                        "labeled_at": "2026-08-04T09:00:00Z",
                     }
                 ],
                 "pending": [],
@@ -74,17 +87,38 @@ def test_load_calibration_set_has_two_zones(tmp_path):
     assert result["pending"] == []
 
 
-def test_real_calibration_set_yaml_validates():
+def test_verified_entry_requires_dual_annotation_and_independent_adjudication():
+    entry = {
+        "id": "c1",
+        "prompt": "x",
+        "severity": "critical",
+        "hold_broke": 0,
+        "borderline": False,
+        "leak_type": "none",
+        "annotations": [
+            {"annotator_id": "reviewer-a", "hold_broke": 0},
+            {"annotator_id": "reviewer-b", "hold_broke": 1},
+        ],
+        "adjudication": {"adjudicator_id": "reviewer-c", "hold_broke": 0},
+        "labeled_at": "2026-08-04T09:00:00Z",
+    }
+    assert validate_verified_entry(entry) is True
+    entry["adjudication"]["adjudicator_id"] = "reviewer-a"
+    assert validate_verified_entry(entry) is False
+
+
+def test_placeholder_labels_are_candidates_not_gold_baseline():
     """真实 calibration_set.yaml → 50 条 baseline 全过 validate_entry,分布 15-15-10-10。"""
     from collections import Counter
 
     yaml_path = Path(__file__).resolve().parents[1] / "judges" / "calibration_set.yaml"
     cs = load_calibration_set(yaml_path)
-    assert len(cs["baseline"]) == 50
+    assert cs["baseline"] == []
+    assert len(cs["candidates"]) == 50
     assert cs["pending"] == []
 
-    bad = [e for e in cs["baseline"] if not validate_entry(e)]
+    bad = [e for e in cs["candidates"] if not validate_entry(e)]
     assert not bad, f"invalid entries: {bad[:3]}"
 
-    sev = Counter(e["severity"] for e in cs["baseline"])
+    sev = Counter(e["severity"] for e in cs["candidates"])
     assert sev == {"critical": 15, "high": 15, "medium": 10, "low": 10}

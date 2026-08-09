@@ -52,6 +52,13 @@ def _cwd(ctx: dict) -> str:
 def _react_format(ctx: dict) -> str | None:
     if ctx.get("mode") != "coding":
         return None
+    if not ctx.get("visible_thought_required", True):
+        return (
+            "## 输出格式\n"
+            "需要工具时直接使用 function call;工具调用由系统处理。"
+            "不要在文本中输出 `Action: {{...}}`、JSON Action 块或模拟工具调用。\n"
+            "任务完成后直接给出简洁结果,不要重复系统标签。"
+        )
     return (
         "## 输出格式(每轮)\n"
         "1. **关于\"思考:\"标记**:每一轮你都会收到一个 \"思考: \" 头部(由系统加上),"
@@ -67,6 +74,8 @@ def _react_format(ctx: dict) -> str | None:
 def _thought_minimum(ctx: dict) -> str | None:
     if ctx.get("mode") != "coding":
         return None
+    if not ctx.get("visible_thought_required", True):
+        return None
     return (
         "## 思考\n每轮都必须先思考再行动。在调任何工具之前,**至少先输出 1-2 句中文/自然语言推理**"
         "(你要做什么、为什么这么做、期望看到什么结果)。**不允许直接调工具而不输出任何思考文本**。"
@@ -75,6 +84,8 @@ def _thought_minimum(ctx: dict) -> str | None:
 
 def _todo_block(ctx: dict) -> str | None:
     if ctx.get("mode") != "coding":
+        return None
+    if not ctx.get("todo_available", True):
         return None
     return (
         "## TODO 块\n如果任务有多步,在思考之后输出\"📝 TODO:\"列出步骤(可选,1-N 条短项),"
@@ -98,6 +109,9 @@ def _tool_discipline(ctx: dict) -> str | None:
         "4. **沙箱执行模式下写文件**:写文件务必用文件类工具(read_file/write_file/edit_file),"
         "别用 shell 重定向(echo > / cat <<EOF / tee)——命令在沙箱里,项目目录 "
         "read-only mount 会拒绝 shell 写;只有文件类工具能改项目文件。"
+        "5. **失败后的完成门槛**:工具失败只是一条观察,不是任务终点。停止重试不等于任务完成;"
+        "改用可用的替代证据或工具,继续完成用户其余明确要求。最终回答前逐项核对用户明确要求,"
+        "不要因为正确停止了一个失败路径就遗漏后续步骤。"
     )
 
 
@@ -210,6 +224,8 @@ def _decomposition_hint(ctx: dict) -> str | None:
     if ctx.get("mode") != "coding":
         return None
     if ctx.get("iter_count", 1) != 0:
+        return None
+    if not ctx.get("todo_available", True) or not ctx.get("subagent_available", True):
         return None
     return (
         "## 分解契约\n"

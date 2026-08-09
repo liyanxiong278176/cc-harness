@@ -18,14 +18,40 @@ def test_usage_record_from_api_with_full_usage():
     assert rec == UsageRecord(prompt_tokens=100, completion_tokens=50, total_tokens=150)
 
 
+def test_usage_record_captures_cache_breakdown_without_double_counting():
+    class Details:
+        cached_tokens = 60
+        cache_write_tokens = 10
+
+    class FakeUsage:
+        prompt_tokens = 100
+        completion_tokens = 50
+        total_tokens = 150
+        prompt_tokens_details = Details()
+
+    rec = UsageRecord.from_api(FakeUsage())
+
+    assert rec is not None
+    assert rec.uncached_prompt_tokens == 30
+    assert rec.cache_creation_prompt_tokens == 10
+    assert rec.cache_read_prompt_tokens == 60
+    assert rec.prompt_tokens == 100
+
+
 def test_usage_record_from_api_with_none_returns_none():
     assert UsageRecord.from_api(None) is None
 
 
 def test_usage_record_add():
-    a = UsageRecord(10, 20, 30)
-    b = UsageRecord(1, 2, 3)
-    assert a + b == UsageRecord(11, 22, 33)
+    a = UsageRecord(10, 20, 30, cache_read_prompt_tokens=4)
+    b = UsageRecord(1, 2, 3, cache_creation_prompt_tokens=1)
+    assert a + b == UsageRecord(
+        11,
+        22,
+        33,
+        cache_read_prompt_tokens=4,
+        cache_creation_prompt_tokens=1,
+    )
 
 
 # --- TokenCounter ---

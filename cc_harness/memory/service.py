@@ -66,7 +66,13 @@ class MemoryService:
                 # UPDATE 走 store.update(改 text+embedding),不改 session_id(保持原归属)
                 old = await self.store.get(decision.target_id)
                 new_embedding = await self.embedder.embed(decision.merged_text)
-                mem = await self.store.update(decision.target_id, decision.merged_text, new_embedding)
+                mem = await self.store.supersede(
+                    decision.target_id,
+                    decision.merged_text,
+                    new_embedding,
+                    source=source,
+                    session_id=session_id,
+                )
                 conflict_embedding = new_embedding
                 result_action_mem = mem
                 result = SaveResult(action="UPDATE", memory=mem, previous=old, duration_ms=_ms(t0))

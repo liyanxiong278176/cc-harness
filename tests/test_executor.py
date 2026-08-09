@@ -4,7 +4,13 @@ from pathlib import Path
 import pytest
 
 from cc_harness.config import ExecutorBackend, ExecutorConfig
-from cc_harness.executor import NativeExecutor, build_executor, strip_secrets
+from cc_harness.executor import (
+    NativeExecutor,
+    _decode_process_output,
+    _select_shell_profile,
+    build_executor,
+    strip_secrets,
+)
 
 
 def test_strip_secrets_removes_key_token_secret():
@@ -29,6 +35,41 @@ async def test_executor_runs_simple_command(tmp_path: Path):
     ex = NativeExecutor(project_root=tmp_path)
     res = await ex.run({"command": "echo hello"}, cwd=tmp_path)
     assert "hello" in res.llm_text
+
+
+def test_windows_shell_profile_is_explicit_powershell():
+    profile = _select_shell_profile(
+        platform="nt",
+        which=lambda name: "C:/Windows/powershell.exe" if name == "powershell" else None,
+    )
+
+    assert profile.name == "PowerShell"
+    assert profile.dialect == "powershell"
+    argv = profile.argv("cat marker.txt")
+    assert argv[0] == "C:/Windows/powershell.exe"
+    assert "-Command" in argv
+    assert "cat marker.txt" in argv[-1]
+
+
+def test_process_output_falls_back_to_windows_code_page():
+    raw = "中文输出".encode("cp936")
+
+    assert _decode_process_output(raw, fallback_encodings=("cp936",)) == "中文输出"
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="Windows PowerShell integration")
+@pytest.mark.asyncio
+async def test_windows_executor_accepts_common_ls_and_cat_aliases(tmp_path: Path):
+    (tmp_path / "marker.txt").write_text("内容", encoding="utf-8")
+    ex = NativeExecutor(project_root=tmp_path)
+
+    listed = await ex.run({"command": "ls"}, cwd=tmp_path)
+    read = await ex.run({"command": "cat marker.txt"}, cwd=tmp_path)
+
+    assert not listed.is_error
+    assert "marker.txt" in listed.llm_text
+    assert not read.is_error
+    assert "内容" in read.llm_text
 
 
 @pytest.mark.asyncio

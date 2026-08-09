@@ -15,7 +15,7 @@ from pathlib import Path
 
 import pytest
 
-from cc_harness.agent import run_turn
+from cc_harness.agent import NATIVE_TOOLS, run_turn
 from cc_harness.cli.init import init_noninteractive
 from cc_harness.llm import PendingToolCall
 from cc_harness.policy import PolicyEngine
@@ -280,12 +280,12 @@ async def test_c_toposort_tree_after_decompose(tmp_path: Path):
         policy=PolicyEngine(project_root=tmp_path, enabled=False),
     )
 
-    # FakeLLM saw the toposort spec (and the other 7 todo specs + run_command)
+    # FakeLLM saw the toposort spec, the other todo specs and all native tools.
     todo_names = {entry["spec"]["function"]["name"] for entry in extras}
     observed_names = {spec["function"]["name"] for spec in tool_specs_seen[0]}
     assert "todo_toposort" in observed_names
     assert todo_names <= observed_names
-    assert observed_names - todo_names == {"run_command"}
+    assert observed_names - todo_names == set(NATIVE_TOOLS)
 
     # The tool message is the HTN tree render
     tool_msgs = [m for m in messages if m.get("role") == "tool"]

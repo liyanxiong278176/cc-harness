@@ -65,6 +65,24 @@ def test_load_memory_config_kill_switch(tmp_path):
     assert c.layered_inject is False
 
 
+def test_load_memory_config_reads_authoritative_enable_and_embedding_values(tmp_path):
+    from cc_harness.memory.config import load_memory_config
+
+    c = load_memory_config(
+        tmp_path / "missing.yaml",
+        environ={
+            "MEMORY_ENABLED": "true",
+            "EMBEDDING_BASE_URL": "https://embedding",
+            "EMBEDDING_API_KEY": "secret",
+            "EMBEDDING_MODEL": "embed-v1",
+            "EMBEDDING_DIM": "768",
+        },
+    )
+    assert c.enabled is True
+    assert c.embedding_model == "embed-v1"
+    assert c.embedding_dim == 768
+
+
 @pytest.mark.asyncio
 async def test_capture_records_and_idempotent(tmp_path):
     from cc_harness.memory.store import MemoryStore

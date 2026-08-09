@@ -1,5 +1,8 @@
 # 从单次采样到 Pass^k:给编程 Agent 做一套统计严谨的安全评估
 
+> **Historical draft:** 本文是 Eval v2 阶段的公开文章草稿，不是当前 release gate 或实现状态。
+> 当前 Claude Code 对标评测以 `docs/eval/claude-code-parity-matrix.md` 为准。
+
 ## 写在前面
 
 做 cc-harness 这个项目时,我最纠结的问题不是"agent 怎么写",而是**怎么知道它安全**。

@@ -1,6 +1,7 @@
 """4-tier context compaction for cc-harness (Plan3).
 
-``maybe_compact`` is invoked before each LLM call in the ReAct loop. It walks a
+``ContextProjection`` is invoked before each LLM call in the ReAct loop. It
+keeps the original transcript append-only while ``maybe_compact`` walks a
 token-budget cascade:
 
 - Tier 1 Snip  (ratio >= tier1): truncate long tool outputs / user code blocks (head/tail).
@@ -8,17 +9,23 @@ token-budget cascade:
 - Tier 3 Summarize (ratio >= tier3): LLM incremental summary (prev + delta -> new summary).
 
 A **protect zone** (the most recent ~``protect_zone_tokens`` plus the last user
-message) is never touched. All tiers mutate ``messages`` in place. Failures are
-isolated: ``maybe_compact`` never raises — it returns ``CompactionStats(error=...)``.
+message) is never touched. Tiers mutate only projection messages. Failures are
+reported in ``CompactionStats`` so the caller can enforce fail-closed window
+protection.
 
 Design spec: ``docs/superpowers/specs/2026-06-12-context-compaction-design.md``.
 """
 from __future__ import annotations
 
+import copy
+import hashlib
 import json
+import os
 import re
+import time
 from dataclasses import dataclass
 from enum import IntEnum
+from pathlib import Path
 from typing import Any
 
 from cc_harness.config import ContextConfig
@@ -76,6 +83,108 @@ class CompactionStats:
     summary_index: int | None = None          # insert index of the new summary
     error: str | None = None                  # exception message (if any)
     before_snapshot: list[dict] | None = None  # debug snapshot (exception path only)
+    summary_version: int | None = None
+    artifact_path: str | None = None
+
+
+class ContextProjection:
+    """Model-facing, rebuildable view over an append-only message transcript."""
+
+    def __init__(
+        self,
+        source_messages: list[dict],
+        *,
+        artifact_dir: Path | None = None,
+    ) -> None:
+        self.messages = copy.deepcopy(source_messages)
+        self.source_count = len(source_messages)
+        self.summary_version = 0
+        self.artifact_dir = Path(artifact_dir) if artifact_dir is not None else None
+        self._restore_latest(source_messages)
+
+    def _restore_latest(self, source_messages: list[dict]) -> None:
+        """Restore the newest valid projection while keeping source records authoritative."""
+        if self.artifact_dir is None or not self.artifact_dir.is_dir():
+            return
+        candidates = sorted(self.artifact_dir.glob("summary-v*.json"), reverse=True)
+        for path in candidates:
+            try:
+                payload = json.loads(path.read_text(encoding="utf-8"))
+                version = int(payload["version"])
+            except (OSError, ValueError, TypeError, KeyError, json.JSONDecodeError):
+                continue
+            self.summary_version = max(self.summary_version, version)
+            source_count = int(payload.get("source_count", 0) or 0)
+            projection = payload.get("projection_messages")
+            if not isinstance(projection, list) or not 0 <= source_count <= len(source_messages):
+                continue
+            if payload.get("source_digest") != _messages_digest(source_messages[:source_count]):
+                continue
+            self.messages = copy.deepcopy(projection)
+            self.messages.extend(copy.deepcopy(source_messages[source_count:]))
+            self.source_count = len(source_messages)
+            return
+
+    def sync(self, source_messages: list[dict]) -> None:
+        if len(source_messages) < self.source_count:
+            self.messages = copy.deepcopy(source_messages)
+            self.source_count = len(source_messages)
+            return
+        if len(source_messages) > self.source_count:
+            self.messages.extend(copy.deepcopy(source_messages[self.source_count:]))
+            self.source_count = len(source_messages)
+
+    async def compact(
+        self,
+        source_messages: list[dict],
+        tool_specs: list[dict] | None,
+        counter: TokenCounter,
+        config: ContextConfig,
+        llm: Any,
+    ) -> CompactionStats:
+        self.sync(source_messages)
+        stats = await maybe_compact(self.messages, tool_specs, counter, config, llm)
+        if stats.summarized and stats.summary_index is not None:
+            self.summary_version += 1
+            summary = self.messages[stats.summary_index]
+            digest = _messages_digest(source_messages[: self.source_count])
+            summary["_compaction_summary_version"] = self.summary_version
+            summary["_compaction_source_count"] = self.source_count
+            summary["_compaction_source_digest"] = digest
+            stats.summary_version = self.summary_version
+            if self.artifact_dir is not None:
+                stats.artifact_path = str(self._write_summary_artifact(summary, stats, digest))
+        return stats
+
+    def _write_summary_artifact(
+        self, summary: dict, stats: CompactionStats, source_digest: str
+    ) -> Path:
+        assert self.artifact_dir is not None
+        self.artifact_dir.mkdir(parents=True, exist_ok=True)
+        path = self.artifact_dir / f"summary-v{self.summary_version:04d}.json"
+        payload = {
+            "schema_version": "cc-harness.context-summary.v1",
+            "version": self.summary_version,
+            "created_at": time.time(),
+            "source_count": self.source_count,
+            "source_digest": source_digest,
+            "summary": summary.get("content", ""),
+            "projection_messages": self.messages,
+            "before_tokens": stats.before_tokens,
+            "after_tokens": stats.after_tokens,
+        }
+        tmp = path.with_suffix(path.suffix + ".tmp")
+        tmp.write_text(
+            json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
+            encoding="utf-8",
+        )
+        os.replace(tmp, path)
+        return path
+
+
+def _messages_digest(messages: list[dict]) -> str:
+    encoded = json.dumps(messages, ensure_ascii=False, sort_keys=True, default=str).encode("utf-8")
+    return "sha256:" + hashlib.sha256(encoded).hexdigest()
 
 
 # Helpers --------------------------------------------------------------------
@@ -425,10 +534,16 @@ async def apply_tier3_summarize(
 
         # 4. Call LLM (tools=None — spec mandates no tools)
         content = ""
-        async for ev in llm.chat(summary_messages, tools=None):
-            if ev.kind == "done":
-                content = ev.content or ""
-                break
+        stream = llm.chat(summary_messages, tools=None)
+        try:
+            async for ev in stream:
+                if ev.kind == "done":
+                    content = ev.content or ""
+                    break
+        finally:
+            close_stream = getattr(stream, "aclose", None)
+            if close_stream is not None:
+                await close_stream()
 
         if not content:
             return CompactionStats(

@@ -26,15 +26,17 @@ def discover_mask_targets(project_root: Path) -> tuple[MaskTarget, ...]:
         retained_dirs = []
         for name in dirnames:
             path = current_path / name
-            if path.is_symlink() or is_sensitive_path(path):
-                targets.append(MaskTarget(path.relative_to(root), is_dir=True))
+            relative = path.relative_to(root)
+            if path.is_symlink() or is_sensitive_path(relative):
+                targets.append(MaskTarget(relative, is_dir=True))
             else:
                 retained_dirs.append(name)
         dirnames[:] = retained_dirs
         for name in filenames:
             path = current_path / name
-            if path.is_symlink() or is_sensitive_path(path):
-                targets.append(MaskTarget(path.relative_to(root), is_dir=False))
+            relative = path.relative_to(root)
+            if path.is_symlink() or is_sensitive_path(relative):
+                targets.append(MaskTarget(relative, is_dir=False))
     return tuple(sorted(targets, key=lambda item: item.relative_path.as_posix()))
 
 

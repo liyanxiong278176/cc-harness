@@ -9,15 +9,21 @@
 保证 `read_ref(node_id)` 能 100% 还原原文 —— "三处一致"是 Q4 的核心不变量。
 """
 from __future__ import annotations
+import hashlib
+import json
+import os
+import time
 from pathlib import Path
 from uuid import uuid4
 
 from cc_harness.memory.offload.models import OffloadResult
 
 
-def gen_id() -> str:
+def gen_id(content: str | None = None) -> str:
     """短稳定 node_id(uuid4 前 8 hex)。三处复用:refs 文件名 / pointer / refs_path。"""
-    return uuid4().hex
+    if content is None:
+        return uuid4().hex
+    return "sha256-" + hashlib.sha256(content.encode("utf-8")).hexdigest()
 
 
 async def maybe_offload(
@@ -28,6 +34,9 @@ async def maybe_offload(
     refs_dir: Path | str,
     llm,
     token_counter,
+    *,
+    manifest_path: Path | str | None = None,
+    session_id: str | None = None,
 ) -> OffloadResult | None:
     """token 严格 > threshold → 卸载;否则 None。
 
@@ -49,11 +58,20 @@ async def maybe_offload(
     if len(result_text) > 256 * 1024:
         raise ValueError("result_text exceeds 256KB hard limit")
 
+    content_digest = "sha256:" + hashlib.sha256(result_text.encode("utf-8")).hexdigest()
     node_id = gen_id()
     refs_path = Path(refs_dir)
     refs_path.mkdir(parents=True, exist_ok=True)
-    ref_file = refs_path / f"{node_id}.md"
-    ref_file.write_text(result_text[:256 * 1024], encoding="utf-8")  # 逐字落盘
+    ref_file = (
+        refs_path / "objects" / f"{content_digest.removeprefix('sha256:')}.md"
+        if manifest_path is not None
+        else refs_path / f"{node_id}.md"
+    )
+    ref_file.parent.mkdir(parents=True, exist_ok=True)
+    if not ref_file.exists():
+        tmp = ref_file.with_suffix(ref_file.suffix + ".tmp")
+        tmp.write_text(result_text, encoding="utf-8")
+        os.replace(tmp, ref_file)
 
     if llm is not None:
         try:
@@ -66,14 +84,43 @@ async def maybe_offload(
         summary = result_text[:200]  # fail-soft:前 200 字,不调 LLM
 
     pointer_msg = (
-        f"[offloaded node={node_id} summary='{summary}' (refs/{node_id}.md)]"
+        f"[offloaded node={node_id} digest={content_digest} "
+        f"summary='{summary}' (refs/{node_id}.md)]"
     )
+    if manifest_path is not None:
+        _append_manifest(
+            Path(manifest_path),
+            {
+                "schema_version": "cc-harness.offload-node.v1",
+                "node_id": node_id,
+                "content_digest": content_digest,
+                "session_id": session_id,
+                "tool_name": tool_name,
+                "args_digest": "sha256:" + hashlib.sha256(
+                    json.dumps(args, sort_keys=True, default=str).encode("utf-8")
+                ).hexdigest(),
+                "size_bytes": len(result_text.encode("utf-8")),
+                "refs_path": str(ref_file),
+                "result_ref": str(ref_file),
+                "created_at": time.time(),
+            },
+        )
     return OffloadResult(
         node_id=node_id,
         summary=summary,
         refs_path=str(ref_file),
         pointer_msg=pointer_msg,
+        content_digest=content_digest,
+        size_bytes=len(result_text.encode("utf-8")),
     )
+
+
+def _append_manifest(path: Path, record: dict) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("a", encoding="utf-8", newline="\n") as handle:
+        handle.write(json.dumps(record, ensure_ascii=False, sort_keys=True) + "\n")
+        handle.flush()
+        os.fsync(handle.fileno())
 
 
 async def _llm_summary(llm, result_text: str) -> str:

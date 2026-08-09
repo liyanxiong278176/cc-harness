@@ -150,6 +150,13 @@ def test_build_system_prompt_substitutes_cwd():
     assert "/test/cwd" in out
 
 
+def test_coding_prompt_does_not_treat_stopping_a_failed_retry_as_completion():
+    out = build_system_prompt("/x", mode="coding")
+    assert "工具失败只是一条观察" in out
+    assert "停止重试不等于任务完成" in out
+    assert "逐项核对用户明确要求" in out
+
+
 def test_build_system_prompt_signature_accepts_mode_and_extra_ctx():
     """build_system_prompt takes cwd (positional) and mode (keyword, default 'coding'),
     plus an extra_ctx keyword-only dict (T2.1)."""
@@ -192,6 +199,30 @@ def test_build_system_prompt_coding_mode_excludes_plan_and_design_overrides():
     # Coding sections ARE present
     assert "📝 TODO" in out
     assert "工具使用纪律" in out
+
+
+def test_bare_capabilities_remove_unavailable_todo_and_visible_thought_contracts():
+    out = build_system_prompt(
+        "/x",
+        mode="coding",
+        extra_ctx={
+            "todo_available": False,
+            "subagent_available": False,
+            "visible_thought_required": False,
+            "e1_decompose_hint": True,
+            "iter_count": 0,
+        },
+    )
+
+    assert "TODO 块" not in out
+    assert "📝 TODO" not in out
+    assert "dispatch_subagent" not in out
+    assert "## 分解契约" not in out
+    assert "至少先输出 1-2 句" not in out
+    assert "不允许直接调工具" not in out
+    assert "工具使用纪律" in out
+    assert "工具能力诚实" in out
+    assert "不要在文本中输出 `Action:" in out
 
 
 def test_composed_prompt_preserves_all_12_legacy_rules():

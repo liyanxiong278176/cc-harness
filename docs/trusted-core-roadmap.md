@@ -1,40 +1,69 @@
 # Trusted Core Roadmap
 
-Updated: 2026-08-03
+Updated: 2026-08-04
 
 This roadmap turns the accepted contracts in `CONTEXT.md` and ADR 0018 into independently
 verifiable stages. A stage is complete only when its acceptance evidence is saved; feature
 presence alone is insufficient.
+
+ADR 0019 fixes the durable storage target. The 2026-08-03 nine-area design review also established
+budget-driven stopping, transactional native mutations, capability-based sandbox conformance,
+versioned headless events, durable least-privilege tasks, layered extension trust, provenance-bearing
+memory and a quality ratchet. These are release contracts, not optional follow-up enhancements.
 
 ## Phase 0: Make product claims true
 
 - [x] Add non-bypassable `DENY` for declared tool paths and enforce it before allowlists and
   permission modes.
 - [ ] Extend hard safety through the command runner, sandbox and egress layers.
-- Make sandbox selection fail closed and remove automatic native fallback.
+  Uninitialized executor and PTY host-shell bypasses are closed, legacy `enabled=false` no longer
+  selects native execution, and sandbox command timeout destroys the container. Sensitive workspace
+  paths now receive empty overlays, CPU/memory limits reach the SDK, and egress is default-deny on
+  owned `dns+nft` servers. This item remains open until cross-platform runtime conformance proves
+  those controls and external servers are rejected or equivalently configured. The first saved
+  Windows Docker run (`20260804T093553Z`) passed nine overlay, environment, cgroup, network, OOM and
+  cleanup probes; the gated Linux workflow and external-server cases remain open.
+- [x] Make sandbox selection fail closed, remove automatic native fallback and require an explicit
+  host-execution startup choice.
+- [x] Publish a sandbox capability profile and withhold the `isolated` label until filesystem,
+  process, resource, network, credential, cancellation and cleanup conformance passes.
 - Separate wired capability help from planned capability documentation.
-- Enable security and core test workflows; remove async resource-leak warnings.
-- Establish a clean Ruff baseline and block new violations while legacy debt is reduced.
+- [ ] Enable a fast cross-platform core/security workflow; keep the multi-hour red-team suite as a
+  scheduled or manually triggered evidence job.
+- [x] Remove async resource-leak warnings. Session-owned LLM, MCP, memory, L2, session-store and
+  executor resources now close explicitly and idempotently; early-exited async streams are closed.
+- [x] Establish a recorded Ruff baseline and block new violations while legacy debt is reduced.
+  The version-pinned, source-fingerprinted quality ratchet covers production, eval, test and script
+  Python code while retaining a zero-warning gate for trusted-core modules.
 
 Exit evidence: bypass mode cannot execute a denied request through interactive, print or runtime
 paths; platform tests and audit records prove the decision.
 
 ## Phase 1: Native local coding loop
 
-- Implement Read, Edit, Write, Glob and Grep beside run_command.
-- Use conditional hashes, atomic replacement, bounded previews and complete local blobs.
+- [x] Implement Read, Edit, Write, Glob and Grep beside run_command.
+- [x] Use conditional hashes, one transactional mutation engine, atomic replacement, bounded
+  structured results and explicit truncation/continuation metadata.
 - Share path rules, structured events, diffs, checkpoints and cancellation across all tools.
-- Serialize workspace mutations and allow only independent reads to run concurrently.
+- [x] Serialize workspace mutations and allow only independent proven native reads to run
+  concurrently. Result messages retain model-request order.
+- [x] Add a deterministic loop control plane for completion verification, structured working
+  state, classified recovery, repeated-trajectory stopping and append-only action journaling.
 
 Exit evidence: a clean benchmark repository can be inspected, modified and verified without MCP;
 conflicting writes fail without losing either change.
 
 ## Phase 2: Event-sourced sessions and context
 
-- Introduce append-only session events and migrations from saved message lists.
+- [ ] Introduce the ADR 0019 project fact store, append-only session events and verifiable migration
+  from saved message lists and refs.
+- Compatibility layer implemented: user-data-directory fact database, immutable event envelopes,
+  content-addressed objects, active-head projection, versioned summaries and read-only legacy import.
+  Runtime cutover and legacy ref materialization remain before this item can be checked.
 - Build transcript and model-context projections from the event log.
 - Replace mutable compaction with reversible offload and versioned summaries.
-- Add context retention budgets, summary validation, branch invalidation and cascade forget.
+- Add deterministic context manifests, retention budgets, summary validation, rewind-head
+  invalidation and cascade forget.
 
 Exit evidence: resume, crash, compact, rewind and branch tests reproduce the same committed facts;
 the raw transcript hash is unchanged by compaction.
@@ -45,6 +74,8 @@ the raw transcript hash is unchanged by compaction.
 - Pin harness profiles per session and make cross-model fallback explicit.
 - Publish versioned JSONL events with monotonic IDs, replay cursors and idempotency keys.
 - Add token, cost, duration and tool-call budgets with resumable budget stops.
+- Replace the production `max_iter=5` stop with budget and no-progress policies; retain only a high
+  configurable emergency step cap and independent smaller Subagent budgets.
 
 Exit evidence: TUI and JSONL runs over the same fixture produce equivalent committed event traces;
 reported usage reconciles with provider usage.
@@ -72,6 +103,8 @@ listener; IDE and terminal observe the same session.
 ## Phase 6: Prove parity and advantages
 
 - Run isolated same-model and equal-budget suites against pinned Claude Code.
+- Separate public development, internal regression and frozen holdout tasks so production defaults
+  cannot be tuned to individual release-gate cases.
 - Gate coding success, cost, latency, safety, recovery and cross-platform behavior.
 - Run dedicated memory and long-context suites separately from clean coding tasks.
 - Publish raw configuration fingerprints, confidence intervals and failure analysis.

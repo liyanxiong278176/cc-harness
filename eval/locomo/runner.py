@@ -304,6 +304,7 @@ async def _run_sample(sample: dict, policy: dict, extras: list[dict], trace: Loc
                 qa.question, predicted, qa.answer,
                 messages=qa_messages, judge_llm=llm,
                 judge_chunk_usefulness=policy.get("judge_chunk_usefulness", True),
+                enable_quality_judge=policy.get("judge_quality", False),
             )
             cost_usd = _estimate_cost(stats.api_prompt_tokens, stats.api_completion_tokens)
             results.append({
@@ -415,6 +416,7 @@ def main():
     ts = datetime.now().strftime("%Y-%m-%d")
     html_path = args.output_dir / f"locomo-report-{ts}.html"
     json_path = args.output_dir / f"locomo-results-{ts}.json"
+    metrics_path = args.output_dir / f"locomo-metrics-{ts}.json"
 
     done: list = []
     all_results: list = []
@@ -482,7 +484,7 @@ def main():
 
     _e = _env()
     judge_llm = None
-    if _e.get("OPENAI_API_KEY") and not args.no_trace:
+    if _e.get("OPENAI_API_KEY") and policy.get("judge_metrics", True):
         try:
             judge_llm = LLMClient(
                 api_key=_e["OPENAI_API_KEY"], model=_e["OPENAI_MODEL"],
@@ -518,10 +520,11 @@ def main():
         all_results, qas, conversations_by_sample_id, judge_llm,
         cache_path=judge_cache_dir, dataset_sha=dataset_sha,
     ))
+    metrics_path.write_text(json.dumps(metrics, ensure_ascii=False, indent=1), encoding="utf-8")
     # metrics_v3 双轨开关(false → M5-1 旧 _summary_cards + q_type 分桶表)
     metrics_v3 = bool(policy.get("metrics_v3", True))
     write_html_report(str(html_path), all_results, metrics=metrics, metrics_v3=metrics_v3)
-    print(f"[runner] DONE. results: {json_path}  html: {html_path}")
+    print(f"[runner] DONE. results: {json_path}  metrics: {metrics_path}  html: {html_path}")
     return 0
 
 

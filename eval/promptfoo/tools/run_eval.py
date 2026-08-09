@@ -21,10 +21,10 @@ EVAL_DIR = Path(__file__).resolve().parents[1]   # eval/promptfoo
 CACHE = EVAL_DIR / ".report-cache"
 
 
-def _run(cmd: list[str], *, check: bool = True) -> None:
+def _run(cmd: list[str]) -> None:
     print(f"$ {' '.join(cmd)}", flush=True)
     executable = shutil.which(cmd[0]) or cmd[0]
-    subprocess.run([executable] + cmd[1:], cwd=str(EVAL_DIR), check=check)
+    subprocess.run([executable] + cmd[1:], cwd=str(EVAL_DIR), check=True)
 
 
 def _gen_md(json_paths: list[Path], out: Path, *, locomo_metrics: dict | None = None) -> None:
@@ -42,7 +42,7 @@ def _security(per_cat: int | None, keep: bool) -> None:
     j = CACHE / "eval.json"
     if per_cat is not None:
         _run([sys.executable, "tools/generate_attacks.py", "--per-cat", str(per_cat)])
-    _run(["npx", "promptfoo", "eval", "-c", "promptfooconfig.security.yaml", "-o", str(j)], check=False)
+    _run(["npx", "promptfoo", "eval", "-c", "promptfooconfig.security.yaml", "-o", str(j)])
     _gen_md([j], EVAL_DIR / "security-report.md")
     if not keep:
         shutil.rmtree(CACHE, ignore_errors=True)
@@ -53,8 +53,8 @@ def _redteam(keep: bool) -> None:
     rt = EVAL_DIR / "redteam.yaml"
     j = CACHE / "owasp.json"
     try:
-        _run(["npx", "promptfoo", "redteam", "generate", "-c", "promptfooconfig.redteam.yaml", "-o", str(rt)], check=False)
-        _run(["npx", "promptfoo", "redteam", "eval", "-c", str(rt), "-j", "1", "-o", str(j)], check=False)
+        _run(["npx", "promptfoo", "redteam", "generate", "-c", "promptfooconfig.redteam.yaml", "-o", str(rt)])
+        _run(["npx", "promptfoo", "redteam", "eval", "-c", str(rt), "-j", "1", "-o", str(j)])
         _gen_md([j], EVAL_DIR / "redteam-report.md")
     finally:
         rt.unlink(missing_ok=True)
@@ -94,17 +94,14 @@ def _unified(per_cat: int | None, keep: bool) -> None:
     try:
         _run(
             ["npx", "promptfoo", "eval", "-c", str(unified_yaml), "-o", str(j_eval)],
-            check=False,
         )
 
         # 3. promptfoo redteam generate + eval 跑 redteam: 段(OWASP + coding-agent)
         _run(
             ["npx", "promptfoo", "redteam", "generate", "-c", str(unified_yaml), "-o", str(rt)],
-            check=False,
         )
         _run(
             ["npx", "promptfoo", "redteam", "eval", "-c", str(rt), "-j", "1", "-o", str(j_redteam)],
-            check=False,
         )
         # 4. 合一份报告(含 locomo memory 段 — Task 13 桥接)
         locomo_metrics = _run_locomo()
@@ -116,7 +113,7 @@ def _unified(per_cat: int | None, keep: bool) -> None:
         shutil.rmtree(CACHE, ignore_errors=True)
 
 
-def _run_locomo() -> dict | None:
+def _run_locomo() -> dict:
     """locomo 5-key memory 跑批 — Task 13 桥接骨架。
 
     降级原因:CLAUDE.md 写明 `cc_harness/memory/` 未 wired 进 ReAct 循环,
@@ -129,7 +126,25 @@ def _run_locomo() -> dict | None:
     #   1) `from pathlib import Path; from locomo.runner import main as locomo_main`
     #   2) 调 locomo_main() 跑子集,产出 metrics + eval/locomo/locomo-report.html
     #   3) 返回 dict,如 {"1_recall": {...}, ..., "5_consistency": {...}}
-    return None
+    output_dir = CACHE / "locomo"
+    output_dir.mkdir(parents=True, exist_ok=True)
+    _run(
+        [
+            sys.executable,
+            str(EVAL_DIR.parent / "locomo" / "runner.py"),
+            "--output-dir",
+            str(output_dir),
+            "--no-trace",
+            "--no-check-trace",
+        ]
+    )
+    metric_files = sorted(output_dir.glob("locomo-metrics-*.json"))
+    if not metric_files:
+        raise FileNotFoundError("LoCoMo completed without a metrics evidence file")
+    metrics = json.loads(metric_files[-1].read_text(encoding="utf-8"))
+    if not isinstance(metrics, dict):
+        raise ValueError("LoCoMo metrics evidence must be a JSON object")
+    return metrics
 
 
 def main() -> int:

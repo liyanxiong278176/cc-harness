@@ -96,9 +96,18 @@ class MemoryRetriever:
         merged = []
         for mem, vec_s, fts_s in scores.values():
             rrf = alpha * vec_s + (1 - alpha) * fts_s
-            merged.append((mem, rrf))
+            age_days = max(0.0, (time.time() - mem.updated_at) / 86400.0)
+            recency = 1.0 / (1.0 + age_days / 30.0)
+            authority = 1.1 if mem.source in {"llm", "manual", "user"} else 1.0
+            merged.append((mem, rrf * recency * authority))
         merged.sort(key=lambda x: -x[1])
-        return merged[:top_k]
+        selected = merged[:top_k]
+        if selected:
+            try:
+                await self._store.touch_recall([mem.id for mem, _ in selected])
+            except Exception as exc:
+                logger.warning("touch_recall failed after hybrid search: %s", exc)
+        return selected
 
     async def _search_vec_only(self, query: str, k: int) -> list:
         try:
@@ -118,7 +127,7 @@ class MemoryRetriever:
         if not (query or "").strip():
             return ""
         try:
-            results = await self.search(query, top_k=self.top_k)
+            results = await self.search_hybrid(query, top_k=self.top_k)
         except Exception as e:
             logger.warning("build_injection_block search failed, returning empty: %s", e)
             return ""

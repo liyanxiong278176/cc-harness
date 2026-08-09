@@ -173,6 +173,19 @@ def test_run_command_spec_is_openai_function_format():
     assert "command" in params["required"]
 
 
+def test_native_executor_surfaces_shell_dialect_in_tool_spec(tmp_path):
+    _init_native(tmp_path)
+
+    command_description = RUN_COMMAND_SPEC["function"]["parameters"]["properties"][
+        "command"
+    ]["description"]
+    if _is_windows():
+        assert "PowerShell" in command_description
+        assert "Windows" in command_description
+    else:
+        assert "POSIX" in command_description
+
+
 # --- confirm_tool (3-way L4 gate) ---
 
 def test_confirm_tool_yes(monkeypatch):

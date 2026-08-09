@@ -264,12 +264,16 @@ async def test_extras_deps_has_offload(tmp_path, monkeypatch):
     monkeypatch.setenv("EMBEDDING_BASE_URL", "http://x")
     monkeypatch.setenv("EMBEDDING_API_KEY", "k")
     monkeypatch.setenv("EMBEDDING_MODEL", "bge-m3")
-    from cc_harness.memory.extras import build_memory_extras
+    from cc_harness.memory.extras import build_memory_extras, close_memory_deps
+
     extras, deps = await build_memory_extras({**os.environ}, tmp_path / "mem.db")
-    if deps is None:
-        pytest.skip("memory deps 未就绪(依赖 init)")  # fail-soft 跳过
-    assert "refs_dir" in deps and "canvas_path" in deps
-    assert "offload" in deps and "canvas" in deps
+    try:
+        if deps is None:
+            pytest.skip("memory deps 未就绪(依赖 init)")  # fail-soft 跳过
+        assert "refs_dir" in deps and "canvas_path" in deps
+        assert "offload" in deps and "canvas" in deps
+    finally:
+        await close_memory_deps(deps)
 
 
 @pytest.mark.asyncio
@@ -619,3 +623,49 @@ async def test_plan3_coexist_q4_kill(tmp_path):
                                  "canvas_inject": False, "canvas_path": None, "refs_dir": None})
     tool_msg = next(m for m in msgs if m.get("role") == "tool")
     assert "offloaded" not in tool_msg["content"]  # kill → 不卸
+
+
+@pytest.mark.asyncio
+async def test_session_offload_uses_unique_nodes_and_deduplicated_objects(tmp_path):
+    import json
+
+    from cc_harness.memory.offload.offload import maybe_offload
+    from cc_harness.memory.offload.read_ref import (
+        inspect_node_handler,
+        read_ref_handler,
+        search_ref_with_manifest_handler,
+    )
+    from cc_harness.tokens import TokenCounter
+
+    refs = tmp_path / "refs"
+    manifest = tmp_path / "nodes.jsonl"
+    content = "needle value\n" + "line\n" * 3000
+    first = await maybe_offload(
+        content, "Read", {"path": "a"}, 2000, refs, None, TokenCounter(),
+        manifest_path=manifest, session_id="s1",
+    )
+    second = await maybe_offload(
+        content, "Read", {"path": "b"}, 2000, refs, None, TokenCounter(),
+        manifest_path=manifest, session_id="s1",
+    )
+
+    assert first.node_id != second.node_id
+    assert first.content_digest == second.content_digest
+    assert len(list((refs / "objects").glob("*.md"))) == 1
+    records = [json.loads(line) for line in manifest.read_text(encoding="utf-8").splitlines()]
+    assert len(records) == 2
+    page = await read_ref_handler(
+        {"node_id": first.node_id, "offset": 0, "limit": 2},
+        cwd=str(tmp_path), refs_dir=refs, manifest_path=manifest,
+    )
+    assert '"complete": false' in page.llm_text
+    search = await search_ref_with_manifest_handler(
+        {"node_id": first.node_id, "query": "needle"},
+        cwd=str(tmp_path), refs_dir=refs, manifest_path=manifest,
+    )
+    assert "needle value" in search.llm_text
+    inspected = await inspect_node_handler(
+        {"node_id": second.node_id}, cwd=str(tmp_path), refs_dir=refs,
+        manifest_path=manifest,
+    )
+    assert second.content_digest in inspected.llm_text

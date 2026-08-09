@@ -132,6 +132,14 @@ def _parse_args() -> argparse.Namespace:
 
 
 def main() -> None:
+    """Compatibility entrypoint; all agent modes use ``SessionRuntime``."""
+    from cc_harness.entrypoint import main as package_main
+
+    package_main()
+    return
+
+    # Legacy assembly is intentionally unreachable and remains temporarily
+    # importable for downstream integrations while they migrate.
     args = _parse_args()
     console = Console()
     # Resolve "." → absolute path so downstream (TUI/REPL/CLI) sees a
@@ -293,7 +301,7 @@ def main() -> None:
                     local_llm=llm,  # F3: 主 LLM 作为本地 fallback
                     l5_engine=_l5_engine,
                     project_root=working_dir,
-                    audit_path=working_dir / "logs" / "drift.jsonl",
+                    audit_path=working_dir / ".cc-harness" / "logs" / "drift.jsonl",
                     every_n_turns=_mem_cfg.drift_every_n_turns,
                     enabled=_mem_cfg.drift_enabled,
                 )
@@ -366,7 +374,19 @@ def main() -> None:
                 emit_events=args.emit_events,
             )
         finally:
-            await mcp.shutdown()
+            try:
+                await mcp.shutdown()
+            except Exception as exc:
+                console.print(f"[yellow]MCP shutdown failed: {exc}[/yellow]")
+            if "_judge_llm" in locals() and _judge_llm is not None:
+                try:
+                    await _judge_llm.aclose()
+                except Exception as exc:
+                    console.print(f"[yellow]judge LLM shutdown failed: {exc}[/yellow]")
+            try:
+                await llm.aclose()
+            except Exception as exc:
+                console.print(f"[yellow]main LLM shutdown failed: {exc}[/yellow]")
 
     asyncio.run(boot())
 

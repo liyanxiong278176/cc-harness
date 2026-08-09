@@ -39,6 +39,15 @@ async def test_evaluate_qa_returns_dict_with_expected_keys():
     assert result["trace_payload"]["pass"] == result["pass"]
 
 
+async def test_evaluate_qa_does_not_invoke_live_quality_judge_by_default(monkeypatch):
+    def unexpected_quality_call(*args, **kwargs):
+        raise AssertionError("offline evaluation leaked into a live quality judge")
+
+    monkeypatch.setattr("eval.locomo.evaluator.GEval", unexpected_quality_call)
+    result = await evaluate_qa("What color?", "blue", "blue")
+    assert result["quality"] is None
+
+
 async def test_evaluate_qa_fail_when_low_f1_and_no_quality():
     result = await evaluate_qa("q", "completely wrong answer xyzzy", "the cat sat on the mat")
     assert result["f1"] < 0.3

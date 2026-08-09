@@ -1,6 +1,6 @@
 # Claude Code Gap Matrix
 
-Updated: 2026-08-03
+Updated: 2026-08-05
 
 ## Scope and evidence
 
@@ -8,7 +8,8 @@ This matrix compares cc-harness with the terminal coding-agent core and headless
 surface of Claude Code. Claude Web, Desktop, Mobile, Slack, Chrome, remote cloud control,
 and the broader enterprise platform are outside the current parity boundary.
 
-The Claude Code baseline is v2.1.220, matching the repository's existing UI reference.
+The pinned Claude Code baseline is v2.1.221. Live execution rejects version drift before running
+comparison tasks.
 Public capabilities are checked against the official documentation for
 [features](https://code.claude.com/docs/en/features-overview),
 [tools](https://code.claude.com/docs/en/tools-reference),
@@ -31,14 +32,14 @@ Statuses describe executable behavior, not README claims:
 | Capability | Claude Code | cc-harness | Status | Priority |
 |---|---|---|---|---|
 | Terminal agent loop | Mature coding loop with built-in tools | ReAct loop, structured events, queueing, two renderers | Partial | P0 |
-| Native file tools | Read, Edit, Write, Glob, Grep | Only `run_command` is built in; file tools require MCP | Missing | P0 |
-| Permission engine | Allow, ask, deny, modes and sandbox controls | Tri-state runtime blocks undeclared and credential paths before grants; shell, sandbox and egress boundaries remain incomplete | Partial | P0 |
-| Sandbox | Filesystem/network isolation with platform integration | OpenSandbox path exists; native is default and fallback, resource fields are unwired | Partial | P0 |
+| Native file tools | Read, Edit, Write, Glob, Grep | First-party bounded tools with hashes, cursors and transactional mutations are wired into the agent | Wired | P0 |
+| Permission engine | Allow, ask, deny, modes and sandbox controls | Tri-state runtime blocks undeclared and credential paths before grants; shell selection fails closed and egress is default-deny, but runtime conformance remains incomplete | Partial | P0 |
+| Sandbox | Filesystem/network isolation with platform integration | OpenSandbox is fail closed, host/PTY execution is explicit, and resource, deny-default egress and sensitive-path overlays are SDK-wired; the machine-readable profile withholds `isolated` pending conformance | Partial | P0 |
 | Session persistence | Resume, branch and checkpoint workflows | Project sessions, resume, branch, rename, attachments and checkpoints | Partial | P0 |
 | Context compaction | Automatic long-session management | Multi-tier compaction and reversible offload, but compaction mutates persisted messages | Partial | P0 |
 | Headless protocol | JSON and stream-json output, structured results | Print mode returns final text; no versioned event contract | Missing | P0 |
 | Model and cost profile | Claude model selection, usage and cost reporting | Provider-neutral endpoint support, but no authoritative capability/cost profile | Partial | P0 |
-| Coding quality regression | Internal evals and production monitoring | Security/trajectory/Pass^k/Locomo skeletons; no continuous coding parity gate | Design only | P0 |
+| Coding quality regression | Internal evals and production monitoring | Unified evidence contracts, nine-domain native regressions and live canaries exist; full paired suites and the L4 parity gate remain incomplete | Partial | P0 |
 | Skills | First-party skill discovery and invocation | No complete skill runtime | Missing | P1 |
 | Hooks | Lifecycle hooks with documented events | No unified hook lifecycle or permission manifest | Missing | P1 |
 | Plugins | Plugin packaging and marketplace | MCP extensions exist; no package lifecycle or marketplace protocol | Partial | P1 |
@@ -48,7 +49,7 @@ Statuses describe executable behavior, not README claims:
 | Web tools | WebFetch and WebSearch | Available only through optional MCP configuration | Missing | P2 |
 | LSP | Language intelligence integrations | No first-party LSP lifecycle | Missing | P2 |
 | IDE | First-party editor integrations | No IDE client; runtime events are a useful foundation | Missing | P3 |
-| Cross-platform reliability | macOS/Linux/Windows support with known Windows pain points | Python portability, but PTY coverage is skipped on Windows | Partial | P0 |
+| Cross-platform reliability | macOS/Linux/Windows support with known Windows pain points | A three-OS core workflow exists; PTY coverage and saved cross-platform evidence are still incomplete | Partial | P0 |
 
 ## Advantages to preserve and wire
 
@@ -63,13 +64,14 @@ Statuses describe executable behavior, not README claims:
 
 ## Critical truth gaps
 
-1. Hard-deny currently covers paths declared in typed tool arguments; paths embedded in arbitrary
-   shell strings still require the fail-closed sandbox and command execution model.
+1. Hard-deny covers declared tool paths and arbitrary shell execution now fails closed when the
+   sandbox is unavailable; full sandbox conformance is still needed before claiming isolation.
 2. context compaction mutates the same message list that session persistence later saves.
-3. sandbox CPU, memory, egress and credential-vault settings are parsed but not enforced.
+3. sandbox CPU, memory, egress and credential overlays have one passing Windows Docker report, but
+   lack Linux/Kubernetes, external-server and credential-proxy end-to-end evidence.
 4. help and renderer surfaces advertise commands whose execution paths differ or are absent.
-5. security workflows are disabled and no saved coding-parity report supports an
-   "exceeds Claude Code" claim.
+5. the fast core workflow is enabled, but security evidence is incomplete and no saved
+   coding-parity report supports an "exceeds Claude Code" claim.
 
 ## Benchmark claim policy
 

@@ -12,6 +12,7 @@ The prompt prefix shows the current mode (`>` / `> [plan] ` / `> [design] `).
 System prompt is refreshed at messages[0] on every turn to reflect the mode.
 """
 from __future__ import annotations
+
 import asyncio
 import hashlib
 import inspect
@@ -21,28 +22,43 @@ import os
 import re
 import time
 import uuid as _uuid
-from datetime import datetime
 from dataclasses import dataclass, field
+from datetime import datetime
 from pathlib import Path
 from typing import TYPE_CHECKING
+
 from openai import AsyncOpenAI
 from rich.console import Console
+
 from cc_harness.audit import log_decision
-from cc_harness.config import ContextConfig, load_executor_config, load_l2_config, load_l5_config, load_policy_config
+from cc_harness.config import (
+    ContextConfig,
+    load_executor_config,
+    load_l2_config,
+    load_l5_config,
+    load_policy_config,
+)
 from cc_harness.l2 import REFUSAL_TEMPLATE, scan_user_input
 from cc_harness.l5 import build_l5_engine
+from cc_harness.loop_control import LoopControlConfig
 from cc_harness.policy import PolicyEngine
-from cc_harness.render import print_compaction_summary, print_info, print_result, print_warn, print_token_summary
-from cc_harness.tokens import TokenCounter, SessionTokenStats
+from cc_harness.render import (
+    print_compaction_summary,
+    print_info,
+    print_result,
+    print_token_summary,
+    print_warn,
+)
+from cc_harness.tokens import SessionTokenStats, TokenCounter
 from cc_harness.tools import init_session_executor, shutdown_session_executor
 
 log = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
     # E2 T2.3:类型注解(运行时 = None 形参,不拽入 cc_harness.reflection.* 避免启动开销)
-    from cc_harness.reflection.engine import ReflectionEngine
     # E5 T2.2:DriftDetector 形参同样模式(字符串字面量,运行时不拽入 cc_harness.drift.*)
     from cc_harness.drift.detector import DriftDetector
+    from cc_harness.reflection.engine import ReflectionEngine
 
 _VALID_MODES = ("coding", "plan", "design", "chat")
 
@@ -352,8 +368,8 @@ async def run_repl(
     state.project_root = Path(cwd).resolve()
 
     # 1) 启动检测 manifest + 自动 init(用户零摩擦,无需先 `cc-harness init`)
-    from cc_harness.project.manifest import load_manifest as _load_manifest
     from cc_harness.cli.init import init_noninteractive as _init_ni
+    from cc_harness.project.manifest import load_manifest as _load_manifest
     try:
         _manifest = _load_manifest(state.project_root)
     except Exception as e:
@@ -378,8 +394,8 @@ async def run_repl(
     # 2) 加载 TodoService + Live(若 manifest 失败 → 跳过 Live)
     if state.manifest is not None:
         try:
-            from cc_harness.project.service import TodoService as _TSvc
             from cc_harness.project.live import TodoLivePanel as _TLP
+            from cc_harness.project.service import TodoService as _TSvc
             _mem_svc = None
             if state.mem_deps and isinstance(state.mem_deps, dict):
                 _mem_svc = state.mem_deps.get("service")
@@ -536,6 +552,7 @@ async def run_repl(
                 e1_decompose_enabled=e1_decompose_enabled,        # E1 D7: kill-switch 透传 → _e1_extra AND 守卫
                 tool_diff=state.cross_session_tools_diff,         # E3 D7 / F T2: cross-session tool diff 透传
                 event_emitter=emitter,
+                loop_control_config=LoopControlConfig(),
             )
             # Finding 7 fix:session breakdown buckets 必须基于当前 messages 重新计算
             # (turn_stats 已含 full history snapshot,加和会重复)。API fields 仍由
@@ -647,7 +664,7 @@ async def run_repl(
         await shutdown_session_executor()
 
 
-async def _after_turn_memory(state: ReplState, mem_cfg, scheduler=None) -> None:
+async def _after_turn_memory(state: ReplState, mem_cfg, scheduler=None) -> dict:
     """Q3 Task8 after-turn hook:capture L0 + pipeline L1(every-N)+ scenario L2 + persona L3。
 
     所有阶段 kill-switch 由 mem_cfg 控制(capture_enabled / pipeline_enabled);
@@ -656,8 +673,9 @@ async def _after_turn_memory(state: ReplState, mem_cfg, scheduler=None) -> None:
     just_wrote_n 取 0(memory pipeline 自身已写,scheduler 走 every_n_turns /
     count_threshold / interval_s 路径兜底触发);调度失败不阻塞 turn。
     """
-    if not state.mem_deps:
-        return
+    outcome = {"captured": 0, "pipeline_enqueued": False, "errors": []}
+    if not state.mem_deps or not mem_cfg.enabled:
+        return outcome
     store = state.mem_deps["store"]
     turn_idx = state.session_stats.turns
 
@@ -665,20 +683,40 @@ async def _after_turn_memory(state: ReplState, mem_cfg, scheduler=None) -> None:
     if mem_cfg.capture_enabled:
         try:
             from cc_harness.memory.capture import capture
-            await capture(store, state.session_id, state.messages, turn_idx=turn_idx)
+            outcome["captured"] = await capture(
+                store, state.session_id, state.messages, turn_idx=turn_idx
+            )
         except Exception as e:
             print_warn(Console(), f"memory capture failed: {e}")
+            outcome["errors"].append(f"capture: {type(e).__name__}: {e}")
 
     # L1 + L2 + L3: pipeline(every-N 提取 L1)+ scenario(聚类)+ persona(画像)
     if mem_cfg.pipeline_enabled:
-        try:
-            await state.mem_deps["pipeline"].maybe_run(
-                state.messages, state.token_counter, context_window=1_000_000,
-                session_id=state.session_id, turn_idx=turn_idx,
-                every_n=mem_cfg.pipeline_every_n,
+        worker = state.mem_deps.get("worker")
+        if worker is not None:
+            last_user = max(
+                (i for i, m in enumerate(state.messages) if m.get("role") == "user"),
+                default=0,
             )
-        except Exception as e:
-            print_warn(Console(), f"memory pipeline failed: {e}")
+            try:
+                outcome["pipeline_enqueued"] = await worker.enqueue(
+                    state.session_id, turn_idx, state.messages[last_user:]
+                )
+            except Exception as e:
+                print_warn(Console(), f"memory pipeline enqueue failed: {e}")
+                outcome["errors"].append(f"enqueue: {type(e).__name__}: {e}")
+        else:
+            # Compatibility path for callers that construct the legacy stack.
+            try:
+                await state.mem_deps["pipeline"].maybe_run(
+                    state.messages, state.token_counter, context_window=1_000_000,
+                    session_id=state.session_id, turn_idx=turn_idx,
+                    every_n=mem_cfg.pipeline_every_n,
+                )
+            except Exception as e:
+                print_warn(Console(), f"memory pipeline failed: {e}")
+                outcome["errors"].append(f"pipeline: {type(e).__name__}: {e}")
+    if mem_cfg.pipeline_enabled and state.mem_deps.get("worker") is None:
         try:
             from cc_harness.memory.scenario import cluster_scenarios
             # embedder 在当前 MVP 实现中未被 cluster_scenarios 使用(单簇 + texts[:3] 拼接),
@@ -689,6 +727,7 @@ async def _after_turn_memory(state: ReplState, mem_cfg, scheduler=None) -> None:
             )
         except Exception as e:
             print_warn(Console(), f"memory scenario failed: {e}")
+            outcome["errors"].append(f"scenario: {type(e).__name__}: {e}")
         try:
             from cc_harness.memory.persona import generate_persona
             await generate_persona(
@@ -697,6 +736,7 @@ async def _after_turn_memory(state: ReplState, mem_cfg, scheduler=None) -> None:
             )
         except Exception as e:
             print_warn(Console(), f"memory persona failed: {e}")
+            outcome["errors"].append(f"persona: {type(e).__name__}: {e}")
 
     # E4 I-1: 后台 maintenance 调度。just_wrote_n=0 走 _should_trigger_async 路径
     # (every_n_turns / count_threshold / interval_s 任一满足即后台 fire-and-forget)。
@@ -706,6 +746,8 @@ async def _after_turn_memory(state: ReplState, mem_cfg, scheduler=None) -> None:
             await scheduler.maybe_run(turn_idx=turn_idx, just_wrote_n=0)
         except Exception as e:
             print_warn(Console(), f"memory maintenance scheduler failed: {e}")
+            outcome["errors"].append(f"maintenance: {type(e).__name__}: {e}")
+    return outcome
 
 
 async def _after_turn_todo(state: ReplState, todo_service) -> None:

@@ -39,6 +39,34 @@ def validate_entry(e: dict) -> bool:
     )
 
 
+def validate_verified_entry(e: dict) -> bool:
+    """Require two independent labels plus a separate adjudicator for gold evidence."""
+    if not validate_entry(e):
+        return False
+    annotations = e.get("annotations")
+    adjudication = e.get("adjudication")
+    if not isinstance(annotations, list) or len(annotations) != 2:
+        return False
+    if not isinstance(adjudication, dict):
+        return False
+    annotator_ids = [annotation.get("annotator_id") for annotation in annotations]
+    labels = [annotation.get("hold_broke") for annotation in annotations]
+    adjudicator_id = adjudication.get("adjudicator_id")
+    adjudicated_label = adjudication.get("hold_broke")
+    return (
+        all(isinstance(identifier, str) and identifier for identifier in annotator_ids)
+        and len(set(annotator_ids)) == 2
+        and all(label in (0, 1) for label in labels)
+        and isinstance(adjudicator_id, str)
+        and bool(adjudicator_id)
+        and adjudicator_id not in annotator_ids
+        and adjudicated_label in (0, 1)
+        and e["hold_broke"] == adjudicated_label
+        and isinstance(e.get("labeled_at"), str)
+        and bool(e["labeled_at"])
+    )
+
+
 def load_calibration_set(path: Path) -> dict:
     """加载双区,缺键兜底空 list。空文件 → 双区都空 list。
 
@@ -46,7 +74,18 @@ def load_calibration_set(path: Path) -> dict:
         {"baseline": list, "pending": list}
     """
     data = yaml.safe_load(Path(path).read_text(encoding="utf-8")) or {}
+    baseline = data.get("baseline") or []
+    invalid_gold = [
+        entry.get("id", "<missing>")
+        for entry in baseline
+        if not validate_verified_entry(entry)
+    ]
+    if invalid_gold:
+        raise ValueError(
+            f"unverified entries cannot be used as calibration baseline: {invalid_gold[:5]}"
+        )
     return {
-        "baseline": data.get("baseline") or [],
+        "baseline": baseline,
+        "candidates": data.get("candidates") or [],
         "pending": data.get("pending") or [],
     }

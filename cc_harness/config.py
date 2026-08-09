@@ -50,6 +50,7 @@ class AppConfig(BaseModel):
     openai_base_url: str
     openai_model: str
     mcp_servers: dict[str, MCPServerConfig]
+    runtime_environment: dict[str, str] = Field(default_factory=dict, exclude=True, repr=False)
 
     model_config = {"extra": "ignore"}
 
@@ -86,6 +87,11 @@ def load_config(env_path: Path, mcp_json_path: Path) -> AppConfig:
         openai_base_url=base_url,
         openai_model=model,
         mcp_servers=servers,
+        runtime_environment={
+            key: value
+            for key, value in os.environ.items()
+            if key.startswith(("MEMORY_", "EMBEDDING_"))
+        },
     )
 
 
@@ -116,6 +122,13 @@ def load_layered_config(
 
     def value(name: str) -> str | None:
         return process_env.get(name) or project_env.get(name) or user_env.get(name)
+
+    layered_runtime_env = {
+        key: selected
+        for key in set(user_env) | set(project_env) | set(process_env)
+        if key.startswith(("MEMORY_", "EMBEDDING_"))
+        and (selected := value(key)) is not None
+    }
 
     api_key = value("OPENAI_API_KEY")
     base_url = value("OPENAI_BASE_URL")
@@ -158,12 +171,13 @@ def load_layered_config(
         openai_base_url=base_url,
         openai_model=model,
         mcp_servers=parsed_servers,
+        runtime_environment=layered_runtime_env,
     )
 
 
 class PolicyConfig(BaseModel):
     """权限闸门配置。M1 只暴露 enabled(杀手开关)。
-    审计路径固定 <项目根>/logs/policy.jsonl(agent 写死),不在此配置。
+    审计路径固定 <项目根>/.cc-harness/logs/policy.jsonl(agent 写死),不在此配置。
 
     E1 D7:e1_decompose_enabled 控制 Decomposer hint 是否注入到 system prompt
     (从 main.py 透传到 repl.py → agent.py run_turn,作为 _e1_extra["e1_decompose_hint"]
@@ -355,6 +369,18 @@ def load_executor_config(path: Path) -> ExecutorConfig:
     backend_env = os.getenv("CC_HARNESS_EXECUTOR_BACKEND", "").strip().lower()
     if backend_env in ("sandbox", "native"):
         cfg.backend = ExecutorBackend(backend_env)
+    sandbox_port = os.getenv("CC_HARNESS_SANDBOX_SERVER_PORT", "").strip()
+    if sandbox_port:
+        try:
+            parsed_port = int(sandbox_port)
+        except ValueError as exc:
+            raise ValueError("CC_HARNESS_SANDBOX_SERVER_PORT must be an integer") from exc
+        if not 1 <= parsed_port <= 65535:
+            raise ValueError("CC_HARNESS_SANDBOX_SERVER_PORT must be between 1 and 65535")
+        cfg.sandbox.server_port = parsed_port
+    sandbox_config = os.getenv("CC_HARNESS_SANDBOX_SERVER_CONFIG_PATH", "").strip()
+    if sandbox_config:
+        cfg.sandbox.server_config_path = Path(sandbox_config).expanduser().resolve()
     return cfg
 
 
@@ -374,6 +400,9 @@ class ContextConfig(BaseModel):
     snip_head_lines: int = 5
     snip_tail_lines: int = 1
     summarize_max_output_tokens: int = 2_000
+    fail_closed: bool = True
+    context_window_source: str = "legacy-default"
+    context_window_verified: bool = False
 
     model_config = {"extra": "ignore"}
 
@@ -394,18 +423,40 @@ class ContextConfig(BaseModel):
         return self
 
 
-def load_context_config(path: Path | None = None) -> ContextConfig:
+def load_context_config(
+    path: Path | None = None,
+    *,
+    model: str | None = None,
+    require_known: bool = False,
+    environ: dict[str, str] | None = None,
+) -> ContextConfig:
     """从 CONTEXT_* env 构造;缺省默认(1M 窗口)。
 
     path 暂不读(policy.yaml 无 context 段);env 覆盖:CONTEXT_WINDOW /
     CONTEXT_TIER1/2/3 / CONTEXT_PROTECT_TOKENS。
     """
-    cw = os.getenv("CONTEXT_WINDOW")
-    t1, t2, t3 = os.getenv("CONTEXT_TIER1"), os.getenv("CONTEXT_TIER2"), os.getenv("CONTEXT_TIER3")
-    pt = os.getenv("CONTEXT_PROTECT_TOKENS")
+    env = os.environ if environ is None else environ
+    cw = env.get("CONTEXT_WINDOW")
+    t1, t2, t3 = env.get("CONTEXT_TIER1"), env.get("CONTEXT_TIER2"), env.get("CONTEXT_TIER3")
+    pt = env.get("CONTEXT_PROTECT_TOKENS")
     kw: dict = {}
     if cw:
         kw["context_window"] = int(cw)
+        kw["context_window_source"] = "CONTEXT_WINDOW"
+        kw["context_window_verified"] = True
+    elif model:
+        from cc_harness.model_capabilities import get_model_capability
+
+        capability = get_model_capability(model)
+        if capability is None:
+            if require_known:
+                raise ConfigError(
+                    f"unknown context window for model {model!r}; set CONTEXT_WINDOW explicitly"
+                )
+        else:
+            kw["context_window"] = capability.context_window
+            kw["context_window_source"] = capability.source
+            kw["context_window_verified"] = capability.verified
     if t1:
         kw["tier1_threshold"] = float(t1)
     if t2:
@@ -417,7 +468,9 @@ def load_context_config(path: Path | None = None) -> ContextConfig:
     return ContextConfig(**kw)
 
 
-def load_memory_config(path: Path) -> "MemoryConfig":  # type: ignore[name-defined]
+def load_memory_config(
+    path: Path, *, environ: dict[str, str] | None = None
+) -> "MemoryConfig":  # type: ignore[name-defined]
     """读 policy.yaml 的 `memory:` 段 + MEMORY_* env 覆盖;path 缺失→默认 MemoryConfig()。
 
     与 load_l2_config / load_policy_config 风格一致。MemoryConfig 定义在
@@ -431,6 +484,7 @@ def load_memory_config(path: Path) -> "MemoryConfig":  # type: ignore[name-defin
     / MEMORY_MERMAID_MAX_TOKEN_RATIO / MEMORY_OFFLOAD_CANVAS_INJECT。
     """
     from cc_harness.memory.config import MemoryConfig  # lazy: dodge circular import
+    env = os.environ if environ is None else environ
     kw: dict = {}
     if path.exists():
         import yaml
@@ -447,18 +501,29 @@ def load_memory_config(path: Path) -> "MemoryConfig":  # type: ignore[name-defin
         ("offload_ratio", "MEMORY_OFFLOAD_RATIO", float),
         ("mermaid_max_token_ratio", "MEMORY_MERMAID_MAX_TOKEN_RATIO", float),
     ]:
-        v = os.getenv(env_name)
+        v = env.get(env_name)
         if v is not None and v.strip():
             kw[key] = cast(v)
     # 布尔型 env 覆盖
     for key, env_name in [
+        ("enabled", "MEMORY_ENABLED"),
         ("layered_inject", "MEMORY_LAYERED_INJECT"),
         ("capture_enabled", "MEMORY_CAPTURE_ENABLED"),
         ("pipeline_enabled", "MEMORY_PIPELINE_ENABLED"),
         ("offload_enabled", "MEMORY_OFFLOAD_ENABLED"),
         ("offload_canvas_inject", "MEMORY_OFFLOAD_CANVAS_INJECT"),
     ]:
-        v = os.getenv(env_name)
+        v = env.get(env_name)
         if v is not None and v.strip():
             kw[key] = v.strip().lower() in ("1", "true", "yes", "on")
+    for key, env_name, cast in [
+        ("db_base_dir", "MEMORY_DB_DIR", Path),
+        ("embedding_base_url", "EMBEDDING_BASE_URL", str),
+        ("embedding_api_key", "EMBEDDING_API_KEY", str),
+        ("embedding_model", "EMBEDDING_MODEL", str),
+        ("embedding_dim", "EMBEDDING_DIM", int),
+    ]:
+        v = env.get(env_name)
+        if v is not None and str(v).strip():
+            kw[key] = cast(v)
     return MemoryConfig(**kw)

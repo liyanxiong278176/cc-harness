@@ -12,19 +12,27 @@ from unittest.mock import MagicMock, AsyncMock
 import pytest
 
 
+@pytest.fixture
+async def store(tmp_path):
+    from cc_harness.memory.store import MemoryStore
+
+    value = MemoryStore(tmp_path / "mem.db", embedding_dim=4)
+    await value.init_schema()
+    try:
+        yield value
+    finally:
+        await value.close()
+
+
 @pytest.mark.asyncio
-async def test_full_pipeline_write_drift_emit_retrieve(tmp_path):
+async def test_full_pipeline_write_drift_emit_retrieve(tmp_path, store):
     """完整管线:写 50 → drift emit → E2 写盘 → retriever 召出。
 
     简化版:直接验证 DriftDetector 调 emit 后,reflection engine.save 被调(source='drift')。
     """
     from cc_harness.drift.detector import DriftDetector
-    from cc_harness.memory.store import Memory, MemoryStore
+    from cc_harness.memory.store import Memory
     from cc_harness.drift.prompts import JUDGE_ENTITIES, JUDGE_GROUP_CONSIST
-
-    # 真实 MemoryStore (in-memory)
-    store = MemoryStore(tmp_path / "mem.db", embedding_dim=4)
-    await store.init_schema()
 
     # Fake 写盘 service(模拟 E2 ReflectionEngine 行为)
     saved_records = []
@@ -85,14 +93,10 @@ async def test_full_pipeline_write_drift_emit_retrieve(tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_drift_reflection_appears_in_search_reflections(tmp_path):
+async def test_drift_reflection_appears_in_search_reflections(store):
     """drift 反思落盘后,E2 search_reflections(24h) 能召出。"""
     # 验证 drift 走 E2 reflection source='drift' 路径被 E2 service 自然召出
     # 简化:直接验证 search_reflections 召 source='drift'
-    from cc_harness.memory.store import MemoryStore
-
-    store = MemoryStore(tmp_path / "mem.db", embedding_dim=4)
-    await store.init_schema()
     emb = [0.1, 0.2, 0.3, 0.4]
     await store.add("反思 1", emb, "reflection", session_id="s1")
     await store.add("drift 反思", emb, "drift", session_id="s1")

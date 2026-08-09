@@ -68,7 +68,9 @@ class DriftDetector:
         self._judge_llm = judge_llm
         self._l5 = l5_engine
         self._project_root = Path(project_root)
-        self._audit_path = audit_path or (self._project_root / "logs" / "drift.jsonl")
+        self._audit_path = audit_path or (
+            self._project_root / ".cc-harness" / "logs" / "drift.jsonl"
+        )
         self._audit_path.parent.mkdir(parents=True, exist_ok=True)
         self._every_n_turns = every_n_turns
         self._enabled = enabled

@@ -5,7 +5,7 @@ import json
 from collections import Counter
 from pathlib import Path
 
-from cc_harness.agent import run_turn
+from cc_harness.agent import NATIVE_TOOLS, run_turn
 from cc_harness.cli.init import init_noninteractive
 from cc_harness.llm import PendingToolCall
 from cc_harness.policy import PolicyEngine
@@ -127,11 +127,11 @@ async def test_b_e2e_llm_uses_topo_sort(tmp_path: Path):
         spec["function"]["name"]
         for spec in tool_specs_seen[0]
     }
-    # FakeLLM sees all 9 todo specs (D1 Task 5); run_command remains the 10th built-in.
+    # FakeLLM sees every todo spec plus the first-party native tool set.
     assert len(prompts) == 2
     assert len(todo_names) == 9
     assert todo_names <= observed_names
-    assert observed_names - todo_names == {"run_command"}
+    assert observed_names - todo_names == set(NATIVE_TOOLS)
     assert len(messages) == 5
     tool_call_message = next(
         message

@@ -61,14 +61,20 @@ def token_f1(predicted: str, gold: str) -> float:
     return 2 * precision * recall / (precision + recall)
 
 
-def quality_score(prompt: str, predicted: str, gold: str) -> Optional[float]:
+def quality_score(
+    prompt: str,
+    predicted: str,
+    gold: str,
+    *,
+    enabled: bool = True,
+) -> Optional[float]:
     """Deepeval GEval('answer quality') — wrapped to fail-soft if deepeval/judge LLM not available.
 
     Returns:
         float 0-1 on success
         None if deepeval not installed or judge LLM failed
     """
-    if GEval is None:  # deepeval not installed
+    if not enabled or GEval is None:  # live judges require an explicit caller opt-in
         return None
     try:
         metric = GEval(
@@ -123,7 +129,9 @@ def _chunk_messages(messages: list[dict]) -> list[dict]:
             content = json.dumps(content, ensure_ascii=False)
         if not content:
             continue
-        tokens = len(_tokenize(content))
+        from cc_harness.tokens import TokenCounter
+
+        tokens = TokenCounter().count_text(content)
         out.append({"role": role, "content": content, "tokens": tokens})
     return out
 
@@ -168,6 +176,7 @@ async def evaluate_qa(
     messages: list[dict] | None = None,
     judge_llm=None,
     judge_chunk_usefulness: bool = True,
+    enable_quality_judge: bool = False,
 ) -> dict:
     """M5-2 extended:返回 dict 含 chunk_usefulness。
 
@@ -176,7 +185,9 @@ async def evaluate_qa(
     """
     f1 = token_f1(predicted, gold)
     semantic = await semantic_f1(prompt, predicted, gold, judge_llm)
-    quality = quality_score(prompt, predicted, gold)
+    quality = (
+        quality_score(prompt, predicted, gold, enabled=True) if enable_quality_judge else None
+    )
     # Pass 判定(Q1 公平性 2026-07-31):三选一兜底,任一过即 pass。
     # 原始 (semantic > 0.7) else (f1 > 0.5) 对同义/复数不友好(quality=0.8 但 f1=0.04
     # 也 fail),locomo pass 率被严重压低。semantic>0.5 + f1>0.3 + quality>0.7 三选一

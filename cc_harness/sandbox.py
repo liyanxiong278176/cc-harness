@@ -136,20 +136,20 @@ async def _with_retry(coro_factory, attempts: int = 3):
 
 
 def _audit_fallback(project_root: Path, reason: str, retries: int = 3) -> None:
-    """降级审计:写一行 JSON 到 <project_root>/logs/sandbox.jsonl。
+    """降级审计:写一行 JSON 到 <project_root>/.cc-harness/logs/sandbox.jsonl。
 
     best-effort:IO 失败只吞(降级路径不能再因审计崩;调用方即将 raise,
     若审计抛 OSError 会 mask 真实的 SandboxUnavailableError)。沿用 audit.py 模式。
     """
     entry = {
-        # ISO 字符串匹配 audit.py(<root>/logs/*.jsonl 消费方格式统一),
+        # ISO 字符串匹配 audit.py(<root>/.cc-harness/logs/*.jsonl 消费方格式统一),
         # 而非 epoch float。
         "ts": time.strftime("%Y-%m-%dT%H:%M:%S"),
         "action": "fallback_after_retry",
         "reason": reason,
         "retries": retries,
     }
-    log = project_root / "logs" / "sandbox.jsonl"
+    log = project_root / ".cc-harness" / "logs" / "sandbox.jsonl"
     try:
         log.parent.mkdir(parents=True, exist_ok=True)
         with log.open("a", encoding="utf-8") as f:
@@ -311,7 +311,7 @@ class SandboxExecutor:
                 ),
             )
         except SandboxUnavailableError as e:
-            # 降级前落审计(action/reason/retries → logs/sandbox.jsonl),再上抛让调用方降级 native。
+            # 降级前落审计,再上抛让调用方按配置处理。
             _audit_fallback(project_root=self.project_root, reason=str(e), retries=3)
             raise
         except Exception as e:

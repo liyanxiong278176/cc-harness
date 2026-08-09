@@ -28,7 +28,8 @@ async def layered_recall(
         atoms: list = []
         if query.strip():
             try:
-                atoms = await retriever.search(query, top_k=top_k)
+                search = getattr(retriever, "search_hybrid", retriever.search)
+                atoms = await search(query, top_k=top_k)
             except Exception:
                 atoms = []
         return RecallResult(persona=persona, scenarios=scenarios, atoms=atoms)
@@ -44,7 +45,13 @@ def read_persona(persona_path: Path) -> Persona | None:
     if not persona_path.exists():
         return None
     txt = persona_path.read_text(encoding="utf-8")
-    return Persona(summary=txt, scenario_ids=[], md_path=str(persona_path))
+    return Persona(
+        summary=txt,
+        scenario_ids=[],
+        md_path=str(persona_path),
+        version=_metadata_int(txt, "version", 1),
+        created_at=_metadata_float(txt, "created_at", persona_path.stat().st_mtime),
+    )
 
 
 def read_top_scenarios(scenarios_dir: Path, top_k: int) -> list[Scenario]:
@@ -57,14 +64,23 @@ def read_top_scenarios(scenarios_dir: Path, top_k: int) -> list[Scenario]:
         return []
     out: list[Scenario] = []
     files = sorted(scenarios_dir.glob("*.md"), key=lambda x: -x.stat().st_mtime)
-    for p in files[:top_k]:
+    seen_sessions: set[str] = set()
+    for p in files:
         txt = p.read_text(encoding="utf-8")
+        session_id = _extract_session_id(p.stem)
+        if session_id in seen_sessions:
+            continue
+        seen_sessions.add(session_id)
         out.append(Scenario(
             atom_ids=_parse_atom_ids(txt),
             summary=_extract_summary(txt),
-            session_id=_extract_session_id(p.stem),
+            session_id=session_id,
             md_path=str(p),
+            version=_metadata_int(txt, "version", 1),
+            created_at=_metadata_float(txt, "created_at", p.stat().st_mtime),
         ))
+        if len(out) >= top_k:
+            break
     return out
 
 
@@ -96,6 +112,31 @@ def _extract_summary(txt: str) -> str:
 
 def _extract_session_id(stem: str) -> str:
     """scenario.py 写 ``{session_id}-{ts}.md``;取首个 ``-`` 前段。无则空。"""
+    if "-v" in stem and stem.rsplit("-v", 1)[1].isdigit():
+        return stem.rsplit("-v", 1)[0]
     if "-" in stem:
-        return stem.split("-", 1)[0]
-    return ""
+        return stem.rsplit("-", 1)[0]
+    return stem
+
+
+def _metadata_int(text: str, key: str, default: int) -> int:
+    try:
+        return int(_metadata_value(text, key) or default)
+    except ValueError:
+        return default
+
+
+def _metadata_float(text: str, key: str, default: float) -> float:
+    try:
+        return float(_metadata_value(text, key) or default)
+    except ValueError:
+        return default
+
+
+def _metadata_value(text: str, key: str) -> str | None:
+    prefix = f"{key}:"
+    for line in text.splitlines():
+        stripped = line.strip()
+        if stripped.startswith(prefix):
+            return stripped[len(prefix):].strip()
+    return None
