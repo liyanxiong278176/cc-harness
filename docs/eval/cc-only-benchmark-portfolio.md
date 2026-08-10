@@ -10,9 +10,11 @@ Run from the repository root:
 
 ```cmd
 scripts\run_eval_context27.cmd
-scripts\run_eval_ruler.cmd
-scripts\run_eval_locomo.cmd
-scripts\run_eval_longmemeval.cmd
+scripts\run_eval_longmemeval_context_memory.cmd
+scripts\run_eval_longmemeval_v2_context_memory.cmd
+scripts\run_eval_locomo_context_memory.cmd
+scripts\run_eval_memoryagentbench_context_memory.cmd
+scripts\run_eval_context_memory_all.cmd
 scripts\run_eval_safety8.cmd
 scripts\run_eval_agentdojo.cmd
 scripts\run_eval_agentharm.cmd
@@ -38,13 +40,12 @@ result directory while its manifest retains the requested `portfolio` or `full` 
   official GPT-4o refusal and semantic judges, so its score is a named judge adaptation.
 - Terminal-Bench's available Harbor registry source is `terminal-bench@2.0`; the historical CMD and
   result slug retain `2.1` but the manifest discloses the actual source.
-- RULER preparation downloads and hashes the pinned Git LFS English word list, Paul Graham essays,
-  SQuAD v2 and HotpotQA before generating frozen cases. On Windows it invokes the pinned task
-  generators with structured argv because upstream `prepare.py` uses `shell=True` with multiline
-  templates, which truncates context under CMD. Generated cases are rejected if their reported
-  token length is below 75% of the requested RULER length.
-- LongMemEval, Harbor tasks and container images require their documented preparation downloads.
-  Context27, LoCoMo and Safety8 use repository-local fixtures.
+- The unified context-memory domain runs LongMemEval-S Cleaned, LongMemEval-V2 Small, LoCoMo and
+  MemoryAgentBench with isolated control/treatment arms. Standalone NVIDIA RULER is retired; the
+  `ruler_qa1`/`ruler_qa2` sources inside MemoryAgentBench remain official suite members and are not
+  reported as standalone RULER.
+- LongMemEval-V2 and MemoryAgentBench require their pinned resumable preparation downloads.
+  LongMemEval-S Cleaned and LoCoMo use the already pinned local files when their SHA-256 matches.
 
 `--check` never performs model preflight or task calls. Live commands require `--confirm-live`; the
 CMD launchers supply it. Safety trials are invalid unless the production safety capability reports

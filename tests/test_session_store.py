@@ -29,6 +29,17 @@ async def test_project_session_store_round_trip_and_delete_attachments(tmp_path)
 
 
 @pytest.mark.asyncio
+async def test_session_store_round_trips_json_surrogates(tmp_path):
+    store = await SessionStore(tmp_path).open()
+    messages = [{"role": "user", "content": "prefix\udc94suffix"}]
+    try:
+        await store.save("surrogate", messages, mode="coding")
+        assert await store.load("surrogate") == messages
+    finally:
+        await store.close()
+
+
+@pytest.mark.asyncio
 async def test_session_store_externalizes_and_restores_image_data(tmp_path):
     store = await SessionStore(tmp_path).open()
     payload = base64.b64encode(b"fake-png").decode("ascii")

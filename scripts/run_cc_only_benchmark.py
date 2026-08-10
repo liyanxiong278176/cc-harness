@@ -17,7 +17,6 @@ from eval.cc_only.adapters import (
     Context27Adapter,
     LoCoMoAdapter,
     LongMemEvalAdapter,
-    RulerAdapter,
     Safety8Adapter,
     SweBenchVerifiedAdapter,
     TerminalBenchAdapter,
@@ -27,7 +26,6 @@ ADAPTERS = {
     "agentdojo": AgentDojoAdapter,
     "agentharm": AgentHarmAdapter,
     "context27": Context27Adapter,
-    "ruler": RulerAdapter,
     "locomo": LoCoMoAdapter,
     "longmemeval": LongMemEvalAdapter,
     "safety8": Safety8Adapter,
@@ -88,21 +86,6 @@ def _prepare(root: Path, benchmark: str, profile: EvalProfile) -> None:
             print(f"downloading={url}", flush=True)
             urllib.request.urlretrieve(url, temporary)
             temporary.replace(target)
-    if benchmark == "ruler":
-        ruler_profile = (
-            EvalProfile.PORTFOLIO if profile is EvalProfile.CHECK else profile
-        )
-        command = [
-            str(shutil.which("uv") or "uv"),
-            "run",
-            "python",
-            "scripts/prepare_ruler_data.py",
-            "--project-root",
-            str(root),
-            "--profile",
-            ruler_profile.value,
-        ]
-        subprocess.run(command, cwd=root, check=True)
     if benchmark in {"terminal-bench-2.1", "swebench-verified"}:
         target = root / "eval" / "result" / "cc-only" / "_artifacts" / "cc_harness-0.1.0-py3-none-any.whl"
         if not target.is_file():

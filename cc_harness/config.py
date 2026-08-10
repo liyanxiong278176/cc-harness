@@ -432,14 +432,17 @@ def load_context_config(
 ) -> ContextConfig:
     """从 CONTEXT_* env 构造;缺省默认(1M 窗口)。
 
-    path 暂不读(policy.yaml 无 context 段);env 覆盖:CONTEXT_WINDOW /
+    path 暂不读(policy.yaml 无 context 段);env 覆盖:CONTEXT_ENABLED / CONTEXT_WINDOW /
     CONTEXT_TIER1/2/3 / CONTEXT_PROTECT_TOKENS。
     """
     env = os.environ if environ is None else environ
+    enabled = env.get("CONTEXT_ENABLED")
     cw = env.get("CONTEXT_WINDOW")
     t1, t2, t3 = env.get("CONTEXT_TIER1"), env.get("CONTEXT_TIER2"), env.get("CONTEXT_TIER3")
     pt = env.get("CONTEXT_PROTECT_TOKENS")
     kw: dict = {}
+    if enabled is not None and enabled.strip():
+        kw["enabled"] = enabled.strip().lower() in ("1", "true", "yes", "on")
     if cw:
         kw["context_window"] = int(cw)
         kw["context_window_source"] = "CONTEXT_WINDOW"

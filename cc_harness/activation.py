@@ -1,4 +1,5 @@
 """Capability profiles and auditable runtime activation evidence."""
+
 from __future__ import annotations
 
 import json
@@ -21,6 +22,9 @@ class CapabilityProfile:
     background_services: bool = True
     loop_control: bool = True
     safety: bool = True
+    mcp: bool = True
+    tools: bool = True
+    one_shot: bool = False
 
     @classmethod
     def named(cls, name: str) -> CapabilityProfile:
@@ -35,11 +39,16 @@ class CapabilityProfile:
             ),
             "benchmark-one-shot": cls(
                 "benchmark-one-shot",
+                mcp=False,
+                tools=False,
                 project_services=False,
                 context=False,
                 long_term_memory=False,
                 reflection=False,
                 background_services=False,
+                loop_control=False,
+                safety=False,
+                one_shot=True,
             ),
             "context-eval": cls(
                 "context-eval",
@@ -53,6 +62,18 @@ class CapabilityProfile:
                 project_services=False,
                 reflection=False,
                 background_services=False,
+            ),
+            "context-memory-control": cls(
+                "context-memory-control",
+                project_services=False,
+                context=False,
+                long_term_memory=False,
+                reflection=False,
+                background_services=False,
+                loop_control=False,
+                safety=False,
+                mcp=False,
+                tools=False,
             ),
             "hardened-safety": cls(
                 "hardened-safety",
@@ -104,9 +125,9 @@ class ActivationManifest:
         self.capabilities: dict[str, CapabilityActivation] = {
             "runtime": CapabilityActivation(enabled=True),
             "model": CapabilityActivation(enabled=True),
-            "mcp": CapabilityActivation(enabled=True),
+            "mcp": CapabilityActivation(enabled=profile.mcp),
             "agent_loop": CapabilityActivation(enabled=profile.loop_control),
-            "tools": CapabilityActivation(enabled=True),
+            "tools": CapabilityActivation(enabled=profile.tools),
             "context": CapabilityActivation(enabled=profile.context),
             "memory": CapabilityActivation(enabled=profile.long_term_memory),
             "safety": CapabilityActivation(enabled=profile.safety),

@@ -143,6 +143,7 @@ class SessionStore:
         )
         override_row = await override.fetchone()
         title = override_row[0] if override_row is not None else self._title(messages)
+        title = title.encode("utf-8", errors="backslashreplace").decode("utf-8")
         await self._db.execute("SAVEPOINT session_save")
         try:
             await self._db.execute(
@@ -176,7 +177,7 @@ class SessionStore:
             next_sequence = int((await sequence_cursor.fetchone())[0])
             for index, message in enumerate(messages):
                 externalized = self._externalize_images(message, session_id)
-                encoded = json.dumps(externalized, ensure_ascii=False, sort_keys=True)
+                encoded = json.dumps(externalized, ensure_ascii=True, sort_keys=True)
                 digest = "sha256:" + hashlib.sha256(encoded.encode("utf-8")).hexdigest()
                 latest_digest = latest_digests.get(index)
                 if latest_digest != digest:
@@ -250,7 +251,7 @@ class SessionStore:
                 await self._db.execute(
                     "INSERT INTO session_event (session_id, event_index, event_json) "
                     "VALUES (?, ?, ?)",
-                    (session_id, index, json.dumps(event, ensure_ascii=False)),
+                    (session_id, index, json.dumps(event, ensure_ascii=True)),
                 )
             await self._db.execute("RELEASE SAVEPOINT session_event_save")
         except BaseException:
@@ -294,7 +295,7 @@ class SessionStore:
                 label[:80],
                 len(messages),
                 max(0, int(event_count)),
-                json.dumps(externalized, ensure_ascii=False),
+                json.dumps(externalized, ensure_ascii=True),
                 time.time(),
             ),
         )
@@ -489,7 +490,7 @@ class SessionStore:
 
     def _externalize_images(self, message: dict, session_id: str) -> dict:
         """Replace data URLs with private attachment references before SQLite."""
-        copied = json.loads(json.dumps(message, ensure_ascii=False))
+        copied = json.loads(json.dumps(message, ensure_ascii=True))
         content = copied.get("content")
         if not isinstance(content, list):
             return copied

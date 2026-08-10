@@ -162,6 +162,8 @@ async def run_turn(
     loop_control_config: LoopControlConfig | None = None,
     context_artifact_dir: Path | None = None,
     context_projection=None,
+    refresh_system_prompt: bool = True,
+    retry_empty_response: bool = True,
 ) -> TurnTokenStats:
     """Run one user turn in the given mode.
 
@@ -317,7 +319,7 @@ async def run_turn(
             messages[0]["content"] = system_prompt
         else:
             messages.insert(0, {"role": "system", "content": system_prompt})
-    elif cwd is not None:
+    elif refresh_system_prompt and cwd is not None:
         _prompt_capabilities = {
             "todo_available": True,
             "subagent_available": True,
@@ -1537,7 +1539,7 @@ async def run_turn(
             # Retry the SAME turn ONCE before giving up, so a flaky first
             # turn doesn't dead-end the session. (Resets iter_count-1 so
             # the retry doesn't burn a max_iter slot.)
-            if not _empty_retried:
+            if retry_empty_response and not _empty_retried:
                 _empty_retried = True
                 print_warn(console, "空回复,重试中... (empty response, retrying)")
                 iter_count -= 1

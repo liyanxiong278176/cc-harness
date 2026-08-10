@@ -162,9 +162,7 @@ class SessionRuntime:
                 self.state.mode = record.mode
                 self.state.messages = await self.session_store.load(record.session_id)
 
-        activation_path = (
-            self.cwd / ".cc-harness" / "activation" / f"{self.state.session_id}.json"
-        )
+        activation_path = self.cwd / ".cc-harness" / "activation" / f"{self.state.session_id}.json"
         self.activation_manifest = ActivationManifest(
             activation_path,
             session_id=self.state.session_id,
@@ -191,23 +189,32 @@ class SessionRuntime:
             artifact_dir=self.cwd / ".cc-harness" / "context" / self.state.session_id,
         )
 
-        try:
-            await self.mcp.start()
-            configured = len(self.config.mcp_servers)
-            connected = len(self.mcp._sessions)
+        configured = len(self.config.mcp_servers)
+        if self.capability_profile.mcp:
+            try:
+                await self.mcp.start()
+                connected = len(self.mcp._sessions)
+                self.activation_manifest.initialize(
+                    "mcp",
+                    configured_servers=configured,
+                    connected_servers=connected,
+                    tool_count=len(self.mcp._tools),
+                )
+                if connected < configured:
+                    self.activation_manifest.degrade(
+                        "mcp", f"only {connected}/{configured} configured servers connected"
+                    )
+            except Exception as exc:
+                self.warnings.append(RuntimeWarning(f"MCP startup failed: {exc}"))
+                self.activation_manifest.degrade("mcp", str(exc))
+        else:
             self.activation_manifest.initialize(
                 "mcp",
                 configured_servers=configured,
-                connected_servers=connected,
-                tool_count=len(self.mcp._tools),
+                connected_servers=0,
+                tool_count=0,
+                disabled_by_profile=True,
             )
-            if connected < configured:
-                self.activation_manifest.degrade(
-                    "mcp", f"only {connected}/{configured} configured servers connected"
-                )
-        except Exception as exc:
-            self.warnings.append(RuntimeWarning(f"MCP startup failed: {exc}"))
-            self.activation_manifest.degrade("mcp", str(exc))
 
         if self.capability_profile.context:
             await self._build_context_services()
@@ -231,8 +238,7 @@ class SessionRuntime:
                 missing_controls.append("l5")
             if missing_controls:
                 raise ConfigError(
-                    "hardened-safety requires enabled controls: "
-                    + ", ".join(missing_controls)
+                    "hardened-safety requires enabled controls: " + ", ".join(missing_controls)
                 )
         if host_execution:
             exec_cfg.backend = ExecutorBackend.NATIVE
@@ -247,9 +253,7 @@ class SessionRuntime:
             pii_active=bool(getattr(self.l5, "pii_active", False)),
             profile=self.capability_profile.name,
         )
-        safety_artifact = (
-            self.cwd / ".cc-harness" / "safety" / f"{self.state.session_id}.json"
-        )
+        safety_artifact = self.cwd / ".cc-harness" / "safety" / f"{self.state.session_id}.json"
         safety_artifact.parent.mkdir(parents=True, exist_ok=True)
         tmp = safety_artifact.with_suffix(".json.tmp")
         tmp.write_text(
@@ -273,20 +277,25 @@ class SessionRuntime:
         os.replace(tmp, safety_artifact)
         self.activation_manifest.add_artifact("safety", safety_artifact)
         self.activation_manifest.initialize(
-            "agent_loop", control_plane="deterministic"
+            "agent_loop",
+            control_plane=("deterministic" if self.capability_profile.loop_control else "disabled"),
         )
         self.activation_manifest.initialize(
             "tools",
-            native_tools=True,
-            mcp_tool_count=len(self.mcp._tools),
+            native_tools=self.capability_profile.tools,
+            mcp_tool_count=(len(self.mcp._tools) if self.capability_profile.mcp else 0),
+            disabled_by_profile=not self.capability_profile.tools,
         )
-        journal_path = (
-            self.cwd / ".cc-harness" / "action-journal" / f"{self.state.session_id}.jsonl"
-        )
-        journal_path.parent.mkdir(parents=True, exist_ok=True)
-        journal_path.touch(exist_ok=True)
-        self.activation_manifest.add_artifact("agent_loop", journal_path)
-        self.activation_manifest.add_artifact("tools", journal_path)
+        if self.capability_profile.loop_control or self.capability_profile.tools:
+            journal_path = (
+                self.cwd / ".cc-harness" / "action-journal" / f"{self.state.session_id}.jsonl"
+            )
+            journal_path.parent.mkdir(parents=True, exist_ok=True)
+            journal_path.touch(exist_ok=True)
+            if self.capability_profile.loop_control:
+                self.activation_manifest.add_artifact("agent_loop", journal_path)
+            if self.capability_profile.tools:
+                self.activation_manifest.add_artifact("tools", journal_path)
         return self
 
     async def _build_context_services(self) -> None:
@@ -404,9 +413,7 @@ class SessionRuntime:
                         }
                         self.activation_manifest.trigger("memory", **details)
                         if event.get("artifact"):
-                            self.activation_manifest.add_artifact(
-                                "memory", str(event["artifact"])
-                            )
+                            self.activation_manifest.add_artifact("memory", str(event["artifact"]))
                         if event.get("error"):
                             self.activation_manifest.degrade("memory", str(event["error"]))
 
@@ -523,11 +530,14 @@ class SessionRuntime:
         message_content=None,
     ):
         assert self.llm is not None and self.mcp is not None
+        one_shot = self.capability_profile.one_shot
         if self.activation_manifest is not None:
-            self.activation_manifest.trigger("agent_loop", turn=self.state.turn_counter + 1)
-            self.activation_manifest.trigger("safety", stage="user_input")
+            if self.capability_profile.loop_control:
+                self.activation_manifest.trigger("agent_loop", turn=self.state.turn_counter + 1)
+            if self.capability_profile.safety:
+                self.activation_manifest.trigger("safety", stage="user_input")
         text = user_text
-        if self.l2_config and self.l2_config.enabled:
+        if self.capability_profile.safety and self.l2_config and self.l2_config.enabled:
             scan = await scan_user_input(
                 text,
                 l2_cfg=self.l2_config,
@@ -560,12 +570,22 @@ class SessionRuntime:
         recall = memory_deps.get("recall")
         memory_layer = (
             {"recall": recall}
-            if recall is not None and self.memory_config.layered_inject
+            if (
+                not one_shot
+                and recall is not None
+                and self.memory_config is not None
+                and self.memory_config.layered_inject
+            )
             else None
         )
         offload_deps = (
             memory_deps
-            if memory_deps and self.memory_config.offload_enabled
+            if (
+                not one_shot
+                and memory_deps
+                and self.memory_config is not None
+                and self.memory_config.offload_enabled
+            )
             else None
         )
         prompt_capabilities = {
@@ -590,8 +610,7 @@ class SessionRuntime:
                         details = {
                             key: value
                             for key, value in event.items()
-                            if key not in {"type", "capability", "artifact"}
-                            and value is not None
+                            if key not in {"type", "capability", "artifact"} and value is not None
                         }
                         self.activation_manifest.trigger(capability, **details)
                         if event.get("artifact"):
@@ -599,9 +618,7 @@ class SessionRuntime:
                                 capability, str(event["artifact"])
                             )
                         if event.get("error"):
-                            self.activation_manifest.degrade(
-                                capability, str(event["error"])
-                            )
+                            self.activation_manifest.degrade(capability, str(event["error"]))
                 await event_emitter(event)
 
             async def subagent_progress(task_id: str, status: str, detail: str = "") -> None:
@@ -619,16 +636,18 @@ class SessionRuntime:
                 self.state.messages,
                 self.llm,
                 self.mcp,
-                mode=self.state.mode,
+                mode="plan" if one_shot else self.state.mode,
                 cwd=str(self.cwd),
                 token_counter=self.state.token_counter,
                 policy=self.policy,
-                l5=self.l5,
-                extra_native_specs=list(self.state.memory_extras or []) or None,
-                context_config=self.state.context_config,
+                l5=None if one_shot else self.l5,
+                extra_native_specs=(
+                    None if one_shot else list(self.state.memory_extras or []) or None
+                ),
+                context_config=None if one_shot else self.state.context_config,
                 memory_layer=memory_layer,
                 offload_deps=offload_deps,
-                todo_service=self.state.todo_service,
+                todo_service=None if one_shot else self.state.todo_service,
                 session_id=self.state.session_id,
                 last_turn_text=self.state.last_turn_text,
                 todo_hints=list(self.state.todo_hints or []),
@@ -643,14 +662,18 @@ class SessionRuntime:
                 subagent_progress_cb=subagent_progress,
                 confirm_handler=confirm_handler,
                 direct_render=False,
-                max_iter=self.max_iterations,
-                loop_control_config=LoopControlConfig(),
+                max_iter=1 if one_shot else self.max_iterations,
+                loop_control_config=LoopControlConfig(enabled=self.capability_profile.loop_control),
                 context_artifact_dir=(
-                    self.cwd / ".cc-harness" / "context" / self.state.session_id
+                    None
+                    if one_shot
+                    else self.cwd / ".cc-harness" / "context" / self.state.session_id
                 ),
-                context_projection=self.context_projection,
+                context_projection=None if one_shot else self.context_projection,
+                refresh_system_prompt=not one_shot,
+                retry_empty_response=not one_shot,
             )
-            if self.l2_config and self.l2_config.enabled:
+            if self.capability_profile.safety and self.l2_config and self.l2_config.enabled:
                 stats.auxiliary_model_calls += scan.model_calls
                 if scan.usage is not None:
                     stats.api_prompt_tokens += scan.usage.prompt_tokens

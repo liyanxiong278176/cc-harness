@@ -4,6 +4,42 @@ cc-harness 是在用户当前终端中运行的编码代理。其交互语言强
 
 ## Language
 
+**上下文-记忆工程评测（Context-Memory Engineering Evaluation）**:
+将上下文压缩、信息卸载、卸载后检索、跨轮次利用、冲突更新与持久恢复视为同一信息生命周期的统一评测能力域。该能力域统一运行并统一报告各 benchmark 与机制门禁，但保留每个 benchmark 的独立成绩，不计算跨 benchmark 加权总分。_Avoid_: 将上下文和记忆拆成互不关联的总分、用人为权重掩盖单项退化、仅凭最终答案宣称内部机制生效
+
+**RULER 评测边界（RULER Evaluation Boundary）**:
+独立 NVIDIA RULER 长上下文评测不属于上下文-记忆工程评测，其入口、适配器、数据缓存与历史评测证据均不保留；MemoryAgentBench 官方套件内的 `ruler_qa1` 与 `ruler_qa2` 予以保留，因为它们在该套件中评估增量记忆写入与检索，并用于维持官方完整结果的可比性。_Avoid_: 将 MemoryAgentBench 的 RULER 派生任务误报为独立 RULER 成绩、删除官方子集后仍宣称完整 MemoryAgentBench 结果、将已退役的独立 RULER 结果纳入对外结论
+
+**MemoryAgentBench 评测档位（MemoryAgentBench Evaluation Profile）**:
+`portfolio` 按官方任务类型分层抽样，仅用于开发调试与快速回归；`full` 覆盖全部官方任务类型和样本，是形成对外可比成绩的唯一档位。_Avoid_: 将 portfolio 子集包装为官方完整成绩、从 full 档位中排除困难任务或 RULER 派生任务
+
+**上下文-记忆评测档位（Context-Memory Evaluation Profile）**:
+`portfolio` 是冻结的分层开发集，包含 LongMemEval-S Cleaned 100 问、LongMemEval-V2 Small 50 问、LoCoMo 4 段对话中的 200 问，以及 MemoryAgentBench 24 条记忆流且每流最多 10 问；`full` 包含对应官方范围内的 500 问、451 问、10 段对话共 1,986 问，以及 146 条记忆流的全部问题。只有未裁剪的 full 档位可形成对外 benchmark 成绩。_Avoid_: 运行时重新抽样、将 portfolio 与 full 混合比较、隐藏 full 档位中失败或无效的样本
+
+**上下文-记忆配对消融（Paired Context-Memory Ablation）**:
+每个冻结任务在相同模型、参数、输入顺序与初始状态下各执行一次 control 和 treatment；control 关闭长期记忆、压缩、卸载与卸载检索，并在超出窗口时采用固定的最近内容截断，treatment 启用生产上下文-记忆链路。正式报告并列给出 treatment 的 benchmark 成绩和相对 control 的配对变化，不以变化值替代 benchmark 成绩。_Avoid_: 将 control 超窗记为基础设施无效、双方使用不同输入顺序、只展示有利的消融结果、把同一组的重复运行误称为配对 A/B
+
+**原始语义事件重放（Native-Semantics Event Replay）**:
+评测历史按照其原始交互语义进入统一信息生命周期：LongMemEval-S Cleaned 与 LoCoMo 重放 user/assistant 会话，LongMemEval-V2 重放 agent action 与 tool result，MemoryAgentBench 按官方增量 chunk 重放对话、文档和外部记录；所有事件共享同一不可变记录、上下文投影、版本化摘要、卸载与检索底层。gold answer、证据标记和评分元数据不得进入模型可见内容；固定机制 canary 只验证机制触发，不计入 benchmark 分数。_Avoid_: 将所有历史拼成单个用户提示、为了触发卸载把普通对话伪装为工具结果、将 canary 成绩混入官方 benchmark 成绩
+
+**上下文-记忆机制门禁（Context-Memory Mechanism Gate）**:
+独立于答案分数验证原始记录完整、版本化摘要真实减载、pointer/node/ref 一致且原文可还原、生产检索实际读取官方证据、模型输入无评分信息泄漏、control 机制确实关闭，以及任务与分组隔离。任一必要门禁失败时保留原始 benchmark 分数，但本次上下文-记忆工程有效性结论无效。_Avoid_: 用答案正确率推断内部机制生效、用部分门禁通过抵消数据损坏、删除门禁失败的运行记录
+
+**上下文-记忆恢复门禁（Context-Memory Recovery Gate）**:
+固定 recovery canary 分别在原始事件提交后、ref 对象写入后、版本化摘要写入中和 checkpoint 后注入中断；恢复必须从最后完整提交继续，不重复或遗漏事件，并使用正确的摘要与节点版本。对原始记录、摘要、节点清单或 ref 对象的篡改必须被摘要校验发现并使运行无效，不得静默信任或改写损坏证据。_Avoid_: 为每道官方题重复注入故障、把损坏数据当作普通答题失败、恢复时重新执行已完成样本
+
+**DeepSeek 适配评分（DeepSeek-Adapted Scoring）**:
+control、treatment 与必要的隔离 judge 均使用经服务端身份验证的 `deepseek-v4-flash`；官方确定性指标保持不变，替代官方 reader 或语义 judge 的分数必须明确标为 DeepSeek adaptation，并保留全部原始预测供未来重新评分。使用官方数据集不等同于获得官方 leaderboard 成绩，模型或 judge 契约不一致时不得直接横向比较公开数字。_Avoid_: 隐藏 judge 替换、让 judge 继承被测记忆、把适配成绩标成官方成绩、为重新评分重复运行被测系统
+
+**可续跑上下文-记忆运行（Resumable Context-Memory Run）**:
+四个 benchmark 在统一结果根下拥有独立运行状态和 control/treatment 证据，并由总报告聚合；同一命令仅跳过完整性校验通过的已完成样本，从首个未完成的 attempt-1 继续。数据集、模型、配置、代码或任务目录摘要变化时拒绝混合续跑，四项成绩与机制门禁分别报告且不生成加权总分。_Avoid_: 仅凭目录存在跳过样本、把不同输入契约写入同一运行、Ctrl+C 后从头执行、用聚合分隐藏单项失败
+
+**上下文-记忆数据占用契约（Context-Memory Data Footprint Contract）**:
+仅准备 LongMemEval-V2 Small 所需文本轨迹与多模态资源，不下载 Medium；输入按内容摘要去重并固定 revision、大小与 SHA-256，下载支持断点续传，数据和证据接近 50 GB 软上限时安全停止。完整 Small 运行必须先验证模型图像能力；不支持时 full 标记为 unsupported，另行运行的纯文本结果只能称为 text-only adaptation。_Avoid_: 每题复制完整轨迹库、静默删除运行证据、忽略图片后宣称完整 Small 成绩、未固定数据版本即继续旧运行
+
+**封存式评测隔离（Sealed Evaluation Isolation）**:
+不同 benchmark、样本及 control/treatment 分组使用互不共享的 workspace、运行目录、会话、记忆库、摘要、ref 与节点清单；每组完成后将其状态封存为只读审计证据并从后续活动运行中卸载，下一组启动前必须验证活动状态为空且不存在跨任务命中。隔离或清理失败使运行无效，评测不得读取或改写用户日常全局记忆。_Avoid_: 复用上一题的 CC_HARNESS_HOME、让 treatment 继承 control 状态、为防污染删除审计证据、清理失败后继续运行
+
 **产品对标边界（Product Parity Boundary）**:
 cc-harness 对标 Claude Code 的终端 coding-agent 内核及 headless/SDK 能力；Web、Desktop、Mobile、Slack、Chrome 与完整企业平台不属于当前对标范围。_Avoid_: 完整复制 Claude 平台、只对齐终端外观
 
@@ -773,14 +809,19 @@ At this handoff point, the latest eval implementation and documentation are stil
   in `TurnTokenStats`, so formal Memory cost comparisons may undercount cc-harness overhead.
   Presidio is optional; activation evidence reports whether PII scanning is actually active.
 
-## cc-only benchmark portfolio status (2026-08-09)
+## cc-only benchmark portfolio status (2026-08-10)
 
 - The accepted portfolio evaluates only cc-harness with `deepseek-v4-flash`; Claude Code appears
   only as separately sourced external reference material.
-- Shared runtime: `eval/cc_only/`; entrypoint: `scripts/run_cc_only_benchmark.py`; evidence root:
-  `eval/result/cc-only/<benchmark>/deepseek-v4-flash/<profile>`.
-- Context27, RULER, LoCoMo, LongMemEval-S Cleaned, Safety8, AgentDojo v1.2.2, AgentHarm public test,
-  Terminal-Bench and SWE-bench Verified adapters are wired to the shared resumable runtime.
+- Context compression, offload, retrieval, long-term memory, conflict update and recovery now share
+  `eval/context_memory/`; entrypoint: `scripts/run_context_memory_benchmark.py`; evidence root:
+  `eval/result/cc-only/context-memory/deepseek-v4-flash/<profile>/<benchmark>`.
+- The unified domain contains LongMemEval-S Cleaned, LongMemEval-V2 Small, LoCoMo and
+  MemoryAgentBench. Each task has one logical attempt with isolated control/treatment arms and
+  non-compensating mechanism gates. Only an untrimmed `full` profile is externally reportable.
+- Standalone NVIDIA RULER code, prepared data, upstream cache and historical results were deleted.
+  MemoryAgentBench's official `ruler_qa1`/`ruler_qa2` sources remain suite members and are never
+  reported as standalone RULER.
 - AgentDojo uses package `agentdojo==0.1.35`, whose v1.2.2 suite contains 97 user tasks and 35
   injection goals. Portfolio/full catalog sizes are 474/7,786.
 - AgentHarm pins dataset revision `e23b3fe60a0da9037314b88e5ee3a0c054970dad` and inspect_evals
@@ -788,25 +829,14 @@ At this handoff point, the latest eval implementation and documentation are stil
   refusal and semantic judges are explicitly non-official GPT-4o judge adaptations.
 - AgentDojo and AgentHarm MCP protocol smoke checks pass. Both zero-model-call checks report ready.
   No live AgentDojo or AgentHarm portfolio run has been executed yet.
-- All nine portfolio prerequisite checks now report `ready=true`, `profile=portfolio`,
-  `check_only=true` and `model_calls=0`. Their task counts are Context27 27, RULER 195, LoCoMo 10,
-  LongMemEval-S Cleaned 100, Safety8 16, AgentDojo 474, AgentHarm 88, Terminal-Bench 30 and
-  SWE-bench Verified 50 (990 total). The final report remains `incomplete` by design until live
-  benchmark results exist.
 - `--check` is an execution mode, not a benchmark profile. It validates the requested
   `portfolio` or `full` catalog without model preflight or task calls and writes disposable check
   evidence below the `check` result namespace. A focused regression test locks this contract.
-- RULER preparation now fetches and hashes the official Paul Graham corpus, resolves the pinned
-  8,564,991-byte Git LFS `english_words.json`, and downloads/records SQuAD v2 and HotpotQA sources.
-  It invokes pinned upstream generators with structured argv because NVIDIA's `prepare.py` passes
-  multiline templates through `shell=True`, which truncates them under Windows CMD. Generated
-  records must reach at least 75% of the requested token length; the valid portfolio contains
-  195/195 records and approximately 58.4 MB of frozen case JSON.
-- The 135 short RULER cases produced before the Windows argv fix are preserved only as invalidated
-  preparation evidence under
-  `eval/cc_only/data/ruler/_superseded-windows-shell-template-20260809/portfolio`; they must never be
-  copied into a live result. Old check contracts are under
-  `eval/result/cc-only/_superseded-checks/20260809-check-profile-contract`.
+- The pinned preparer supports HTTP Range resume, content-addressed deduplication, size/SHA-256
+  validation and a 50 GB managed-data soft limit. LongMemEval-V2 never downloads Medium and requires
+  a live image capability preflight; there is no silent text-only fallback.
+- Fixed recovery/tamper canaries cover four crash points and five corruption targets. Canary results
+  are mechanism evidence only and never enter benchmark scores.
 - Run and resume instructions are in `docs/eval/cc-only-benchmark-portfolio.md`. Existing paired,
   specialist and Harbor evidence remains untouched.
 

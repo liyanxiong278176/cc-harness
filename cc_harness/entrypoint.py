@@ -74,6 +74,7 @@ def build_parser() -> argparse.ArgumentParser:
             "clean-coding",
             "benchmark-one-shot",
             "context-eval",
+            "context-memory-control",
             "memory-eval",
             "hardened-safety",
         ),
@@ -300,9 +301,7 @@ def _write_print_json(
             "cache_creation_input_tokens": int(
                 getattr(stats, "api_cache_creation_prompt_tokens", 0) or 0
             ),
-            "cache_read_input_tokens": int(
-                getattr(stats, "api_cache_read_prompt_tokens", 0) or 0
-            ),
+            "cache_read_input_tokens": int(getattr(stats, "api_cache_read_prompt_tokens", 0) or 0),
             "output_tokens": int(getattr(stats, "api_completion_tokens", 0) or 0),
             "model_calls": int(getattr(stats, "iter_count", 0) or 0)
             + int(getattr(stats, "auxiliary_model_calls", 0) or 0),

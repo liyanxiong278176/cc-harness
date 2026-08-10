@@ -64,6 +64,16 @@ def test_hardened_safety_rejects_host_execution():
         )
 
 
+def test_benchmark_one_shot_profile_disables_agent_subsystems():
+    profile = CapabilityProfile.named("benchmark-one-shot")
+
+    assert profile.one_shot is True
+    assert profile.mcp is False
+    assert profile.tools is False
+    assert profile.loop_control is False
+    assert profile.safety is False
+
+
 @pytest.mark.asyncio
 async def test_run_user_turn_passes_runtime_iteration_budget_to_agent(tmp_path, monkeypatch):
     observed = {}
@@ -99,9 +109,7 @@ async def test_run_user_turn_passes_runtime_iteration_budget_to_agent(tmp_path, 
 
 
 @pytest.mark.asyncio
-async def test_context_only_runtime_does_not_require_long_term_memory_deps(
-    tmp_path, monkeypatch
-):
+async def test_context_only_runtime_does_not_require_long_term_memory_deps(tmp_path, monkeypatch):
     observed = {}
 
     async def fake_run_turn(messages, llm, mcp, **kwargs):
@@ -181,6 +189,14 @@ async def test_one_shot_runtime_does_not_require_memory_config(tmp_path, monkeyp
 
     assert observed["memory_layer"] is None
     assert observed["offload_deps"] is None
+    assert observed["mode"] == "plan"
+    assert observed["max_iter"] == 1
+    assert observed["refresh_system_prompt"] is False
+    assert observed["retry_empty_response"] is False
+    assert observed["l5"] is None
+    assert observed["loop_control_config"].enabled is False
+    assert observed["context_config"] is None
+    assert observed["context_projection"] is None
 
 
 @pytest.mark.asyncio

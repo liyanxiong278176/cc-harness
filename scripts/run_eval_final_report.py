@@ -1,4 +1,4 @@
-"""Build the no-model-call four-domain cc-harness evaluation report."""
+"""Build the no-model-call cc-harness domain evaluation report."""
 
 from __future__ import annotations
 
@@ -12,8 +12,7 @@ from eval.cc_only.storage import atomic_json, atomic_text, digest_file
 
 MODEL = "deepseek-v4-flash"
 DOMAINS = {
-    "context": ("ruler", "context27-v6"),
-    "memory": ("locomo-memory", "longmemeval-s-cleaned"),
+    "context-memory": ("context-memory",),
     "safety": ("safety8", "agentdojo-v1.2.2", "agentharm-public-test"),
     "overall-agent-ability": ("terminal-bench-2.1", "swe-bench-verified"),
 }
@@ -31,7 +30,16 @@ def main() -> int:
     records = []
     for domain, benchmarks in DOMAINS.items():
         for benchmark in benchmarks:
-            summary_path = result_root / benchmark / MODEL / parsed.profile / "summary.json"
+            summary_path = (
+                result_root
+                / "context-memory"
+                / MODEL
+                / parsed.profile
+                / "aggregate"
+                / "summary.json"
+                if benchmark == "context-memory"
+                else result_root / benchmark / MODEL / parsed.profile / "summary.json"
+            )
             summary = _read(summary_path)
             records.append(
                 {
@@ -55,7 +63,7 @@ def main() -> int:
         else:
             domain_status[domain] = "incomplete"
     summary = {
-        "schema_version": "eval.cc-only-four-domain-summary.v1",
+        "schema_version": "eval.cc-only-domain-summary.v2",
         "model": MODEL,
         "profile": parsed.profile,
         "generated_at": datetime.now(UTC).isoformat(),
@@ -75,7 +83,9 @@ def main() -> int:
     summary_path = output / "summary.json"
     report_path = output / "report.md"
     references_path = output / "external-references.md"
-    atomic_json(index_path, {"schema_version": "eval.cc-only-benchmark-index.v1", "benchmarks": records})
+    atomic_json(
+        index_path, {"schema_version": "eval.cc-only-benchmark-index.v1", "benchmarks": records}
+    )
     atomic_json(summary_path, summary)
     atomic_text(report_path, _report(summary, records))
     atomic_text(
@@ -97,8 +107,11 @@ def main() -> int:
     )
     print("model_calls=0")
     for name, path in (
-        ("summary", summary_path), ("report", report_path), ("integrity", integrity_path),
-        ("benchmark_index", index_path), ("external_references", references_path),
+        ("summary", summary_path),
+        ("report", report_path),
+        ("integrity", integrity_path),
+        ("benchmark_index", index_path),
+        ("external_references", references_path),
     ):
         print(f"{name}={path}")
     return 0 if parsed.check or summary["status"] == "complete" else 2
@@ -114,8 +127,12 @@ def _read(path: Path) -> dict[str, Any] | None:
 
 def _report(summary: dict[str, Any], records: list[dict[str, Any]]) -> str:
     lines = [
-        "# cc-harness Four-Domain Evaluation", "", f"Status: `{summary['status']}`", "",
-        "No overall weighted score or Claude Code capability percentage is calculated.", "",
+        "# cc-harness Domain Evaluation",
+        "",
+        f"Status: `{summary['status']}`",
+        "",
+        "No overall weighted score or Claude Code capability percentage is calculated.",
+        "",
     ]
     for domain, status in summary["domains"].items():
         lines.extend((f"## {domain.replace('-', ' ').title()}", "", f"Status: `{status}`", ""))

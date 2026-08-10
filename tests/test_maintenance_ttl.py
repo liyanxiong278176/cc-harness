@@ -1,9 +1,12 @@
 """E4 Task 3: TTL 过期清理算子测试."""
-import pytest
+
 import tempfile
 from pathlib import Path
-from cc_harness.memory.store import MemoryStore
+
+import pytest
+
 from cc_harness.memory.maintenance.ttl import purge_stale
+from cc_harness.memory.store import MemoryStore
 
 
 @pytest.mark.asyncio
@@ -34,7 +37,9 @@ async def test_purge_above_threshold_removes():
         deleted = await purge_stale(store, staleness_threshold=0.85, limit=100)
         assert m1.id in deleted
         assert m2.id not in deleted
-        assert await store.get(m1.id) is None
+        tombstone = await store.get(m1.id)
+        assert tombstone is not None
+        assert tombstone.validity == "tombstoned"
         assert await store.get(m2.id) is not None
         await store.close()
 
