@@ -556,14 +556,16 @@ class SessionRuntime:
         content = message_content if message_content is not None else text
         self.state.messages.append({"role": "user", "content": content})
         self.state.turn_counter += 1
+        memory_deps = self.state.mem_deps or {}
+        recall = memory_deps.get("recall")
         memory_layer = (
-            {"recall": self.state.mem_deps["recall"]}
-            if self.state.mem_deps and self.memory_config.layered_inject
+            {"recall": recall}
+            if recall is not None and self.memory_config.layered_inject
             else None
         )
         offload_deps = (
-            self.state.mem_deps
-            if self.state.mem_deps and self.memory_config.offload_enabled
+            memory_deps
+            if memory_deps and self.memory_config.offload_enabled
             else None
         )
         prompt_capabilities = {
@@ -668,7 +670,7 @@ class SessionRuntime:
             self.state.last_turn_text = _extract_final_text(self.state.messages)
             if self.activation_manifest is not None:
                 self.activation_manifest.set_resolved_model(self.llm.resolved_model)
-            if self.memory_config is not None:
+            if self.memory_config is not None and "store" in memory_deps:
                 memory_outcome = await _after_turn_memory(
                     self.state, self.memory_config, scheduler=self.scheduler
                 )

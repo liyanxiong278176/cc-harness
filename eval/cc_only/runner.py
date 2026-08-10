@@ -207,7 +207,22 @@ async def _ensure_preflight(
             watchdog_seconds=watchdog_seconds,
             host_execution=False,
         )
-        parsed = final_result(completed.stdout)
+        if completed.evidence.timed_out:
+            raise RuntimeError(
+                f"cc-harness preflight timed out after {watchdog_seconds}s"
+            )
+        if completed.evidence.exit_code not in (None, 0):
+            stderr = completed.stderr.decode("utf-8", errors="replace").strip()
+            detail = stderr[-4_000:] or completed.evidence.parse_error or "no stderr"
+            raise RuntimeError(
+                f"cc-harness preflight exited {completed.evidence.exit_code}: {detail}"
+            )
+        try:
+            parsed = final_result(completed.stdout)
+        except (UnicodeError, ValueError) as exc:
+            raise RuntimeError(
+                completed.evidence.parse_error or f"invalid preflight output: {exc}"
+            ) from exc
         valid = (
             completed.evidence.valid_for_parity
             and parsed.get("resolved_model") == MODEL
@@ -218,9 +233,16 @@ async def _ensure_preflight(
                 completed.evidence.parse_error
                 or f"model preflight mismatch: {parsed.get('resolved_model')!r}"
             )
-    except BaseException:
+    except (asyncio.CancelledError, KeyboardInterrupt):
         record["status"] = TrialStatus.INTERRUPTED.value
         record["finished_at"] = utc_now()
+        preflight["status"] = "pending"
+        store.save(state)
+        raise
+    except Exception as exc:
+        record["status"] = TrialStatus.INVALID.value
+        record["finished_at"] = utc_now()
+        record["error"] = f"{type(exc).__name__}: {exc}"[:4_000]
         preflight["status"] = "pending"
         store.save(state)
         raise

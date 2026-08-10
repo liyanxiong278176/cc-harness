@@ -4,6 +4,9 @@ import asyncio
 import hashlib
 import json
 from pathlib import Path
+from types import SimpleNamespace
+
+import pytest
 
 from eval.cc_only.adapters import (
     Context27Adapter,
@@ -16,7 +19,7 @@ from eval.cc_only.adapters import (
 from eval.cc_only.adapters.agentharm import _portfolio
 from eval.cc_only.adapters.common import capability_activation
 from eval.cc_only.contracts import BenchmarkTask, CheckResult, EvalProfile
-from eval.cc_only.runner import run_benchmark
+from eval.cc_only.runner import _ensure_preflight, run_benchmark
 from eval.cc_only.storage import RunStateStore, atomic_json, read_json
 from scripts.prepare_ruler_data import (
     _generator_command,
@@ -268,3 +271,40 @@ def test_check_only_preserves_requested_profile_without_model_calls(tmp_path: Pa
     assert seen == [("catalog", EvalProfile.FULL), ("check", EvalProfile.FULL)]
     assert read_json(output / "manifest.json")["profile"] == "full"
     assert read_json(output / "summary.json")["usage"]["model_calls"] == 0
+
+
+@pytest.mark.asyncio
+async def test_preflight_reports_nonzero_launch_stderr(tmp_path: Path, monkeypatch) -> None:
+    async def failed_launch(*_args, **_kwargs):
+        return SimpleNamespace(
+            stdout=b"",
+            stderr=b"KeyError: 'recall'\n",
+            evidence=SimpleNamespace(
+                exit_code=1,
+                timed_out=False,
+                valid_for_parity=False,
+                parse_error="structured output contains no JSON objects",
+            ),
+        )
+
+    monkeypatch.setattr("eval.cc_only.runner.run_cc_prompt", failed_launch)
+
+    class Store:
+        def save(self, _state):
+            return None
+
+    state = {"preflight": {"attempts": [], "status": "pending"}}
+    adapter = SimpleNamespace(capability_profile="context-eval")
+
+    with pytest.raises(RuntimeError, match="KeyError: 'recall'"):
+        await _ensure_preflight(
+            adapter,
+            tmp_path,
+            tmp_path / "result",
+            state,
+            Store(),
+            watchdog_seconds=60,
+            progress=lambda _message: None,
+        )
+
+    assert state["preflight"]["attempts"][0]["status"] == "invalid"

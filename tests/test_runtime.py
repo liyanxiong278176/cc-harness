@@ -4,8 +4,8 @@ from unittest.mock import AsyncMock
 
 import pytest
 
-from cc_harness.config import L2Config
 from cc_harness.activation import ActivationManifest, CapabilityProfile
+from cc_harness.config import L2Config
 from cc_harness.l2 import ScanResult
 from cc_harness.runtime import SessionRuntime
 from cc_harness.tokens import TurnTokenStats, UsageRecord
@@ -96,6 +96,91 @@ async def test_run_user_turn_passes_runtime_iteration_budget_to_agent(tmp_path, 
     )
 
     assert observed["max_iter"] == 37
+
+
+@pytest.mark.asyncio
+async def test_context_only_runtime_does_not_require_long_term_memory_deps(
+    tmp_path, monkeypatch
+):
+    observed = {}
+
+    async def fake_run_turn(messages, llm, mcp, **kwargs):
+        del llm, mcp
+        observed.update(kwargs)
+        messages.append({"role": "assistant", "content": "done"})
+        return TurnTokenStats(iter_count=1)
+
+    after_turn_memory = AsyncMock()
+    monkeypatch.setattr("cc_harness.runtime.run_turn", fake_run_turn)
+    monkeypatch.setattr("cc_harness.runtime._after_turn_memory", after_turn_memory)
+
+    runtime = SessionRuntime()
+    runtime.cwd = tmp_path
+    runtime.llm = object()
+    runtime.mcp = object()
+    runtime.capability_profile = CapabilityProfile.named("context-eval")
+    runtime.memory_config = SimpleNamespace(
+        enabled=True,
+        layered_inject=True,
+        offload_enabled=True,
+    )
+    context_deps = {
+        "refs_dir": tmp_path / "refs",
+        "manifest_path": tmp_path / "manifest.jsonl",
+    }
+    runtime.state.mem_deps = context_deps
+
+    async def emit(_event):
+        return None
+
+    async def confirm(_tool, _args, _reason):
+        return "yes"
+
+    await runtime.run_user_turn(
+        "inspect the context",
+        event_emitter=emit,
+        confirm_handler=confirm,
+    )
+
+    assert observed["memory_layer"] is None
+    assert observed["offload_deps"] is context_deps
+    after_turn_memory.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_one_shot_runtime_does_not_require_memory_config(tmp_path, monkeypatch):
+    observed = {}
+
+    async def fake_run_turn(messages, llm, mcp, **kwargs):
+        del llm, mcp
+        observed.update(kwargs)
+        messages.append({"role": "assistant", "content": "done"})
+        return TurnTokenStats(iter_count=1)
+
+    monkeypatch.setattr("cc_harness.runtime.run_turn", fake_run_turn)
+
+    runtime = SessionRuntime()
+    runtime.cwd = tmp_path
+    runtime.llm = object()
+    runtime.mcp = object()
+    runtime.capability_profile = CapabilityProfile.named("benchmark-one-shot")
+    runtime.memory_config = None
+    runtime.state.mem_deps = None
+
+    async def emit(_event):
+        return None
+
+    async def confirm(_tool, _args, _reason):
+        return "yes"
+
+    await runtime.run_user_turn(
+        "answer once",
+        event_emitter=emit,
+        confirm_handler=confirm,
+    )
+
+    assert observed["memory_layer"] is None
+    assert observed["offload_deps"] is None
 
 
 @pytest.mark.asyncio
