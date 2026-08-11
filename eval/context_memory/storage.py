@@ -15,7 +15,7 @@ from eval.cc_only.storage import (
 )
 
 from .contracts import Arm, BenchmarkTask, ExecutionStatus
-from .isolation import verify_sealed_runtime
+from .isolation import resolve_sealed_root, verify_sealed_runtime
 
 STATE_VERSION = "eval.context-memory-state.v2"
 MANIFEST_VERSION = "eval.context-memory-manifest.v2"
@@ -212,8 +212,9 @@ PairedStateStore = TreatmentStateStore
 
 
 def write_attempt_integrity(attempt_root: Path) -> Path:
-    sealed = attempt_root / "sealed-state"
-    sealed_ok, sealed_errors = verify_sealed_runtime(sealed)
+    sealed_marker = attempt_root / "sealed-state"
+    sealed = resolve_sealed_root(sealed_marker)
+    sealed_ok, sealed_errors = verify_sealed_runtime(sealed_marker)
     if not sealed_ok:
         raise ValueError(f"cannot finalize invalid sealed runtime: {sealed_errors}")
     manifest_path = attempt_root / "attempt-integrity.json"
@@ -222,14 +223,22 @@ def write_attempt_integrity(attempt_root: Path) -> Path:
         for path in sorted(attempt_root.rglob("*"))
         if path.is_file() and path != manifest_path and not path.is_relative_to(sealed)
     ]
+    sealed_manifest = {
+        "path": "sealed-state/seal.json",
+        "sha256": digest_file(sealed / "seal.json"),
+    }
+    pointer = sealed_marker / "pointer.json"
+    if pointer.is_file():
+        sealed_manifest = {
+            "path": "sealed-state/pointer.json",
+            "sha256": digest_file(pointer),
+            "seal_sha256": digest_file(sealed / "seal.json"),
+        }
     atomic_json(
         manifest_path,
         {
             "schema_version": "eval.context-memory-attempt-integrity.v1",
-            "sealed_manifest": {
-                "path": "sealed-state/seal.json",
-                "sha256": digest_file(sealed / "seal.json"),
-            },
+            "sealed_manifest": sealed_manifest,
             "files": [
                 {
                     "path": path.relative_to(attempt_root).as_posix(),
@@ -255,13 +264,23 @@ def verify_attempt_integrity(
     attempt_root = manifest_path.parent
     manifest = read_json(manifest_path)
     errors = []
-    sealed_ok, sealed_errors = verify_sealed_runtime(attempt_root / "sealed-state")
+    sealed_marker = attempt_root / "sealed-state"
+    sealed_ok, sealed_errors = verify_sealed_runtime(sealed_marker)
     if not sealed_ok:
         errors.extend(f"sealed:{error}" for error in sealed_errors)
     sealed_manifest = manifest.get("sealed_manifest") or {}
-    seal = attempt_root / str(sealed_manifest.get("path") or "")
-    if not seal.is_file() or digest_file(seal) != sealed_manifest.get("sha256"):
-        errors.append("sealed-manifest-digest-mismatch")
+    sealed_root = resolve_sealed_root(sealed_marker)
+    pointer = sealed_marker / "pointer.json"
+    if pointer.is_file():
+        if not pointer.is_file() or digest_file(pointer) != sealed_manifest.get("sha256"):
+            errors.append("sealed-pointer-digest-mismatch")
+        seal = sealed_root / "seal.json"
+        if not seal.is_file() or digest_file(seal) != sealed_manifest.get("seal_sha256"):
+            errors.append("external-sealed-manifest-digest-mismatch")
+    else:
+        seal = attempt_root / str(sealed_manifest.get("path") or "")
+        if not seal.is_file() or digest_file(seal) != sealed_manifest.get("sha256"):
+            errors.append("sealed-manifest-digest-mismatch")
     for item in manifest.get("files") or []:
         path = attempt_root / str(item.get("path") or "")
         if not path.is_file():

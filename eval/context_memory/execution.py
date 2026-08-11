@@ -116,9 +116,13 @@ async def run_phase(
         host_execution=not judge,
         environment_overrides=arm_env,
     )
-    if completed.evidence.timed_out:
-        raise PhaseError(f"phase timed out: {phase_name}")
-    if not completed.evidence.valid_for_parity:
+    timed_out_after_final_result = (
+        completed.evidence.timed_out
+        and completed.evidence.exit_code == 0
+        and not completed.evidence.stdout_truncated
+        and not completed.evidence.stderr_truncated
+    )
+    if not completed.evidence.valid_for_parity and not timed_out_after_final_result:
         detail = completed.stderr.decode("utf-8", errors="replace")[-2_000:]
         raise PhaseError(
             f"phase failed: {phase_name}; exit={completed.evidence.exit_code}; {detail}"
@@ -238,10 +242,17 @@ def snapshot_runtime(workspace: Path, home: Path, target: Path) -> None:
     )
 
 
-def restore_runtime(snapshot: Path, workspace: Path, home: Path) -> None:
+def restore_runtime(
+    snapshot: Path,
+    workspace: Path,
+    home: Path,
+    *,
+    allowed_root: Path | None = None,
+) -> None:
     _verify_snapshot(snapshot)
+    runtime_root = (allowed_root or snapshot.parent).resolve()
     for path in (workspace, home):
-        if not path.resolve().is_relative_to(snapshot.parent.resolve()):
+        if not path.resolve().is_relative_to(runtime_root):
             raise ValueError(f"refusing to reset runtime path outside the attempt: {path}")
         if path.is_symlink():
             raise ValueError(f"refusing to reset a runtime symlink: {path}")

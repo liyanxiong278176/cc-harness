@@ -156,6 +156,7 @@ async def run_context_memory_benchmark(
                 arm=arm,
                 namespace=namespace,
                 watchdog_seconds=watchdog_seconds,
+                snapshot_root=runtime.snapshot_root,
             )
             progress(f"start {sequence}/{len(tasks)} {task.task_id}.{arm.value} attempt-1")
             try:

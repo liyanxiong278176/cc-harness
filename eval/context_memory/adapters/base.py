@@ -69,16 +69,21 @@ class NativeEventAdapter:
                     protocol={"source_digest": source_digest},
                     invalid_reason=f"native event {event.event_id} was not acknowledged",
                 )
-        snapshot = context.attempt_root / "query-snapshot"
+        snapshot = context.snapshot_root or context.attempt_root / "query-snapshot"
         snapshot_runtime(context.workspace, context.home, snapshot)
 
         for index, question in enumerate(case.questions, 1):
             workspace = context.active_root / "treatment-query"
             home = context.active_root / "treatment-home"
-            restore_runtime(context.attempt_root / "query-snapshot", workspace, home)
+            restore_runtime(
+                snapshot,
+                workspace,
+                home,
+                allowed_root=context.active_root,
+            )
             checkpoint_restore_verified = (
                 checkpoint_restore_verified
-                and restored_runtime_matches(context.attempt_root / "query-snapshot", workspace, home)
+                and restored_runtime_matches(snapshot, workspace, home)
             )
             prompt = (
                 "Answer only from the production context-memory state. You must call "
@@ -137,7 +142,7 @@ class NativeEventAdapter:
                 "expect_ref_retrieval": True,
                 "checkpoint_restore_verified": checkpoint_restore_verified,
                 "checkpoint_manifest_digest": _snapshot_manifest_digest(
-                    context.attempt_root / "query-snapshot"
+                    snapshot
                 ),
             },
         )

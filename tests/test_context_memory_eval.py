@@ -34,6 +34,7 @@ from eval.context_memory.contracts import (
 from eval.context_memory.execution import (
     restore_runtime,
     restored_runtime_matches,
+    run_phase,
     snapshot_runtime,
     write_source_manifest,
 )
@@ -42,6 +43,8 @@ from eval.context_memory.isolation import open_runtime, seal_runtime
 from eval.context_memory.prepare import DownloadSpec, download_file
 from eval.context_memory.runner import run_context_memory_benchmark
 from eval.context_memory.storage import TreatmentStateStore, write_attempt_integrity
+from eval.launch.models import HarnessKind, LaunchEvidence
+from eval.launch.runner import CompletedLaunch
 from scripts.run_context_memory_benchmark import build_parser as build_context_memory_parser
 
 
@@ -792,6 +795,77 @@ def test_restored_runtime_is_compared_with_snapshot_bytes(tmp_path: Path) -> Non
         '{"version":2}\n', encoding="utf-8"
     )
     assert restored_runtime_matches(snapshot, restored_workspace, restored_home) is False
+
+
+def test_long_attempt_uses_short_runtime_root_on_windows(tmp_path: Path, monkeypatch) -> None:
+    from eval.context_memory import isolation
+
+    monkeypatch.setattr(isolation, "_needs_short_runtime", lambda _attempt: True)
+    attempt = tmp_path / "attempt-1"
+    attempt.mkdir(parents=True)
+    runtime = open_runtime(attempt, "fixture-treatment", resumed=False)
+    assert runtime.active_root != attempt / "active"
+    assert runtime.active_root.parent == Path(attempt.anchor) / ".cm-runtime"
+    (runtime.workspace / "state.txt").write_text("short", encoding="utf-8")
+    sealed = seal_runtime(runtime, attempt)
+    assert (sealed / "workspace" / "state.txt").read_text(encoding="utf-8") == "short"
+    assert (attempt / "sealed-state" / "pointer.json").is_file()
+
+
+@pytest.mark.asyncio
+async def test_phase_accepts_final_result_after_watchdog(tmp_path: Path, monkeypatch) -> None:
+    attempt = tmp_path / "attempt"
+    active = attempt / "active"
+    workspace = active / "workspace"
+    home = active / "home"
+    workspace.mkdir(parents=True)
+    home.mkdir(parents=True)
+    context = TrialContext(
+        project_root=tmp_path,
+        output_root=tmp_path / "output",
+        attempt_root=attempt,
+        active_root=active,
+        workspace=workspace,
+        home=home,
+        task=BenchmarkTask("fixture/task", "fixture"),
+        profile=EvalProfile.PORTFOLIO,
+        arm=Arm.TREATMENT,
+        namespace="fixture-treatment",
+        watchdog_seconds=1,
+    )
+    payload = {
+        "schema_version": "cc-harness.print-result.v1",
+        "type": "result",
+        "text": "MEMORY_INGESTED",
+        "requested_model": "deepseek-v4-flash",
+        "resolved_model": "deepseek-v4-flash",
+        "error": None,
+        "usage": {"model_calls": 1, "tool_calls": 1},
+    }
+    evidence = LaunchEvidence(
+        harness=HarnessKind.CC_HARNESS,
+        requested_model="deepseek-v4-flash",
+        resolved_model="deepseek-v4-flash",
+        exit_code=0,
+        timed_out=True,
+        wall_time_ms=1_000,
+        model_calls=1,
+        tool_calls=1,
+    )
+    completed = CompletedLaunch(
+        evidence=evidence,
+        stdout=(json.dumps(payload) + "\n").encode(),
+        stderr=b"",
+    )
+
+    async def fake_run_cc_prompt(*_args, **_kwargs):
+        return completed
+
+    monkeypatch.setattr("eval.context_memory.execution.run_cc_prompt", fake_run_cc_prompt)
+    result, usage = await run_phase(context, "ingest-0001", "prompt")
+    assert result["text"] == "MEMORY_INGESTED"
+    assert usage["model_calls"] == 1
+    assert (attempt / "phases" / "ingest-0001" / "phase-complete.json").is_file()
 
 
 def test_treatment_mechanism_gates_are_non_compensating(tmp_path: Path) -> None:

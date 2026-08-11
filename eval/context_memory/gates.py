@@ -70,16 +70,20 @@ def evaluate_trial_gates(
         checks["ref_retrieval_used"] = _check(called and provenance, called=called)
     if protocol.get("expect_memory"):
         checks["memory_state_created"] = _check(bool(memory_dbs), count=len(memory_dbs))
-    checkpoint = context.attempt_root / "query-snapshot" / "snapshot.json"
+    checkpoint_candidates = (
+        sealed_root / "query-snapshot" / "snapshot.json",
+        context.attempt_root / "query-snapshot" / "snapshot.json",
+    )
+    checkpoint = next((path for path in checkpoint_candidates if path.is_file()), None)
     expected_checkpoint = protocol.get("checkpoint_manifest_digest")
     checks["checkpoint_restore_consistent"] = _check(
         bool(
             protocol.get("checkpoint_restore_verified")
-            and checkpoint.is_file()
+            and checkpoint is not None
             and expected_checkpoint == digest_file(checkpoint)
         ),
         expected=expected_checkpoint,
-        actual=digest_file(checkpoint) if checkpoint.is_file() else None,
+        actual=digest_file(checkpoint) if checkpoint is not None else None,
     )
 
     passed = bool(checks) and all(item["passed"] for item in checks.values())

@@ -105,6 +105,7 @@ class TrialContext:
     arm: Arm
     namespace: str
     watchdog_seconds: int
+    snapshot_root: Path | None = None
 
 
 @dataclass(frozen=True)
