@@ -613,6 +613,60 @@ async def test_live_runner_executes_each_task_once_as_treatment(
     assert "control" not in json.dumps(normalized)
 
 
+def test_task_limit_freezes_only_a_deterministic_subset(tmp_path: Path) -> None:
+    checked_tasks = []
+
+    class Adapter:
+        slug = "limited-fixture"
+        title = "Limited Fixture"
+        protocol_version = "limited-fixture.v1"
+        adaptations = ()
+        requires_images = False
+
+        def dataset_contract(self, project_root):
+            return {"root": str(project_root)}
+
+        def catalog(self, project_root, profile):
+            del project_root, profile
+            return tuple(BenchmarkTask(f"fixture/{index:02d}", "fixture") for index in range(12))
+
+        def check(self, project_root, profile, tasks):
+            del project_root, profile
+            checked_tasks.extend(task.task_id for task in tasks)
+            return CheckResult(True, {"catalog_task_count": len(tasks)})
+
+        async def execute(self, context):
+            del context
+            raise AssertionError("check-only limit must not execute tasks")
+
+        def summarize(self, results):
+            return {"result_count": len(results)}
+
+    output = tmp_path / "result"
+    asyncio.run(
+        run_context_memory_benchmark(
+            Adapter(),
+            tmp_path,
+            output,
+            profile=EvalProfile.PORTFOLIO,
+            task_limit=10,
+            check_only=True,
+        )
+    )
+
+    assert checked_tasks == [f"fixture/{index:02d}" for index in range(12)]
+    manifest = read_json(output / "manifest.json")
+    catalog = read_json(output / "catalog.json")
+    summary = read_json(output / "summary.json")
+    assert manifest["catalog_task_count"] == 12
+    assert manifest["task_limit"] == 10
+    assert manifest["task_count"] == 10
+    assert len(catalog["tasks"]) == 10
+    assert summary["task_count"] == 10
+    assert summary["check"]["catalog_task_count"] == 12
+    assert summary["check"]["run_task_count"] == 10
+
+
 @pytest.mark.asyncio
 async def test_failed_image_preflight_marks_run_unsupported_without_text_fallback(
     tmp_path: Path, monkeypatch
@@ -658,10 +712,11 @@ async def test_failed_image_preflight_marks_run_unsupported_without_text_fallbac
 
 def test_unified_cli_and_aggregate_report_keep_benchmark_metrics_separate(tmp_path: Path) -> None:
     parsed = build_context_memory_parser().parse_args(
-        ["longmemeval-v2", "--profile", "full", "--check"]
+        ["longmemeval-v2", "--profile", "full", "--limit", "10", "--check"]
     )
     assert parsed.benchmark == "longmemeval-v2"
     assert parsed.profile == "full"
+    assert parsed.limit == 10
     base = (
         tmp_path
         / "eval"

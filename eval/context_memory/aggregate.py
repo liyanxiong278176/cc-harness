@@ -20,10 +20,15 @@ BENCHMARKS = (
 
 
 def aggregate_reports(
-    project_root: Path, *, profile: EvalProfile, check_only: bool = False
+    project_root: Path,
+    *,
+    profile: EvalProfile,
+    task_limit: int | None = None,
+    check_only: bool = False,
 ) -> dict[str, Path]:
     base = project_root.resolve() / "eval" / "result" / "cc-only" / "context-memory" / MODEL
-    source_base = base / "check" / profile.value if check_only else base / profile.value
+    profile_slug = result_profile(profile, task_limit)
+    source_base = base / "check" / profile_slug if check_only else base / profile_slug
     records = []
     for benchmark in BENCHMARKS:
         path = source_base / benchmark / "summary.json"
@@ -48,6 +53,7 @@ def aggregate_reports(
         "schema_version": "eval.context-memory-aggregate.v1",
         "model": MODEL,
         "profile": profile.value,
+        "task_limit": task_limit,
         "check_only": check_only,
         "status": status,
         "benchmarks": records,
@@ -77,6 +83,14 @@ def aggregate_reports(
         },
     )
     return {"summary": summary_path, "report": report_path, "integrity": integrity_path}
+
+
+def result_profile(profile: EvalProfile, task_limit: int | None = None) -> str:
+    """Return the immutable result-root slug for a profile and optional smoke limit."""
+
+    if task_limit is not None and task_limit < 1:
+        raise ValueError("task_limit must be at least 1")
+    return profile.value if task_limit is None else f"{profile.value}-limit{task_limit}"
 
 
 def _read(path: Path) -> dict[str, Any] | None:

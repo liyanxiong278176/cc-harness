@@ -88,6 +88,10 @@ eval\result\cc-only\context-memory\deepseek-v4-flash\check\<profile>\<benchmark>
 The aggregate output is the sibling `aggregate` directory. It retains each benchmark's metric and
 mechanism verdict; `overall_score` and `cross_benchmark_weighted_score` are always null.
 
+For a live smoke run, append `--limit 10` to a benchmark command. The runner validates the full
+catalog, executes the first ten deterministic tasks, and writes to an isolated
+`<profile>-limit10` result root so a later untrimmed `portfolio` or `full` run is unaffected.
+
 To make the engineering gate non-optional, treatment materializes every native event and ingests it
 through the production `Read` tool with an evaluation-only one-token offload threshold. This forces
 real node/ref creation and a source-traceable `search_ref`/`read_ref` call before each answer. The

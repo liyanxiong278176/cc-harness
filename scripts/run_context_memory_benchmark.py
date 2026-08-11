@@ -13,7 +13,7 @@ from eval.context_memory.adapters import (
     LongMemEvalV2Adapter,
     MemoryAgentBenchAdapter,
 )
-from eval.context_memory.aggregate import aggregate_reports
+from eval.context_memory.aggregate import aggregate_reports, result_profile
 from eval.context_memory.contracts import MODEL, EvalProfile
 from eval.context_memory.prepare import prepare_benchmark
 from eval.context_memory.runner import run_context_memory_benchmark
@@ -31,6 +31,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("benchmark", choices=(*ADAPTERS, "aggregate"))
     parser.add_argument("--project-root", type=Path, default=Path.cwd())
     parser.add_argument("--profile", choices=("portfolio", "full"), default="portfolio")
+    parser.add_argument(
+        "--limit",
+        type=int,
+        default=None,
+        help="Run only the first N deterministic tasks in an isolated result root",
+    )
     parser.add_argument("--check", action="store_true", help="Run zero-model-call readiness checks")
     parser.add_argument(
         "--prepare", action="store_true", help="Prepare pinned upstream inputs first"
@@ -45,8 +51,12 @@ def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     root = args.project_root.resolve()
     profile = EvalProfile(args.profile)
+    if args.limit is not None and args.limit < 1:
+        raise SystemExit("--limit must be at least 1")
     if args.benchmark == "aggregate":
-        paths = aggregate_reports(root, profile=profile, check_only=args.check)
+        paths = aggregate_reports(
+            root, profile=profile, task_limit=args.limit, check_only=args.check
+        )
         for name, path in paths.items():
             print(f"{name}={path}")
         status = read_json(paths["summary"])["status"]
@@ -64,10 +74,11 @@ def main(argv: list[str] | None = None) -> int:
         )
     adapter = ADAPTERS[args.benchmark]()
     base = root / "eval" / "result" / "cc-only" / "context-memory" / MODEL
+    profile_slug = result_profile(profile, args.limit)
     output = (
-        base / "check" / profile.value / adapter.slug
+        base / "check" / profile_slug / adapter.slug
         if args.check
-        else base / profile.value / adapter.slug
+        else base / profile_slug / adapter.slug
     )
     paths = asyncio.run(
         run_context_memory_benchmark(
@@ -75,6 +86,7 @@ def main(argv: list[str] | None = None) -> int:
             root,
             output,
             profile=profile,
+            task_limit=args.limit,
             check_only=args.check,
             watchdog_seconds=args.watchdog_seconds,
         )

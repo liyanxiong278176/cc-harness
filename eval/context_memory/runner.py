@@ -39,15 +39,21 @@ async def run_context_memory_benchmark(
     output_root: Path,
     *,
     profile: EvalProfile,
+    task_limit: int | None = None,
     check_only: bool = False,
     watchdog_seconds: int = 7_200,
     progress: Callable[[str], None] = print,
 ) -> dict[str, Path]:
     project_root = project_root.resolve()
     output_root = output_root.resolve()
-    tasks = tuple(adapter.catalog(project_root, profile))
-    _validate_catalog(tasks)
-    checked = adapter.check(project_root, profile, tasks)
+    catalog_tasks = tuple(adapter.catalog(project_root, profile))
+    _validate_catalog(catalog_tasks)
+    if task_limit is not None and not 1 <= task_limit <= len(catalog_tasks):
+        raise ValueError(
+            f"task_limit must be between 1 and {len(catalog_tasks)} for {adapter.slug}"
+        )
+    tasks = catalog_tasks if task_limit is None else catalog_tasks[:task_limit]
+    checked = adapter.check(project_root, profile, catalog_tasks)
     contract = {
         "benchmark": adapter.slug,
         "benchmark_title": adapter.title,
@@ -67,6 +73,13 @@ async def run_context_memory_benchmark(
             "offload_threshold_tokens": EVAL_OFFLOAD_THRESHOLD,
         },
     }
+    if task_limit is not None:
+        contract.update(
+            {
+                "catalog_task_count": len(catalog_tasks),
+                "task_limit": task_limit,
+            }
+        )
     store = TreatmentStateStore(output_root)
     state = store.initialize(contract=contract, tasks=tasks)
     canary = run_recovery_tamper_canaries(output_root / "canary" / "fixed")
@@ -81,6 +94,9 @@ async def run_context_memory_benchmark(
         "passed": bool(canary["passed"]),
         "model_calls": int(canary["model_calls"]),
     }
+    check_payload["catalog_task_count"] = len(catalog_tasks)
+    check_payload["run_task_count"] = len(tasks)
+    check_payload["task_limit"] = task_limit
     if not canary["passed"]:
         check_payload["ready"] = False
         check_payload["warnings"].append("fixed recovery/tamper canary failed")
