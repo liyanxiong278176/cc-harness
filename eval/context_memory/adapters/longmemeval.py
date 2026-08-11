@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 from collections.abc import Mapping, Sequence
+from dataclasses import dataclass
 from functools import lru_cache
 from pathlib import Path
 from typing import Any
@@ -55,7 +56,7 @@ class LongMemEvalAdapter(NativeEventAdapter):
         path = self.data_path(project_root)
         if not path.is_file():
             return ()
-        records = _records(path)
+        records = _catalog_records(path)
         selected = records
         if profile is EvalProfile.PORTFOLIO:
             selected = stable_stratified(
@@ -109,11 +110,11 @@ class LongMemEvalAdapter(NativeEventAdapter):
 
     def case(self, project_root: Path, task: BenchmarkTask) -> NativeCase:
         question_id = str(task.payload["question_id"])
-        item = next(
-            record
-            for record in _records(self.data_path(project_root))
-            if str(record["question_id"]) == question_id
+        path = self.data_path(project_root)
+        reference = next(
+            item for item in _record_index(path) if item.question_id == question_id
         )
+        item = _read_record(path, reference)
         events = []
         for index, turns in enumerate(item["haystack_sessions"]):
             transcript = [
@@ -169,12 +170,125 @@ class LongMemEvalAdapter(NativeEventAdapter):
         }
 
 
+@dataclass(frozen=True)
+class _RecordReference:
+    question_id: str
+    question_type: str
+    start: int
+    end: int
+
+
+def _catalog_records(path: Path) -> tuple[dict[str, Any], ...]:
+    """Return only the small metadata needed to build the task catalog.
+
+    LongMemEval-S is a 277 MB JSON array. Keeping parsed haystacks in memory while
+    selecting 100/500 tasks can exceed the Windows process commit limit, so the
+    catalog retains offsets and task metadata rather than full records.
+    """
+
+    return tuple(
+        {
+            "question_id": reference.question_id,
+            "question_type": reference.question_type,
+        }
+        for reference in _record_index(path)
+    )
+
+
 @lru_cache(maxsize=2)
-def _records(path: Path) -> tuple[dict[str, Any], ...]:
-    value = json.loads(path.read_text(encoding="utf-8"))
-    if not isinstance(value, list):
-        raise TypeError(f"LongMemEval dataset must be a JSON array: {path}")
-    return tuple(dict(item) for item in value)
+def _record_index(path: Path) -> tuple[_RecordReference, ...]:
+    return tuple(
+        _RecordReference(
+            question_id=str(record["question_id"]),
+            question_type=str(record["question_type"]),
+            start=start,
+            end=end,
+        )
+        for start, end, record in _iter_json_array_records(path)
+    )
+
+
+def _read_record(path: Path, reference: _RecordReference) -> dict[str, Any]:
+    with path.open("rb") as handle:
+        handle.seek(reference.start)
+        value = json.loads(handle.read(reference.end - reference.start))
+    if not isinstance(value, dict):
+        raise TypeError(f"LongMemEval record is not an object: {path}:{reference.start}")
+    return dict(value)
+
+
+def _iter_json_array_records(path: Path):
+    """Yield ``(start, end, record)`` for a top-level JSON array incrementally."""
+
+    chunk_size = 1024 * 1024
+    started = False
+    finished = False
+    depth = 0
+    in_string = False
+    escaped = False
+    record_start: int | None = None
+    record = bytearray()
+    offset = 0
+
+    with path.open("rb") as handle:
+        while chunk := handle.read(chunk_size):
+            for byte in chunk:
+                current = offset
+                offset += 1
+
+                if finished:
+                    if byte not in b" \t\r\n":
+                        raise ValueError(f"unexpected data after LongMemEval JSON array: {path}")
+                    continue
+                if not started:
+                    if byte in b" \t\r\n":
+                        continue
+                    if byte != ord("["):
+                        raise TypeError(f"LongMemEval dataset must be a JSON array: {path}")
+                    started = True
+                    continue
+                if depth == 0:
+                    if byte in b" \t\r\n,":
+                        continue
+                    if byte == ord("]"):
+                        finished = True
+                        continue
+                    if byte != ord("{"):
+                        raise ValueError(f"expected object in LongMemEval array: {path}:{current}")
+                    record_start = current
+                    record = bytearray((byte,))
+                    depth = 1
+                    continue
+
+                record.append(byte)
+                if in_string:
+                    if escaped:
+                        escaped = False
+                    elif byte == ord("\\"):
+                        escaped = True
+                    elif byte == ord('"'):
+                        in_string = False
+                    continue
+                if byte == ord('"'):
+                    in_string = True
+                elif byte in (ord("{"), ord("[")):
+                    depth += 1
+                elif byte in (ord("}"), ord("]")):
+                    depth -= 1
+                if depth == 0:
+                    if record_start is None:
+                        raise ValueError(f"missing LongMemEval record start: {path}:{current}")
+                    value = json.loads(bytes(record))
+                    if not isinstance(value, dict):
+                        raise TypeError(
+                            f"LongMemEval record is not an object: {path}:{record_start}"
+                        )
+                    yield record_start, current + 1, dict(value)
+                    record_start = None
+                    record.clear()
+
+    if not started or not finished or depth != 0 or in_string or record:
+        raise ValueError(f"truncated LongMemEval JSON array: {path}")
 
 
 def _judge_prompt(question: NativeQuestion, prediction: str) -> str:
