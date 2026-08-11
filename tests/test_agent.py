@@ -1365,6 +1365,39 @@ async def test_run_turn_default_no_context_config_no_crash(tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_run_turn_syncs_bootstrapped_context_projection_before_first_call(tmp_path):
+    """A projection created before the user message must still receive that message."""
+    from cc_harness import agent as agent_mod
+    from cc_harness.context import ContextProjection
+
+    events = [FakeStreamEvent(kind="done", content="ok", pending=[], finish_reason="stop")]
+    llm = FakeLLM(responses=[events])
+    seen = []
+    original_chat = llm.chat
+
+    async def recording_chat(model_messages, tools):
+        seen.append([dict(message) for message in model_messages])
+        async for event in original_chat(model_messages, tools):
+            yield event
+
+    llm.chat = recording_chat
+    messages = [{"role": "user", "content": "current user request"}]
+    projection = ContextProjection([])
+
+    await agent_mod.run_turn(
+        messages,
+        llm,
+        FakeMCP(tools_spec=[], results={}, calls=[]),
+        mode="coding",
+        cwd=str(tmp_path),
+        max_iter=1,
+        context_projection=projection,
+    )
+
+    assert seen and seen[0][-1]["content"] == "current user request"
+
+
+@pytest.mark.asyncio
 async def test_run_turn_compaction_disabled(tmp_path):
     """context_config.enabled=False → 不调 maybe_compact,compaction None。"""
     from cc_harness import agent as agent_mod

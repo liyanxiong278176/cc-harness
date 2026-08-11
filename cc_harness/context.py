@@ -101,6 +101,7 @@ class ContextProjection:
         self.summary_version = 0
         self.artifact_dir = Path(artifact_dir) if artifact_dir is not None else None
         self._restore_latest(source_messages)
+        self.messages = _repair_tool_result_pairing(self.messages)
 
     def _restore_latest(self, source_messages: list[dict]) -> None:
         """Restore the newest valid projection while keeping source records authoritative."""
@@ -129,10 +130,12 @@ class ContextProjection:
         if len(source_messages) < self.source_count:
             self.messages = copy.deepcopy(source_messages)
             self.source_count = len(source_messages)
+            self.messages = _repair_tool_result_pairing(self.messages)
             return
         if len(source_messages) > self.source_count:
             self.messages.extend(copy.deepcopy(source_messages[self.source_count:]))
             self.source_count = len(source_messages)
+        self.messages = _repair_tool_result_pairing(self.messages)
 
     async def compact(
         self,
@@ -144,9 +147,19 @@ class ContextProjection:
     ) -> CompactionStats:
         self.sync(source_messages)
         stats = await maybe_compact(self.messages, tool_specs, counter, config, llm)
+        self.messages = _repair_tool_result_pairing(self.messages)
         if stats.summarized and stats.summary_index is not None:
             self.summary_version += 1
-            summary = self.messages[stats.summary_index]
+            summary_index = next(
+                (
+                    i
+                    for i, message in enumerate(self.messages)
+                    if message.get(SUMMARY_MARKER_KEY)
+                ),
+                stats.summary_index,
+            )
+            stats.summary_index = summary_index
+            summary = self.messages[summary_index]
             digest = _messages_digest(source_messages[: self.source_count])
             summary["_compaction_summary_version"] = self.summary_version
             summary["_compaction_source_count"] = self.source_count
@@ -185,6 +198,45 @@ class ContextProjection:
 def _messages_digest(messages: list[dict]) -> str:
     encoded = json.dumps(messages, ensure_ascii=False, sort_keys=True, default=str).encode("utf-8")
     return "sha256:" + hashlib.sha256(encoded).hexdigest()
+
+
+def _repair_tool_result_pairing(messages: list[dict]) -> list[dict]:
+    """Drop persisted tool results whose assistant tool call was compacted away.
+
+    Tier-3 compaction can place a protect boundary between an assistant
+    ``tool_calls`` message and its result.  The source transcript remains
+    authoritative, but the model-facing projection must not send an orphaned
+    ``role=tool`` message to providers such as OpenAI.  Keep legacy/tool-log
+    messages without a ``tool_call_id`` untouched; only repair messages that
+    use the provider's explicit tool-call protocol.
+    """
+    repaired: list[dict] = []
+    active_tool_ids: set[str] | None = None
+    for message in messages:
+        role = message.get("role")
+        if role == "assistant":
+            tool_calls = message.get("tool_calls") or []
+            ids = {
+                str(tool_call.get("id"))
+                for tool_call in tool_calls
+                if isinstance(tool_call, dict) and tool_call.get("id")
+            }
+            active_tool_ids = ids or None
+            repaired.append(message)
+            continue
+
+        if role == "tool" and message.get("tool_call_id"):
+            call_id = str(message["tool_call_id"])
+            if active_tool_ids is None or call_id not in active_tool_ids:
+                continue
+            repaired.append(message)
+            active_tool_ids.discard(call_id)
+            continue
+
+        if role != "tool":
+            active_tool_ids = None
+        repaired.append(message)
+    return repaired
 
 
 # Helpers --------------------------------------------------------------------

@@ -879,6 +879,10 @@ async def run_turn(
     while max_iter is None or iter_count < max_iter:
         iter_count += 1
         iter_usage: UsageRecord | None = None   # usage for this iter (set on done)
+        # The runtime appends the current user message before calling run_turn.
+        # Keep a projection supplied at session boot in sync even when both
+        # offload and context compaction are disabled.
+        _context_projection.sync(messages)
 
         # Q4 Task7: ratio 批量兜底(无 count_messages,用 sum count_text)。
         # context 总 token 超 offload_ratio × context_window → 批量卸载剩余大 tool
@@ -891,7 +895,6 @@ async def run_turn(
                 _cw = offload_deps.get("context_window") or (
                     context_config.context_window if context_config else 1_000_000)
                 _tc = token_counter or TokenCounter()
-                _context_projection.sync(messages)
                 _projected = _context_projection.messages
                 _total = sum(_tc.count_text(_message_text(m)) for m in _projected)
                 if _cw > 0 and _total / _cw > offload_deps.get("offload_ratio", 0.5):

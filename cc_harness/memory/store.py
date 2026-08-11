@@ -11,6 +11,8 @@ import numpy as np
 
 logger = logging.getLogger(__name__)
 
+_FTS_TOKEN_RE = re.compile(r"\w+", re.UNICODE)
+
 try:
     import sqlite_vec
 except ImportError as e:
@@ -42,6 +44,12 @@ def _vec_to_blob(vec: list[float]) -> bytes:
 
 def _blob_to_vec(blob: bytes) -> list[float]:
     return np.frombuffer(blob, dtype=np.float32).tolist()
+
+
+def _safe_fts5_query(query: str) -> str:
+    """Turn natural-language input into a syntax-safe FTS5 AND query."""
+    tokens = _FTS_TOKEN_RE.findall(query)
+    return " AND ".join('"' + token.replace('"', '""') + '"' for token in tokens)
 
 
 class MemoryStore:
@@ -540,12 +548,15 @@ class MemoryStore:
         """
         if not self._has_fts5 or not query.strip():
             return []
+        safe_query = _safe_fts5_query(query)
+        if not safe_query:
+            return []
         assert self._db is not None
         try:
             cur = await self._db.execute(
                 "SELECT rowid, bm25(memories_fts) FROM memories_fts "
                 "WHERE memories_fts MATCH ? ORDER BY bm25(memories_fts) LIMIT ?",
-                (query, k * 4),
+                (safe_query, k * 4),
             )
             rows = await cur.fetchall()
             if not rows:

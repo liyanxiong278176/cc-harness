@@ -889,3 +889,42 @@ async def test_context_projection_restores_latest_projection_and_increments_vers
     assert stats2.summary_version == 2
     assert (tmp_path / "summary-v0001.json").is_file()
     assert (tmp_path / "summary-v0002.json").is_file()
+
+
+def test_context_projection_drops_orphaned_provider_tool_results(tmp_path):
+    """A restored compaction artifact must not send a tool result without its call."""
+    import json
+
+    from cc_harness.context import ContextProjection, _messages_digest
+
+    source = [
+        {"role": "system", "content": "system"},
+        {"role": "user", "content": "current"},
+    ]
+    artifact = {
+        "schema_version": "cc-harness.context-summary.v1",
+        "version": 1,
+        "source_count": 1,
+        "source_digest": _messages_digest(source[:1]),
+        "projection_messages": [
+            source[0],
+            {"role": "assistant", "content": "summary", "_compaction_summary": True},
+            {
+                "role": "tool",
+                "tool_call_id": "call-compacted-away",
+                "name": "Read",
+                "content": "orphan",
+            },
+        ],
+    }
+    (tmp_path / "summary-v0001.json").write_text(
+        json.dumps(artifact), encoding="utf-8"
+    )
+
+    projection = ContextProjection(source, artifact_dir=tmp_path)
+
+    assert all(
+        message.get("tool_call_id") != "call-compacted-away"
+        for message in projection.messages
+    )
+    assert projection.messages[-1]["content"] == "current"

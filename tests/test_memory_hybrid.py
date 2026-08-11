@@ -85,6 +85,7 @@ async def test_search_fts_empty_or_no_match(tmp_path):
     await s.add("some text", [0.1]*4, source="llm")
     assert await s.search_fts("", k=5) == []
     assert await s.search_fts("   ", k=5) == []
+    assert len(await s.search_fts("some text.", k=5)) == 1
     assert await s.search_fts("nonexistent_token_qqq", k=5) == []
     await s.close()
 
