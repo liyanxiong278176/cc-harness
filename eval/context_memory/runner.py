@@ -121,7 +121,7 @@ async def run_context_memory_benchmark(
         output_root,
         state,
         store,
-        min(180, watchdog_seconds),
+        min(600, watchdog_seconds),
         progress,
     )
     if not image_supported:
