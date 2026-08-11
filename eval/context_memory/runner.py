@@ -48,11 +48,16 @@ async def run_context_memory_benchmark(
     output_root = output_root.resolve()
     catalog_tasks = tuple(adapter.catalog(project_root, profile))
     _validate_catalog(catalog_tasks)
-    if task_limit is not None and not 1 <= task_limit <= len(catalog_tasks):
-        raise ValueError(
-            f"task_limit must be between 1 and {len(catalog_tasks)} for {adapter.slug}"
-        )
-    tasks = catalog_tasks if task_limit is None else catalog_tasks[:task_limit]
+    if task_limit is not None and task_limit < 1:
+        raise ValueError("task_limit must be at least 1")
+    # A smoke request is an upper bound.  Some portfolio adapters have fewer
+    # task units than the shared smoke target (LoCoMo has four conversations),
+    # so run the complete available catalog instead of rejecting the command.
+    tasks = (
+        catalog_tasks
+        if task_limit is None
+        else catalog_tasks[: min(task_limit, len(catalog_tasks))]
+    )
     checked = adapter.check(project_root, profile, catalog_tasks)
     contract = {
         "benchmark": adapter.slug,
@@ -425,6 +430,14 @@ def _finalize(
 
 def _report(adapter: BenchmarkAdapter, summary: Mapping[str, Any]) -> str:
     metrics = json.dumps(summary.get("benchmark_metrics", {}), ensure_ascii=False, indent=2)
+    check = summary.get("check") or {}
+    smoke_lines = []
+    if check.get("task_limit") is not None:
+        smoke_lines = [
+            f"- Smoke task limit requested: {check['task_limit']}",
+            f"- Catalog tasks validated: {check.get('catalog_task_count', 'unknown')}",
+            f"- Tasks executed in this root: {check.get('run_task_count', summary['task_count'])}",
+        ]
     return "\n".join(
         [
             f"# {adapter.title}",
@@ -432,6 +445,7 @@ def _report(adapter: BenchmarkAdapter, summary: Mapping[str, Any]) -> str:
             f"- Status: `{summary['status']}`",
             f"- Model: `{MODEL}`",
             f"- Complete treatment results: {summary['complete_result_count']}/{summary['task_count']}",
+            *smoke_lines,
             f"- Mechanism verdict: `{summary['mechanism_verdict']}`",
             "- Cross-benchmark weighted score: not calculated",
             "",

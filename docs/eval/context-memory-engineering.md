@@ -89,8 +89,10 @@ The aggregate output is the sibling `aggregate` directory. It retains each bench
 mechanism verdict; `overall_score` and `cross_benchmark_weighted_score` are always null.
 
 For a live smoke run, append `--limit 10` to a benchmark command. The runner validates the full
-catalog, executes the first ten deterministic tasks, and writes to an isolated
+catalog, executes up to the first ten deterministic tasks, and writes to an isolated
 `<profile>-limit10` result root so a later untrimmed `portfolio` or `full` run is unaffected.
+LoCoMo's portfolio contains four conversation task units (200 QA total), so its smoke run uses
+all four and records the requested limit separately from the actual task count.
 
 To make the engineering gate non-optional, treatment materializes every native event and ingests it
 through the production `Read` tool with an evaluation-only one-token offload threshold. This forces
