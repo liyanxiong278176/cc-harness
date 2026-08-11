@@ -94,6 +94,23 @@ def test_local_catalogs_have_frozen_profile_sizes() -> None:
     assert sum(int(task.payload["qa_count"]) for task in full) == 1_986
 
 
+def test_locomo_case_and_category5_abstention_are_supported() -> None:
+    root = Path(__file__).resolve().parents[1]
+    adapter = LoCoMoAdapter()
+    task = adapter.catalog(root, EvalProfile.PORTFOLIO)[0]
+    case = adapter.case(root, task)
+
+    adversarial = next(question for question in case.questions if question.metadata["category"] == "5")
+    assert adversarial.gold is None
+    score, grading = asyncio.run(
+        adapter.grade(None, adversarial, "No information available", 1)  # type: ignore[arg-type]
+    )
+    assert score == 1.0
+    assert grading["metric"] == "locomo_official_category5_abstention"
+    wrong_score, _ = asyncio.run(adapter.grade(None, adversarial, "self-care is important", 1))  # type: ignore[arg-type]
+    assert wrong_score == 0.0
+
+
 def test_v2_portfolio_is_stable_stratified_and_gold_is_not_replayed(tmp_path: Path) -> None:
     data = tmp_path / "eval" / "context_memory" / "data" / "longmemeval-v2"
     (data / "haystacks").mkdir(parents=True)

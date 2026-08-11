@@ -23,6 +23,7 @@ from .base import NativeEventAdapter, stable_stratified
 SHA256 = "79fa87e90f04081343b8c8debecb80a9a6842b76a7aa537dc9fdf651ea698ff4"
 SIZE_BYTES = 2_805_274
 PORTFOLIO_CONVERSATIONS = ("conv-26", "conv-41", "conv-47", "conv-49")
+CATEGORY_5_ABSTENTION_MARKERS = ("no information available", "not mentioned")
 
 
 class LoCoMoAdapter(NativeEventAdapter):
@@ -160,15 +161,39 @@ class LoCoMoAdapter(NativeEventAdapter):
                 NativeQuestion(
                     question_id=f"{sample_id}/qa-{int(index):04d}",
                     question=str(qa["question"]),
-                    gold=qa["answer"],
+                    # Category 5 adversarial records intentionally omit ``answer`` in
+                    # the pinned release.  Their score is based on abstention, not a
+                    # reference answer (the few records that retain ``answer`` are
+                    # handled by the same category-specific rule).
+                    gold=qa.get("answer"),
                     metadata={"category": str(qa.get("category") or "unknown")},
                 )
             )
         return NativeCase(tuple(event for _, event in sorted(sessions)), tuple(questions))
 
+    async def grade(
+        self,
+        context,
+        question: NativeQuestion,
+        prediction: str,
+        index: int,
+    ) -> tuple[float, Mapping[str, Any]]:
+        if question.metadata.get("category") == "5":
+            normalized = prediction.casefold()
+            abstained = any(marker in normalized for marker in CATEGORY_5_ABSTENTION_MARKERS)
+            return (
+                1.0 if abstained else 0.0,
+                {
+                    "metric": "locomo_official_category5_abstention",
+                    "gold": question.gold,
+                    "abstained": abstained,
+                },
+            )
+        return await super().grade(context, question, prediction, index)
+
     def summarize(self, results: Sequence[Mapping[str, Any]]) -> Mapping[str, Any]:
         summary = dict(super().summarize(results))
-        summary["metric"] = "LoCoMo official deterministic token F1"
+        summary["metric"] = "LoCoMo official deterministic QA with category-5 abstention"
         return summary
 
 
