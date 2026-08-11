@@ -116,21 +116,21 @@ async def run_phase(
         host_execution=not judge,
         environment_overrides=arm_env,
     )
+    try:
+        parsed = final_result(completed.stdout)
+    except (UnicodeError, ValueError) as exc:
+        raise PhaseError(f"phase returned malformed product result: {phase_name}: {exc}") from exc
     timed_out_after_final_result = (
         completed.evidence.timed_out
-        and completed.evidence.exit_code == 0
         and not completed.evidence.stdout_truncated
         and not completed.evidence.stderr_truncated
+        and parsed.get("error") in (None, "")
     )
     if not completed.evidence.valid_for_parity and not timed_out_after_final_result:
         detail = completed.stderr.decode("utf-8", errors="replace")[-2_000:]
         raise PhaseError(
             f"phase failed: {phase_name}; exit={completed.evidence.exit_code}; {detail}"
         )
-    try:
-        parsed = final_result(completed.stdout)
-    except (UnicodeError, ValueError) as exc:
-        raise PhaseError(f"phase returned malformed product result: {phase_name}: {exc}") from exc
     if parsed.get("resolved_model") != "deepseek-v4-flash":
         raise PhaseError(
             f"model identity mismatch in {phase_name}: {parsed.get('resolved_model')!r}"

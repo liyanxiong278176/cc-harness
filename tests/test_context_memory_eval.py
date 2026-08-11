@@ -885,6 +885,63 @@ async def test_phase_accepts_final_result_after_watchdog(tmp_path: Path, monkeyp
     assert (attempt / "phases" / "ingest-0001" / "phase-complete.json").is_file()
 
 
+@pytest.mark.asyncio
+async def test_phase_accepts_clean_final_result_after_nonzero_watchdog_exit(
+    tmp_path: Path, monkeypatch
+) -> None:
+    attempt = tmp_path / "attempt"
+    active = attempt / "active"
+    workspace = active / "workspace"
+    home = active / "home"
+    workspace.mkdir(parents=True)
+    home.mkdir(parents=True)
+    context = TrialContext(
+        project_root=tmp_path,
+        output_root=tmp_path / "output",
+        attempt_root=attempt,
+        active_root=active,
+        workspace=workspace,
+        home=home,
+        task=BenchmarkTask("fixture/task", "fixture"),
+        profile=EvalProfile.PORTFOLIO,
+        arm=Arm.TREATMENT,
+        namespace="fixture-treatment",
+        watchdog_seconds=1,
+    )
+    payload = {
+        "schema_version": "cc-harness.print-result.v1",
+        "type": "result",
+        "text": "MEMORY_INGESTED",
+        "requested_model": "deepseek-v4-flash",
+        "resolved_model": "deepseek-v4-flash",
+        "error": None,
+        "usage": {"model_calls": 1, "tool_calls": 1},
+    }
+    evidence = LaunchEvidence(
+        harness=HarnessKind.CC_HARNESS,
+        requested_model="deepseek-v4-flash",
+        resolved_model="deepseek-v4-flash",
+        exit_code=1,
+        timed_out=True,
+        wall_time_ms=1_000,
+        model_calls=1,
+        tool_calls=1,
+    )
+    completed = CompletedLaunch(
+        evidence=evidence,
+        stdout=(json.dumps(payload) + "\n").encode(),
+        stderr=b"watchdog terminated after final result\n",
+    )
+
+    async def fake_run_cc_prompt(*_args, **_kwargs):
+        return completed
+
+    monkeypatch.setattr("eval.context_memory.execution.run_cc_prompt", fake_run_cc_prompt)
+    result, usage = await run_phase(context, "ingest-0001", "prompt")
+    assert result["text"] == "MEMORY_INGESTED"
+    assert usage["model_calls"] == 1
+
+
 def test_treatment_mechanism_gates_are_non_compensating(tmp_path: Path) -> None:
     context = _trial_context(tmp_path, Arm.TREATMENT)
     source_digest = write_source_manifest(
