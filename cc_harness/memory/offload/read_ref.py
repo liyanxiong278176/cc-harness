@@ -13,6 +13,7 @@ LLM 看到 pointer、需要精确细节时,主动调 `read_ref(node_id=...)` 取
 穿越载体。非法 → 安全错误返回,绝不读盘。
 """
 from __future__ import annotations
+
 import json
 import re
 from pathlib import Path
@@ -238,6 +239,26 @@ def _resolve_ref_file(
         try:
             candidate.relative_to(refs_root)
         except ValueError:
-            return refs_root / f"{node_id}.invalid"
+            # Runtime snapshots copy the offload tree into a new workspace,
+            # but the immutable nodes manifest intentionally keeps the
+            # original absolute result_ref for provenance.  Rebase only the
+            # suffix below the recorded ``refs`` directory; never follow an
+            # arbitrary path outside the active refs root.
+            candidate = _rebase_snapshot_ref(candidate, refs_root)
+            try:
+                candidate.relative_to(refs_root)
+            except ValueError:
+                return refs_root / f"{node_id}.invalid"
         return candidate
     return refs_root / f"{node_id}.missing"
+
+
+def _rebase_snapshot_ref(candidate: Path, refs_root: Path) -> Path:
+    """Map a copied manifest's absolute ``.../refs/...`` path locally."""
+    positions = [
+        index for index, part in enumerate(candidate.parts) if part.casefold() == "refs"
+    ]
+    if not positions or positions[-1] == len(candidate.parts) - 1:
+        return candidate
+    relative = Path(*candidate.parts[positions[-1] + 1 :])
+    return refs_root / relative

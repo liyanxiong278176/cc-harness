@@ -1,4 +1,6 @@
 """Q4 短期卸载 unit。mock LLM/token_counter。"""
+import json
+
 import pytest
 
 
@@ -237,6 +239,41 @@ async def test_read_ref_handler(tmp_path):
     r = await read_ref_handler({"node_id": "n1"}, cwd=str(tmp_path), refs_dir=refs_dir)
     assert "完整原文" in r.llm_text
     assert READ_REF_SPEC["function"]["name"] == "read_ref"
+
+
+@pytest.mark.asyncio
+async def test_read_ref_rebases_snapshot_manifest_paths(tmp_path):
+    """Copied query runtimes must resolve refs recorded with ingest paths."""
+    from cc_harness.memory.offload.read_ref import read_ref_handler
+
+    source_refs = tmp_path / "ingest" / ".cc-harness" / "context" / "s1" / "offload" / "refs"
+    query_refs = tmp_path / "query" / ".cc-harness" / "context" / "s1" / "offload" / "refs"
+    source_file = source_refs / "objects" / "digest.md"
+    source_file.parent.mkdir(parents=True)
+    source_file.write_text("snapshot evidence", encoding="utf-8")
+    query_file = query_refs / "objects" / "digest.md"
+    query_file.parent.mkdir(parents=True)
+    query_file.write_text(source_file.read_text(encoding="utf-8"), encoding="utf-8")
+
+    manifest = query_refs.parent / "nodes.jsonl"
+    manifest.write_text(
+        json.dumps(
+            {
+                "node_id": "node1",
+                "result_ref": str(source_file),
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    result = await read_ref_handler(
+        {"node_id": "node1"},
+        cwd=str(query_refs),
+        refs_dir=query_refs,
+        manifest_path=manifest,
+    )
+    assert "snapshot evidence" in result.llm_text
 
 
 @pytest.mark.asyncio
