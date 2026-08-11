@@ -30,6 +30,7 @@ from .contracts import (
 from .execution import EVAL_CONTEXT_WINDOW, EVAL_OFFLOAD_THRESHOLD, MECHANISM_ADAPTATION
 from .gates import evaluate_trial_gates
 from .isolation import open_runtime, seal_runtime
+from .progress import ContextMemoryProgress
 from .storage import TreatmentStateStore, write_attempt_integrity
 
 
@@ -106,24 +107,40 @@ async def run_context_memory_benchmark(
         check_payload["ready"] = False
         check_payload["warnings"].append("fixed recovery/tamper canary failed")
     atomic_json(output_root / "check.json", check_payload)
+    progress_tracker = ContextMemoryProgress(
+        output_root,
+        benchmark=adapter.slug,
+        profile=profile.value,
+        model=MODEL,
+        total_tasks=len(tasks),
+        state=state,
+        emit=progress,
+    )
+    report_progress = progress_tracker.message
     if check_only:
         summary = _summary(adapter, tasks, state, [], check_payload)
         summary["status"] = "ready" if check_payload["ready"] else "not-ready"
         summary["canary"] = canary
+        progress_tracker.finish(summary["status"])
         return _finalize(adapter, output_root, store, state, tasks, summary)
     if not check_payload["ready"]:
+        progress_tracker.finish("not-ready")
         raise RuntimeError(
             "benchmark prerequisites not ready: " + "; ".join(check_payload["warnings"])
         )
-    image_supported = await _preflight(
-        adapter,
-        project_root,
-        output_root,
-        state,
-        store,
-        min(600, watchdog_seconds),
-        progress,
-    )
+    try:
+        image_supported = await _preflight(
+            adapter,
+            project_root,
+            output_root,
+            state,
+            store,
+            min(600, watchdog_seconds),
+            report_progress,
+        )
+    except Exception as exc:
+        progress_tracker.failed(f"preflight failed: {type(exc).__name__}: {exc}")
+        raise
     if not image_supported:
         summary = _summary(adapter, tasks, state, [], check_payload)
         summary.update(
@@ -134,6 +151,7 @@ async def run_context_memory_benchmark(
                 "canary": canary,
             }
         )
+        progress_tracker.finish(summary["status"])
         return _finalize(adapter, output_root, store, state, tasks, summary)
 
     results: list[dict[str, Any]] = []
@@ -157,8 +175,14 @@ async def run_context_memory_benchmark(
                 namespace=namespace,
                 watchdog_seconds=watchdog_seconds,
                 snapshot_root=runtime.snapshot_root,
+                progress=progress_tracker,
             )
-            progress(f"start {sequence}/{len(tasks)} {task.task_id}.{arm.value} attempt-1")
+            progress_tracker.task_start(
+                sequence,
+                task.task_id,
+                arm.value,
+                resumed=resumed,
+            )
             try:
                 outcome = await adapter.execute(context)
                 sealed = seal_runtime(runtime, attempt_root)
@@ -175,7 +199,9 @@ async def run_context_memory_benchmark(
                     )
             except (asyncio.CancelledError, KeyboardInterrupt):
                 store.interrupt(state, task.task_id, arm, record)
-                progress(f"interrupted {task.task_id}.{arm.value}; rerun the same command")
+                progress_tracker.interrupted(
+                    f"interrupted {task.task_id}.{arm.value}; rerun the same command"
+                )
                 raise
             except Exception as exc:  # noqa: BLE001 - preserve failure as auditable invalid
                 outcome = ArmOutcome(
@@ -208,10 +234,14 @@ async def run_context_memory_benchmark(
                 outcome.status,
                 integrity_path,
             )
-            progress(f"complete {task.task_id}.{arm.value}: {outcome.status.value}")
+            progress_tracker.task_complete(task.task_id, outcome.status.value)
             selected = store.selected_result(state, task.task_id, arm)
         else:
-            progress(f"skip verified {sequence}/{len(tasks)} {task.task_id}.{arm.value}")
+            progress_tracker.task_skipped(
+                sequence,
+                task.task_id,
+                selected.get("status", "unknown"),
+            )
 
         if selected is not None:
             result = _normalize_result(task, selected)
@@ -224,6 +254,7 @@ async def run_context_memory_benchmark(
     summary = _summary(adapter, tasks, state, results, check_payload)
     summary["canary"] = canary
     summary["benchmark_metrics"] = dict(adapter.summarize(results))
+    progress_tracker.finish(summary["status"])
     return _finalize(adapter, output_root, store, state, tasks, summary)
 
 
@@ -426,6 +457,9 @@ def _finalize(
         "report": report_path,
         "integrity": integrity_path,
         "raw": output_root / "raw",
+        "progress": output_root / "progress.json",
+        "progress_report": output_root / "progress.md",
+        "progress_log": output_root / "progress.log",
     }
 
 

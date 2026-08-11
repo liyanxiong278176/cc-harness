@@ -76,6 +76,17 @@ Live evidence is written below:
 eval\result\cc-only\context-memory\deepseek-v4-flash\<profile>\<benchmark>
 ```
 
+Each live or check run also exposes operational progress in the benchmark result directory:
+`progress.json` is machine-readable, `progress.md` is a human-readable snapshot, and
+`progress.log` is an append-only event log. The terminal prints task, phase, event/question,
+cumulative model-call, elapsed-time and ETA information. While a model phase is running, a
+heartbeat is emitted every 30 seconds, so a quiet model call is distinguishable from a stalled
+process. To watch the snapshot from a second PowerShell window:
+
+```powershell
+Get-Content eval\result\cc-only\context-memory\deepseek-v4-flash\portfolio\longmemeval-s-cleaned\progress.md -Wait
+```
+
 Check evidence is isolated below:
 
 ```text

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import json
 import os
@@ -90,62 +91,93 @@ async def run_phase(
     phase_root = context.attempt_root / "phases" / phase_name
     completed_path = phase_root / "phase-complete.json"
     digest_path = phase_root / "phase-complete.sha256"
+    progress = context.progress
     if completed_path.is_file():
         if not digest_path.is_file() or digest_path.read_text(
             encoding="ascii"
         ).strip() != digest_file(completed_path):
             raise PhaseError(f"completed phase failed integrity: {phase_name}")
         payload = read_json(completed_path)
+        if progress is not None:
+            progress.phase_completed(phase_name, payload.get("usage") or {}, cached=True)
         return dict(payload["result"]), dict(payload["usage"])
     selected_workspace = workspace or context.workspace
     selected_home = home or context.home
     selected_workspace.mkdir(parents=True, exist_ok=True)
     selected_home.mkdir(parents=True, exist_ok=True)
     arm_env = environment(context.arm, selected_home, disabled=judge)
-    completed = await run_cc_prompt(
-        context.project_root,
-        selected_workspace,
-        phase_root / "launch",
-        prompt,
-        capability_profile=(
-            "context-memory-control" if judge else "memory-eval"
-        ),
-        home=selected_home,
-        watchdog_seconds=context.watchdog_seconds,
-        continue_session=continue_session and not judge,
-        host_execution=not judge,
-        environment_overrides=arm_env,
-    )
+    if progress is not None:
+        progress.phase_started(phase_name)
+    heartbeat_task = None
+    heartbeat = getattr(progress, "heartbeat", None)
+    if heartbeat is not None:
+        heartbeat_task = asyncio.create_task(_phase_heartbeat(progress, phase_name))
     try:
-        parsed = final_result(completed.stdout)
-    except (UnicodeError, ValueError) as exc:
-        raise PhaseError(f"phase returned malformed product result: {phase_name}: {exc}") from exc
-    timed_out_after_final_result = (
-        completed.evidence.timed_out
-        and not completed.evidence.stdout_truncated
-        and not completed.evidence.stderr_truncated
-        and parsed.get("error") in (None, "")
-    )
-    if not completed.evidence.valid_for_parity and not timed_out_after_final_result:
-        detail = completed.stderr.decode("utf-8", errors="replace")[-2_000:]
-        raise PhaseError(
-            f"phase failed: {phase_name}; exit={completed.evidence.exit_code}; {detail}"
+        completed = await run_cc_prompt(
+            context.project_root,
+            selected_workspace,
+            phase_root / "launch",
+            prompt,
+            capability_profile=(
+                "context-memory-control" if judge else "memory-eval"
+            ),
+            home=selected_home,
+            watchdog_seconds=context.watchdog_seconds,
+            continue_session=continue_session and not judge,
+            host_execution=not judge,
+            environment_overrides=arm_env,
         )
-    if parsed.get("resolved_model") != "deepseek-v4-flash":
-        raise PhaseError(
-            f"model identity mismatch in {phase_name}: {parsed.get('resolved_model')!r}"
+        try:
+            parsed = final_result(completed.stdout)
+        except (UnicodeError, ValueError) as exc:
+            raise PhaseError(
+                f"phase returned malformed product result: {phase_name}: {exc}"
+            ) from exc
+        timed_out_after_final_result = (
+            completed.evidence.timed_out
+            and not completed.evidence.stdout_truncated
+            and not completed.evidence.stderr_truncated
+            and parsed.get("error") in (None, "")
         )
-    phase_usage = usage(completed)
-    atomic_json(
-        completed_path,
-        {
-            "schema_version": "eval.context-memory-phase.v1",
-            "result": parsed,
-            "usage": phase_usage,
-        },
-    )
-    digest_path.write_text(digest_file(completed_path) + "\n", encoding="ascii")
+        if not completed.evidence.valid_for_parity and not timed_out_after_final_result:
+            detail = completed.stderr.decode("utf-8", errors="replace")[-2_000:]
+            raise PhaseError(
+                f"phase failed: {phase_name}; exit={completed.evidence.exit_code}; {detail}"
+            )
+        if parsed.get("resolved_model") != "deepseek-v4-flash":
+            raise PhaseError(
+                f"model identity mismatch in {phase_name}: {parsed.get('resolved_model')!r}"
+            )
+        phase_usage = usage(completed)
+        atomic_json(
+            completed_path,
+            {
+                "schema_version": "eval.context-memory-phase.v1",
+                "result": parsed,
+                "usage": phase_usage,
+            },
+        )
+        digest_path.write_text(digest_file(completed_path) + "\n", encoding="ascii")
+    except Exception as exc:
+        if progress is not None:
+            progress.phase_failed(phase_name, f"{type(exc).__name__}: {exc}")
+        raise
+    finally:
+        if heartbeat_task is not None:
+            heartbeat_task.cancel()
+            try:
+                await heartbeat_task
+            except asyncio.CancelledError:
+                pass
+    if progress is not None:
+        progress.phase_completed(phase_name, phase_usage)
     return parsed, phase_usage
+
+
+async def _phase_heartbeat(progress: Any, phase_name: str) -> None:
+    while True:
+        await asyncio.sleep(30)
+        progress.heartbeat(phase_name)
 
 
 def environment(arm: Arm, home: Path, *, disabled: bool = False) -> dict[str, str]:

@@ -106,6 +106,9 @@ class TrialContext:
     namespace: str
     watchdog_seconds: int
     snapshot_root: Path | None = None
+    # Optional live progress sink. It is intentionally outside the evaluation
+    # contract so reporting failures cannot change the benchmark outcome.
+    progress: Any | None = None
 
 
 @dataclass(frozen=True)

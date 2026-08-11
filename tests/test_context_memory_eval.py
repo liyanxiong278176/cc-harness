@@ -564,6 +564,11 @@ async def test_live_runner_executes_each_task_once_as_treatment(
     assert summary["benchmark_metrics"] == {"result_count": 2}
     assert "complete_pair_count" not in summary
     assert "control" not in json.dumps(summary)
+    progress = read_json(output / "progress.json")
+    assert progress["status"] == "complete"
+    assert progress["completed_tasks"] == 2
+    assert (output / "progress.md").is_file()
+    assert (output / "progress.log").is_file()
     normalized = read_json(output / "normalized" / "0001-fixture-one.json")
     assert set(normalized) == {"schema_version", "task_id", "group", "treatment", "treatment_score"}
     assert "control" not in json.dumps(normalized)

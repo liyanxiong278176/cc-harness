@@ -50,11 +50,16 @@ class NativeEventAdapter:
         source_digest = write_source_manifest(context, source_events)
         total = empty_usage()
         records: list[dict[str, Any]] = []
+        progress = context.progress
+        if progress is not None:
+            progress.task_shape(len(case.events), len(case.questions))
         if context.arm is not Arm.TREATMENT:
             raise ValueError(f"unsupported context-memory execution arm: {context.arm!r}")
         checkpoint_restore_verified = True
 
         for index, event in enumerate(case.events, 1):
+            if progress is not None:
+                progress.item_started("event", index, len(case.events), event.event_id)
             result, phase_usage = await run_phase(
                 context,
                 f"ingest-{index:04d}",
@@ -63,16 +68,22 @@ class NativeEventAdapter:
             )
             add_usage(total, phase_usage)
             if "MEMORY_INGESTED" not in str(result.get("text") or ""):
+                if progress is not None:
+                    progress.item_failed("event", index, "missing MEMORY_INGESTED acknowledgement")
                 return ArmOutcome(
                     status=ExecutionStatus.INVALID,
                     usage=total,
                     protocol={"source_digest": source_digest},
                     invalid_reason=f"native event {event.event_id} was not acknowledged",
                 )
+            if progress is not None:
+                progress.item_completed("event", index, len(case.events))
         snapshot = context.snapshot_root or context.attempt_root / "query-snapshot"
         snapshot_runtime(context.workspace, context.home, snapshot)
 
         for index, question in enumerate(case.questions, 1):
+            if progress is not None:
+                progress.item_started("question", index, len(case.questions), question.question_id)
             workspace = context.active_root / "treatment-query"
             home = context.active_root / "treatment-home"
             restore_runtime(
@@ -112,6 +123,13 @@ class NativeEventAdapter:
             }
             records.append(record)
             atomic_json(context.attempt_root / "graded" / f"{index:04d}.json", record)
+            if progress is not None:
+                progress.item_completed(
+                    "question",
+                    index,
+                    len(case.questions),
+                    score=score,
+                )
 
         score = sum(item["score"] for item in records) / len(records) if records else 0.0
         return ArmOutcome(
