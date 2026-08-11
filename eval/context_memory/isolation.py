@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import uuid
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -143,7 +144,12 @@ def seal_runtime(runtime: IsolatedRuntime, attempt_root: Path) -> Path:
     # tree would make the sealed files unaddressable again under MAX_PATH.
     sealed = runtime.active_root.with_name(runtime.active_root.name + "-sealed")
     if sealed.exists():
-        raise ValueError(f"short sealed runtime already exists: {sealed}")
+        # A canary or a resumed attempt can leave the deterministic sealed
+        # name behind after a process crash. Preserve that evidence and use a
+        # fresh external name for the runtime being sealed now.
+        sealed = runtime.active_root.with_name(
+            runtime.active_root.name + "-sealed-" + uuid.uuid4().hex[:12]
+        )
     os.replace(runtime.active_root, sealed)
     marker = attempt_root / "sealed-state"
     marker.mkdir(parents=True, exist_ok=False)
