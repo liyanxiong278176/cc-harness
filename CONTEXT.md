@@ -14,31 +14,34 @@ cc-harness 是在用户当前终端中运行的编码代理。其交互语言强
 `portfolio` 按官方任务类型分层抽样，仅用于开发调试与快速回归；`full` 覆盖全部官方任务类型和样本，是形成对外可比成绩的唯一档位。_Avoid_: 将 portfolio 子集包装为官方完整成绩、从 full 档位中排除困难任务或 RULER 派生任务
 
 **上下文-记忆评测档位（Context-Memory Evaluation Profile）**:
-`portfolio` 是冻结的分层开发集，包含 LongMemEval-S Cleaned 100 问、LongMemEval-V2 Small 50 问、LoCoMo 4 段对话中的 200 问，以及 MemoryAgentBench 24 条记忆流且每流最多 10 问；`full` 包含对应官方范围内的 500 问、451 问、10 段对话共 1,986 问，以及 146 条记忆流的全部问题。只有未裁剪的 full 档位可形成对外 benchmark 成绩。_Avoid_: 运行时重新抽样、将 portfolio 与 full 混合比较、隐藏 full 档位中失败或无效的样本
+`portfolio` 是冻结的分层开发集，包含 LongMemEval-S Cleaned 100 问、LoCoMo 4 段对话中的 200 问，以及 MemoryAgentBench 24 条记忆流且每流最多 10 问；`full` 包含对应官方范围内的 500 问、10 段对话共 1,986 问，以及 146 条记忆流的全部问题。只有未裁剪的 full 档位可形成对外 benchmark 成绩。_Avoid_: 运行时重新抽样、将 portfolio 与 full 混合比较、隐藏 full 档位中失败或无效的样本
+
+**当前上下文-记忆 benchmark 集（Active Context-Memory Benchmark Set）**:
+当前 treatment-only 上下文-记忆套件仅包含 LongMemEval-S Cleaned、LoCoMo 与 MemoryAgentBench。LongMemEval-V2 因配置的 `deepseek-v4-flash` 无法接受其必需的图片输入而退出当前套件；历史 V2 数据与结果证据保留用于审计，但不属于当前聚合报告或可运行命令。_Avoid_: 将已退役的 V2 证据当作当前成绩、静默丢弃图片输入、将三 benchmark 聚合报告称为四 benchmark 结果
 
 **上下文-记忆配对消融（Paired Context-Memory Ablation）**:
-每个冻结任务在相同模型、参数、输入顺序与初始状态下各执行一次 control 和 treatment；control 关闭长期记忆、压缩、卸载与卸载检索，并在超出窗口时采用固定的最近内容截断，treatment 启用生产上下文-记忆链路。正式报告并列给出 treatment 的 benchmark 成绩和相对 control 的配对变化，不以变化值替代 benchmark 成绩。_Avoid_: 将 control 超窗记为基础设施无效、双方使用不同输入顺序、只展示有利的消融结果、把同一组的重复运行误称为配对 A/B
+上下文-记忆评测当前只执行一次 treatment；历史 control/treatment 配对结果仅作为不可变审计证据，不能由当前运行续接。treatment 在相同模型、参数、输入顺序与初始状态下启用生产上下文-记忆链路，正式报告给出各 benchmark 的独立成绩与机制门禁，不以历史配对变化值替代 benchmark 成绩。_Avoid_: 将历史 control 当作当前必要运行、混用不同输入顺序、只展示有利的消融结果、把同一组的重复运行误称为当前配对 A/B
 
 **原始语义事件重放（Native-Semantics Event Replay）**:
-评测历史按照其原始交互语义进入统一信息生命周期：LongMemEval-S Cleaned 与 LoCoMo 重放 user/assistant 会话，LongMemEval-V2 重放 agent action 与 tool result，MemoryAgentBench 按官方增量 chunk 重放对话、文档和外部记录；所有事件共享同一不可变记录、上下文投影、版本化摘要、卸载与检索底层。gold answer、证据标记和评分元数据不得进入模型可见内容；固定机制 canary 只验证机制触发，不计入 benchmark 分数。_Avoid_: 将所有历史拼成单个用户提示、为了触发卸载把普通对话伪装为工具结果、将 canary 成绩混入官方 benchmark 成绩
+评测历史按照其原始交互语义进入统一信息生命周期：LongMemEval-S Cleaned 与 LoCoMo 重放 user/assistant 会话，MemoryAgentBench 按官方增量 chunk 重放对话、文档和外部记录；所有事件共享同一不可变记录、上下文投影、版本化摘要、卸载与检索底层。gold answer、证据标记和评分元数据不得进入模型可见内容；固定机制 canary 只验证机制触发，不计入 benchmark 分数。_Avoid_: 将所有历史拼成单个用户提示、为了触发卸载把普通对话伪装为工具结果、将 canary 成绩混入官方 benchmark 成绩
 
 **上下文-记忆机制门禁（Context-Memory Mechanism Gate）**:
-独立于答案分数验证原始记录完整、版本化摘要真实减载、pointer/node/ref 一致且原文可还原、生产检索实际读取官方证据、模型输入无评分信息泄漏、control 机制确实关闭，以及任务与分组隔离。任一必要门禁失败时保留原始 benchmark 分数，但本次上下文-记忆工程有效性结论无效。_Avoid_: 用答案正确率推断内部机制生效、用部分门禁通过抵消数据损坏、删除门禁失败的运行记录
+独立于答案分数验证原始记录完整、版本化摘要真实减载、pointer/node/ref 一致且原文可还原、生产检索实际读取官方证据、模型输入无评分信息泄漏，以及任务与分组隔离。任一必要门禁失败时保留原始 benchmark 分数，但本次上下文-记忆工程有效性结论无效。_Avoid_: 用答案正确率推断内部机制生效、用部分门禁通过抵消数据损坏、删除门禁失败的运行记录
 
 **上下文-记忆恢复门禁（Context-Memory Recovery Gate）**:
 固定 recovery canary 分别在原始事件提交后、ref 对象写入后、版本化摘要写入中和 checkpoint 后注入中断；恢复必须从最后完整提交继续，不重复或遗漏事件，并使用正确的摘要与节点版本。对原始记录、摘要、节点清单或 ref 对象的篡改必须被摘要校验发现并使运行无效，不得静默信任或改写损坏证据。_Avoid_: 为每道官方题重复注入故障、把损坏数据当作普通答题失败、恢复时重新执行已完成样本
 
 **DeepSeek 适配评分（DeepSeek-Adapted Scoring）**:
-control、treatment 与必要的隔离 judge 均使用经服务端身份验证的 `deepseek-v4-flash`；官方确定性指标保持不变，替代官方 reader 或语义 judge 的分数必须明确标为 DeepSeek adaptation，并保留全部原始预测供未来重新评分。使用官方数据集不等同于获得官方 leaderboard 成绩，模型或 judge 契约不一致时不得直接横向比较公开数字。_Avoid_: 隐藏 judge 替换、让 judge 继承被测记忆、把适配成绩标成官方成绩、为重新评分重复运行被测系统
+treatment 与必要的隔离 judge 均使用经服务端身份验证的 `deepseek-v4-flash`；官方确定性指标保持不变，替代官方 reader 或语义 judge 的分数必须明确标为 DeepSeek adaptation，并保留全部原始预测供未来重新评分。使用官方数据集不等同于获得官方 leaderboard 成绩，模型或 judge 契约不一致时不得直接横向比较公开数字。_Avoid_: 隐藏 judge 替换、让 judge 继承被测记忆、把适配成绩标成官方成绩、为重新评分重复运行被测系统
 
 **可续跑上下文-记忆运行（Resumable Context-Memory Run）**:
-四个 benchmark 在统一结果根下拥有独立运行状态和 control/treatment 证据，并由总报告聚合；同一命令仅跳过完整性校验通过的已完成样本，从首个未完成的 attempt-1 继续。数据集、模型、配置、代码或任务目录摘要变化时拒绝混合续跑，四项成绩与机制门禁分别报告且不生成加权总分。_Avoid_: 仅凭目录存在跳过样本、把不同输入契约写入同一运行、Ctrl+C 后从头执行、用聚合分隐藏单项失败
+三个 benchmark 在统一结果根下拥有独立运行状态和 treatment 证据，并由总报告聚合；同一命令仅跳过完整性校验通过的已完成样本，从首个未完成的 attempt-1 继续。数据集、模型、配置、代码或任务目录摘要变化时拒绝混合续跑，三项成绩与机制门禁分别报告且不生成加权总分。_Avoid_: 仅凭目录存在跳过样本、把不同输入契约写入同一运行、Ctrl+C 后从头执行、用聚合分隐藏单项失败
 
 **上下文-记忆数据占用契约（Context-Memory Data Footprint Contract）**:
-仅准备 LongMemEval-V2 Small 所需文本轨迹与多模态资源，不下载 Medium；输入按内容摘要去重并固定 revision、大小与 SHA-256，下载支持断点续传，数据和证据接近 50 GB 软上限时安全停止。完整 Small 运行必须先验证模型图像能力；不支持时 full 标记为 unsupported，另行运行的纯文本结果只能称为 text-only adaptation。_Avoid_: 每题复制完整轨迹库、静默删除运行证据、忽略图片后宣称完整 Small 成绩、未固定数据版本即继续旧运行
+当前活动套件仅准备 LongMemEval-S Cleaned、LoCoMo 与 MemoryAgentBench 所需的固定输入；下载按内容摘要去重并固定 revision、大小与 SHA-256，支持断点续传，数据和证据接近 50 GB 软上限时安全停止。LongMemEval-V2 的历史多模态数据不再由活动命令准备或聚合，原有文件与证据保留用于审计。_Avoid_: 每题复制完整轨迹库、静默删除历史证据、忽略图片后宣称 V2 成绩、未固定数据版本即继续旧运行
 
 **封存式评测隔离（Sealed Evaluation Isolation）**:
-不同 benchmark、样本及 control/treatment 分组使用互不共享的 workspace、运行目录、会话、记忆库、摘要、ref 与节点清单；每组完成后将其状态封存为只读审计证据并从后续活动运行中卸载，下一组启动前必须验证活动状态为空且不存在跨任务命中。隔离或清理失败使运行无效，评测不得读取或改写用户日常全局记忆。_Avoid_: 复用上一题的 CC_HARNESS_HOME、让 treatment 继承 control 状态、为防污染删除审计证据、清理失败后继续运行
+不同 benchmark、样本及 treatment 分组使用互不共享的 workspace、运行目录、会话、记忆库、摘要、ref 与节点清单；每组完成后将其状态封存为只读审计证据并从后续活动运行中卸载，下一组启动前必须验证活动状态为空且不存在跨任务命中。隔离或清理失败使运行无效，评测不得读取或改写用户日常全局记忆。_Avoid_: 复用上一题的 CC_HARNESS_HOME、让 treatment 继承其他任务状态、为防污染删除审计证据、清理失败后继续运行
 
 **产品对标边界（Product Parity Boundary）**:
 cc-harness 对标 Claude Code 的终端 coding-agent 内核及 headless/SDK 能力；Web、Desktop、Mobile、Slack、Chrome 与完整企业平台不属于当前对标范围。_Avoid_: 完整复制 Claude 平台、只对齐终端外观
@@ -816,8 +819,10 @@ At this handoff point, the latest eval implementation and documentation are stil
 - Context compression, offload, retrieval, long-term memory, conflict update and recovery now share
   `eval/context_memory/`; entrypoint: `scripts/run_context_memory_benchmark.py`; evidence root:
   `eval/result/cc-only/context-memory/deepseek-v4-flash/<profile>/<benchmark>`.
-- The unified domain contains LongMemEval-S Cleaned, LongMemEval-V2 Small, LoCoMo and
-  MemoryAgentBench. Each task has one logical attempt with isolated control/treatment arms and
+- The unified domain contains LongMemEval-S Cleaned, LoCoMo and MemoryAgentBench. LongMemEval-V2
+  is retired from the active set because `deepseek-v4-flash` cannot accept its required image inputs;
+  its historical data and result evidence remain available for audit. Each task has one logical
+  treatment attempt with
   non-compensating mechanism gates. Only an untrimmed `full` profile is externally reportable.
 - Standalone NVIDIA RULER code, prepared data, upstream cache and historical results were deleted.
   MemoryAgentBench's official `ruler_qa1`/`ruler_qa2` sources remain suite members and are never
@@ -833,8 +838,8 @@ At this handoff point, the latest eval implementation and documentation are stil
   `portfolio` or `full` catalog without model preflight or task calls and writes disposable check
   evidence below the `check` result namespace. A focused regression test locks this contract.
 - The pinned preparer supports HTTP Range resume, content-addressed deduplication, size/SHA-256
-  validation and a 50 GB managed-data soft limit. LongMemEval-V2 never downloads Medium and requires
-  a live image capability preflight; there is no silent text-only fallback.
+  validation and a 50 GB managed-data soft limit. Retired LongMemEval-V2 data is not downloaded by
+  active commands and has no silent text-only fallback.
 - Fixed recovery/tamper canaries cover four crash points and five corruption targets. Canary results
   are mechanism evidence only and never enter benchmark scores.
 - Run and resume instructions are in `docs/eval/cc-only-benchmark-portfolio.md`. Existing paired,

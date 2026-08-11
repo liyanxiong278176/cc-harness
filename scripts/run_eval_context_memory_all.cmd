@@ -4,8 +4,6 @@ cd /d "%~dp0\.."
 set "run_status=0"
 call scripts\run_eval_longmemeval_context_memory.cmd %*
 if errorlevel 1 set "run_status=1"
-call scripts\run_eval_longmemeval_v2_context_memory.cmd %*
-if errorlevel 1 set "run_status=1"
 call scripts\run_eval_locomo_context_memory.cmd %*
 if errorlevel 1 set "run_status=1"
 call scripts\run_eval_memoryagentbench_context_memory.cmd %*

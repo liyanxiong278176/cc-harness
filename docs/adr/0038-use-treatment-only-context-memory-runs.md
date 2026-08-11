@@ -16,7 +16,7 @@ root is required for treatment-only execution. Each completed task still records
 sealed runtime state, mechanism-gate results, an integrity manifest and the automatic benchmark
 report.
 
-The four benchmark commands and the aggregate command retain their independent native metrics;
+The three active benchmark commands and the aggregate command retain their independent native metrics;
 the aggregate never calculates a cross-benchmark score. The `context-memory-control` capability
 profile remains available only for model-free preflight and isolated judge calls; it is not a
 benchmark arm.

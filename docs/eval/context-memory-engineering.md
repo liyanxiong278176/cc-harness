@@ -10,7 +10,6 @@ benchmarks.
 | Benchmark | `portfolio` | `full` |
 | --- | ---: | ---: |
 | LongMemEval-S Cleaned | 100 questions | 500 questions |
-| LongMemEval-V2 Small | 50 questions | 451 questions |
 | LoCoMo | 4 conversations, 200 QA | 10 conversations, 1,986 QA |
 | MemoryAgentBench | 24 streams, at most 10 QA each | 146 streams, all QA |
 
@@ -21,41 +20,39 @@ not official same-condition leaderboard scores.
 ## Prepare and check
 
 LongMemEval-S and LoCoMo are already local and are accepted only when their pinned size and SHA-256
-match. Prepare the other datasets before a live run:
+match. Prepare MemoryAgentBench before a live run:
 
 ```cmd
-scripts\run_eval_longmemeval_v2_context_memory.cmd --prepare-only
 scripts\run_eval_memoryagentbench_context_memory.cmd --prepare-only
 ```
 
 The preparer pins the Hugging Face revision, records every size and SHA-256, resumes with HTTP Range,
-and publishes downloads through a content-addressed object store. It downloads only LongMemEval-V2
-Small. Dataset plus context-memory evidence has a 50 GB soft limit; crossing it stops safely and
-retains `.part` state for the same command to resume.
+and publishes downloads through a content-addressed object store. Dataset plus context-memory evidence
+has a 50 GB soft limit; crossing it stops safely and retains `.part` state for the same command to
+resume.
 
 Run zero-model checks in this order:
 
 ```cmd
 scripts\run_eval_longmemeval_context_memory.cmd --check
-scripts\run_eval_longmemeval_v2_context_memory.cmd --check
 scripts\run_eval_locomo_context_memory.cmd --check
 scripts\run_eval_memoryagentbench_context_memory.cmd --check
 scripts\run_eval_context_memory_all.cmd --check
 ```
 
-Every check runs the fixed recovery/tamper canaries but performs no model call. LongMemEval-V2's real
-image capability probe runs immediately before live execution. If it fails, the run is
-`unsupported`; the evaluator never silently emits a text-only full result.
+Every check runs the fixed recovery/tamper canaries but performs no model call. The active suite has no
+text-only fallback for retired image-required V2 evidence; the historical V2 run remains explicitly
+unsupported and is excluded from the active aggregate.
 
 ## Live execution and resume
 
-Run the same four commands, in the same order, without `--check`. Append `--profile full` for the
+Run the same three commands, in the same order, without `--check`. Append `--profile full` for the
 complete scope. Each CMD supplies the explicit live confirmation. Ctrl+C leaves the current phase
 and logical `attempt-1` resumable; rerun the identical CMD. Each task executes exactly once as the
 treatment arm and is skipped only after its recorded result digest verifies. Active runtime state is
 sealed after the task and cannot be reopened by a later task.
 
-The recommended entry point runs all four benchmarks in order and automatically writes the aggregate
+The recommended entry point runs all three benchmarks in order and automatically writes the aggregate
 JSON, complete Markdown report and integrity manifest after the benchmark commands finish. No manual
 aggregate command is required:
 
@@ -109,8 +106,8 @@ because the pinned Hugging Face distribution does not include the official `enti
 
 - Live benchmark calls are intentionally not part of repository tests and can be costly.
 - MemoryAgentBench preparation requires the `benchmarks` optional dependency for Parquet (`pyarrow`).
-- LongMemEval-V2 Small needs about 7.1 GB of downloads plus extracted screenshots and retained
-  evidence; available disk must remain below the 50 GB managed-data soft limit.
+- Retired LongMemEval-V2 Small evidence may occupy about 7.1 GB of historical downloads plus extracted
+  screenshots; it is not included in active preparation or aggregate reports.
 - Auxiliary memory extraction/decider usage follows the existing runtime accounting caveat and may
   undercount formal Memory cost until `TurnTokenStats` includes every auxiliary call.
 - MemoryAgentBench's official `ruler_qa1` and `ruler_qa2` sources are retained inside that suite and

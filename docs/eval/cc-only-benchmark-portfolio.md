@@ -11,7 +11,6 @@ Run from the repository root:
 ```cmd
 scripts\run_eval_context27.cmd
 scripts\run_eval_longmemeval_context_memory.cmd
-scripts\run_eval_longmemeval_v2_context_memory.cmd
 scripts\run_eval_locomo_context_memory.cmd
 scripts\run_eval_memoryagentbench_context_memory.cmd
 scripts\run_eval_context_memory_all.cmd
@@ -40,12 +39,14 @@ result directory while its manifest retains the requested `portfolio` or `full` 
   official GPT-4o refusal and semantic judges, so its score is a named judge adaptation.
 - Terminal-Bench's available Harbor registry source is `terminal-bench@2.0`; the historical CMD and
   result slug retain `2.1` but the manifest discloses the actual source.
-- The unified context-memory domain runs LongMemEval-S Cleaned, LongMemEval-V2 Small, LoCoMo and
+- The unified context-memory domain runs LongMemEval-S Cleaned, LoCoMo and
   MemoryAgentBench with one isolated treatment run per task. Standalone NVIDIA RULER is retired; the
   `ruler_qa1`/`ruler_qa2` sources inside MemoryAgentBench remain official suite members and are not
   reported as standalone RULER.
-- LongMemEval-V2 and MemoryAgentBench require their pinned resumable preparation downloads.
-  LongMemEval-S Cleaned and LoCoMo use the already pinned local files when their SHA-256 matches.
+- MemoryAgentBench requires its pinned resumable preparation download. LongMemEval-S Cleaned and
+  LoCoMo use the already pinned local files when their SHA-256 matches. LongMemEval-V2 is retired from
+  the active suite because the configured model cannot accept its required image inputs; historical
+  V2 data and result evidence remain available for audit but are not runnable or aggregated.
 
 `--check` never performs model preflight or task calls. Live commands require `--confirm-live`; the
 CMD launchers supply it. Safety trials are invalid unless the production safety capability reports

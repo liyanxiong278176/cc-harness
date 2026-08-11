@@ -1,4 +1,4 @@
-"""Aggregate four independent context-memory reports without a cross-benchmark score."""
+"""Aggregate three independent context-memory reports without a cross-benchmark score."""
 
 from __future__ import annotations
 
@@ -13,7 +13,6 @@ from .contracts import MODEL, EvalProfile
 
 BENCHMARKS = (
     "longmemeval-s-cleaned",
-    "longmemeval-v2-small",
     "locomo",
     "memoryagentbench",
 )

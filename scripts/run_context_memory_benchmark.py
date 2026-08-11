@@ -10,7 +10,6 @@ from eval.cc_only.storage import read_json
 from eval.context_memory.adapters import (
     LoCoMoAdapter,
     LongMemEvalAdapter,
-    LongMemEvalV2Adapter,
     MemoryAgentBenchAdapter,
 )
 from eval.context_memory.aggregate import aggregate_reports, result_profile
@@ -20,7 +19,6 @@ from eval.context_memory.runner import run_context_memory_benchmark
 
 ADAPTERS = {
     "longmemeval": LongMemEvalAdapter,
-    "longmemeval-v2": LongMemEvalV2Adapter,
     "locomo": LoCoMoAdapter,
     "memoryagentbench": MemoryAgentBenchAdapter,
 }

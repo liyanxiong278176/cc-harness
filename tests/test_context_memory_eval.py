@@ -14,7 +14,6 @@ from eval.cc_only.storage import atomic_json, read_json
 from eval.context_memory.adapters import (
     LoCoMoAdapter,
     LongMemEvalAdapter,
-    LongMemEvalV2Adapter,
     MemoryAgentBenchAdapter,
 )
 from eval.context_memory.adapters.base import _image_mentions, _ingest_prompt, parse_yes_no_judge
@@ -109,69 +108,6 @@ def test_locomo_case_and_category5_abstention_are_supported() -> None:
     assert grading["metric"] == "locomo_official_category5_abstention"
     wrong_score, _ = asyncio.run(adapter.grade(None, adversarial, "self-care is important", 1))  # type: ignore[arg-type]
     assert wrong_score == 0.0
-
-
-def test_v2_portfolio_is_stable_stratified_and_gold_is_not_replayed(tmp_path: Path) -> None:
-    data = tmp_path / "eval" / "context_memory" / "data" / "longmemeval-v2"
-    (data / "haystacks").mkdir(parents=True)
-    questions = []
-    trajectories = []
-    for index in range(60):
-        question_id = f"q-{index:03d}"
-        questions.append(
-            {
-                "id": question_id,
-                "domain": "web" if index % 2 else "enterprise",
-                "environment": f"env-{index % 3}",
-                "question_type": f"type-{index % 5}",
-                "question": f"question {index}",
-                "image": None,
-                "answer": f"SECRET-GOLD-{index}",
-                "eval_function": "exact_match",
-            }
-        )
-        trajectories.append(
-            {
-                "id": f"t-{index:03d}",
-                "domain": questions[-1]["domain"],
-                "environment": questions[-1]["environment"],
-                "goal": "inspect the application",
-                "outcome": "success",
-                "start_url": "https://example.test",
-                "states": [
-                    {
-                        "state_index": 0,
-                        "step": 0,
-                        "url": "https://example.test",
-                        "action": "click('Orders')",
-                        "thought": "find order state",
-                        "accessibility_tree": "Orders table",
-                        "screenshot": None,
-                    }
-                ],
-            }
-        )
-    (data / "questions.jsonl").write_text(
-        "\n".join(json.dumps(item) for item in questions) + "\n", encoding="utf-8"
-    )
-    (data / "trajectories.jsonl").write_text(
-        "\n".join(json.dumps(item) for item in trajectories) + "\n", encoding="utf-8"
-    )
-    (data / "haystacks" / "lme_v2_small.json").write_text(
-        json.dumps({item["id"]: [f"t-{index:03d}"] for index, item in enumerate(questions)}),
-        encoding="utf-8",
-    )
-
-    adapter = LongMemEvalV2Adapter()
-    first = adapter.catalog(tmp_path, EvalProfile.PORTFOLIO)
-    second = adapter.catalog(tmp_path, EvalProfile.PORTFOLIO)
-
-    assert len(first) == 50
-    assert [task.task_id for task in first] == [task.task_id for task in second]
-    case = adapter.case(tmp_path, first[0])
-    replay = json.dumps([event.as_dict() for event in case.events])
-    assert "SECRET-GOLD" not in replay
-    assert {event.kind for event in case.events} >= {"agent_state"}
 
 
 def test_memoryagentbench_portfolio_has_six_streams_per_capability(tmp_path: Path) -> None:
@@ -731,12 +667,8 @@ async def test_failed_image_preflight_marks_run_unsupported_without_text_fallbac
 
 
 def test_unified_cli_and_aggregate_report_keep_benchmark_metrics_separate(tmp_path: Path) -> None:
-    parsed = build_context_memory_parser().parse_args(
-        ["longmemeval-v2", "--profile", "full", "--limit", "10", "--check"]
-    )
-    assert parsed.benchmark == "longmemeval-v2"
-    assert parsed.profile == "full"
-    assert parsed.limit == 10
+    with pytest.raises(SystemExit):
+        build_context_memory_parser().parse_args(["longmemeval-v2", "--check"])
     base = (
         tmp_path
         / "eval"
@@ -770,7 +702,6 @@ def test_unified_cli_and_aggregate_report_keep_benchmark_metrics_separate(tmp_pa
         0.1,
         0.2,
         0.3,
-        0.4,
     ]
     report = paths["report"].read_text(encoding="utf-8")
     for index, benchmark in enumerate(BENCHMARKS, 1):

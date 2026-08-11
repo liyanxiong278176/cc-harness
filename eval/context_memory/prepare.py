@@ -7,7 +7,6 @@ import json
 import os
 import re
 import shutil
-import tarfile
 import urllib.error
 import urllib.request
 from collections.abc import Callable, Iterable, Mapping
@@ -20,15 +19,6 @@ from eval.cc_only.storage import atomic_json, digest_file
 from .adapters.longmemeval import REVISION as LONGMEM_REVISION
 from .adapters.longmemeval import SHA256 as LONGMEM_SHA256
 from .adapters.longmemeval import SIZE_BYTES as LONGMEM_SIZE
-from .adapters.longmemeval_v2 import (
-    HAYSTACK_SHA256,
-    HAYSTACK_SIZE,
-    QUESTIONS_SHA256,
-    QUESTIONS_SIZE,
-    TRAJECTORIES_SHA256,
-    TRAJECTORIES_SIZE,
-)
-from .adapters.longmemeval_v2 import REVISION as V2_REVISION
 from .adapters.memoryagentbench import FILES as MAB_FILES
 from .adapters.memoryagentbench import REVISION as MAB_REVISION
 
@@ -142,8 +132,6 @@ def prepare_benchmark(project_root: Path, benchmark: str) -> Mapping[str, Any]:
         return _prepare_longmemeval(project_root)
     if benchmark == "locomo":
         return _prepare_locomo(project_root)
-    if benchmark == "longmemeval-v2":
-        return _prepare_v2(project_root)
     if benchmark == "memoryagentbench":
         return _prepare_memoryagentbench(project_root)
     raise ValueError(f"unknown context-memory benchmark: {benchmark}")
@@ -173,62 +161,6 @@ def _prepare_locomo(project_root: Path) -> Mapping[str, Any]:
     )
     result = download_file(spec, target, object_root=_object_root(project_root))
     return _manifest("locomo", None, [result])
-
-
-def _prepare_v2(project_root: Path) -> Mapping[str, Any]:
-    root = project_root / "eval" / "context_memory" / "data" / "longmemeval-v2"
-    fixed = {
-        "questions.jsonl": (QUESTIONS_SIZE, QUESTIONS_SHA256),
-        "trajectories.jsonl": (TRAJECTORIES_SIZE, TRAJECTORIES_SHA256),
-        "haystacks/lme_v2_small.json": (HAYSTACK_SIZE, HAYSTACK_SHA256),
-    }
-    tree = _repo_tree("xiaowu0162/longmemeval-v2", V2_REVISION)
-    allowed = fixed.keys() | {
-        item["path"]
-        for item in tree
-        if str(item.get("path", "")).startswith("question_screenshots/")
-        or str(item.get("path", "")).startswith("trajectory_screenshots/")
-    }
-    specs = []
-    for item in tree:
-        path = str(item.get("path") or "")
-        if path not in allowed or item.get("type") != "file":
-            continue
-        if path in fixed:
-            size, sha256 = fixed[path]
-        else:
-            lfs = item.get("lfs") or {}
-            size, sha256 = int(item["size"]), str(lfs.get("oid") or "")
-        if not sha256:
-            raise RuntimeError(f"pinned V2 tree lacks SHA-256 for {path}")
-        specs.append(
-            (
-                path,
-                DownloadSpec(
-                    _hf_url("xiaowu0162/longmemeval-v2", V2_REVISION, path),
-                    size,
-                    sha256,
-                    V2_REVISION,
-                ),
-            )
-        )
-    footprint = _managed_footprint(project_root)
-    results = []
-    for path, spec in specs:
-        result = download_file(
-            spec,
-            root / path,
-            object_root=_object_root(project_root),
-            footprint_bytes=footprint,
-        )
-        results.append(result)
-        footprint = _managed_footprint(project_root)
-    screenshots = root / "screenshots"
-    for archive in sorted((root / "trajectory_screenshots").glob("*.tar.gz")):
-        _extract_tar_safe(archive, screenshots)
-    manifest = _manifest("longmemeval-v2", V2_REVISION, results)
-    atomic_json(root / "prepared-manifest.json", manifest)
-    return manifest
 
 
 def _prepare_memoryagentbench(project_root: Path) -> Mapping[str, Any]:
@@ -324,30 +256,6 @@ def _memoryagentbench_chunks(context: str, metadata: Mapping[str, Any]) -> list[
         )
         chunks.append({"kind": kind, "content": value, "official_index": index})
     return chunks or [{"kind": "document", "content": context, "official_index": 1}]
-
-
-def _repo_tree(repository: str, revision: str) -> list[dict[str, Any]]:
-    url = f"https://huggingface.co/api/datasets/{repository}/tree/{revision}?recursive=true&expand=true"
-    with urllib.request.urlopen(url, timeout=120) as response:
-        value = json.load(response)
-    if not isinstance(value, list):
-        raise TypeError(f"unexpected Hugging Face tree response for {repository}@{revision}")
-    return [dict(item) for item in value]
-
-
-def _extract_tar_safe(archive: Path, destination: Path) -> None:
-    marker = destination / f".{archive.name}.complete"
-    if marker.is_file() and marker.read_text(encoding="ascii").strip() == digest_file(archive):
-        return
-    destination.mkdir(parents=True, exist_ok=True)
-    resolved = destination.resolve()
-    with tarfile.open(archive, "r:gz") as bundle:
-        for member in bundle.getmembers():
-            target = (destination / member.name).resolve()
-            if not target.is_relative_to(resolved) or member.issym() or member.islnk():
-                raise ValueError(f"unsafe path in screenshot archive: {member.name}")
-        bundle.extractall(destination)
-    marker.write_text(digest_file(archive) + "\n", encoding="ascii")
 
 
 def _manifest(
