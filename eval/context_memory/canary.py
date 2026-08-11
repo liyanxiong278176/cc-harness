@@ -19,7 +19,7 @@ from .execution import (
     write_source_manifest,
 )
 from .gates import evaluate_trial_gates
-from .isolation import open_runtime, seal_runtime
+from .isolation import _short_runtime_root, open_runtime, seal_runtime
 from .storage import verify_attempt_integrity, write_attempt_integrity
 
 RECOVERY_STAGES = (
@@ -229,6 +229,12 @@ def _build_production_probe(root: Path) -> dict[str, Any]:
     root.mkdir(parents=True)
     task = BenchmarkTask("canary/production", "canary")
     namespace = "context-memory/canary/production/treatment"
+    # The production-path probe intentionally reuses a fixed deep result
+    # path.  If a prior process died after opening the external short root,
+    # remove that exact generated canary runtime before rebuilding the probe.
+    short_active = _short_runtime_root(root, namespace)
+    if short_active.exists():
+        shutil.rmtree(short_active)
     runtime = open_runtime(root, namespace, resumed=False)
     context = TrialContext(
         project_root=root,
