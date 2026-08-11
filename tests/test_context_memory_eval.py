@@ -245,6 +245,21 @@ def test_memoryagentbench_check_revalidates_prepared_bytes(
     assert adapter.check(tmp_path, EvalProfile.PORTFOLIO, tasks).ready is False
 
 
+@pytest.mark.parametrize(
+    ("source", "metric"),
+    (
+        ("eventqa_131072", "substring_exact_match"),
+        ("factconsolidation_mh_64k", "substring_exact_match"),
+        ("factconsolidation_sh_262k", "substring_exact_match"),
+        ("recsys_redial_full", "Recall@5"),
+    ),
+)
+def test_memoryagentbench_metric_dispatch_accepts_pinned_source_variants(
+    source: str, metric: str
+) -> None:
+    assert mab_module._metric_for_source(source) == metric
+
+
 @pytest.mark.asyncio
 async def test_memoryagentbench_dispatches_official_deterministic_metrics(tmp_path: Path) -> None:
     adapter = MemoryAgentBenchAdapter()
@@ -339,6 +354,67 @@ def test_download_resumes_into_content_addressed_store(tmp_path: Path) -> None:
     assert target.read_bytes() == payload
     assert result.sha256 == f"sha256:{expected}"
     assert (tmp_path / "objects" / expected).read_bytes() == payload
+
+
+def test_download_retries_from_new_partial_after_timeout(tmp_path: Path) -> None:
+    payload = b"immutable benchmark payload"
+    expected = hashlib.sha256(payload).hexdigest()
+    target = tmp_path / "dataset" / "payload.jsonl"
+    ranges = []
+
+    class InterruptedResponse(io.BytesIO):
+        status = 200
+
+        def __init__(self) -> None:
+            super().__init__(payload[:10])
+            self.headers: dict[str, str] = {}
+            self._timed_out = False
+
+        def read(self, size: int = -1) -> bytes:
+            value = super().read(size)
+            if value:
+                return value
+            if not self._timed_out:
+                self._timed_out = True
+                raise TimeoutError("simulated proxy timeout")
+            return b""
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            self.close()
+
+    class ResumedResponse(io.BytesIO):
+        status = 206
+
+        def __init__(self) -> None:
+            super().__init__(payload[10:])
+            self.headers = {"Content-Range": f"bytes 10-{len(payload) - 1}/{len(payload)}"}
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            self.close()
+
+    responses = iter((InterruptedResponse(), ResumedResponse()))
+
+    def opener(request, timeout):
+        del timeout
+        ranges.append(request.headers.get("Range"))
+        return next(responses)
+
+    result = download_file(
+        DownloadSpec("https://example.test/payload", len(payload), expected),
+        target,
+        object_root=tmp_path / "objects",
+        opener=opener,
+    )
+
+    assert ranges == [None, "bytes=10-"]
+    assert target.read_bytes() == payload
+    assert result.sha256 == f"sha256:{expected}"
 
 
 def test_download_limit_counts_only_remaining_partial_bytes(tmp_path: Path) -> None:
@@ -531,7 +607,7 @@ def test_unified_cli_and_aggregate_report_keep_benchmark_metrics_separate(tmp_pa
                 "status": "complete",
                 "mechanism_verdict": "valid",
                 "benchmark_metrics": {"native_metric": index / 10},
-                "adaptations": [],
+                "adaptations": [f"adaptation-{index}"],
             },
         )
 
@@ -547,6 +623,12 @@ def test_unified_cli_and_aggregate_report_keep_benchmark_metrics_separate(tmp_pa
         0.3,
         0.4,
     ]
+    report = paths["report"].read_text(encoding="utf-8")
+    for index, benchmark in enumerate(BENCHMARKS, 1):
+        assert f"## {benchmark}" in report
+        assert f'"native_metric": {index / 10}' in report
+        assert f"adaptation-{index}" in report
+        assert str(base / benchmark / "summary.json") in report
 
 
 def test_source_resume_rejects_tampered_event(tmp_path: Path) -> None:

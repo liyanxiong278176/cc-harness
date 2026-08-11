@@ -55,6 +55,20 @@ and logical `attempt-1` resumable; rerun the identical CMD. A completed arm is s
 recorded result digest verifies. Active runtime state is sealed after the arm and cannot be reopened
 by a later task.
 
+The recommended entry point runs all four benchmarks in order and automatically writes the aggregate
+JSON, complete Markdown report and integrity manifest after the benchmark commands finish. No manual
+aggregate command is required:
+
+```cmd
+scripts\run_eval_context_memory_all.cmd --profile portfolio
+scripts\run_eval_context_memory_all.cmd --profile full
+```
+
+The aggregate Markdown embeds each benchmark's native metrics, mechanism verdict, adaptations and
+source-summary path. If an individual benchmark fails, the same entry point still refreshes an
+`incomplete` aggregate for diagnosis and returns a non-zero exit code; it never labels a partial run
+complete.
+
 Live evidence is written below:
 
 ```text

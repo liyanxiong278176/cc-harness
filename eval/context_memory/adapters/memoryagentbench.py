@@ -343,11 +343,21 @@ class MemoryAgentBenchAdapter(NativeEventAdapter):
 
 def _metric_for_source(source: str) -> str | None:
     normalized = re.sub(r"[^a-z0-9]", "", source.lower())
-    if normalized in {"eventqa", "rulerqa1", "rulerqa2", "factmh", "factsh"}:
+    if normalized.startswith(
+        (
+            "eventqa",
+            "rulerqa1",
+            "rulerqa2",
+            "factmh",
+            "factsh",
+            "factconsolidationmh",
+            "factconsolidationsh",
+        )
+    ):
         return "substring_exact_match"
     if normalized == "detectiveqa" or normalized.startswith("icl"):
         return "exact_match"
-    if normalized == "recsys":
+    if normalized.startswith("recsys"):
         return "Recall@5"
     if "longmemeval" in normalized:
         return "deepseek_adapted_longmemeval_judge"

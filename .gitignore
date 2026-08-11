@@ -75,6 +75,7 @@ cc_harness/memory/*.db
 /eval/result/
 /eval/cc_only/data/
 /eval/cc_only/upstream/
+/eval/context_memory/data/
 
 # Local agent/runtime state and tool caches.
 /.cc-harness/

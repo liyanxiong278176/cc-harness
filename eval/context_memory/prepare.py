@@ -2,11 +2,13 @@
 
 from __future__ import annotations
 
+import http.client
 import json
 import os
 import re
 import shutil
 import tarfile
+import urllib.error
 import urllib.request
 from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass
@@ -31,6 +33,7 @@ from .adapters.memoryagentbench import FILES as MAB_FILES
 from .adapters.memoryagentbench import REVISION as MAB_REVISION
 
 SOFT_LIMIT_BYTES = 50 * 1024**3
+DOWNLOAD_ATTEMPTS = 8
 
 
 @dataclass(frozen=True)
@@ -58,6 +61,7 @@ def download_file(
     opener: Callable[..., BinaryIO] = urllib.request.urlopen,
     footprint_bytes: int = 0,
     soft_limit_bytes: int = SOFT_LIMIT_BYTES,
+    max_attempts: int = DOWNLOAD_ATTEMPTS,
 ) -> DownloadResult:
     """Download with HTTP Range, then publish through a SHA-256 object store."""
 
@@ -75,31 +79,45 @@ def download_file(
     target.parent.mkdir(parents=True, exist_ok=True)
     object_root.mkdir(parents=True, exist_ok=True)
     partial = target.with_suffix(target.suffix + ".part")
-    resumed_from = partial.stat().st_size if partial.is_file() else 0
-    if resumed_from > spec.size_bytes:
-        raise ValueError(f"partial download is larger than the pinned object: {partial}")
-    remaining_bytes = spec.size_bytes - resumed_from
-    if footprint_bytes + remaining_bytes > soft_limit_bytes:
-        raise RuntimeError(
-            f"50 GB soft limit would be exceeded by {target}; partial state is preserved"
-        )
-    request = urllib.request.Request(spec.url)
-    if resumed_from:
-        request.add_header("Range", f"bytes={resumed_from}-")
-    with opener(request, timeout=120) as response:
-        status = int(getattr(response, "status", 200) or 200)
-        if resumed_from and status != 206:
-            resumed_from = 0
-        if resumed_from and not str(response.headers.get("Content-Range", "")).startswith(
-            f"bytes {resumed_from}-"
-        ):
-            raise RuntimeError("server returned an invalid Content-Range for resumed download")
-        mode = "ab" if resumed_from else "wb"
-        with partial.open(mode) as handle:
-            while chunk := response.read(4 * 1024 * 1024):
-                handle.write(chunk)
-            handle.flush()
-            os.fsync(handle.fileno())
+    initial_resumed_from = partial.stat().st_size if partial.is_file() else 0
+    if max_attempts < 1:
+        raise ValueError("max_attempts must be at least 1")
+    retryable = (TimeoutError, ConnectionError, urllib.error.URLError, http.client.IncompleteRead)
+    for attempt in range(1, max_attempts + 1):
+        resumed_from = partial.stat().st_size if partial.is_file() else 0
+        if resumed_from > spec.size_bytes:
+            raise ValueError(f"partial download is larger than the pinned object: {partial}")
+        remaining_bytes = spec.size_bytes - resumed_from
+        if footprint_bytes + remaining_bytes > soft_limit_bytes:
+            raise RuntimeError(
+                f"50 GB soft limit would be exceeded by {target}; partial state is preserved"
+            )
+        request = urllib.request.Request(spec.url)
+        if resumed_from:
+            request.add_header("Range", f"bytes={resumed_from}-")
+        try:
+            with opener(request, timeout=120) as response:
+                status = int(getattr(response, "status", 200) or 200)
+                if resumed_from and status != 206:
+                    resumed_from = 0
+                if resumed_from and not str(response.headers.get("Content-Range", "")).startswith(
+                    f"bytes {resumed_from}-"
+                ):
+                    raise RuntimeError("server returned an invalid Content-Range for resumed download")
+                mode = "ab" if resumed_from else "wb"
+                with partial.open(mode) as handle:
+                    while chunk := response.read(4 * 1024 * 1024):
+                        handle.write(chunk)
+                    handle.flush()
+                    os.fsync(handle.fileno())
+        except retryable:
+            if attempt == max_attempts:
+                raise
+            continue
+        if partial.stat().st_size == spec.size_bytes:
+            break
+        if attempt == max_attempts:
+            raise ValueError(f"downloaded object has the wrong pinned size: {target}")
     if not _valid(partial, spec.size_bytes, expected):
         raise ValueError(f"downloaded object failed pinned size/SHA-256: {target}")
     if object_path.exists() and not _valid(object_path, spec.size_bytes, expected):
@@ -113,7 +131,7 @@ def download_file(
         target,
         spec.size_bytes,
         f"sha256:{expected}",
-        resumed_from,
+        initial_resumed_from,
         object_path,
     )
 

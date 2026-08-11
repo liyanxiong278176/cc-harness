@@ -101,13 +101,30 @@ def _report(summary: dict[str, Any]) -> str:
             "DeepSeek reader/judge substitutions remain explicitly adapted results."
         ),
         "",
-        "## Benchmarks",
-        "",
     ]
     for record in summary["benchmarks"]:
-        lines.append(
-            f"- `{record['benchmark']}`: {record['status']}; mechanism="
-            f"{record['mechanism_verdict'] or 'unavailable'}"
+        lines.extend(
+            (
+                f"## {record['benchmark']}",
+                "",
+                f"- Status: `{record['status']}`",
+                f"- Mechanism verdict: `{record['mechanism_verdict'] or 'unavailable'}`",
+                f"- Source summary: `{record['summary_path']}`",
+                "",
+                "### Benchmark metrics",
+                "",
+                "```json",
+                json.dumps(record["benchmark_metrics"], ensure_ascii=False, indent=2),
+                "```",
+                "",
+                "### Protocol adaptations",
+                "",
+            )
         )
-    lines.append("")
+        adaptations = record["adaptations"]
+        if adaptations:
+            lines.extend(f"- {adaptation}" for adaptation in adaptations)
+        else:
+            lines.append("- None")
+        lines.append("")
     return "\n".join(lines)
