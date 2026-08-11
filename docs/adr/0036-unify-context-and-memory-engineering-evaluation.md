@@ -1,8 +1,12 @@
 # ADR 0036: Unify context and memory engineering evaluation
 
-Status: Accepted
+Status: Accepted (execution arm design superseded by ADR 0038)
 
 Date: 2026-08-10
+
+ADR 0038 supersedes the paired control/treatment execution design below. The benchmark catalog,
+native metrics, isolation requirements and non-compensating mechanism gates remain applicable;
+current commands execute treatment-only.
 
 Context compression, offload, retrieval, long-term memory and recovery are evaluated as one
 information lifecycle rather than independent scores. LongMemEval-S Cleaned, LongMemEval-V2 Small,

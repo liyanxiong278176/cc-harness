@@ -166,8 +166,8 @@ class LoCoMoAdapter(NativeEventAdapter):
             )
         return NativeCase(tuple(event for _, event in sorted(sessions)), tuple(questions))
 
-    def summarize(self, pairs: Sequence[Mapping[str, Any]]) -> Mapping[str, Any]:
-        summary = dict(super().summarize(pairs))
+    def summarize(self, results: Sequence[Mapping[str, Any]]) -> Mapping[str, Any]:
+        summary = dict(super().summarize(results))
         summary["metric"] = "LoCoMo official deterministic token F1"
         return summary
 

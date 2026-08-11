@@ -24,8 +24,6 @@ from ..contracts import (
 from ..execution import (
     add_usage,
     empty_usage,
-    recency_events,
-    recency_prompt,
     restore_runtime,
     restored_runtime_matches,
     run_phase,
@@ -44,7 +42,7 @@ def parse_yes_no_judge(result: Mapping[str, Any]) -> tuple[float, str]:
 
 
 class NativeEventAdapter:
-    """Default paired executor; concrete adapters only map upstream records."""
+    """Default treatment executor; concrete adapters only map upstream records."""
 
     async def execute(self, context: TrialContext) -> ArmOutcome:
         case = self.case(context.project_root, context.task)
@@ -52,53 +50,44 @@ class NativeEventAdapter:
         source_digest = write_source_manifest(context, source_events)
         total = empty_usage()
         records: list[dict[str, Any]] = []
-        checkpoint_restore_verified = context.arm is Arm.TREATMENT
+        if context.arm is not Arm.TREATMENT:
+            raise ValueError(f"unsupported context-memory execution arm: {context.arm!r}")
+        checkpoint_restore_verified = True
 
-        if context.arm is Arm.TREATMENT:
-            for index, event in enumerate(case.events, 1):
-                result, phase_usage = await run_phase(
-                    context,
-                    f"ingest-{index:04d}",
-                    _ingest_prompt(event, context.workspace),
-                    continue_session=index > 1,
+        for index, event in enumerate(case.events, 1):
+            result, phase_usage = await run_phase(
+                context,
+                f"ingest-{index:04d}",
+                _ingest_prompt(event, context.workspace),
+                continue_session=index > 1,
+            )
+            add_usage(total, phase_usage)
+            if "MEMORY_INGESTED" not in str(result.get("text") or ""):
+                return ArmOutcome(
+                    status=ExecutionStatus.INVALID,
+                    usage=total,
+                    protocol={"source_digest": source_digest},
+                    invalid_reason=f"native event {event.event_id} was not acknowledged",
                 )
-                add_usage(total, phase_usage)
-                if "MEMORY_INGESTED" not in str(result.get("text") or ""):
-                    return ArmOutcome(
-                        status=ExecutionStatus.INVALID,
-                        usage=total,
-                        protocol={"source_digest": source_digest},
-                        invalid_reason=f"native event {event.event_id} was not acknowledged",
-                    )
-            snapshot = context.attempt_root / "query-snapshot"
-            snapshot_runtime(context.workspace, context.home, snapshot)
+        snapshot = context.attempt_root / "query-snapshot"
+        snapshot_runtime(context.workspace, context.home, snapshot)
 
         for index, question in enumerate(case.questions, 1):
-            if context.arm is Arm.CONTROL:
-                prompt = recency_prompt(source_events, question.question)
-                workspace = context.active_root / "control-queries" / f"q-{index:04d}"
-                home = context.active_root / "control-homes" / f"q-{index:04d}"
-                projected = recency_events(source_events, question.question)
-                prompt += _image_mentions(projected, question.image, workspace)
-                continue_session = False
-            else:
-                workspace = context.active_root / "treatment-query"
-                home = context.active_root / "treatment-home"
-                restore_runtime(context.attempt_root / "query-snapshot", workspace, home)
-                checkpoint_restore_verified = (
-                    checkpoint_restore_verified
-                    and restored_runtime_matches(
-                        context.attempt_root / "query-snapshot", workspace, home
-                    )
-                )
-                prompt = (
-                    "Answer only from the production context-memory state. You must call "
-                    "search_ref or read_ref before answering so the retrieval evidence is "
-                    "traceable to an offload node. If the answer is not available, say so. Give "
-                    "only a concise answer.\n\nQuestion: " + question.question
-                )
-                prompt += _image_mentions((), question.image, workspace)
-                continue_session = True
+            workspace = context.active_root / "treatment-query"
+            home = context.active_root / "treatment-home"
+            restore_runtime(context.attempt_root / "query-snapshot", workspace, home)
+            checkpoint_restore_verified = (
+                checkpoint_restore_verified
+                and restored_runtime_matches(context.attempt_root / "query-snapshot", workspace, home)
+            )
+            prompt = (
+                "Answer only from the production context-memory state. You must call "
+                "search_ref or read_ref before answering so the retrieval evidence is "
+                "traceable to an offload node. If the answer is not available, say so. Give "
+                "only a concise answer.\n\nQuestion: " + question.question
+            )
+            prompt += _image_mentions((), question.image, workspace)
+            continue_session = True
             result, phase_usage = await run_phase(
                 context,
                 f"answer-{index:04d}",
@@ -142,15 +131,13 @@ class NativeEventAdapter:
                 "source_digest": source_digest,
                 "source_event_count": len(case.events),
                 "gold_visible_to_sue": False,
-                "expect_compaction": context.arm is Arm.TREATMENT,
-                "expect_memory": context.arm is Arm.TREATMENT,
-                "expect_offload": context.arm is Arm.TREATMENT,
-                "expect_ref_retrieval": context.arm is Arm.TREATMENT,
+                "expect_compaction": True,
+                "expect_memory": True,
+                "expect_offload": True,
+                "expect_ref_retrieval": True,
                 "checkpoint_restore_verified": checkpoint_restore_verified,
-                "checkpoint_manifest_digest": (
-                    None
-                    if context.arm is Arm.CONTROL
-                    else _snapshot_manifest_digest(context.attempt_root / "query-snapshot")
+                "checkpoint_manifest_digest": _snapshot_manifest_digest(
+                    context.attempt_root / "query-snapshot"
                 ),
             },
         )
@@ -168,28 +155,20 @@ class NativeEventAdapter:
         score = max((token_f1(prediction, str(value)) for value in variants), default=0.0)
         return score, {"metric": "token_f1", "gold": gold}
 
-    def summarize(self, pairs: Sequence[Mapping[str, Any]]) -> Mapping[str, Any]:
+    def summarize(self, results: Sequence[Mapping[str, Any]]) -> Mapping[str, Any]:
         valid = [
-            pair
-            for pair in pairs
-            if (pair.get("control") or {}).get("status") == "complete"
-            and (pair.get("treatment") or {}).get("status") == "complete"
-        ]
-        control = [
-            float(pair["control_score"]) for pair in valid if pair.get("control_score") is not None
+            result
+            for result in results
+            if (result.get("treatment") or {}).get("status") == "complete"
         ]
         treatment = [
-            float(pair["treatment_score"])
-            for pair in valid
-            if pair.get("treatment_score") is not None
+            float(result["treatment_score"])
+            for result in valid
+            if result.get("treatment_score") is not None
         ]
         return {
-            "valid_pair_count": len(valid),
-            "control_mean": sum(control) / len(control) if control else None,
+            "valid_result_count": len(valid),
             "treatment_mean": sum(treatment) / len(treatment) if treatment else None,
-            "paired_mean_delta": (
-                sum(float(pair["score_delta"]) for pair in valid) / len(valid) if valid else None
-            ),
         }
 
 
@@ -249,8 +228,8 @@ def stable_stratified(
     return sorted(selected, key=lambda item: str(identity(item)))
 
 
-def count_statuses(pairs: Sequence[Mapping[str, Any]], field: str) -> dict[str, int]:
-    return dict(Counter(str((pair.get(field) or {}).get("status")) for pair in pairs))
+def count_statuses(results: Sequence[Mapping[str, Any]], field: str) -> dict[str, int]:
+    return dict(Counter(str((result.get(field) or {}).get("status")) for result in results))
 
 
 def _ingest_prompt(event: NativeEvent, workspace: Path) -> str:

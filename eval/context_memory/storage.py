@@ -1,4 +1,4 @@
-"""Atomic, resumable state for paired context-memory runs."""
+"""Atomic, resumable state for treatment-only context-memory runs."""
 
 from __future__ import annotations
 
@@ -17,12 +17,12 @@ from eval.cc_only.storage import (
 from .contracts import Arm, BenchmarkTask, ExecutionStatus
 from .isolation import verify_sealed_runtime
 
-STATE_VERSION = "eval.context-memory-state.v1"
-MANIFEST_VERSION = "eval.context-memory-manifest.v1"
+STATE_VERSION = "eval.context-memory-state.v2"
+MANIFEST_VERSION = "eval.context-memory-manifest.v2"
 CATALOG_VERSION = "eval.context-memory-catalog.v1"
 
 
-class PairedStateStore:
+class TreatmentStateStore:
     def __init__(self, root: Path) -> None:
         self.root = root.resolve()
         self.manifest_path = self.root / "manifest.json"
@@ -42,7 +42,8 @@ class PairedStateStore:
             "schema_version": MANIFEST_VERSION,
             "catalog_digest": catalog["catalog_digest"],
             "task_count": len(tasks),
-            "arms": [Arm.CONTROL.value, Arm.TREATMENT.value],
+            "arms": [Arm.TREATMENT.value],
+            "execution_mode": "treatment-only",
             "attempts_per_arm": 1,
         }
         contract_digest = digest_json(immutable)
@@ -197,11 +198,17 @@ class PairedStateStore:
     def _recover_interrupted(state: dict[str, Any]) -> None:
         if (state.get("preflight") or {}).get("status") == ExecutionStatus.RUNNING.value:
             state["preflight"]["status"] = ExecutionStatus.PENDING.value
-        for pair in state.get("trials", {}).values():
-            for record in pair.values():
+        for trial in state.get("trials", {}).values():
+            for record in trial.values():
                 if record.get("status") == ExecutionStatus.RUNNING.value:
                     record["status"] = ExecutionStatus.INTERRUPTED.value
                     record["recovered_on_resume"] = True
+
+
+# Keep the old import name as a compatibility shim for callers that only use the
+# storage API. It now creates and validates treatment-only state and never
+# creates a control record.
+PairedStateStore = TreatmentStateStore
 
 
 def write_attempt_integrity(attempt_root: Path) -> Path:

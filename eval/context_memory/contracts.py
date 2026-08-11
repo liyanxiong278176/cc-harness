@@ -1,4 +1,4 @@
-"""Contracts for paired context-memory benchmark runs."""
+"""Contracts for treatment-only context-memory benchmark runs."""
 
 from __future__ import annotations
 
@@ -12,7 +12,6 @@ MODEL = "deepseek-v4-flash"
 
 
 class Arm(StrEnum):
-    CONTROL = "control"
     TREATMENT = "treatment"
 
 
@@ -151,4 +150,4 @@ class BenchmarkAdapter(Protocol):
 
     async def execute(self, context: TrialContext) -> ArmOutcome: ...
 
-    def summarize(self, pairs: Sequence[Mapping[str, Any]]) -> Mapping[str, Any]: ...
+    def summarize(self, results: Sequence[Mapping[str, Any]]) -> Mapping[str, Any]: ...

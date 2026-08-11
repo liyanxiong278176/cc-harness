@@ -301,40 +301,23 @@ class MemoryAgentBenchAdapter(NativeEventAdapter):
             "judge_usage": judge_usage,
         }
 
-    def summarize(self, pairs: Sequence[Mapping[str, Any]]) -> Mapping[str, Any]:
+    def summarize(self, results: Sequence[Mapping[str, Any]]) -> Mapping[str, Any]:
         valid = [
-            pair
-            for pair in pairs
-            if (pair.get("control") or {}).get("status") == "complete"
-            and (pair.get("treatment") or {}).get("status") == "complete"
+            result
+            for result in results
+            if (result.get("treatment") or {}).get("status") == "complete"
         ]
-        control = _question_scores(valid, "control")
         treatment = _question_scores(valid, "treatment")
-        control_by_id = {item["question_id"]: float(item["score"]) for item in control}
-        deltas = [
-            float(item["score"]) - control_by_id[item["question_id"]]
-            for item in treatment
-            if item["question_id"] in control_by_id
-        ]
         return {
-            "valid_pair_count": len(valid),
-            "control_qa_count": len(control),
+            "valid_result_count": len(valid),
             "treatment_qa_count": len(treatment),
-            "control_qa_mean": _mean(control),
             "treatment_qa_mean": _mean(treatment),
-            "paired_qa_mean_delta": sum(deltas) / len(deltas) if deltas else None,
             "by_capability": {
-                group: _score_summary(
-                    [item for item in control if item.get("group") == group],
-                    [item for item in treatment if item.get("group") == group],
-                )
+                group: _score_summary([item for item in treatment if item.get("group") == group])
                 for group in GROUPS
             },
             "by_source": {
-                source: _score_summary(
-                    [item for item in control if item.get("source") == source],
-                    [item for item in treatment if item.get("source") == source],
-                )
+                source: _score_summary([item for item in treatment if item.get("source") == source])
                 for source in sorted({str(item.get("source")) for item in treatment})
             },
             "standalone_ruler_score": None,
@@ -420,11 +403,11 @@ def _parse_judge_score(result: Mapping[str, Any]) -> tuple[float, str]:
     return float(match.group(1)), answer
 
 
-def _question_scores(pairs: Sequence[Mapping[str, Any]], arm: str) -> list[dict[str, Any]]:
+def _question_scores(results: Sequence[Mapping[str, Any]], arm: str) -> list[dict[str, Any]]:
     return [
         dict(item)
-        for pair in pairs
-        for item in (((pair.get(arm) or {}).get("metrics") or {}).get("question_scores") or [])
+        for result in results
+        for item in (((result.get(arm) or {}).get("metrics") or {}).get("question_scores") or [])
     ]
 
 
@@ -432,12 +415,9 @@ def _mean(items: Sequence[Mapping[str, Any]]) -> float | None:
     return sum(float(item["score"]) for item in items) / len(items) if items else None
 
 
-def _score_summary(
-    control: Sequence[Mapping[str, Any]], treatment: Sequence[Mapping[str, Any]]
-) -> dict[str, Any]:
+def _score_summary(treatment: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
     return {
         "metric": next((item.get("metric") for item in treatment), None),
         "qa_count": len(treatment),
-        "control_mean": _mean(control),
         "treatment_mean": _mean(treatment),
     }

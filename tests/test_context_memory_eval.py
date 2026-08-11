@@ -41,7 +41,7 @@ from eval.context_memory.gates import evaluate_trial_gates
 from eval.context_memory.isolation import open_runtime, seal_runtime
 from eval.context_memory.prepare import DownloadSpec, download_file
 from eval.context_memory.runner import run_context_memory_benchmark
-from eval.context_memory.storage import PairedStateStore, write_attempt_integrity
+from eval.context_memory.storage import TreatmentStateStore, write_attempt_integrity
 from scripts.run_context_memory_benchmark import build_parser as build_context_memory_parser
 
 
@@ -72,7 +72,7 @@ def test_native_event_images_cannot_silently_fall_back_to_text(tmp_path: Path) -
     with pytest.raises(FileNotFoundError, match="screenshot is missing"):
         _ingest_prompt(event, tmp_path / "workspace")
     with pytest.raises(FileNotFoundError, match="benchmark image is missing"):
-        _image_mentions((event.as_dict(),), None, tmp_path / "control")
+        _image_mentions((event.as_dict(),), None, tmp_path / "treatment")
 
 
 def test_local_catalogs_have_frozen_profile_sizes() -> None:
@@ -302,18 +302,17 @@ def test_memoryagentbench_summary_micro_averages_questions() -> None:
             },
         }
 
-    pairs = [
-        {
-            "control": outcome([("q1", 0.0), ("q2", 1.0)]),
-            "treatment": outcome([("q1", 1.0), ("q2", 1.0)]),
-        },
-        {"control": outcome([("q3", 0.0)]), "treatment": outcome([("q3", 0.0)])},
+    results = [
+        {"treatment": outcome([("q1", 1.0), ("q2", 1.0)])},
+        {"treatment": outcome([("q3", 0.0)])},
     ]
 
-    summary = MemoryAgentBenchAdapter().summarize(pairs)
+    summary = MemoryAgentBenchAdapter().summarize(results)
     assert summary["treatment_qa_count"] == 3
     assert summary["treatment_qa_mean"] == pytest.approx(2 / 3)
-    assert summary["paired_qa_mean_delta"] == pytest.approx(1 / 3)
+    assert summary["valid_result_count"] == 2
+    assert "control_qa_count" not in summary
+    assert "paired_qa_mean_delta" not in summary
 
 
 def test_download_resumes_into_content_addressed_store(tmp_path: Path) -> None:
@@ -540,6 +539,78 @@ def test_check_only_runs_mechanism_canaries_without_model_calls(tmp_path: Path) 
     assert canary["passed"] is True
     assert canary["model_calls"] == 0
     assert summary["canary"]["passed"] is True
+    manifest = read_json(output / "manifest.json")
+    state = read_json(output / "state.json")
+    assert manifest["arms"] == ["treatment"]
+    assert manifest["execution_mode"] == "treatment-only"
+    assert set(state["trials"]["fixture/task"]) == {"treatment"}
+    assert summary["execution_mode"] == "treatment-only"
+    assert summary["result_count"] == 0
+    assert "control" not in json.dumps(summary)
+
+
+@pytest.mark.asyncio
+async def test_live_runner_executes_each_task_once_as_treatment(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    calls = []
+
+    class Adapter:
+        slug = "fixture"
+        title = "Fixture"
+        protocol_version = "fixture.v1"
+        adaptations = ()
+        requires_images = False
+
+        def dataset_contract(self, project_root):
+            return {"root": str(project_root)}
+
+        def catalog(self, project_root, profile):
+            del project_root, profile
+            return (
+                BenchmarkTask("fixture/one", "fixture"),
+                BenchmarkTask("fixture/two", "fixture"),
+            )
+
+        def check(self, project_root, profile, tasks):
+            del project_root, profile
+            return CheckResult(True, {"task_count": len(tasks)})
+
+        async def execute(self, context):
+            calls.append((context.task.task_id, context.arm.value))
+            return ArmOutcome(
+                ExecutionStatus.COMPLETE,
+                metrics={"score": 1.0},
+                protocol={"source_digest": "not-used-by-test"},
+            )
+
+        def summarize(self, results):
+            return {"result_count": len(results)}
+
+    async def preflight(*_args, **_kwargs):
+        return True
+
+    monkeypatch.setattr("eval.context_memory.runner._preflight", preflight)
+    monkeypatch.setattr(
+        "eval.context_memory.runner.evaluate_trial_gates",
+        lambda *_args, **_kwargs: {"passed": True},
+    )
+    output = tmp_path / "result"
+    paths = await run_context_memory_benchmark(
+        Adapter(), tmp_path, output, profile=EvalProfile.PORTFOLIO
+    )
+
+    assert calls == [("fixture/one", "treatment"), ("fixture/two", "treatment")]
+    summary = read_json(paths["summary"])
+    assert summary["status"] == "complete"
+    assert summary["complete_result_count"] == 2
+    assert summary["result_count"] == 2
+    assert summary["benchmark_metrics"] == {"result_count": 2}
+    assert "complete_pair_count" not in summary
+    assert "control" not in json.dumps(summary)
+    normalized = read_json(output / "normalized" / "0001-fixture-one.json")
+    assert set(normalized) == {"schema_version", "task_id", "group", "treatment", "treatment_score"}
+    assert "control" not in json.dumps(normalized)
 
 
 @pytest.mark.asyncio
@@ -604,6 +675,9 @@ def test_unified_cli_and_aggregate_report_keep_benchmark_metrics_separate(tmp_pa
         atomic_json(
             base / benchmark / "summary.json",
             {
+                "schema_version": "eval.context-memory-summary.v2",
+                "execution_mode": "treatment-only",
+                "arm": "treatment",
                 "status": "complete",
                 "mechanism_verdict": "valid",
                 "benchmark_metrics": {"native_metric": index / 10},
@@ -632,7 +706,7 @@ def test_unified_cli_and_aggregate_report_keep_benchmark_metrics_separate(tmp_pa
 
 
 def test_source_resume_rejects_tampered_event(tmp_path: Path) -> None:
-    context = _trial_context(tmp_path, Arm.CONTROL)
+    context = _trial_context(tmp_path, Arm.TREATMENT)
     events = [{"event_id": "e1", "kind": "conversation", "content": "immutable"}]
     write_source_manifest(context, events)
     (context.attempt_root / "source-events.jsonl").write_text(
@@ -755,12 +829,12 @@ def test_treatment_mechanism_gates_are_non_compensating(tmp_path: Path) -> None:
     assert invalid["checks"]["versioned_summary"]["passed"] is False
 
 
-def test_completed_arm_becomes_invalid_when_sealed_state_is_tampered(tmp_path: Path) -> None:
-    store = PairedStateStore(tmp_path / "result")
+def test_completed_treatment_becomes_invalid_when_sealed_state_is_tampered(tmp_path: Path) -> None:
+    store = TreatmentStateStore(tmp_path / "result")
     task = BenchmarkTask("fixture/task", "fixture")
     state = store.initialize(contract={"benchmark": "fixture"}, tasks=(task,))
-    attempt, record, resumed = store.begin(state, task, Arm.CONTROL, 1)
-    runtime = open_runtime(attempt, "fixture-control", resumed=resumed)
+    attempt, record, resumed = store.begin(state, task, Arm.TREATMENT, 1)
+    runtime = open_runtime(attempt, "fixture-treatment", resumed=resumed)
     (runtime.workspace / "state.txt").write_text("sealed", encoding="utf-8")
     sealed = seal_runtime(runtime, attempt)
     result = attempt / "result.json"
@@ -769,16 +843,16 @@ def test_completed_arm_becomes_invalid_when_sealed_state_is_tampered(tmp_path: P
     store.finish(
         state,
         task.task_id,
-        Arm.CONTROL,
+        Arm.TREATMENT,
         record,
         result,
         ExecutionStatus.COMPLETE,
         integrity,
     )
-    assert store.selected_result(state, task.task_id, Arm.CONTROL)["status"] == "complete"
+    assert store.selected_result(state, task.task_id, Arm.TREATMENT)["status"] == "complete"
 
     (sealed / "workspace" / "state.txt").write_text("tampered", encoding="utf-8")
-    selected = store.selected_result(state, task.task_id, Arm.CONTROL)
+    selected = store.selected_result(state, task.task_id, Arm.TREATMENT)
     assert selected["status"] == "invalid"
     assert selected["protocol"]["tamper_detected"] is True
 

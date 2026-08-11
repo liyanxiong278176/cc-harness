@@ -1,4 +1,4 @@
-"""Single-pass, paired and resumable context-memory runner."""
+"""Single-pass, treatment-only and resumable context-memory runner."""
 
 from __future__ import annotations
 
@@ -30,7 +30,7 @@ from .contracts import (
 from .execution import EVAL_CONTEXT_WINDOW, EVAL_OFFLOAD_THRESHOLD, MECHANISM_ADAPTATION
 from .gates import evaluate_trial_gates
 from .isolation import open_runtime, seal_runtime
-from .storage import PairedStateStore, write_attempt_integrity
+from .storage import TreatmentStateStore, write_attempt_integrity
 
 
 async def run_context_memory_benchmark(
@@ -67,7 +67,7 @@ async def run_context_memory_benchmark(
             "offload_threshold_tokens": EVAL_OFFLOAD_THRESHOLD,
         },
     }
-    store = PairedStateStore(output_root)
+    store = TreatmentStateStore(output_root)
     state = store.initialize(contract=contract, tasks=tasks)
     canary = run_recovery_tamper_canaries(output_root / "canary" / "fixed")
     state["canaries"]["recovery_tamper"] = {
@@ -115,13 +115,11 @@ async def run_context_memory_benchmark(
         )
         return _finalize(adapter, output_root, store, state, tasks, summary)
 
-    pairs: list[dict[str, Any]] = []
+    results: list[dict[str, Any]] = []
     for sequence, task in enumerate(tasks, 1):
-        for arm in _arm_order(task.task_id):
-            selected = store.selected_result(state, task.task_id, arm)
-            if selected is not None:
-                progress(f"skip verified {sequence}/{len(tasks)} {task.task_id}.{arm.value}")
-                continue
+        arm = Arm.TREATMENT
+        selected = store.selected_result(state, task.task_id, arm)
+        if selected is None:
             attempt_root, record, resumed = store.begin(state, task, arm, sequence)
             namespace = _namespace(adapter.slug, profile, task.task_id, arm)
             runtime = open_runtime(attempt_root, namespace, resumed=resumed)
@@ -189,20 +187,21 @@ async def run_context_memory_benchmark(
                 integrity_path,
             )
             progress(f"complete {task.task_id}.{arm.value}: {outcome.status.value}")
+            selected = store.selected_result(state, task.task_id, arm)
+        else:
+            progress(f"skip verified {sequence}/{len(tasks)} {task.task_id}.{arm.value}")
 
-        control = store.selected_result(state, task.task_id, Arm.CONTROL)
-        treatment = store.selected_result(state, task.task_id, Arm.TREATMENT)
-        if control is not None and treatment is not None:
-            pair = _normalize_pair(task, control, treatment)
-            pair_path = (
+        if selected is not None:
+            result = _normalize_result(task, selected)
+            result_path = (
                 output_root / "normalized" / f"{sequence:04d}-{_safe_name(task.task_id)}.json"
             )
-            atomic_json(pair_path, pair)
-            pairs.append(pair)
+            atomic_json(result_path, result)
+            results.append(result)
 
-    summary = _summary(adapter, tasks, state, pairs, check_payload)
+    summary = _summary(adapter, tasks, state, results, check_payload)
     summary["canary"] = canary
-    summary["benchmark_metrics"] = dict(adapter.summarize(pairs))
+    summary["benchmark_metrics"] = dict(adapter.summarize(results))
     return _finalize(adapter, output_root, store, state, tasks, summary)
 
 
@@ -211,7 +210,7 @@ async def _preflight(
     project_root: Path,
     output_root: Path,
     state: dict[str, Any],
-    store: PairedStateStore,
+    store: TreatmentStateStore,
     watchdog_seconds: int,
     progress: Callable[[str], None],
 ) -> bool:
@@ -301,24 +300,14 @@ async def _image_preflight(
     )
 
 
-def _normalize_pair(
-    task: BenchmarkTask, control: Mapping[str, Any], treatment: Mapping[str, Any]
-) -> dict[str, Any]:
-    control_score = _score(control)
+def _normalize_result(task: BenchmarkTask, treatment: Mapping[str, Any]) -> dict[str, Any]:
     treatment_score = _score(treatment)
     return {
-        "schema_version": "eval.context-memory-pair.v1",
+        "schema_version": "eval.context-memory-result.v2",
         "task_id": task.task_id,
         "group": task.group,
-        "control": dict(control),
         "treatment": dict(treatment),
-        "control_score": control_score,
         "treatment_score": treatment_score,
-        "score_delta": (
-            treatment_score - control_score
-            if control_score is not None and treatment_score is not None
-            else None
-        ),
     }
 
 
@@ -331,30 +320,32 @@ def _summary(
     adapter: BenchmarkAdapter,
     tasks: tuple[BenchmarkTask, ...],
     state: Mapping[str, Any],
-    pairs: Sequence[Mapping[str, Any]],
+    results: Sequence[Mapping[str, Any]],
     check: Mapping[str, Any],
 ) -> dict[str, Any]:
     arm_counts = {arm.value: Counter() for arm in Arm}
-    for pair_state in state.get("trials", {}).values():
+    for trial_state in state.get("trials", {}).values():
         for arm in Arm:
-            arm_counts[arm.value][pair_state[arm.value]["status"]] += 1
-    complete_pairs = sum(
-        all(pair_state[arm.value]["status"] == ExecutionStatus.COMPLETE.value for arm in Arm)
-        for pair_state in state.get("trials", {}).values()
+            arm_counts[arm.value][trial_state[arm.value]["status"]] += 1
+    complete_results = sum(
+        trial_state[Arm.TREATMENT.value]["status"] == ExecutionStatus.COMPLETE.value
+        for trial_state in state.get("trials", {}).values()
     )
     invalid = sum(
         counts[ExecutionStatus.INVALID.value] + counts[ExecutionStatus.UNSUPPORTED.value]
         for counts in arm_counts.values()
     )
-    status = "complete" if complete_pairs == len(tasks) and not invalid else "incomplete"
+    status = "complete" if complete_results == len(tasks) and not invalid else "incomplete"
     return {
-        "schema_version": "eval.context-memory-summary.v1",
+        "schema_version": "eval.context-memory-summary.v2",
         "benchmark": adapter.slug,
         "title": adapter.title,
         "model": MODEL,
         "task_count": len(tasks),
-        "paired_result_count": len(pairs),
-        "complete_pair_count": complete_pairs,
+        "result_count": len(results),
+        "complete_result_count": complete_results,
+        "execution_mode": "treatment-only",
+        "arm": Arm.TREATMENT.value,
         "arm_counts": {arm: dict(counts) for arm, counts in arm_counts.items()},
         "status": status,
         "mechanism_verdict": "valid" if status == "complete" else "invalid-or-incomplete",
@@ -368,7 +359,7 @@ def _summary(
 def _finalize(
     adapter: BenchmarkAdapter,
     output_root: Path,
-    store: PairedStateStore,
+    store: TreatmentStateStore,
     state: dict[str, Any],
     tasks: tuple[BenchmarkTask, ...],
     summary: dict[str, Any],
@@ -424,7 +415,7 @@ def _report(adapter: BenchmarkAdapter, summary: Mapping[str, Any]) -> str:
             "",
             f"- Status: `{summary['status']}`",
             f"- Model: `{MODEL}`",
-            f"- Complete pairs: {summary['complete_pair_count']}/{summary['task_count']}",
+            f"- Complete treatment results: {summary['complete_result_count']}/{summary['task_count']}",
             f"- Mechanism verdict: `{summary['mechanism_verdict']}`",
             "- Cross-benchmark weighted score: not calculated",
             "",
@@ -452,11 +443,6 @@ def _validate_catalog(tasks: tuple[BenchmarkTask, ...]) -> None:
         raise ValueError("context-memory task ids must be unique")
     if any(not task_id or len(task_id) > 240 for task_id in ids):
         raise ValueError("context-memory task ids must be 1-240 characters")
-
-
-def _arm_order(task_id: str) -> tuple[Arm, Arm]:
-    parity = int(hashlib.sha256(task_id.encode()).hexdigest(), 16) & 1
-    return (Arm.CONTROL, Arm.TREATMENT) if parity == 0 else (Arm.TREATMENT, Arm.CONTROL)
 
 
 def _namespace(slug: str, profile: EvalProfile, task_id: str, arm: Arm) -> str:

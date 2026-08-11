@@ -51,9 +51,9 @@ image capability probe runs immediately before live execution. If it fails, the 
 
 Run the same four commands, in the same order, without `--check`. Append `--profile full` for the
 complete scope. Each CMD supplies the explicit live confirmation. Ctrl+C leaves the current phase
-and logical `attempt-1` resumable; rerun the identical CMD. A completed arm is skipped only after its
-recorded result digest verifies. Active runtime state is sealed after the arm and cannot be reopened
-by a later task.
+and logical `attempt-1` resumable; rerun the identical CMD. Each task executes exactly once as the
+treatment arm and is skipped only after its recorded result digest verifies. Active runtime state is
+sealed after the task and cannot be reopened by a later task.
 
 The recommended entry point runs all four benchmarks in order and automatically writes the aggregate
 JSON, complete Markdown report and integrity manifest after the benchmark commands finish. No manual
@@ -68,6 +68,10 @@ The aggregate Markdown embeds each benchmark's native metrics, mechanism verdict
 source-summary path. If an individual benchmark fails, the same entry point still refreshes an
 `incomplete` aggregate for diagnosis and returns a non-zero exit code; it never labels a partial run
 complete.
+
+Context-memory execution is treatment-only: there is no control run or paired delta. The manifest
+records `arms: ["treatment"]` and a `treatment-only` execution mode. Existing paired result roots
+are historical evidence and cannot be resumed by this contract; start a fresh root after upgrading.
 
 Live evidence is written below:
 

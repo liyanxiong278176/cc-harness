@@ -9,7 +9,7 @@ from typing import Any
 
 from eval.cc_only.storage import digest_file
 
-from .contracts import Arm, ArmOutcome, TrialContext
+from .contracts import ArmOutcome, TrialContext
 
 
 def evaluate_trial_gates(
@@ -43,64 +43,44 @@ def evaluate_trial_gates(
 
     summaries = sorted(sealed_root.rglob("summary-v*.json"))
     node_manifests = sorted(sealed_root.rglob("nodes.jsonl"))
-    refs = sorted(
-        path
-        for path in sealed_root.rglob("*.md")
-        if "offload" in {part.lower() for part in path.parts}
-    )
     action_logs = sorted(sealed_root.rglob("action-journal/*.jsonl"))
     action_text = "\n".join(_safe_text(path) for path in action_logs)
     memory_dbs = sorted(sealed_root.rglob("memory.db"))
 
-    if context.arm is Arm.CONTROL:
-        checks["control_mechanisms_disabled"] = _check(
-            not summaries
-            and not node_manifests
-            and not refs
-            and not memory_dbs
-            and '"search_ref"' not in action_text
-            and '"read_ref"' not in action_text,
-            summaries=len(summaries),
-            node_manifests=len(node_manifests),
-            refs=len(refs),
-            memory_dbs=len(memory_dbs),
-            retrieval_called=('"search_ref"' in action_text or '"read_ref"' in action_text),
+    if protocol.get("expect_compaction"):
+        checks["versioned_summary"] = _check(
+            _valid_summary_versions(summaries), count=len(summaries)
         )
-    else:
-        if protocol.get("expect_compaction"):
-            checks["versioned_summary"] = _check(
-                _valid_summary_versions(summaries), count=len(summaries)
-            )
-            reductions = _summary_reductions(summaries)
-            checks["compaction_reduces_tokens"] = _check(
-                bool(reductions) and all(after < before for before, after in reductions),
-                reductions=[{"before": before, "after": after} for before, after in reductions],
-            )
-        if protocol.get("expect_offload"):
-            offload = _verify_offload(node_manifests, sealed_root)
-            checks["offload_integrity"] = _check(
-                offload["passed"],
-                **{key: value for key, value in offload.items() if key != "passed"},
-            )
-        if protocol.get("expect_ref_retrieval"):
-            called = '"search_ref"' in action_text or '"read_ref"' in action_text
-            provenance = _retrieval_provenance(
-                action_text, node_manifests, source_path, sealed_root
-            )
-            checks["ref_retrieval_used"] = _check(called and provenance, called=called)
-        if protocol.get("expect_memory"):
-            checks["memory_state_created"] = _check(bool(memory_dbs), count=len(memory_dbs))
-        checkpoint = context.attempt_root / "query-snapshot" / "snapshot.json"
-        expected_checkpoint = protocol.get("checkpoint_manifest_digest")
-        checks["checkpoint_restore_consistent"] = _check(
-            bool(
-                protocol.get("checkpoint_restore_verified")
-                and checkpoint.is_file()
-                and expected_checkpoint == digest_file(checkpoint)
-            ),
-            expected=expected_checkpoint,
-            actual=digest_file(checkpoint) if checkpoint.is_file() else None,
+        reductions = _summary_reductions(summaries)
+        checks["compaction_reduces_tokens"] = _check(
+            bool(reductions) and all(after < before for before, after in reductions),
+            reductions=[{"before": before, "after": after} for before, after in reductions],
         )
+    if protocol.get("expect_offload"):
+        offload = _verify_offload(node_manifests, sealed_root)
+        checks["offload_integrity"] = _check(
+            offload["passed"],
+            **{key: value for key, value in offload.items() if key != "passed"},
+        )
+    if protocol.get("expect_ref_retrieval"):
+        called = '"search_ref"' in action_text or '"read_ref"' in action_text
+        provenance = _retrieval_provenance(
+            action_text, node_manifests, source_path, sealed_root
+        )
+        checks["ref_retrieval_used"] = _check(called and provenance, called=called)
+    if protocol.get("expect_memory"):
+        checks["memory_state_created"] = _check(bool(memory_dbs), count=len(memory_dbs))
+    checkpoint = context.attempt_root / "query-snapshot" / "snapshot.json"
+    expected_checkpoint = protocol.get("checkpoint_manifest_digest")
+    checks["checkpoint_restore_consistent"] = _check(
+        bool(
+            protocol.get("checkpoint_restore_verified")
+            and checkpoint.is_file()
+            and expected_checkpoint == digest_file(checkpoint)
+        ),
+        expected=expected_checkpoint,
+        actual=digest_file(checkpoint) if checkpoint.is_file() else None,
+    )
 
     passed = bool(checks) and all(item["passed"] for item in checks.values())
     return {

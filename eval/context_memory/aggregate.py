@@ -84,7 +84,15 @@ def _read(path: Path) -> dict[str, Any] | None:
         value = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError):
         return None
-    return value if isinstance(value, dict) else None
+    if not isinstance(value, dict):
+        return None
+    if (
+        value.get("schema_version") != "eval.context-memory-summary.v2"
+        or value.get("execution_mode") != "treatment-only"
+        or value.get("arm") != "treatment"
+    ):
+        return None
+    return value
 
 
 def _report(summary: dict[str, Any]) -> str:

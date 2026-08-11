@@ -41,7 +41,7 @@ result directory while its manifest retains the requested `portfolio` or `full` 
 - Terminal-Bench's available Harbor registry source is `terminal-bench@2.0`; the historical CMD and
   result slug retain `2.1` but the manifest discloses the actual source.
 - The unified context-memory domain runs LongMemEval-S Cleaned, LongMemEval-V2 Small, LoCoMo and
-  MemoryAgentBench with isolated control/treatment arms. Standalone NVIDIA RULER is retired; the
+  MemoryAgentBench with one isolated treatment run per task. Standalone NVIDIA RULER is retired; the
   `ruler_qa1`/`ruler_qa2` sources inside MemoryAgentBench remain official suite members and are not
   reported as standalone RULER.
 - LongMemEval-V2 and MemoryAgentBench require their pinned resumable preparation downloads.

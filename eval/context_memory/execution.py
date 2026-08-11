@@ -10,7 +10,6 @@ from collections.abc import Mapping, Sequence
 from pathlib import Path
 from typing import Any
 
-from cc_harness.tokens import TokenCounter
 from eval.cc_only.adapters.common import usage
 from eval.cc_only.launch import final_result, run_cc_prompt
 from eval.cc_only.storage import atomic_json, digest_file, read_json
@@ -18,7 +17,6 @@ from eval.cc_only.storage import atomic_json, digest_file, read_json
 from .contracts import Arm, TrialContext
 
 EVAL_CONTEXT_WINDOW = 16_000
-CONTROL_PROMPT_BUDGET = 13_000
 EVAL_OFFLOAD_THRESHOLD = 1
 MECHANISM_ADAPTATION = (
     "Treatment lowers the production offload threshold to one token so every incrementally Read "
@@ -103,14 +101,14 @@ async def run_phase(
     selected_home = home or context.home
     selected_workspace.mkdir(parents=True, exist_ok=True)
     selected_home.mkdir(parents=True, exist_ok=True)
-    arm_env = environment(Arm.CONTROL if judge else context.arm, selected_home)
+    arm_env = environment(context.arm, selected_home, disabled=judge)
     completed = await run_cc_prompt(
         context.project_root,
         selected_workspace,
         phase_root / "launch",
         prompt,
         capability_profile=(
-            "context-memory-control" if context.arm is Arm.CONTROL or judge else "memory-eval"
+            "context-memory-control" if judge else "memory-eval"
         ),
         home=selected_home,
         watchdog_seconds=context.watchdog_seconds,
@@ -146,14 +144,16 @@ async def run_phase(
     return parsed, phase_usage
 
 
-def environment(arm: Arm, home: Path) -> dict[str, str]:
-    if arm is Arm.CONTROL:
+def environment(arm: Arm, home: Path, *, disabled: bool = False) -> dict[str, str]:
+    if disabled:
         return {
             "CONTEXT_ENABLED": "false",
             "MEMORY_ENABLED": "false",
             "MEMORY_OFFLOAD_ENABLED": "false",
             "MEMORY_DB_DIR": str((home / "memory-disabled").resolve()),
         }
+    if arm is not Arm.TREATMENT:
+        raise ValueError(f"unsupported context-memory execution arm: {arm!r}")
     return {
         "CONTEXT_ENABLED": "true",
         "CONTEXT_WINDOW": str(EVAL_CONTEXT_WINDOW),
@@ -166,43 +166,6 @@ def environment(arm: Arm, home: Path) -> dict[str, str]:
         "MEMORY_OFFLOAD_THRESHOLD": str(EVAL_OFFLOAD_THRESHOLD),
         "MEMORY_OFFLOAD_RATIO": "0.5",
     }
-
-
-def recency_prompt(
-    events: Sequence[Mapping[str, Any]],
-    question: str,
-    *,
-    budget_tokens: int = CONTROL_PROMPT_BUDGET,
-) -> str:
-    selected_events = recency_events(events, question, budget_tokens=budget_tokens)
-    selected = [_render_event(event) for event in selected_events]
-    return (
-        "Use only the following deterministic recent-history projection. If the answer is not "
-        "present, say the information is unavailable. Give only the concise answer.\n\n"
-        + "\n\n".join(selected)
-        + f"\n\nQuestion: {question}"
-    )
-
-
-def recency_events(
-    events: Sequence[Mapping[str, Any]],
-    question: str,
-    *,
-    budget_tokens: int = CONTROL_PROMPT_BUDGET,
-) -> list[Mapping[str, Any]]:
-    """Return the exact deterministic event suffix used by the control arm."""
-
-    counter = TokenCounter()
-    selected: list[Mapping[str, Any]] = []
-    used = counter.count_text(question)
-    for event in reversed(events):
-        size = counter.count_text(_render_event(event))
-        if used + size > budget_tokens:
-            break
-        selected.append(event)
-        used += size
-    selected.reverse()
-    return selected
 
 
 def conversation_prompt(timestamp: str, turns: Sequence[Mapping[str, Any]]) -> str:
@@ -332,10 +295,3 @@ def event_descriptor(event_id: str, kind: str, content: str, **metadata: Any) ->
         "size_bytes": len(content.encode("utf-8")),
         **metadata,
     }
-
-
-def _render_event(event: Mapping[str, Any]) -> str:
-    timestamp = event.get("timestamp") or event.get("date") or "unknown-time"
-    role = event.get("role") or event.get("kind") or "record"
-    content = event.get("content") or event.get("text") or ""
-    return f"[{timestamp}] {role}: {content}"
