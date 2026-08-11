@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -51,6 +52,20 @@ def test_store_recovers_running_attempt_without_overwriting(tmp_path: Path) -> N
     attempt, second_root, _ = store.begin_attempt(resumed, tasks[0], 1)
     assert attempt == 2
     assert second_root.name == "attempt-2"
+
+
+def test_atomic_json_uses_unique_temp_files_under_concurrent_writes(tmp_path: Path) -> None:
+    """Concurrent writers must never publish partial JSON or collide on temp names."""
+    target = tmp_path / "state.json"
+
+    def write(index: int) -> None:
+        atomic_json(target, {"writer": index})
+
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        list(pool.map(write, range(32)))
+
+    assert read_json(target)["writer"] in range(32)
+    assert not list(tmp_path.glob(".state.json.*.tmp"))
 
 
 def test_store_rejects_changed_immutable_contract(tmp_path: Path) -> None:

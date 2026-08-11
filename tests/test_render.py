@@ -10,14 +10,22 @@ Per the current design:
   - Each block preceded by a blank line for visual separation
   - print_warn uses ⚠, print_error uses ✗, print_info is plain
 """
-from io import StringIO
 import pathlib
+from io import BytesIO, StringIO, TextIOWrapper
 from unittest.mock import MagicMock
+
 from rich.console import Console as C
+
 from cc_harness.render import (
-    print_thought, print_action, print_observation, print_result,
-    print_warn, print_error, print_info,
-    print_token_summary, print_compaction_summary,
+    print_action,
+    print_compaction_summary,
+    print_error,
+    print_info,
+    print_observation,
+    print_result,
+    print_thought,
+    print_token_summary,
+    print_warn,
 )
 
 
@@ -219,6 +227,21 @@ def test_print_error_uses_error_glyph():
     assert "\x1b[" not in text
 
 
+def test_print_warn_does_not_crash_on_gbk_console():
+    """A Windows GBK stdout must not abort a phase on the warning glyph."""
+    raw = BytesIO()
+    stream = TextIOWrapper(raw, encoding="gbk", errors="strict")
+    c = C(file=stream, force_terminal=False, color_system=None, width=120)
+    try:
+        print_warn(c, "memory capture failed")
+        stream.flush()
+        output = raw.getvalue().decode("gbk")
+    finally:
+        stream.detach()
+
+    assert "memory capture failed" in output
+
+
 def test_print_info_plain():
     c, buf = _make_console()
     print_info(c, "ready")
@@ -238,7 +261,7 @@ def test_print_compaction_summary_none_stats_no_output():
 
 def test_print_compaction_summary_none_tier_no_output():
     """tier==NONE → 不打印(未触发压缩)。"""
-    from cc_harness.context import CompactionTier, CompactionStats
+    from cc_harness.context import CompactionStats, CompactionTier
     c, buf = _make_console()
     stats = CompactionStats(
         tier=CompactionTier.NONE, before_tokens=100, after_tokens=100,
@@ -250,7 +273,7 @@ def test_print_compaction_summary_none_tier_no_output():
 
 def test_print_compaction_summary_snip_prints_line():
     """tier=SNIP → 单行含 label + tier + ratio + snip 计数。"""
-    from cc_harness.context import CompactionTier, CompactionStats
+    from cc_harness.context import CompactionStats, CompactionTier
     c, buf = _make_console()
     stats = CompactionStats(
         tier=CompactionTier.SNIP, before_tokens=1000, after_tokens=800,
@@ -268,7 +291,7 @@ def test_print_compaction_summary_snip_prints_line():
 
 def test_print_compaction_summary_summarize_shows_summary_index():
     """tier=SUMMARIZE + summarized → 含 [summary 插入 #idx]。"""
-    from cc_harness.context import CompactionTier, CompactionStats
+    from cc_harness.context import CompactionStats, CompactionTier
     c, buf = _make_console()
     stats = CompactionStats(
         tier=CompactionTier.SUMMARIZE, before_tokens=10000, after_tokens=5000,
@@ -282,7 +305,7 @@ def test_print_compaction_summary_summarize_shows_summary_index():
 
 def test_print_compaction_summary_error_appends_warning():
     """error 非空 → 追加 ⚠ 行。"""
-    from cc_harness.context import CompactionTier, CompactionStats
+    from cc_harness.context import CompactionStats, CompactionTier
     c, buf = _make_console()
     stats = CompactionStats(
         tier=CompactionTier.SUMMARIZE, before_tokens=1000, after_tokens=1000,
@@ -329,8 +352,8 @@ def test_print_token_summary_no_summary_bucket_when_zero():
 
 def test_print_cross_session_summary_no_diff():
     """E3 D4: 无 tool 变更 + 无 in-progress subagent → 简洁摘要。"""
-    from cc_harness.render import print_cross_session_summary
     from cc_harness.memory.checkpoint import CheckpointRecord
+    from cc_harness.render import print_cross_session_summary
 
     console = MagicMock()
     candidate = CheckpointRecord(
@@ -349,8 +372,8 @@ def test_print_cross_session_summary_no_diff():
 
 def test_print_cross_session_summary_with_diff_and_subagents():
     """E3 D6/D7: 有 tool 变更 + 有 cancelled subagent → 完整摘要。"""
-    from cc_harness.render import print_cross_session_summary
     from cc_harness.memory.checkpoint import CheckpointRecord
+    from cc_harness.render import print_cross_session_summary
 
     console = MagicMock()
     candidate = CheckpointRecord(

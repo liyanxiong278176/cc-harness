@@ -27,8 +27,42 @@ Design rules:
     output is visible in real-time even when stdout is piped.
 """
 from __future__ import annotations
+
 import json
+
 from rich.console import Console
+
+
+def _safe_console_text(console: Console, text: str) -> str:
+    """Make user/model text safe for legacy Windows console encodings.
+
+    Rich ultimately writes to ``console.file``.  On some Windows setups that
+    stream still advertises ``gbk``/``cp936``; writing our intentional warning
+    and error glyphs (or a model response containing Unicode) then raises
+    ``UnicodeEncodeError`` and can abort a benchmark phase.  Keep the full
+    Unicode text for UTF-8/StringIO streams, but replace only characters the
+    target stream cannot represent.
+    """
+    encoding = getattr(getattr(console, "file", None), "encoding", None)
+    if not isinstance(encoding, str) or not encoding:
+        return text
+    try:
+        text.encode(encoding)
+    except (LookupError, UnicodeEncodeError):
+        try:
+            return text.encode(encoding, errors="replace").decode(
+                encoding, errors="replace"
+            )
+        except (LookupError, UnicodeError):
+            # A custom stream may expose an invalid encoding name.  Let Rich
+            # handle the original value rather than hiding the actual output.
+            return text
+    return text
+
+
+def _print(console: Console, text: str, **kwargs) -> None:
+    """Print text without allowing a narrow console encoding to crash us."""
+    console.print(_safe_console_text(console, text), **kwargs)
 
 
 def _flush(console: Console) -> None:
@@ -64,7 +98,7 @@ def print_thought(console: Console, text: str) -> None:
     防 Rich 把内容里的 `[bold]` / `[red]` / markdown 误当成样式/token 高亮。
     """
     _blank(console)
-    console.print(f"思考: {text}", markup=False, highlight=False)
+    _print(console, f"思考: {text}", markup=False, highlight=False)
     _flush(console)
 
 
@@ -75,12 +109,12 @@ def print_action(console: Console, name: str, arguments: dict) -> None:
     防 `[red]` 等样式逃逸。
     """
     _blank(console)
-    console.print(f"行动: {name}", markup=False, highlight=False)
+    _print(console, f"行动: {name}", markup=False, highlight=False)
     if arguments:
         for k, v in arguments.items():
             val_repr = json.dumps(v, ensure_ascii=False)
             # markup=False stops Rich from interpreting [bracket] in JSON values
-            console.print(f"  {k}: {val_repr}", markup=False, highlight=False)
+            _print(console, f"  {k}: {val_repr}", markup=False, highlight=False)
     _flush(console)
 
 
@@ -96,9 +130,9 @@ def print_observation(console: Console, text: str) -> None:
     highlight=False 防 Rich 解释 `[red]` / `[bold]` 样式 / token 高亮污染终端。
     """
     _blank(console)
-    console.print("观察:", markup=False, highlight=False)
+    _print(console, "观察:", markup=False, highlight=False)
     for line in (text or "").splitlines() or [""]:
-        console.print(f"  {line}", markup=False, highlight=False)
+        _print(console, f"  {line}", markup=False, highlight=False)
     _flush(console)
 
 
@@ -109,25 +143,25 @@ def print_result(console: Console, text: str) -> None:
     Finding 8 fix:`text` 是 LLM 最终输出,untrusted,markup=False 防样式逃逸。
     """
     _blank(console)
-    console.print(f"结果: {text}", markup=False, highlight=False)
+    _print(console, f"结果: {text}", markup=False, highlight=False)
     _flush(console)
 
 
 def print_warn(console: Console, text: str) -> None:
     # Finding 8 fix:warn text 可能含用户输入拼接(unknown slash cmd 等),markup=False。
-    console.print(f"⚠ {text}", markup=False, highlight=False)
+    _print(console, f"⚠ {text}", markup=False, highlight=False)
     _flush(console)
 
 
 def print_error(console: Console, text: str) -> None:
-    console.print(f"✗ {text}", markup=False, highlight=False)
+    _print(console, f"✗ {text}", markup=False, highlight=False)
     _flush(console)
 
 
 def print_info(console: Console, text: str) -> None:
     # Finding 8 fix:info text 可能含 untrusted 来源(LLM 输出 / 文件内容 / 用户输入),
     # markup=False 防样式逃逸。
-    console.print(text, markup=False, highlight=False)
+    _print(console, text, markup=False, highlight=False)
     _flush(console)
 
 
@@ -160,19 +194,21 @@ def print_token_summary(console: Console, label: str, stats) -> None:
         f"工具定义 {stats.tool_definitions}  "
         f"= {sub}"
     )
-    console.print(line)
+    _print(console, line)
     # API delta (only meaningful when api_total_tokens > 0)
     if getattr(stats, "api_total_tokens", 0):
         delta = sub - stats.api_total_tokens
         pct = 100.0 * delta / stats.api_total_tokens
-        console.print(
+        _print(
+            console,
             f"        API 报告 {stats.api_total_tokens}  "
             f"差 {delta:+d} ({pct:+.1f}%)",
             highlight=False,
         )
     # Warning if this turn's API didn't report usage
     if hasattr(stats, "api_reported") and not stats.api_reported:
-        console.print(
+        _print(
+            console,
             "⚠ 本轮后端未报告 token(可能未实现 stream_options.include_usage)",
             highlight=False,
         )
@@ -212,15 +248,15 @@ def print_compaction_summary(console: Console, label: str, stats) -> None:
     ]
     if stats.summarized and stats.summary_index is not None:
         parts.append(f"[summary 插入 #{stats.summary_index}]")
-    console.print("  ".join(parts), markup=False, highlight=False)
+    _print(console, "  ".join(parts), markup=False, highlight=False)
 
     if stats.error:
-        console.print(f"⚠ 压缩异常: {stats.error}", highlight=False)
+        _print(console, f"⚠ 压缩异常: {stats.error}", highlight=False)
     _flush(console)
 
 
 def print_cross_session_summary(
-    console: "Console",
+    console: Console,
     candidate,
     tool_diff: list[str],
     in_progress_subagents: list[str] | None = None,
@@ -248,7 +284,7 @@ def print_cross_session_summary(
         lines.append(
             f"  • 上次 fan-out 中断的 subagent:{len(in_progress_subagents)} 个已标 cancelled"
         )
-    console.print("\n".join(lines), markup=False)
+    _print(console, "\n".join(lines), markup=False)
 
 
 # ---------------------------------------------------------------------------
@@ -260,18 +296,18 @@ def print_cross_session_summary(
 #    matching ``RenderDriver`` method, with the ``ToolCallEnd.duration_ms``
 #    field threaded all the way through.
 # ---------------------------------------------------------------------------
-from cc_harness.render_protocol import (  # noqa: E402  (import after module code is intentional)
+from cc_harness.render_protocol import (
+    FinalText,
+    ModeChanged,
+    PermissionModeChanged,
     RenderDriver,
     RenderEvent,
     ThinkingChunk,
     ThinkingDone,
-    ToolCallStart,
-    ToolCallEnd,
-    FinalText,
-    Usage,
     TodoUpdate,
-    ModeChanged,
-    PermissionModeChanged,
+    ToolCallEnd,
+    ToolCallStart,
+    Usage,
 )
 
 
@@ -286,9 +322,7 @@ def emit(event: RenderEvent, *, driver: RenderDriver) -> None:
         # 4-phase legacy render drops it; TUIDriver and TestDriver both
         # forward it.
         driver.write_tool_result(event.result, event.error, event.duration_ms)
-    elif isinstance(event, FinalText):
-        driver.write(event.text)
-    elif isinstance(event, ThinkingDone):
+    elif isinstance(event, (FinalText, ThinkingDone)):
         driver.write(event.text)
     elif isinstance(event, TodoUpdate):
         driver.write_todo(event.items)

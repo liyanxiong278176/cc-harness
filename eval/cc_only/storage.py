@@ -6,6 +6,8 @@ import hashlib
 import json
 import os
 import re
+import tempfile
+import time
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -43,14 +45,37 @@ def atomic_text(path: Path, value: str) -> None:
     atomic_bytes(path, value.encode("utf-8"))
 
 
+def _replace_with_retry(source: Path, target: Path) -> None:
+    """Replace a file, tolerating short-lived Windows sharing violations."""
+    for attempt in range(20):
+        try:
+            os.replace(source, target)
+            return
+        except PermissionError:
+            if attempt == 19:
+                raise
+            time.sleep(min(0.01 * (attempt + 1), 0.1))
+
+
 def atomic_bytes(path: Path, value: bytes) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    temporary = path.with_name(f".{path.name}.{os.getpid()}.tmp")
-    with temporary.open("wb") as handle:
-        handle.write(value)
-        handle.flush()
-        os.fsync(handle.fileno())
-    os.replace(temporary, path)
+    descriptor, temporary_name = tempfile.mkstemp(
+        prefix=f".{path.name}.",
+        suffix=".tmp",
+        dir=path.parent,
+    )
+    temporary = Path(temporary_name)
+    try:
+        with os.fdopen(descriptor, "wb") as handle:
+            handle.write(value)
+            handle.flush()
+            os.fsync(handle.fileno())
+        _replace_with_retry(temporary, path)
+    finally:
+        # ``os.replace`` removes the temporary name on success.  If writing or
+        # replacing fails, clean up the unique file so retries do not inherit
+        # stale state.
+        temporary.unlink(missing_ok=True)
 
 
 def read_json(path: Path) -> dict[str, Any]:
