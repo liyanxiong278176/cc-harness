@@ -51,7 +51,12 @@ def build_parser() -> argparse.ArgumentParser:
         default=[],
         help="Add an accessible directory (repeatable)",
     )
-    parser.add_argument("--mode", choices=("coding", "plan", "design", "chat"), default="coding")
+    parser.add_argument(
+        "--mode",
+        choices=("coding", "plan", "design", "chat"),
+        default=None,
+        help="Session mode; when omitted, a resumed session keeps its saved mode",
+    )
     parser.add_argument("--model", default=None)
     parser.add_argument("--effort", choices=("low", "medium", "high"), default=None)
     parser.add_argument(

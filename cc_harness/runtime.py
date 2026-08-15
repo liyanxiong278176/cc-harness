@@ -17,6 +17,7 @@ from openai import AsyncOpenAI
 
 from cc_harness.activation import ActivationManifest, CapabilityProfile
 from cc_harness.agent import run_turn
+from cc_harness.atomic import atomic_write_text
 from cc_harness.config import (
     AppConfig,
     ConfigError,
@@ -41,6 +42,12 @@ from cc_harness.tools import init_session_executor, shutdown_session_executor
 
 EventEmitter = Callable[[dict], Awaitable[None]]
 ConfirmHandler = Callable[[str, dict, str], Awaitable[str]]
+
+
+def _effective_resume_mode(requested_mode: str | None, saved_mode: str | None) -> str:
+    """Keep an explicit mode when resuming; otherwise use the saved mode."""
+
+    return requested_mode or saved_mode or "coding"
 
 
 @dataclass
@@ -83,7 +90,41 @@ class SessionRuntime:
         cls,
         cwd: Path,
         *,
-        mode: str = "coding",
+        mode: str | None = None,
+        additional_dirs: list[Path] | None = None,
+        effort: str | None = None,
+        session_id: str | None = None,
+        resume: str | None = None,
+        host_execution: bool = False,
+        max_iterations: int | None = 20,
+        bare: bool = False,
+        capability_profile: str | CapabilityProfile | None = None,
+    ) -> "SessionRuntime":
+        self = cls()
+        try:
+            return await self._initialize(
+                cwd,
+                mode=mode,
+                additional_dirs=additional_dirs,
+                effort=effort,
+                session_id=session_id,
+                resume=resume,
+                host_execution=host_execution,
+                max_iterations=max_iterations,
+                bare=bare,
+                capability_profile=capability_profile,
+            )
+        except BaseException:
+            self._closed = True
+            with contextlib.suppress(BaseException):
+                await self._shutdown_owned_resources(flush_memory=False)
+            raise
+
+    async def _initialize(
+        self,
+        cwd: Path,
+        *,
+        mode: str | None = None,
         additional_dirs: list[Path] | None = None,
         effort: str | None = None,
         session_id: str | None = None,
@@ -95,7 +136,6 @@ class SessionRuntime:
     ) -> "SessionRuntime":
         if max_iterations is not None and not 1 <= max_iterations <= 100:
             raise ValueError("max_iterations must be between 1 and 100")
-        self = cls()
         self.cwd = Path(cwd).resolve()
         self.additional_dirs = tuple(Path(p).resolve() for p in (additional_dirs or []))
         self.max_iterations = max_iterations
@@ -140,7 +180,7 @@ class SessionRuntime:
         self.l2_model = os.getenv("JUDGE_MODEL") or self.config.openai_model
 
         self.state = ReplState(
-            mode=mode,
+            mode=_effective_resume_mode(mode, None),
             context_config=load_context_config(
                 model=self.config.openai_model,
                 require_known=self.capability_profile.name == "context-eval",
@@ -159,7 +199,7 @@ class SessionRuntime:
             record = await self._resolve_resume(resume)
             if record is not None:
                 self.state.session_id = record.session_id
-                self.state.mode = record.mode
+                self.state.mode = _effective_resume_mode(mode, record.mode)
                 self.state.messages = await self.session_store.load(record.session_id)
 
         activation_path = self.cwd / ".cc-harness" / "activation" / f"{self.state.session_id}.json"
@@ -254,9 +294,8 @@ class SessionRuntime:
             profile=self.capability_profile.name,
         )
         safety_artifact = self.cwd / ".cc-harness" / "safety" / f"{self.state.session_id}.json"
-        safety_artifact.parent.mkdir(parents=True, exist_ok=True)
-        tmp = safety_artifact.with_suffix(".json.tmp")
-        tmp.write_text(
+        atomic_write_text(
+            safety_artifact,
             json.dumps(
                 {
                     "schema_version": "cc-harness.safety-session.v1",
@@ -272,9 +311,7 @@ class SessionRuntime:
                 indent=2,
             )
             + "\n",
-            encoding="utf-8",
         )
-        os.replace(tmp, safety_artifact)
         self.activation_manifest.add_artifact("safety", safety_artifact)
         self.activation_manifest.initialize(
             "agent_loop",
@@ -378,6 +415,22 @@ class SessionRuntime:
                 "OPENAI_MODEL": self.config.openai_model,
             }
         )
+        benchmark_read_only = str(env.get("MEMORY_READ_ONLY", "")).casefold() in {
+            "1", "true", "yes"
+        }
+        benchmark_history = str(env.get("MEMORY_HISTORY_PRESERVE", "")).casefold() in {
+            "1", "true", "yes"
+        }
+        if benchmark_read_only or benchmark_history:
+            # LoCoMo owns its historical write policy.  QA is read-only;
+            # ingestion writes preserved facts directly and must not let the
+            # product pipeline/maintenance collapse them afterward.
+            self.memory_config.pipeline_enabled = False
+            self.memory_config.maintenance_enabled = False
+            self.memory_config.reflection_enabled = False
+            self.memory_config.drift_enabled = False
+            if benchmark_read_only:
+                self.memory_config.capture_enabled = False
         try:
             # Older helpers print fail-soft diagnostics. Capture them so the
             # terminal renderer remains the sole owner of stdout.
@@ -387,7 +440,12 @@ class SessionRuntime:
                     self.cwd / ".cc-harness" / "memory.db",
                     include_offload=False,
                     memory_config=self.memory_config,
-                    project_scope=str(self.cwd),
+                    # Benchmark snapshots are deliberately restored into a
+                    # different workspace for every isolated query.  A
+                    # caller-supplied logical scope keeps the copied memory
+                    # visible after that relocation while ordinary sessions
+                    # retain the workspace path as their default scope.
+                    project_scope=env.get("MEMORY_PROJECT_SCOPE") or str(self.cwd),
                 )
             existing_extras = list(self.state.memory_extras or [])
             existing_deps = dict(self.state.mem_deps or {})
@@ -401,8 +459,6 @@ class SessionRuntime:
                         "memory", "memory dependency construction returned no stack"
                     )
                 else:
-                    from cc_harness.memory.worker import LayeredMemoryWorker
-
                     def memory_event(event: dict) -> None:
                         if self.activation_manifest is None:
                             return
@@ -417,20 +473,23 @@ class SessionRuntime:
                         if event.get("error"):
                             self.activation_manifest.degrade("memory", str(event["error"]))
 
-                    worker = LayeredMemoryWorker(
-                        store=deps["store"],
-                        pipeline=deps["pipeline"],
-                        config=self.memory_config,
-                        context_window=self.state.context_config.context_window,
-                        scenarios_dir=deps["scenarios_dir"],
-                        persona_path=deps["persona_path"],
-                        artifact_dir=self.cwd / ".cc-harness" / "memory" / "pipeline",
-                        llm=getattr(deps["service"].decider, "_llm", None),
-                        event_callback=memory_event,
-                    )
-                    await worker.start()
-                    deps["worker"] = worker
-                    self.state.mem_deps["worker"] = worker
+                    if not (deps.get("read_only") or deps.get("history_mode")):
+                        from cc_harness.memory.worker import LayeredMemoryWorker
+
+                        worker = LayeredMemoryWorker(
+                            store=deps["store"],
+                            pipeline=deps["pipeline"],
+                            config=self.memory_config,
+                            context_window=self.state.context_config.context_window,
+                            scenarios_dir=deps["scenarios_dir"],
+                            persona_path=deps["persona_path"],
+                            artifact_dir=self.cwd / ".cc-harness" / "memory" / "pipeline",
+                            llm=getattr(deps["service"].decider, "_llm", None),
+                            event_callback=memory_event,
+                        )
+                        await worker.start()
+                        deps["worker"] = worker
+                        self.state.mem_deps["worker"] = worker
                     self.activation_manifest.initialize(
                         "memory",
                         capture_enabled=self.memory_config.capture_enabled,
@@ -728,22 +787,33 @@ class SessionRuntime:
             return
         self._closed = True
 
+        try:
+            await self.save(status="closed")
+        finally:
+            await self._shutdown_owned_resources(flush_memory=True)
+
+    async def _shutdown_owned_resources(self, *, flush_memory: bool) -> None:
         async def close_owned(label: str, operation) -> None:
             try:
                 await operation()
             except Exception as exc:
                 self.warnings.append(RuntimeWarning(f"{label} shutdown failed: {exc}"))
 
-        try:
-            await self.save(status="closed")
-        finally:
-            worker = (self.state.mem_deps or {}).get("worker")
-            if worker is not None and self.capability_profile.name == "memory-eval":
+        worker = (self.state.mem_deps or {}).get("worker")
+        if (
+            flush_memory
+            and worker is not None
+            and self.capability_profile.name == "memory-eval"
+        ):
+            try:
                 flushed = await worker.flush(timeout_s=60.0)
                 if not flushed and self.activation_manifest is not None:
                     self.activation_manifest.degrade(
                         "memory", "memory extraction queue did not drain before eval shutdown"
                     )
+            except Exception as exc:
+                self.warnings.append(RuntimeWarning(f"memory flush failed: {exc}"))
+        if flush_memory:
             for component, timeout in (
                 (self.scheduler, 5.0),
                 (self.reflection_engine, 5.0),
@@ -754,20 +824,20 @@ class SessionRuntime:
                         await component._drain(timeout_s=timeout)
                     except Exception:
                         pass
-            from cc_harness.memory.extras import close_memory_deps
+        from cc_harness.memory.extras import close_memory_deps
 
-            await close_owned("memory services", lambda: close_memory_deps(self.state.mem_deps))
-            if self.session_store is not None:
-                await close_owned("session store", self.session_store.close)
-            if self.mcp is not None:
-                await close_owned("MCP", self.mcp.shutdown)
-            if self.l2_client is not None:
-                await close_owned("L2 client", self.l2_client.close)
-            if self.judge_llm is not None:
-                await close_owned("judge LLM", self.judge_llm.aclose)
-            if self.llm is not None:
-                await close_owned("main LLM", self.llm.aclose)
-            await close_owned("session executor", shutdown_session_executor)
+        await close_owned("memory services", lambda: close_memory_deps(self.state.mem_deps))
+        if self.session_store is not None:
+            await close_owned("session store", self.session_store.close)
+        if self.mcp is not None:
+            await close_owned("MCP", self.mcp.shutdown)
+        if self.l2_client is not None:
+            await close_owned("L2 client", self.l2_client.close)
+        if self.judge_llm is not None:
+            await close_owned("judge LLM", self.judge_llm.aclose)
+        if self.llm is not None:
+            await close_owned("main LLM", self.llm.aclose)
+        await close_owned("session executor", shutdown_session_executor)
 
     async def __aenter__(self) -> "SessionRuntime":
         return self

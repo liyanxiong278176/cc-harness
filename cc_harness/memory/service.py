@@ -3,13 +3,17 @@ EmbeddingClient, MemoryStore, and LLMDecider. The 4-step flow is:
     embed → search_similar → decide → apply
 """
 from __future__ import annotations
+
+import json
+import logging
+import re
 import sqlite3
 import time
-import logging
 from dataclasses import dataclass
 
-from cc_harness.memory.embedding import EmbeddingError
 from cc_harness.memory.decider import Decision, DecisionResult
+from cc_harness.memory.embedding import EmbeddingError
+from cc_harness.memory.temporal import extract_temporal_metadata
 
 logger = logging.getLogger(__name__)
 
@@ -34,6 +38,95 @@ class MemoryService:
     async def recall(self, query: str, top_k: int = 5) -> list:
         embedding = await self.embedder.embed(query)
         return await self.store.search_similar(embedding, k=top_k)
+
+    async def save_preserved_facts(
+        self,
+        text: str,
+        *,
+        session_id: str,
+        provenance: dict | None = None,
+        source: str = "locomo-history",
+    ) -> list[SaveResult]:
+        """Persist benchmark history without product conflict resolution.
+
+        LoCoMo contains time-local facts that are semantically similar across
+        sessions.  The normal ``save`` path intentionally resolves such
+        similarities for interactive memory, but that policy would erase the
+        very history this benchmark asks us to retrieve.  This path only
+        removes exact duplicates within the same session and scope.
+        """
+
+        facts = split_history_facts(text)
+        results: list[SaveResult] = []
+        base_provenance = dict(provenance or {})
+        for index, fact in enumerate(facts, 1):
+            started = time.time()
+            try:
+                duplicate = await self.store.find_active_exact(
+                    fact, session_id=session_id
+                )
+                if duplicate is not None:
+                    results.append(
+                        SaveResult(
+                            action="NOOP",
+                            memory=duplicate,
+                            duration_ms=_ms(started),
+                        )
+                    )
+                    continue
+                embedding = await self.embedder.embed(fact)
+                fact_provenance = {
+                    **base_provenance,
+                    "session_id": session_id,
+                    "fact_index": index,
+                    "fact_count": len(facts),
+                    "retention": "session-scoped-preserve",
+                    "temporal": extract_temporal_metadata(
+                        fact,
+                        session_timestamp=str(base_provenance.get("session_timestamp") or ""),
+                    ),
+                }
+                memory = await self.store.add(
+                    fact,
+                    embedding,
+                    source,
+                    session_id=session_id,
+                    provenance_json=json.dumps(
+                        fact_provenance, ensure_ascii=False, sort_keys=True
+                    ),
+                )
+                results.append(
+                    SaveResult(
+                        action="HISTORY_ADD",
+                        memory=memory,
+                        duration_ms=_ms(started),
+                    )
+                )
+            except EmbeddingError as exc:
+                results.append(
+                    SaveResult(
+                        action="ERROR",
+                        error=f"embedding: {exc}",
+                        duration_ms=_ms(started),
+                    )
+                )
+            except sqlite3.Error as exc:
+                results.append(
+                    SaveResult(
+                        action="ERROR",
+                        error=f"db: {exc}",
+                        duration_ms=_ms(started),
+                    )
+                )
+            except Exception as exc:  # pragma: no cover - defensive tool boundary
+                results.append(
+                    SaveResult(
+                        action="ERROR",
+                        error=f"{type(exc).__name__}: {exc}",
+                        duration_ms=_ms(started),
+                    )
+                )
+        return results
 
     async def save(self, text: str, source: str, session_id: str | None = None, *, turn_idx: int | None = None) -> SaveResult:
         # M2: turn_idx 优先用 caller 传,None 时退占位(向后兼容)
@@ -100,13 +193,18 @@ class MemoryService:
                     # (v 是 ConflictVerdict dataclass,但 result_action_mem 路径上
                     # 历史上偶发被替换为 tuple,这里做 defensive 兜底)
                     def _mem_id(m):
-                        if m is None: return None
-                        if hasattr(m, "id"): return m.id
-                        if isinstance(m, dict): return m.get("id")
+                        if m is None:
+                            return None
+                        if hasattr(m, "id"):
+                            return m.id
+                        if isinstance(m, dict):
+                            return m.get("id")
                         if isinstance(m, tuple):
                             for x in m:
-                                if hasattr(x, "id"): return x.id
-                                if isinstance(x, dict) and "id" in x: return x["id"]
+                                if hasattr(x, "id"):
+                                    return x.id
+                                if isinstance(x, dict) and "id" in x:
+                                    return x["id"]
                         return None
                     new_id = _mem_id(result_action_mem)
                     for v in verdicts:
@@ -185,6 +283,38 @@ class MemoryService:
             await self.store._db.rollback()
             raise
         return del_cur.rowcount
+
+
+_HISTORY_FACT_SPLIT_RE = re.compile(
+    r"(?<=[.!?。！？])\s+|;\s+|\n+|(?<=\])\s+(?=\[FACT\])"
+)
+
+
+def split_history_facts(text: str, *, max_facts: int = 8) -> list[str]:
+    """Split a model-produced history note into retrievable fact claims.
+
+    The model is encouraged to emit one claim per ``memory_save`` call, but
+    this deterministic fallback protects the benchmark when it compresses a
+    session into one tool argument.  It never merges facts from another
+    session; at most the tail of this one note is grouped into the final fact.
+    """
+
+    normalized = re.sub(r"\s+", " ", str(text or "").strip())
+    if not normalized:
+        return []
+    pieces = []
+    for raw in _HISTORY_FACT_SPLIT_RE.split(normalized):
+        fact = re.sub(r"^\s*(?:[-*•]|\[FACT\])\s*", "", raw).strip()
+        fact = re.sub(r"\s+", " ", fact)
+        if fact:
+            pieces.append(fact)
+    if not pieces:
+        return [normalized]
+    if len(pieces) <= max_facts:
+        return pieces
+    head = pieces[: max_facts - 1]
+    head.append(" ".join(pieces[max_facts - 1 :]))
+    return head
 
 
 def _ms(t0: float) -> int:

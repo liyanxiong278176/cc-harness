@@ -19,6 +19,7 @@ import asyncio
 import io
 import json
 import logging
+import os
 import re
 import time
 from pathlib import Path
@@ -386,17 +387,43 @@ async def run_turn(
                        if m.get("role") == "user"), "")
             recall = await asyncio.wait_for(
                 memory_layer["recall"](_q), timeout=10.0)
+            if (
+                messages[0].get("role") == "system"
+                and os.getenv("MEMORY_PROJECT_SCOPE", "").startswith("locomo:")
+            ):
+                messages[0]["content"] += (
+                    "\n\n## [working_context]\n"
+                    "The ordered user/assistant/tool transcript surrounding this question is the "
+                    "working context. Keep its chronology separate from [long_term_memory]."
+                )
             if recall.atoms and messages[0].get("role") == "system":
                 atom_lines = []
                 for item in recall.atoms:
                     memory = item[0] if isinstance(item, tuple) else item
                     text = getattr(memory, "text", "")
                     if text:
-                        atom_lines.append(f"- {text[:240]}")
+                        session = getattr(memory, "session_id", None) or "unknown"
+                        atom_lines.append(f"- {text[:240]} [session={session}]")
                 if atom_lines:
                     messages[0]["content"] += (
-                        "\n\n## Relevant memory facts\n" + "\n".join(atom_lines)
+                        "\n\n## [long_term_memory] Relevant memory facts\n" + "\n".join(atom_lines)
                     )
+            atom_evidence = []
+            for item in recall.atoms:
+                memory = item[0] if isinstance(item, tuple) else item
+                score = item[1] if isinstance(item, tuple) and len(item) > 1 else None
+                atom_evidence.append(
+                    {
+                        "atom_id": str(getattr(memory, "id", "")),
+                        "text": str(getattr(memory, "text", ""))[:500],
+                        "source": str(getattr(memory, "source", "")),
+                        "session_id": getattr(memory, "session_id", None),
+                        "created_at": getattr(memory, "created_at", None),
+                        "updated_at": getattr(memory, "updated_at", None),
+                        "provenance_json": str(getattr(memory, "provenance_json", "{}")),
+                        "relevance": float(score) if isinstance(score, (int, float)) else None,
+                    }
+                )
             await _safe_emit({
                 "type": "capability_activation",
                 "capability": "memory",
@@ -404,6 +431,7 @@ async def run_turn(
                 "persona": recall.persona is not None,
                 "scenario_count": len(recall.scenarios),
                 "atom_count": len(recall.atoms),
+                "atoms": atom_evidence,
             })
             if recall.persona and messages[0].get("role") == "system":
                 messages[0]["content"] += f"\n\n## 用户画像\n{recall.persona.summary[:200]}"
@@ -559,6 +587,8 @@ async def run_turn(
 
     iter_usages: list[UsageRecord] = []   # per-iter API-reported usage
 
+    memory_recall_calls = 0
+
     async def _dispatch(p, args: dict, project_root: Path):
         """Route a tool call to its handler.
 
@@ -567,6 +597,7 @@ async def run_turn(
         mcp_client.ToolResult; the caller reads `.llm_text` for the message
         appended to `messages`.
         """
+        nonlocal memory_recall_calls
         if p.name in NATIVE_TOOLS:
             return await NATIVE_TOOLS[p.name]["handler"](args, cwd=str(project_root))
         extra_entry = next(
@@ -575,6 +606,18 @@ async def run_turn(
             None,
         )
         if extra_entry is not None:
+            if p.name == "memory_recall":
+                configured_limit = os.getenv("MEMORY_RECALL_TOOL_MAX_PER_TURN")
+                if configured_limit:
+                    limit = max(0, int(configured_limit))
+                    if memory_recall_calls >= limit:
+                        from cc_harness.mcp_client import ToolResult
+
+                        return ToolResult.error(
+                            display="memory_recall round limit reached",
+                            llm="[Tool Error] memory_recall round limit reached; answer from the evidence already retrieved.",
+                        )
+                memory_recall_calls += 1
             h_kwargs = {"cwd": str(project_root), **extra_entry.get("deps", {})}
             return await extra_entry["handler"](args, **h_kwargs)
         return await mcp.call_tool(p.name, args)

@@ -15,6 +15,7 @@ from cc_harness.config import (
     SandboxConfig,
     load_config,
     load_executor_config,
+    load_memory_config,
 )
 
 
@@ -115,6 +116,19 @@ def test_load_config_happy_path(tmp_path: Path, monkeypatch: pytest.MonkeyPatch)
     assert set(cfg.mcp_servers) == {"fs", "remote"}
     assert cfg.mcp_servers["fs"].transport_type == "stdio"
     assert cfg.mcp_servers["remote"].transport_type == "sse"
+
+
+def test_load_memory_config_accepts_retrieval_budget_overrides(tmp_path: Path):
+    cfg = load_memory_config(
+        tmp_path / "missing-policy.yaml",
+        environ={
+            "MEMORY_RETRIEVER_TOP_K": "12",
+            "MEMORY_INJECTION_TOKEN_BUDGET": "2400",
+        },
+    )
+
+    assert cfg.retriever_top_k == 12
+    assert cfg.injection_token_budget == 2400
 
 
 def test_load_config_missing_mcp_json_raises(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):

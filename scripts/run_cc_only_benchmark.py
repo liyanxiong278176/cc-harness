@@ -41,13 +41,65 @@ def main() -> int:
     if not args.check and not args.confirm_live:
         raise SystemExit("refusing live model calls without --confirm-live")
     adapter = ADAPTERS[args.benchmark]()
+    if args.new_run and args.benchmark != "locomo":
+        raise SystemExit("--new-run is currently supported only for locomo")
+    if args.rerun_sample and args.benchmark != "locomo":
+        raise SystemExit("--rerun-sample is currently supported only for locomo")
+    if (args.cache_only or args.sample_filter) and args.benchmark != "locomo":
+        raise SystemExit("cache options are currently supported only for locomo")
+    if args.sample_filter and not args.cache_only:
+        raise SystemExit("--sample requires --cache-only")
+    if args.rerun_sample and (
+        args.check
+        or args.new_run
+        or args.cache_only
+        or args.sample_filter
+        or args.retry_invalid
+        or args.task_limit is not None
+        or args.qa_limit is not None
+        or args.refresh
+        or args.refresh_all
+    ):
+        raise SystemExit(
+            "--rerun-sample requires the existing live LoCoMo result root and cannot be combined with filters/retries"
+        )
+    if args.refresh_all and not args.confirm_refresh_all:
+        raise SystemExit("--refresh-all requires --confirm-refresh-all")
+    if args.refresh_all and args.sample_filter:
+        raise SystemExit("--refresh-all cannot be combined with --sample")
+    if args.refresh and args.refresh_all:
+        raise SystemExit("use either --refresh or --refresh-all, not both")
+    if args.refresh and not args.sample_filter:
+        raise SystemExit("--refresh requires --sample <sample_id>")
+    if (args.refresh or args.refresh_all) and not args.cache_only:
+        raise SystemExit("cache refresh requires --cache-only")
     selected = EvalProfile.CHECK if args.check else profile
     _prepare(root, args.benchmark, selected)
-    output = root / "eval" / "result" / "cc-only" / adapter.slug / "deepseek-v4-flash" / selected.value
+    suffix = []
+    if args.new_run:
+        if args.check:
+            raise SystemExit("--new-run cannot be combined with --check")
+        suffix.append(f"new-{_run_stamp()}")
+    if args.cache_only:
+        suffix.append(f"cache-preparation-{_run_stamp()}")
+    if args.task_limit is not None:
+        suffix.append(f"tasks{args.task_limit}")
+    if args.qa_limit is not None:
+        suffix.append(f"qa{args.qa_limit}")
+    profile_root = selected.value if not suffix else f"{selected.value}-{'-'.join(suffix)}"
+    output = root / "eval" / "result" / "cc-only" / adapter.slug / "deepseek-v4-flash" / profile_root
     print(f"mode={'resume' if (output / 'state.json').is_file() else 'new'}")
     print(f"benchmark={adapter.slug}")
     print(f"profile={profile.value}")
-    print(f"execution_mode={'check-only' if args.check else 'live'}")
+    print(
+        f"execution_mode={'check-only' if args.check else 'cache-only' if args.cache_only else 'live'}"
+    )
+    if args.task_limit is not None:
+        print(f"task_limit={args.task_limit}")
+    if args.qa_limit is not None:
+        print(f"qa_limit={args.qa_limit}")
+    if args.rerun_sample:
+        print(f"rerun_sample={args.rerun_sample}")
     print(f"output_root={output}")
     print("model=deepseek-v4-flash")
     if args.check:
@@ -63,6 +115,12 @@ def main() -> int:
                 retry_invalid=args.retry_invalid,
                 watchdog_seconds=args.watchdog_seconds,
                 cooldown_scale=args.cooldown_scale,
+                task_limit=args.task_limit,
+                qa_limit=args.qa_limit,
+                cache_only=args.cache_only,
+                cache_refresh=args.refresh or args.refresh_all,
+                sample_filter=args.sample_filter,
+                rerun_sample=args.rerun_sample,
                 progress=_progress,
             )
         )
@@ -72,6 +130,14 @@ def main() -> int:
     for name, path in paths.items():
         print(f"{name}={path}")
     return 0
+
+
+def _run_stamp() -> str:
+    # Keep generated result roots short enough for Windows runtime snapshots. The
+    # nested context/offload paths can add another 40+ characters during copy.
+    # Second precision keeps normal invocations distinct while saving enough
+    # path budget for Windows' directory-creation limit.
+    return datetime.now().astimezone().strftime("%y%m%d%H%M%S")
 
 
 def _prepare(root: Path, benchmark: str, profile: EvalProfile) -> None:
@@ -201,9 +267,37 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--project-root", type=Path, default=Path.cwd())
     parser.add_argument("--profile", choices=("portfolio", "full"), default="portfolio")
     parser.add_argument("--check", action="store_true")
+    parser.add_argument("--cache-only", action="store_true", help="build LoCoMo snapshots without QA")
+    parser.add_argument("--sample", dest="sample_filter", help="prepare one LoCoMo sample")
+    parser.add_argument(
+        "--rerun-sample",
+        help="rerun one existing LoCoMo sample in the current result root without touching other samples",
+    )
+    parser.add_argument("--refresh", action="store_true", help="rebuild the named LoCoMo sample")
+    parser.add_argument("--refresh-all", action="store_true", help="rebuild every LoCoMo sample")
+    parser.add_argument(
+        "--confirm-refresh-all",
+        action="store_true",
+        help="confirm the live cost of rebuilding every LoCoMo sample",
+    )
+    parser.add_argument(
+        "--new-run",
+        action="store_true",
+        help="start a fresh result root while reusing validated LoCoMo snapshots",
+    )
     parser.add_argument("--retry-invalid", action="store_true")
     parser.add_argument("--confirm-live", action="store_true")
     parser.add_argument("--watchdog-seconds", type=int, default=7_200)
+    parser.add_argument(
+        "--task-limit",
+        type=int,
+        help="run only the first N catalog tasks in an isolated result root",
+    )
+    parser.add_argument(
+        "--qa-limit",
+        type=int,
+        help="for adapters that support it, run only the first N questions per task",
+    )
     parser.add_argument("--cooldown-scale", type=float, default=1.0, help=argparse.SUPPRESS)
     return parser
 

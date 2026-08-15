@@ -135,14 +135,37 @@ async def build_memory_extras(
             ),
         )
 
+    read_only = str(env.get("MEMORY_READ_ONLY", "")).casefold() in {"1", "true", "yes"}
+    history_mode = str(env.get("MEMORY_HISTORY_PRESERVE", "")).casefold() in {
+        "1", "true", "yes"
+    }
     extras: list[dict] = [
         {"spec": MEMORY_RECALL_SPEC, "handler": memory_recall_handler, "deps": {"retriever": retriever}},
-        {"spec": MEMORY_SAVE_SPEC, "handler": memory_save_handler, "deps": {"service": service}},
     ]
+    if history_mode:
+        extras.append(
+            {
+                "spec": MEMORY_SAVE_SPEC,
+                "handler": memory_save_handler,
+                "deps": {
+                    "service": service,
+                    "history_mode": True,
+                    "history_session_id": env.get("MEMORY_BENCHMARK_SESSION_ID"),
+                    "history_timestamp": env.get("MEMORY_BENCHMARK_TIMESTAMP"),
+                    "history_sample_id": env.get("MEMORY_BENCHMARK_SAMPLE_ID"),
+                },
+            }
+        )
+    elif not read_only:
+        extras.append(
+            {"spec": MEMORY_SAVE_SPEC, "handler": memory_save_handler, "deps": {"service": service}}
+        )
     deps: dict = {
         "service": service, "retriever": retriever, "pipeline": pipeline,
         "recall": _recall, "store": store,
         "persona_path": persona_path, "scenarios_dir": scenarios_dir,
+        "read_only": read_only,
+        "history_mode": history_mode,
     }
 
     if not include_offload:

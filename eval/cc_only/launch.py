@@ -53,6 +53,7 @@ def build_cc_invocation(
     permission_mode: str = "bypass-prompts",
     host_execution: bool = True,
     continue_session: bool = False,
+    mode: str | None = None,
     environment_overrides: Mapping[str, str] | None = None,
 ) -> tuple[LaunchProfile, LaunchInvocation, ResourceBudget]:
     profile = cc_harness_profile()
@@ -71,11 +72,20 @@ def build_cc_invocation(
         argv.append("--host-execution")
     if continue_session:
         argv.insert(2, "--continue")
+    if mode is not None:
+        if mode not in {"coding", "plan", "design", "chat"}:
+            raise ValueError(f"unsupported cc-harness mode: {mode!r}")
+        argv.extend(("--mode", mode))
     home.mkdir(parents=True, exist_ok=True)
     environment = dict(invocation.environment)
     environment["HOME"] = str(home.resolve())
     environment["USERPROFILE"] = str(home.resolve())
     environment["OPENAI_MODEL"] = MODEL
+    # The parent always writes UTF-8 bytes to stdin. Windows otherwise lets the
+    # child select the active ANSI code page, which can turn punctuation such
+    # as an en dash into lone surrogate code points during resumed sessions.
+    environment["PYTHONIOENCODING"] = "utf-8"
+    environment["PYTHONUTF8"] = "1"
     if environment_overrides:
         environment.update(environment_overrides)
     return (
@@ -115,6 +125,7 @@ async def run_cc_prompt(
     permission_mode: str = "bypass-prompts",
     host_execution: bool = True,
     continue_session: bool = False,
+    mode: str | None = None,
     environment_overrides: Mapping[str, str] | None = None,
 ):
     profile, invocation, budget = build_cc_invocation(
@@ -127,14 +138,21 @@ async def run_cc_prompt(
         permission_mode=permission_mode,
         host_execution=host_execution,
         continue_session=continue_session,
+        mode=mode,
         environment_overrides=environment_overrides,
     )
-    completed = await run_invocation(
-        profile, invocation, timeout_seconds=budget.execution_timeout_seconds
-    )
     evidence_root.mkdir(parents=True, exist_ok=True)
-    (evidence_root / "stdout.jsonl").write_bytes(completed.stdout)
-    (evidence_root / "stderr.txt").write_bytes(completed.stderr)
+    stdout_path = evidence_root / "stdout.jsonl"
+    stderr_path = evidence_root / "stderr.txt"
+    completed = await run_invocation(
+        profile,
+        invocation,
+        timeout_seconds=budget.execution_timeout_seconds,
+        stdout_path=stdout_path,
+        stderr_path=stderr_path,
+    )
+    stdout_path.write_bytes(completed.stdout)
+    stderr_path.write_bytes(completed.stderr)
     from .storage import atomic_json
 
     atomic_json(evidence_root / "launch.json", completed.evidence.model_dump(mode="json"))

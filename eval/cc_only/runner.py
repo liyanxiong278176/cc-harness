@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import platform
 from collections import Counter
 from collections.abc import Callable, Mapping, Sequence
@@ -38,6 +39,12 @@ async def run_benchmark(
     retry_invalid: bool = False,
     watchdog_seconds: int = 7_200,
     cooldown_scale: float = 1.0,
+    task_limit: int | None = None,
+    qa_limit: int | None = None,
+    cache_only: bool = False,
+    cache_refresh: bool = False,
+    sample_filter: str | None = None,
+    rerun_sample: str | None = None,
     progress: Callable[[str], None] = print,
 ) -> dict[str, Path]:
     project_root = project_root.resolve()
@@ -46,9 +53,31 @@ async def run_benchmark(
         raise ValueError("watchdog_seconds must be at least 60")
     if cooldown_scale < 0:
         raise ValueError("cooldown_scale cannot be negative")
-    tasks = tuple(adapter.catalog(project_root, profile))
-    _validate_catalog(tasks)
-    checked = adapter.check(project_root, profile, tasks)
+    if task_limit is not None and task_limit <= 0:
+        raise ValueError("task_limit must be positive")
+    if qa_limit is not None and qa_limit <= 0:
+        raise ValueError("qa_limit must be positive")
+    if rerun_sample is not None and adapter.slug != "locomo-memory":
+        raise ValueError("rerun_sample is currently supported only for locomo-memory")
+    if rerun_sample is not None and sample_filter is not None:
+        raise ValueError("rerun_sample cannot be combined with sample_filter")
+    # A disconnected terminal/pipe must not turn a valid model trial into an
+    # infrastructure failure.  Progress is observability only; scoring and
+    # resumability must continue when its sink disappears.
+    progress = _safe_progress(progress)
+    catalog_tasks = tuple(adapter.catalog(project_root, profile))
+    _validate_catalog(catalog_tasks)
+    checked = adapter.check(project_root, profile, catalog_tasks)
+    tasks = (
+        tuple(
+            task
+            for task in catalog_tasks
+            if str(task.payload.get("sample_id")) == sample_filter
+        )
+        if sample_filter is not None
+        else catalog_tasks
+    )
+    tasks = tasks[:task_limit] if task_limit is not None else tasks
     contract = {
         "benchmark": adapter.slug,
         "benchmark_title": adapter.title,
@@ -58,6 +87,8 @@ async def run_benchmark(
         "system": "cc-harness",
         "model": MODEL,
         "capability_profile": adapter.capability_profile,
+        "cache_only": cache_only,
+        "cache_refresh": cache_refresh,
         "adaptations": list(adapter.adaptations),
         "watchdog_seconds": watchdog_seconds,
         "runtime": {
@@ -66,8 +97,51 @@ async def run_benchmark(
             "cc_harness_version": _package_version(),
         },
     }
+    if task_limit is not None:
+        contract["task_limit"] = task_limit
+    if qa_limit is not None:
+        contract["qa_limit"] = qa_limit
+    if sample_filter is not None:
+        contract["sample_filter"] = sample_filter
     store = RunStateStore(output_root)
     state = store.initialize(contract=contract, tasks=tasks)
+    if rerun_sample is not None:
+        rerun_task = next(
+            (
+                task
+                for task in tasks
+                if str(task.payload.get("sample_id")) == rerun_sample
+            ),
+            None,
+        )
+        if rerun_task is None:
+            raise ValueError(f"LoCoMo sample not found in frozen catalog: {rerun_sample}")
+        rerun_trial = state["trials"][rerun_task.task_id]
+        if rerun_trial.get("status") == "running":
+            raise RuntimeError(f"cannot rerun active LoCoMo sample: {rerun_sample}")
+        # A forced sample rerun is a new retry generation, but only this trial
+        # is moved back to pending. Other samples remain terminal and their
+        # selected result paths are not touched.
+        state["retry_generation"] = int(state.get("retry_generation", 0)) + 1
+        rerun_trial["status"] = "pending"
+        store.save(state)
+        progress(f"rerun selected sample {rerun_sample}; other terminal trials remain unchanged")
+    if adapter.slug == "locomo-memory":
+        # Checkpoint-preserving LoCoMo infrastructure failures resume on the
+        # next ordinary invocation.  They remain retained as invalid evidence
+        # inside the same logical attempt rather than forcing a new sample.
+        for task_id, trial in state["trials"].items():
+            if rerun_sample is not None and task_id != f"locomo/{rerun_sample}":
+                continue
+            if trial.get("status") != TrialStatus.INVALID.value:
+                continue
+            result = trial.get("result")
+            if not isinstance(result, str) or not (output_root / result).is_file():
+                continue
+            payload = read_json(output_root / result)
+            if (payload.get("protocol") or {}).get("checkpoint_preserving"):
+                trial["status"] = "pending"
+        store.save(state)
     atomic_json(output_root / "check.json", checked.as_dict())
     if check_only:
         summary = _base_summary(adapter, tasks, state, [], checked.as_dict())
@@ -122,6 +196,19 @@ async def run_benchmark(
                 f"generation {generation}"
             )
             try:
+                progress_log = attempt_root / "progress.jsonl"
+
+                def attempt_progress(message: str, *, _progress_log=progress_log) -> None:
+                    progress(message)
+                    with _progress_log.open("a", encoding="utf-8") as stream:
+                        stream.write(
+                            json.dumps(
+                                {"timestamp": utc_now(), "message": message},
+                                ensure_ascii=False,
+                            )
+                            + "\n"
+                        )
+
                 outcome = await adapter.execute(
                     TrialContext(
                         project_root=project_root,
@@ -131,6 +218,13 @@ async def run_benchmark(
                         profile=profile,
                         attempt=attempt,
                         watchdog_seconds=watchdog_seconds,
+                        progress=attempt_progress,
+                        task_index=sequence,
+                        task_total=len(tasks),
+                        task_limit=task_limit,
+                        qa_limit=qa_limit,
+                        cache_only=cache_only,
+                        cache_refresh=cache_refresh,
                     )
                 )
             except (asyncio.CancelledError, KeyboardInterrupt):
@@ -158,6 +252,13 @@ async def run_benchmark(
             generation_attempts += 1
             if outcome.status is not TrialStatus.INVALID:
                 break
+            if adapter.slug == "locomo-memory" and (
+                outcome.protocol.get("checkpoint_preserving") is True
+            ):
+                # The adapter already exhausted its three child-QA retries.
+                # Continue with the next sample; a later ordinary invocation
+                # reopens this same logical attempt at the failed question.
+                break
             if generation_attempts < MAX_AUTOMATIC_ATTEMPTS:
                 delay = COOLDOWNS[min(generation_attempts - 1, len(COOLDOWNS) - 1)]
                 delay *= cooldown_scale
@@ -172,6 +273,21 @@ async def run_benchmark(
     summary = _base_summary(adapter, tasks, state, task_results, checked.as_dict())
     summary["benchmark_metrics"] = dict(adapter.summarize(task_results))
     return _finalize(adapter, output_root, store, state, tasks, summary)
+
+
+def _safe_progress(progress: Callable[[str], None]) -> Callable[[str], None]:
+    disabled = False
+
+    def emit(message: str) -> None:
+        nonlocal disabled
+        if disabled:
+            return
+        try:
+            progress(message)
+        except (BrokenPipeError, OSError):
+            disabled = True
+
+    return emit
 
 
 async def _ensure_preflight(
@@ -304,6 +420,16 @@ def _base_summary(
         "critical_failures": critical,
         "usage": usage,
         "status": status,
+        "execution_status": {
+            "completed": counts.get(TrialStatus.PASS.value, 0)
+            + counts.get(TrialStatus.FAIL.value, 0),
+            "invalid_or_incomplete": invalid + pending,
+        },
+        "evidence_status": {
+            "valid": counts.get(TrialStatus.PASS.value, 0),
+            "invalid": invalid,
+            "pending": pending,
+        },
         "adaptations": list(adapter.adaptations),
         "check": dict(check),
         "retry_generation": int(state.get("retry_generation", 0)),
@@ -374,7 +500,10 @@ def _report(adapter: BenchmarkAdapter, summary: Mapping[str, Any]) -> str:
         f"- Status: `{summary['status']}`",
         f"- Tasks: {summary['result_count']}/{summary['task_count']} completed",
         (
-            f"- Outcomes: {counts['pass']} pass, {counts['fail']} fail, "
+            f"- Evidence: {counts['pass']} valid, {counts['invalid']} invalid, "
+            f"{counts['pending']} pending"
+            if adapter.slug == "locomo-memory"
+            else f"- Outcomes: {counts['pass']} pass, {counts['fail']} fail, "
             f"{counts['invalid']} invalid, {counts['pending']} pending"
         ),
         f"- Critical failures: {summary['critical_failures']}",

@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 from enum import StrEnum
 from pathlib import Path
@@ -84,6 +84,16 @@ class TrialContext:
     profile: EvalProfile
     attempt: int
     watchdog_seconds: int
+    # Live progress is deliberately outside the immutable benchmark contract.
+    # Adapters may use it for phase/session/QA visualization without affecting
+    # scoring or resumability.
+    progress: Callable[[str], None] = print
+    task_index: int = 1
+    task_total: int = 1
+    task_limit: int | None = None
+    qa_limit: int | None = None
+    cache_only: bool = False
+    cache_refresh: bool = False
 
 
 class BenchmarkAdapter(Protocol):

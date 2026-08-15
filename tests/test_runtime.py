@@ -1,3 +1,4 @@
+import os
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
@@ -7,8 +8,15 @@ import pytest
 from cc_harness.activation import ActivationManifest, CapabilityProfile
 from cc_harness.config import L2Config
 from cc_harness.l2 import ScanResult
-from cc_harness.runtime import SessionRuntime
+from cc_harness.runtime import SessionRuntime, _effective_resume_mode
 from cc_harness.tokens import TurnTokenStats, UsageRecord
+
+
+def test_explicit_mode_wins_when_resuming_saved_session() -> None:
+    """A benchmark can change mode without inheriting an old coding session."""
+    assert _effective_resume_mode("chat", "coding") == "chat"
+    assert _effective_resume_mode(None, "coding") == "coding"
+    assert _effective_resume_mode(None, None) == "coding"
 
 
 def test_activation_manifest_records_four_part_capability_evidence(tmp_path):
@@ -35,6 +43,120 @@ def test_activation_manifest_records_four_part_capability_evidence(tmp_path):
     assert state["triggered"] is True
     assert state["artifacts"] == [str(tmp_path / "summary-v1.json")]
     assert state["no_degradation"] is True
+
+
+def test_activation_manifest_retries_transient_windows_replace_failure(
+    tmp_path, monkeypatch
+):
+    path = tmp_path / "activation.json"
+    manifest = ActivationManifest(
+        path,
+        session_id="session-test",
+        project_root=tmp_path,
+        profile=CapabilityProfile.named("memory-eval"),
+        requested_model="deepseek-v4-flash",
+    )
+    real_replace = os.replace
+    calls = 0
+
+    def flaky_replace(source, target):
+        nonlocal calls
+        calls += 1
+        if calls < 3:
+            raise PermissionError(13, "transient Windows sharing violation")
+        return real_replace(source, target)
+
+    monkeypatch.setattr(os, "replace", flaky_replace)
+
+    manifest.initialize("runtime", entrypoint="SessionRuntime")
+
+    assert calls == 3
+    assert path.is_file()
+    assert not list(tmp_path.glob("*.tmp"))
+
+
+@pytest.mark.asyncio
+async def test_runtime_create_closes_owned_resources_when_initialization_fails(
+    tmp_path, monkeypatch
+):
+    session_store_closed = AsyncMock()
+    memory_worker = SimpleNamespace(close=AsyncMock())
+    memory_store = SimpleNamespace(close=AsyncMock())
+    llm = SimpleNamespace(aclose=AsyncMock())
+    mcp = SimpleNamespace(
+        _sessions={},
+        _tools={},
+        start=AsyncMock(),
+        shutdown=AsyncMock(),
+    )
+    executor_shutdown = AsyncMock()
+
+    class FakeSessionStore:
+        def __init__(self, cwd):
+            self.db_path = Path(cwd) / ".cc-harness" / "sessions.db"
+
+        async def open(self):
+            return self
+
+        async def import_legacy(self, _path):
+            return 0
+
+        async def close(self):
+            await session_store_closed()
+
+    async def build_context(_self):
+        return None
+
+    async def build_memory(self):
+        self.memory_config = SimpleNamespace(enabled=True)
+        self.state.mem_deps = {
+            "worker": memory_worker,
+            "store": memory_store,
+            "service": SimpleNamespace(
+                embedder=None,
+                decider=SimpleNamespace(_llm=None),
+            ),
+        }
+
+    original_initialize = ActivationManifest.initialize
+
+    def fail_at_safety(self, name, **details):
+        if name == "safety":
+            raise PermissionError(13, "activation replace failed")
+        return original_initialize(self, name, **details)
+
+    config = SimpleNamespace(
+        openai_api_key="test-key",
+        openai_base_url="https://example.invalid",
+        openai_model="deepseek-v4-flash",
+        mcp_servers={},
+        runtime_environment={},
+    )
+    monkeypatch.setattr("cc_harness.runtime.load_layered_config", lambda _cwd: config)
+    monkeypatch.setattr("cc_harness.runtime.LLMClient", lambda **_kwargs: llm)
+    monkeypatch.setattr("cc_harness.runtime.MCPClient", lambda _servers: mcp)
+    monkeypatch.setattr("cc_harness.runtime.SessionStore", FakeSessionStore)
+    monkeypatch.setattr(SessionRuntime, "_build_context_services", build_context)
+    monkeypatch.setattr(SessionRuntime, "_build_memory_services", build_memory)
+    monkeypatch.setattr(ActivationManifest, "initialize", fail_at_safety)
+    monkeypatch.setattr("cc_harness.runtime.init_session_executor", lambda *_args: None)
+    monkeypatch.setattr(
+        "cc_harness.runtime.shutdown_session_executor", executor_shutdown
+    )
+
+    with pytest.raises(PermissionError, match="activation replace failed"):
+        await SessionRuntime.create(
+            tmp_path,
+            capability_profile="memory-eval",
+            host_execution=True,
+        )
+
+    session_store_closed.assert_awaited_once()
+    memory_worker.close.assert_awaited_once()
+    memory_store.close.assert_awaited_once()
+    mcp.shutdown.assert_awaited_once()
+    llm.aclose.assert_awaited_once()
+    executor_shutdown.assert_awaited_once()
 
 
 def test_bare_and_conflicting_capability_profile_are_rejected():

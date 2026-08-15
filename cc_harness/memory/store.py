@@ -36,6 +36,7 @@ class Memory:
     version: int = 1
     supersedes_id: str | None = None
     tombstoned_at: float | None = None
+    provenance_json: str = "{}"
 
 
 def _vec_to_blob(vec: list[float]) -> bytes:
@@ -355,6 +356,7 @@ class MemoryStore:
             project_scope=self.project_scope,
             version=version,
             supersedes_id=supersedes_id,
+            provenance_json=provenance_json,
         )
         blob = _vec_to_blob(embedding)
         await self._db.execute(
@@ -445,7 +447,7 @@ class MemoryStore:
         assert self._db is not None
         cur = await self._db.execute(
             "SELECT id, text, embedding, created_at, updated_at, source, layer, session_id, "
-            "project_scope, validity, version, supersedes_id, tombstoned_at "
+            "project_scope, validity, version, supersedes_id, tombstoned_at, provenance_json "
             "FROM memories WHERE id=?",
             (id,),
         )
@@ -457,6 +459,41 @@ class MemoryStore:
             created_at=row[3], updated_at=row[4], source=row[5],
             layer=row[6], session_id=row[7], project_scope=row[8], validity=row[9],
             version=row[10], supersedes_id=row[11], tombstoned_at=row[12],
+            provenance_json=row[13] or "{}",
+        )
+
+    async def find_active_exact(
+        self, text: str, *, session_id: str | None = None
+    ) -> Memory | None:
+        """Find an active exact fact within this store's scope and session.
+
+        This is intentionally narrower than vector similarity: benchmark
+        history may contain semantically related facts from different dates
+        and sessions, and those facts must not be treated as duplicates.
+        """
+
+        assert self._db is not None
+        scope_sql = "project_scope = ?" if self.project_scope else "project_scope IS NULL"
+        params: list[object] = [text]
+        if self.project_scope:
+            params.append(self.project_scope)
+        params.append(session_id)
+        cur = await self._db.execute(
+            "SELECT id, text, embedding, created_at, updated_at, source, layer, session_id, "
+            "project_scope, validity, version, supersedes_id, tombstoned_at, provenance_json "
+            "FROM memories WHERE validity='active' AND text=? AND "
+            f"{scope_sql} AND session_id IS ? ORDER BY created_at LIMIT 1",
+            params,
+        )
+        row = await cur.fetchone()
+        if row is None:
+            return None
+        return Memory(
+            id=row[0], text=row[1], embedding=_blob_to_vec(row[2]),
+            created_at=row[3], updated_at=row[4], source=row[5], layer=row[6],
+            session_id=row[7], project_scope=row[8], validity=row[9],
+            version=row[10], supersedes_id=row[11], tombstoned_at=row[12],
+            provenance_json=row[13] or "{}",
         )
 
     async def list_all(self, limit: int = 100) -> list[Memory]:
@@ -464,7 +501,8 @@ class MemoryStore:
         scope_sql = " AND (project_scope=? OR project_scope IS NULL)" if self.project_scope else ""
         params = ([self.project_scope] if self.project_scope else []) + [limit]
         cur = await self._db.execute(
-            "SELECT id, text, embedding, created_at, updated_at, source, layer, session_id "
+            "SELECT id, text, embedding, created_at, updated_at, source, layer, session_id, "
+            "provenance_json "
             f"FROM memories WHERE validity='active'{scope_sql} "
             "ORDER BY updated_at DESC LIMIT ?",
             params,
@@ -473,7 +511,7 @@ class MemoryStore:
         return [
             Memory(id=r[0], text=r[1], embedding=_blob_to_vec(r[2]),
                    created_at=r[3], updated_at=r[4], source=r[5],
-                   layer=r[6], session_id=r[7])
+                   layer=r[6], session_id=r[7], provenance_json=r[8] or "{}")
             for r in rows
         ]
 
@@ -498,7 +536,8 @@ class MemoryStore:
         scope_sql = " AND (project_scope=? OR project_scope IS NULL)" if self.project_scope else ""
         params = list(ids) + ([self.project_scope] if self.project_scope else [])
         mem_cur = await self._db.execute(
-            f"SELECT id, text, embedding, created_at, updated_at, source, layer, session_id "
+            f"SELECT id, text, embedding, created_at, updated_at, source, layer, session_id, "
+            f"provenance_json "
             f"FROM memories WHERE validity='active' AND id IN ({placeholders}){scope_sql}",
             params,
         )
@@ -506,7 +545,7 @@ class MemoryStore:
         mem_by_id = {
             r[0]: Memory(id=r[0], text=r[1], embedding=_blob_to_vec(r[2]),
                          created_at=r[3], updated_at=r[4], source=r[5],
-                         layer=r[6], session_id=r[7])
+                         layer=r[6], session_id=r[7], provenance_json=r[8] or "{}")
             for r in mem_rows
         }
         return [(mem_by_id[i], d) for i, d in zip(ids, distances) if i in mem_by_id][:k]
@@ -567,15 +606,16 @@ class MemoryStore:
             scope_sql = " AND (project_scope=? OR project_scope IS NULL)" if self.project_scope else ""
             params = list(rowids) + ([self.project_scope] if self.project_scope else [])
             mem_cur = await self._db.execute(
-                f"SELECT id, text, embedding, created_at, updated_at, source, layer, session_id, rowid "
+                f"SELECT id, text, embedding, created_at, updated_at, source, layer, session_id, "
+                f"provenance_json, rowid "
                 f"FROM memories WHERE validity='active' AND rowid IN ({placeholders}){scope_sql}",
                 params,
             )
             mem_rows = await mem_cur.fetchall()
             mem_by_rowid = {
-                r[8]: Memory(id=r[0], text=r[1], embedding=_blob_to_vec(r[2]),
+                r[9]: Memory(id=r[0], text=r[1], embedding=_blob_to_vec(r[2]),
                             created_at=r[3], updated_at=r[4], source=r[5],
-                            layer=r[6], session_id=r[7])
+                            layer=r[6], session_id=r[7], provenance_json=r[8] or "{}")
                 for r in mem_rows
             }
             return [(mem_by_rowid[i], s) for i, s in zip(rowids, scores) if i in mem_by_rowid][:k]

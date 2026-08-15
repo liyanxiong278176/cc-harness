@@ -1,0 +1,559 @@
+mode=resume
+benchmark=locomo-memory
+profile=full
+execution_mode=live
+rerun_sample=conv-26
+output_root=D:\agent_learning\cc-harness\eval\result\cc-only\locomo-memory\deepseek-v4-flash\full
+model=deepseek-v4-flash
+[10:03:34] rerun selected sample conv-26; other terminal trials remain unchanged
+[10:03:34] start 1/10 locomo/conv-26 attempt 2 generation 1
+[10:03:36] [locomo] [--------------------] task=1/10 task_id=conv-26 phase=task items=0/1 calls=0 elapsed=0s eta=-- event=start conv-26 sessions=19
+[10:03:36] [locomo] [--------------------] task=1/10 task_id=conv-26 phase=ingest-0001 items=0/19 calls=0 elapsed=2s eta=-- event=start item=1/19
+[10:03:51] [locomo] [--------------------] task=1/10 task_id=conv-26 phase=ingest-0001 items=0/19 calls=0 elapsed=17s eta=-- event=heartbeat waiting for model/runtime
+[10:03:56] [locomo] [#-------------------] task=1/10 task_id=conv-26 phase=ingest-0001 items=1/19 calls=3 elapsed=22s eta=6m44s event=complete session_1 turns=18
+[10:03:56] [locomo] [#-------------------] task=1/10 task_id=conv-26 phase=ingest-0002 items=1/19 calls=0 elapsed=22s eta=6m44s event=start item=2/19
+[10:04:11] [locomo] [#-------------------] task=1/10 task_id=conv-26 phase=ingest-0002 items=1/19 calls=0 elapsed=37s eta=11m15s event=heartbeat waiting for model/runtime
+[10:04:16] [locomo] [##------------------] task=1/10 task_id=conv-26 phase=ingest-0002 items=2/19 calls=6 elapsed=42s eta=6m00s event=complete session_2 turns=17
+[10:04:16] [locomo] [##------------------] task=1/10 task_id=conv-26 phase=ingest-0003 items=2/19 calls=0 elapsed=42s eta=6m00s event=start item=3/19
+[10:04:31] [locomo] [##------------------] task=1/10 task_id=conv-26 phase=ingest-0003 items=2/19 calls=0 elapsed=57s eta=8m07s event=heartbeat waiting for model/runtime
+[10:04:36] [locomo] [###-----------------] task=1/10 task_id=conv-26 phase=ingest-0003 items=3/19 calls=9 elapsed=1m01s eta=5m30s event=complete session_3 turns=23
+[10:04:36] [locomo] [###-----------------] task=1/10 task_id=conv-26 phase=ingest-0004 items=3/19 calls=0 elapsed=1m01s eta=5m30s event=start item=4/19
+[10:04:51] [locomo] [###-----------------] task=1/10 task_id=conv-26 phase=ingest-0004 items=3/19 calls=0 elapsed=1m16s eta=6m50s event=heartbeat waiting for model/runtime
+[10:04:56] [locomo] [####----------------] task=1/10 task_id=conv-26 phase=ingest-0004 items=4/19 calls=12 elapsed=1m22s eta=5m09s event=complete session_4 turns=18
+[10:04:56] [locomo] [####----------------] task=1/10 task_id=conv-26 phase=ingest-0005 items=4/19 calls=0 elapsed=1m22s eta=5m09s event=start item=5/19
+[10:05:11] [locomo] [####----------------] task=1/10 task_id=conv-26 phase=ingest-0005 items=4/19 calls=0 elapsed=1m37s eta=6m05s event=heartbeat waiting for model/runtime
+[10:05:13] [locomo] [#####---------------] task=1/10 task_id=conv-26 phase=ingest-0005 items=5/19 calls=15 elapsed=1m39s eta=4m38s event=complete session_5 turns=16
+[10:05:13] [locomo] [#####---------------] task=1/10 task_id=conv-26 phase=ingest-0006 items=5/19 calls=0 elapsed=1m39s eta=4m38s event=start item=6/19
+[10:05:28] [locomo] [#####---------------] task=1/10 task_id=conv-26 phase=ingest-0006 items=5/19 calls=0 elapsed=1m54s eta=5m20s event=heartbeat waiting for model/runtime
+[10:05:32] [locomo] [######--------------] task=1/10 task_id=conv-26 phase=ingest-0006 items=6/19 calls=18 elapsed=1m57s eta=4m15s event=complete session_6 turns=16
+[10:05:32] [locomo] [######--------------] task=1/10 task_id=conv-26 phase=ingest-0007 items=6/19 calls=0 elapsed=1m57s eta=4m15s event=start item=7/19
+[10:05:47] [locomo] [######--------------] task=1/10 task_id=conv-26 phase=ingest-0007 items=6/19 calls=0 elapsed=2m12s eta=4m48s event=heartbeat waiting for model/runtime
+[10:05:53] [locomo] [#######-------------] task=1/10 task_id=conv-26 phase=ingest-0007 items=7/19 calls=21 elapsed=2m19s eta=3m59s event=complete session_7 turns=27
+[10:05:53] [locomo] [#######-------------] task=1/10 task_id=conv-26 phase=ingest-0008 items=7/19 calls=0 elapsed=2m19s eta=3m59s event=start item=8/19
+[10:06:08] [locomo] [#######-------------] task=1/10 task_id=conv-26 phase=ingest-0008 items=7/19 calls=0 elapsed=2m34s eta=4m24s event=heartbeat waiting for model/runtime
+[10:06:15] [locomo] [########------------] task=1/10 task_id=conv-26 phase=ingest-0008 items=8/19 calls=24 elapsed=2m41s eta=3m42s event=complete session_8 turns=39
+[10:06:15] [locomo] [########------------] task=1/10 task_id=conv-26 phase=ingest-0009 items=8/19 calls=0 elapsed=2m41s eta=3m42s event=start item=9/19
+[10:06:31] [locomo] [########------------] task=1/10 task_id=conv-26 phase=ingest-0009 items=8/19 calls=0 elapsed=2m56s eta=4m03s event=heartbeat waiting for model/runtime
+[10:06:39] [locomo] [#########-----------] task=1/10 task_id=conv-26 phase=ingest-0009 items=9/19 calls=27 elapsed=3m05s eta=3m25s event=complete session_9 turns=17
+[10:06:39] [locomo] [#########-----------] task=1/10 task_id=conv-26 phase=ingest-0010 items=9/19 calls=0 elapsed=3m05s eta=3m25s event=start item=10/19
+[10:06:54] [locomo] [#########-----------] task=1/10 task_id=conv-26 phase=ingest-0010 items=9/19 calls=0 elapsed=3m20s eta=3m42s event=heartbeat waiting for model/runtime
+[10:06:57] [locomo] [##########----------] task=1/10 task_id=conv-26 phase=ingest-0010 items=10/19 calls=30 elapsed=3m23s eta=3m03s event=complete session_10 turns=24
+[10:06:57] [locomo] [##########----------] task=1/10 task_id=conv-26 phase=ingest-0011 items=10/19 calls=0 elapsed=3m23s eta=3m03s event=start item=11/19
+[10:07:12] [locomo] [##########----------] task=1/10 task_id=conv-26 phase=ingest-0011 items=10/19 calls=0 elapsed=3m38s eta=3m16s event=heartbeat waiting for model/runtime
+[10:07:17] [locomo] [###########---------] task=1/10 task_id=conv-26 phase=ingest-0011 items=11/19 calls=33 elapsed=3m43s eta=2m42s event=complete session_11 turns=17
+[10:07:17] [locomo] [###########---------] task=1/10 task_id=conv-26 phase=ingest-0012 items=11/19 calls=0 elapsed=3m43s eta=2m42s event=start item=12/19
+[10:07:32] [locomo] [###########---------] task=1/10 task_id=conv-26 phase=ingest-0012 items=11/19 calls=0 elapsed=3m58s eta=2m53s event=heartbeat waiting for model/runtime
+[10:07:34] [locomo] [############--------] task=1/10 task_id=conv-26 phase=ingest-0012 items=12/19 calls=36 elapsed=4m00s eta=2m20s event=complete session_12 turns=21
+[10:07:34] [locomo] [############--------] task=1/10 task_id=conv-26 phase=ingest-0013 items=12/19 calls=0 elapsed=4m00s eta=2m20s event=start item=13/19
+[10:07:49] [locomo] [############--------] task=1/10 task_id=conv-26 phase=ingest-0013 items=12/19 calls=0 elapsed=4m15s eta=2m28s event=heartbeat waiting for model/runtime
+[10:07:53] [locomo] [#############-------] task=1/10 task_id=conv-26 phase=ingest-0013 items=13/19 calls=39 elapsed=4m19s eta=1m59s event=complete session_13 turns=18
+[10:07:53] [locomo] [#############-------] task=1/10 task_id=conv-26 phase=ingest-0014 items=13/19 calls=0 elapsed=4m19s eta=1m59s event=start item=14/19
+[10:08:08] [locomo] [#############-------] task=1/10 task_id=conv-26 phase=ingest-0014 items=13/19 calls=0 elapsed=4m34s eta=2m06s event=heartbeat waiting for model/runtime
+[10:08:12] [locomo] [##############------] task=1/10 task_id=conv-26 phase=ingest-0014 items=14/19 calls=42 elapsed=4m38s eta=1m39s event=complete session_14 turns=35
+[10:08:12] [locomo] [##############------] task=1/10 task_id=conv-26 phase=ingest-0015 items=14/19 calls=0 elapsed=4m38s eta=1m39s event=start item=15/19
+[10:08:27] [locomo] [##############------] task=1/10 task_id=conv-26 phase=ingest-0015 items=14/19 calls=0 elapsed=4m53s eta=1m44s event=heartbeat waiting for model/runtime
+[10:08:36] [locomo] [###############-----] task=1/10 task_id=conv-26 phase=ingest-0015 items=15/19 calls=45 elapsed=5m02s eta=1m20s event=complete session_15 turns=28
+[10:08:36] [locomo] [###############-----] task=1/10 task_id=conv-26 phase=ingest-0016 items=15/19 calls=0 elapsed=5m02s eta=1m20s event=start item=16/19
+[10:08:52] [locomo] [###############-----] task=1/10 task_id=conv-26 phase=ingest-0016 items=15/19 calls=0 elapsed=5m17s eta=1m24s event=heartbeat waiting for model/runtime
+[10:08:58] [locomo] [################----] task=1/10 task_id=conv-26 phase=ingest-0016 items=16/19 calls=48 elapsed=5m23s eta=1m00s event=complete session_16 turns=20
+[10:08:58] [locomo] [################----] task=1/10 task_id=conv-26 phase=ingest-0017 items=16/19 calls=0 elapsed=5m23s eta=1m00s event=start item=17/19
+[10:09:13] [locomo] [################----] task=1/10 task_id=conv-26 phase=ingest-0017 items=16/19 calls=0 elapsed=5m38s eta=1m03s event=heartbeat waiting for model/runtime
+[10:09:18] [locomo] [#################---] task=1/10 task_id=conv-26 phase=ingest-0017 items=17/19 calls=51 elapsed=5m44s eta=40s event=complete session_17 turns=26
+[10:09:18] [locomo] [#################---] task=1/10 task_id=conv-26 phase=ingest-0018 items=17/19 calls=0 elapsed=5m44s eta=40s event=start item=18/19
+[10:09:33] [locomo] [#################---] task=1/10 task_id=conv-26 phase=ingest-0018 items=17/19 calls=0 elapsed=5m59s eta=42s event=heartbeat waiting for model/runtime
+[10:09:40] [locomo] [##################--] task=1/10 task_id=conv-26 phase=ingest-0018 items=18/19 calls=54 elapsed=6m06s eta=20s event=complete session_18 turns=24
+[10:09:40] [locomo] [##################--] task=1/10 task_id=conv-26 phase=ingest-0019 items=18/19 calls=0 elapsed=6m06s eta=20s event=start item=19/19
+[10:09:55] [locomo] [##################--] task=1/10 task_id=conv-26 phase=ingest-0019 items=18/19 calls=0 elapsed=6m21s eta=21s event=heartbeat waiting for model/runtime
+[10:09:57] [locomo] [####################] task=1/10 task_id=conv-26 phase=ingest-0019 items=19/19 calls=57 elapsed=6m23s eta=0s event=complete session_19 turns=15
+[10:09:57] [locomo] [####################] task=1/10 task_id=conv-26 phase=snapshot items=19/19 calls=57 elapsed=6m23s eta=0s event=creating query snapshot
+[10:10:00] [locomo] [--------------------] task=1/10 task_id=conv-26 phase=qa items=0/199 calls=57 elapsed=6m26s eta=-- event=start questions=199
+[10:10:00] [locomo] [--------------------] task=1/10 task_id=conv-26 phase=qa-0001 items=0/199 calls=0 elapsed=6m26s eta=-- event=start item=1/199
+[10:10:13] [locomo] [--------------------] task=1/10 task_id=conv-26 phase=qa-0001 items=1/199 calls=59 elapsed=6m38s eta=21h56m event=complete score=1.000 mean=1.000
+[10:10:13] [locomo] [--------------------] task=1/10 task_id=conv-26 phase=qa-0002 items=1/199 calls=0 elapsed=6m38s eta=21h56m event=start item=2/199
+[10:10:24] [locomo] [--------------------] task=1/10 task_id=conv-26 phase=qa-0002 items=2/199 calls=61 elapsed=6m50s eta=11h13m event=complete score=1.000 mean=1.000
+[10:10:24] [locomo] [--------------------] task=1/10 task_id=conv-26 phase=qa-0003 items=2/199 calls=0 elapsed=6m50s eta=11h13m event=start item=3/199
+[10:10:37] [locomo] [--------------------] task=1/10 task_id=conv-26 phase=qa-0003 items=3/199 calls=63 elapsed=7m02s eta=7h40m event=complete score=0.333 mean=0.778
+[10:10:37] [locomo] [--------------------] task=1/10 task_id=conv-26 phase=qa-0004 items=3/199 calls=0 elapsed=7m02s eta=7h40m event=start item=4/199
+[10:10:48] [locomo] [--------------------] task=1/10 task_id=conv-26 phase=qa-0004 items=4/199 calls=65 elapsed=7m14s eta=5h53m event=complete score=1.000 mean=0.833
+[10:10:49] [locomo] [--------------------] task=1/10 task_id=conv-26 phase=qa-0005 items=4/199 calls=0 elapsed=7m14s eta=5h53m event=start item=5/199
+[10:10:59] [locomo] [--------------------] task=1/10 task_id=conv-26 phase=qa-0005 items=5/199 calls=67 elapsed=7m25s eta=4h48m event=complete score=1.000 mean=0.867
+[10:10:59] [locomo] [--------------------] task=1/10 task_id=conv-26 phase=qa-0006 items=5/199 calls=0 elapsed=7m25s eta=4h48m event=start item=6/199
+[10:11:12] [locomo] [--------------------] task=1/10 task_id=conv-26 phase=qa-0006 items=6/199 calls=69 elapsed=7m38s eta=4h05m event=complete score=0.500 mean=0.806
+[10:11:12] [locomo] [--------------------] task=1/10 task_id=conv-26 phase=qa-0007 items=6/199 calls=0 elapsed=7m38s eta=4h05m event=start item=7/199
+[10:11:27] [locomo] [--------------------] task=1/10 task_id=conv-26 phase=qa-0007 items=6/199 calls=0 elapsed=7m53s eta=4h13m event=heartbeat waiting for model/runtime
+[10:11:36] [locomo] [--------------------] task=1/10 task_id=conv-26 phase=qa-0007 items=7/199 calls=72 elapsed=8m02s eta=3h40m event=complete score=1.000 mean=0.833
+[10:11:36] [locomo] [--------------------] task=1/10 task_id=conv-26 phase=qa-0008 items=7/199 calls=0 elapsed=8m02s eta=3h40m event=start item=8/199
+[10:11:49] [locomo] [--------------------] task=1/10 task_id=conv-26 phase=qa-0008 items=8/199 calls=74 elapsed=8m15s eta=3h16m event=complete score=1.000 mean=0.854
+[10:11:49] [locomo] [--------------------] task=1/10 task_id=conv-26 phase=qa-0009 items=8/199 calls=0 elapsed=8m15s eta=3h16m event=start item=9/199
+[10:12:00] [locomo] [--------------------] task=1/10 task_id=conv-26 phase=qa-0009 items=9/199 calls=76 elapsed=8m26s eta=2h58m event=complete score=0.714 mean=0.839
+[10:12:01] [locomo] [--------------------] task=1/10 task_id=conv-26 phase=qa-0010 items=9/199 calls=0 elapsed=8m26s eta=2h58m event=start item=10/199
+[10:12:16] [locomo] [--------------------] task=1/10 task_id=conv-26 phase=qa-0010 items=9/199 calls=0 elapsed=8m41s eta=3h03m event=heartbeat waiting for model/runtime
+[10:12:20] [locomo] [#-------------------] task=1/10 task_id=conv-26 phase=qa-0010 items=10/199 calls=78 elapsed=8m46s eta=2h45m event=complete score=0.714 mean=0.826
+[10:12:20] [locomo] [#-------------------] task=1/10 task_id=conv-26 phase=qa-0011 items=10/199 calls=0 elapsed=8m46s eta=2h45m event=start item=11/199
+[10:12:32] [locomo] [#-------------------] task=1/10 task_id=conv-26 phase=qa-0011 items=11/199 calls=80 elapsed=8m58s eta=2h33m event=complete score=1.000 mean=0.842
+[10:12:32] [locomo] [#-------------------] task=1/10 task_id=conv-26 phase=qa-0012 items=11/199 calls=0 elapsed=8m58s eta=2h33m event=start item=12/199
+[10:12:47] [locomo] [#-------------------] task=1/10 task_id=conv-26 phase=qa-0012 items=11/199 calls=0 elapsed=9m13s eta=2h37m event=heartbeat waiting for model/runtime
+[10:12:47] [locomo] [#-------------------] task=1/10 task_id=conv-26 phase=qa-0012 items=12/199 calls=82 elapsed=9m13s eta=2h23m event=complete score=1.000 mean=0.855
+[10:12:47] [locomo] [#-------------------] task=1/10 task_id=conv-26 phase=qa-0013 items=12/199 calls=0 elapsed=9m13s eta=2h23m event=start item=13/199
+[10:13:00] [locomo] [#-------------------] task=1/10 task_id=conv-26 phase=qa-0013 items=13/199 calls=84 elapsed=9m25s eta=2h14m event=complete score=0.667 mean=0.841
+[10:13:00] [locomo] [#-------------------] task=1/10 task_id=conv-26 phase=qa-0014 items=13/199 calls=0 elapsed=9m25s eta=2h14m event=start item=14/199
+[10:13:12] [locomo] [#-------------------] task=1/10 task_id=conv-26 phase=qa-0014 items=14/199 calls=86 elapsed=9m38s eta=2h07m event=complete score=0.600 mean=0.823
+[10:13:12] [locomo] [#-------------------] task=1/10 task_id=conv-26 phase=qa-0015 items=14/199 calls=0 elapsed=9m38s eta=2h07m event=start item=15/199
+[10:13:27] [locomo] [#-------------------] task=1/10 task_id=conv-26 phase=qa-0015 items=15/199 calls=88 elapsed=9m53s eta=2h01m event=complete score=0.143 mean=0.778
+[10:13:27] [locomo] [#-------------------] task=1/10 task_id=conv-26 phase=qa-0016 items=15/199 calls=0 elapsed=9m53s eta=2h01m event=start item=16/199
+[10:13:42] [locomo] [#-------------------] task=1/10 task_id=conv-26 phase=qa-0016 items=15/199 calls=0 elapsed=10m08s eta=2h04m event=heartbeat waiting for model/runtime
+[10:13:45] [locomo] [#-------------------] task=1/10 task_id=conv-26 phase=qa-0016 items=16/199 calls=90 elapsed=10m11s eta=1h56m event=complete score=0.725 mean=0.775
+[10:13:45] [locomo] [#-------------------] task=1/10 task_id=conv-26 phase=qa-0017 items=16/199 calls=0 elapsed=10m11s eta=1h56m event=start item=17/199
+[10:13:58] [locomo] [#-------------------] task=1/10 task_id=conv-26 phase=qa-0017 items=17/199 calls=92 elapsed=10m24s eta=1h51m event=complete score=1.000 mean=0.788
+[10:13:58] [locomo] [#-------------------] task=1/10 task_id=conv-26 phase=qa-0018 items=17/199 calls=0 elapsed=10m24s eta=1h51m event=start item=18/199
+[10:14:10] [locomo] [#-------------------] task=1/10 task_id=conv-26 phase=qa-0018 items=18/199 calls=94 elapsed=10m36s eta=1h46m event=complete score=1.000 mean=0.800
+[10:14:10] [locomo] [#-------------------] task=1/10 task_id=conv-26 phase=qa-0019 items=18/199 calls=0 elapsed=10m36s eta=1h46m event=start item=19/199
+[10:14:25] [locomo] [#-------------------] task=1/10 task_id=conv-26 phase=qa-0019 items=18/199 calls=0 elapsed=10m51s eta=1h49m event=heartbeat waiting for model/runtime
+[10:14:27] [locomo] [#-------------------] task=1/10 task_id=conv-26 phase=qa-0019 items=19/199 calls=97 elapsed=10m53s eta=1h43m event=complete score=1.000 mean=0.810
+[10:14:28] [locomo] [#-------------------] task=1/10 task_id=conv-26 phase=qa-0020 items=19/199 calls=0 elapsed=10m53s eta=1h43m event=start item=20/199
+[10:14:43] [locomo] [#-------------------] task=1/10 task_id=conv-26 phase=qa-0020 items=19/199 calls=0 elapsed=11m08s eta=1h45m event=heartbeat waiting for model/runtime
+[10:14:46] [locomo] [##------------------] task=1/10 task_id=conv-26 phase=qa-0020 items=20/199 calls=99 elapsed=11m11s eta=1h40m event=complete score=0.154 mean=0.778
+[10:14:46] [locomo] [##------------------] task=1/10 task_id=conv-26 phase=qa-0021 items=20/199 calls=0 elapsed=11m11s eta=1h40m event=start item=21/199
+[10:14:56] [locomo] [##------------------] task=1/10 task_id=conv-26 phase=qa-0021 items=21/199 calls=101 elapsed=11m22s eta=1h36m event=complete score=1.000 mean=0.788
+[10:14:56] [locomo] [##------------------] task=1/10 task_id=conv-26 phase=qa-0022 items=21/199 calls=0 elapsed=11m22s eta=1h36m event=start item=22/199
+[10:15:09] [locomo] [##------------------] task=1/10 task_id=conv-26 phase=qa-0022 items=22/199 calls=103 elapsed=11m35s eta=1h33m event=complete score=0.714 mean=0.785
+[10:15:09] [locomo] [##------------------] task=1/10 task_id=conv-26 phase=qa-0023 items=22/199 calls=0 elapsed=11m35s eta=1h33m event=start item=23/199
+[10:15:24] [locomo] [##------------------] task=1/10 task_id=conv-26 phase=qa-0023 items=22/199 calls=0 elapsed=11m50s eta=1h35m event=heartbeat waiting for model/runtime
+[10:15:30] [locomo] [##------------------] task=1/10 task_id=conv-26 phase=qa-0023 items=23/199 calls=105 elapsed=11m56s eta=1h31m event=complete score=0.632 mean=0.778
+[10:15:30] [locomo] [##------------------] task=1/10 task_id=conv-26 phase=qa-0024 items=23/199 calls=0 elapsed=11m56s eta=1h31m event=start item=24/199
+[10:15:45] [locomo] [##------------------] task=1/10 task_id=conv-26 phase=qa-0024 items=23/199 calls=0 elapsed=12m11s eta=1h33m event=heartbeat waiting for model/runtime
+[10:15:45] [locomo] [##------------------] task=1/10 task_id=conv-26 phase=qa-0024 items=24/199 calls=107 elapsed=12m11s eta=1h28m event=complete score=0.500 mean=0.767
+[10:15:45] [locomo] [##------------------] task=1/10 task_id=conv-26 phase=qa-0025 items=24/199 calls=0 elapsed=12m11s eta=1h28m event=start item=25/199
+[10:15:59] [locomo] [##------------------] task=1/10 task_id=conv-26 phase=qa-0025 items=25/199 calls=109 elapsed=12m24s eta=1h26m event=complete score=0.500 mean=0.756
+[10:15:59] [locomo] [##------------------] task=1/10 task_id=conv-26 phase=qa-0026 items=25/199 calls=0 elapsed=12m24s eta=1h26m event=start item=26/199
+[10:16:11] [locomo] [##------------------] task=1/10 task_id=conv-26 phase=qa-0026 items=26/199 calls=111 elapsed=12m37s eta=1h23m event=complete score=1.000 mean=0.765
+[10:16:11] [locomo] [##------------------] task=1/10 task_id=conv-26 phase=qa-0027 items=26/199 calls=0 elapsed=12m37s eta=1h23m event=start item=27/199
+[10:16:26] [locomo] [##------------------] task=1/10 task_id=conv-26 phase=qa-0027 items=26/199 calls=0 elapsed=12m52s eta=1h25m event=heartbeat waiting for model/runtime
+[10:16:40] [locomo] [##------------------] task=1/10 task_id=conv-26 phase=qa-0027 items=27/199 calls=115 elapsed=13m06s eta=1h23m event=complete score=0.000 mean=0.737
+[10:16:40] [locomo] [##------------------] task=1/10 task_id=conv-26 phase=qa-0028 items=27/199 calls=0 elapsed=13m06s eta=1h23m event=start item=28/199
+[10:16:55] [locomo] [##------------------] task=1/10 task_id=conv-26 phase=qa-0028 items=27/199 calls=0 elapsed=13m21s eta=1h25m event=heartbeat waiting for model/runtime
+[10:16:58] [locomo] [##------------------] task=1/10 task_id=conv-26 phase=qa-0028 items=28/199 calls=118 elapsed=13m23s eta=1h21m event=complete score=0.400 mean=0.725
+[10:16:58] [locomo] [##------------------] task=1/10 task_id=conv-26 phase=qa-0029 items=28/199 calls=0 elapsed=13m23s eta=1h21m event=start item=29/199
+[10:17:10] [locomo] [##------------------] task=1/10 task_id=conv-26 phase=qa-0029 items=29/199 calls=120 elapsed=13m36s eta=1h19m event=complete score=0.500 mean=0.717
+[10:17:10] [locomo] [##------------------] task=1/10 task_id=conv-26 phase=qa-0030 items=29/199 calls=0 elapsed=13m36s eta=1h19m event=start item=30/199
+[10:17:23] [locomo] [###-----------------] task=1/10 task_id=conv-26 phase=qa-0030 items=30/199 calls=122 elapsed=13m49s eta=1h17m event=complete score=0.500 mean=0.710
+[10:17:23] [locomo] [###-----------------] task=1/10 task_id=conv-26 phase=qa-0031 items=30/199 calls=0 elapsed=13m49s eta=1h17m event=start item=31/199
+[10:17:38] [locomo] [###-----------------] task=1/10 task_id=conv-26 phase=qa-0031 items=31/199 calls=124 elapsed=14m04s eta=1h16m event=complete score=0.133 mean=0.691
+[10:17:38] [locomo] [###-----------------] task=1/10 task_id=conv-26 phase=qa-0032 items=31/199 calls=0 elapsed=14m04s eta=1h16m event=start item=32/199
+[10:17:53] [locomo] [###-----------------] task=1/10 task_id=conv-26 phase=qa-0032 items=31/199 calls=0 elapsed=14m19s eta=1h17m event=heartbeat waiting for model/runtime
+[10:17:55] [locomo] [###-----------------] task=1/10 task_id=conv-26 phase=qa-0032 items=32/199 calls=126 elapsed=14m21s eta=1h14m event=complete score=0.714 mean=0.692
+[10:17:55] [locomo] [###-----------------] task=1/10 task_id=conv-26 phase=qa-0033 items=32/199 calls=0 elapsed=14m21s eta=1h14m event=start item=33/199
+[10:18:10] [locomo] [###-----------------] task=1/10 task_id=conv-26 phase=qa-0033 items=32/199 calls=0 elapsed=14m36s eta=1h16m event=heartbeat waiting for model/runtime
+[10:18:25] [locomo] [###-----------------] task=1/10 task_id=conv-26 phase=qa-0033 items=32/199 calls=0 elapsed=14m51s eta=1h17m event=heartbeat waiting for model/runtime
+[10:18:28] [locomo] [###-----------------] task=1/10 task_id=conv-26 phase=qa-0033 items=33/199 calls=129 elapsed=14m54s eta=1h15m event=complete score=0.494 mean=0.686
+[10:18:28] [locomo] [###-----------------] task=1/10 task_id=conv-26 phase=qa-0034 items=33/199 calls=0 elapsed=14m54s eta=1h15m event=start item=34/199
+[10:18:43] [locomo] [###-----------------] task=1/10 task_id=conv-26 phase=qa-0034 items=33/199 calls=0 elapsed=15m09s eta=1h16m event=heartbeat waiting for model/runtime
+[10:18:44] [locomo] [###-----------------] task=1/10 task_id=conv-26 phase=qa-0034 items=34/199 calls=131 elapsed=15m10s eta=1h13m event=complete score=0.182 mean=0.671
+[10:18:44] [locomo] [###-----------------] task=1/10 task_id=conv-26 phase=qa-0035 items=34/199 calls=0 elapsed=15m10s eta=1h13m event=start item=35/199
+[10:18:59] [locomo] [###-----------------] task=1/10 task_id=conv-26 phase=qa-0035 items=34/199 calls=0 elapsed=15m25s eta=1h14m event=heartbeat waiting for model/runtime
+[10:19:06] [locomo] [###-----------------] task=1/10 task_id=conv-26 phase=qa-0035 items=35/199 calls=134 elapsed=15m32s eta=1h12m event=complete score=0.125 mean=0.656
+[10:19:06] [locomo] [###-----------------] task=1/10 task_id=conv-26 phase=qa-0036 items=35/199 calls=0 elapsed=15m32s eta=1h12m event=start item=36/199
+[10:19:21] [locomo] [###-----------------] task=1/10 task_id=conv-26 phase=qa-0036 items=35/199 calls=0 elapsed=15m47s eta=1h13m event=heartbeat waiting for model/runtime
+[10:19:25] [locomo] [###-----------------] task=1/10 task_id=conv-26 phase=qa-0036 items=36/199 calls=136 elapsed=15m51s eta=1h11m event=complete score=0.800 mean=0.660
+[10:19:25] [locomo] [###-----------------] task=1/10 task_id=conv-26 phase=qa-0037 items=36/199 calls=0 elapsed=15m51s eta=1h11m event=start item=37/199
+[10:19:40] [locomo] [###-----------------] task=1/10 task_id=conv-26 phase=qa-0037 items=36/199 calls=0 elapsed=16m06s eta=1h12m event=heartbeat waiting for model/runtime
+[10:19:42] [locomo] [###-----------------] task=1/10 task_id=conv-26 phase=qa-0037 items=37/199 calls=138 elapsed=16m08s eta=1h10m event=complete score=0.714 mean=0.661
+[10:19:42] [locomo] [###-----------------] task=1/10 task_id=conv-26 phase=qa-0038 items=37/199 calls=0 elapsed=16m08s eta=1h10m event=start item=38/199
+[10:19:55] [locomo] [###-----------------] task=1/10 task_id=conv-26 phase=qa-0038 items=38/199 calls=140 elapsed=16m21s eta=1h09m event=complete score=0.000 mean=0.644
+[10:19:55] [locomo] [###-----------------] task=1/10 task_id=conv-26 phase=qa-0039 items=38/199 calls=0 elapsed=16m21s eta=1h09m event=start item=39/199
+[10:20:09] [locomo] [###-----------------] task=1/10 task_id=conv-26 phase=qa-0039 items=39/199 calls=142 elapsed=16m35s eta=1h08m event=complete score=0.650 mean=0.644
+[10:20:09] [locomo] [###-----------------] task=1/10 task_id=conv-26 phase=qa-0040 items=39/199 calls=0 elapsed=16m35s eta=1h08m event=start item=40/199
+[10:20:24] [locomo] [####----------------] task=1/10 task_id=conv-26 phase=qa-0040 items=40/199 calls=144 elapsed=16m50s eta=1h06m event=complete score=0.479 mean=0.640
+[10:20:24] [locomo] [####----------------] task=1/10 task_id=conv-26 phase=qa-0041 items=40/199 calls=0 elapsed=16m50s eta=1h06m event=start item=41/199
+[10:20:37] [locomo] [####----------------] task=1/10 task_id=conv-26 phase=qa-0041 items=41/199 calls=146 elapsed=17m03s eta=1h05m event=complete score=1.000 mean=0.648
+[10:20:37] [locomo] [####----------------] task=1/10 task_id=conv-26 phase=qa-0042 items=41/199 calls=0 elapsed=17m03s eta=1h05m event=start item=42/199
+[10:20:49] [locomo] [####----------------] task=1/10 task_id=conv-26 phase=qa-0042 items=42/199 calls=148 elapsed=17m15s eta=1h04m event=complete score=0.500 mean=0.645
+[10:20:49] [locomo] [####----------------] task=1/10 task_id=conv-26 phase=qa-0043 items=42/199 calls=0 elapsed=17m15s eta=1h04m event=start item=43/199
+[10:21:04] [locomo] [####----------------] task=1/10 task_id=conv-26 phase=qa-0043 items=42/199 calls=0 elapsed=17m30s eta=1h05m event=heartbeat waiting for model/runtime
+[10:21:04] [locomo] [####----------------] task=1/10 task_id=conv-26 phase=qa-0043 items=43/199 calls=150 elapsed=17m30s eta=1h03m event=complete score=1.000 mean=0.653
+[10:21:04] [locomo] [####----------------] task=1/10 task_id=conv-26 phase=qa-0044 items=43/199 calls=0 elapsed=17m30s eta=1h03m event=start item=44/199
+[10:21:18] [locomo] [####----------------] task=1/10 task_id=conv-26 phase=qa-0044 items=44/199 calls=152 elapsed=17m44s eta=1h02m event=complete score=0.000 mean=0.638
+[10:21:18] [locomo] [####----------------] task=1/10 task_id=conv-26 phase=qa-0045 items=44/199 calls=0 elapsed=17m44s eta=1h02m event=start item=45/199
+[10:21:33] [locomo] [####----------------] task=1/10 task_id=conv-26 phase=qa-0045 items=45/199 calls=154 elapsed=17m59s eta=1h01m event=complete score=0.800 mean=0.642
+[10:21:33] [locomo] [####----------------] task=1/10 task_id=conv-26 phase=qa-0046 items=45/199 calls=0 elapsed=17m59s eta=1h01m event=start item=46/199
+[10:21:46] [locomo] [####----------------] task=1/10 task_id=conv-26 phase=qa-0046 items=46/199 calls=156 elapsed=18m11s eta=1h00m event=complete score=0.500 mean=0.639
+[10:21:46] [locomo] [####----------------] task=1/10 task_id=conv-26 phase=qa-0047 items=46/199 calls=0 elapsed=18m11s eta=1h00m event=start item=47/199
+[10:21:59] [locomo] [####----------------] task=1/10 task_id=conv-26 phase=qa-0047 items=47/199 calls=158 elapsed=18m25s eta=59m34s event=complete score=0.333 mean=0.632
+[10:21:59] [locomo] [####----------------] task=1/10 task_id=conv-26 phase=qa-0048 items=47/199 calls=0 elapsed=18m25s eta=59m34s event=start item=48/199
+[10:22:14] [locomo] [####----------------] task=1/10 task_id=conv-26 phase=qa-0048 items=47/199 calls=0 elapsed=18m40s eta=1h00m event=heartbeat waiting for model/runtime
+[10:22:22] [locomo] [####----------------] task=1/10 task_id=conv-26 phase=qa-0048 items=48/199 calls=161 elapsed=18m48s eta=59m10s event=complete score=0.467 mean=0.629
+[10:22:22] [locomo] [####----------------] task=1/10 task_id=conv-26 phase=qa-0049 items=48/199 calls=0 elapsed=18m48s eta=59m11s event=start item=49/199
+[10:22:38] [locomo] [####----------------] task=1/10 task_id=conv-26 phase=qa-0049 items=48/199 calls=0 elapsed=19m03s eta=59m58s event=heartbeat waiting for model/runtime
+[10:22:43] [locomo] [####----------------] task=1/10 task_id=conv-26 phase=qa-0049 items=49/199 calls=163 elapsed=19m09s eta=58m37s event=complete score=0.000 mean=0.616
+[10:22:43] [locomo] [####----------------] task=1/10 task_id=conv-26 phase=qa-0050 items=49/199 calls=0 elapsed=19m09s eta=58m38s event=start item=50/199
+[10:22:58] [locomo] [#####---------------] task=1/10 task_id=conv-26 phase=qa-0050 items=50/199 calls=165 elapsed=19m24s eta=57m49s event=complete score=0.667 mean=0.617
+[10:22:58] [locomo] [#####---------------] task=1/10 task_id=conv-26 phase=qa-0051 items=50/199 calls=0 elapsed=19m24s eta=57m49s event=start item=51/199
+[10:23:13] [locomo] [#####---------------] task=1/10 task_id=conv-26 phase=qa-0051 items=50/199 calls=0 elapsed=19m39s eta=58m33s event=heartbeat waiting for model/runtime
+[10:23:15] [locomo] [#####---------------] task=1/10 task_id=conv-26 phase=qa-0051 items=51/199 calls=167 elapsed=19m40s eta=57m07s event=complete score=0.000 mean=0.605
+[10:23:15] [locomo] [#####---------------] task=1/10 task_id=conv-26 phase=qa-0052 items=51/199 calls=0 elapsed=19m41s eta=57m07s event=start item=52/199
+[10:23:30] [locomo] [#####---------------] task=1/10 task_id=conv-26 phase=qa-0052 items=51/199 calls=0 elapsed=19m56s eta=57m50s event=heartbeat waiting for model/runtime
+[10:23:34] [locomo] [#####---------------] task=1/10 task_id=conv-26 phase=qa-0052 items=52/199 calls=169 elapsed=20m00s eta=56m32s event=complete score=0.389 mean=0.601
+[10:23:34] [locomo] [#####---------------] task=1/10 task_id=conv-26 phase=qa-0053 items=52/199 calls=0 elapsed=20m00s eta=56m32s event=start item=53/199
+[10:23:49] [locomo] [#####---------------] task=1/10 task_id=conv-26 phase=qa-0053 items=52/199 calls=0 elapsed=20m15s eta=57m15s event=heartbeat waiting for model/runtime
+[10:23:55] [locomo] [#####---------------] task=1/10 task_id=conv-26 phase=qa-0053 items=53/199 calls=171 elapsed=20m21s eta=56m05s event=complete score=1.000 mean=0.608
+[10:23:55] [locomo] [#####---------------] task=1/10 task_id=conv-26 phase=qa-0054 items=53/199 calls=0 elapsed=20m21s eta=56m05s event=start item=54/199
+[10:24:10] [locomo] [#####---------------] task=1/10 task_id=conv-26 phase=qa-0054 items=54/199 calls=173 elapsed=20m36s eta=55m18s event=complete score=0.800 mean=0.612
+[10:24:10] [locomo] [#####---------------] task=1/10 task_id=conv-26 phase=qa-0055 items=54/199 calls=0 elapsed=20m36s eta=55m18s event=start item=55/199
+[10:24:23] [locomo] [#####---------------] task=1/10 task_id=conv-26 phase=qa-0055 items=55/199 calls=175 elapsed=20m49s eta=54m31s event=complete score=1.000 mean=0.619
+[10:24:23] [locomo] [#####---------------] task=1/10 task_id=conv-26 phase=qa-0056 items=55/199 calls=0 elapsed=20m49s eta=54m31s event=start item=56/199
+[10:24:37] [locomo] [#####---------------] task=1/10 task_id=conv-26 phase=qa-0056 items=56/199 calls=177 elapsed=21m03s eta=53m46s event=complete score=1.000 mean=0.626
+[10:24:37] [locomo] [#####---------------] task=1/10 task_id=conv-26 phase=qa-0057 items=56/199 calls=0 elapsed=21m03s eta=53m46s event=start item=57/199
+[10:24:52] [locomo] [#####---------------] task=1/10 task_id=conv-26 phase=qa-0057 items=56/199 calls=0 elapsed=21m18s eta=54m25s event=heartbeat waiting for model/runtime
+[10:24:53] [locomo] [#####---------------] task=1/10 task_id=conv-26 phase=qa-0057 items=57/199 calls=179 elapsed=21m19s eta=53m06s event=complete score=0.222 mean=0.619
+[10:24:53] [locomo] [#####---------------] task=1/10 task_id=conv-26 phase=qa-0058 items=57/199 calls=0 elapsed=21m19s eta=53m06s event=start item=58/199
+[10:25:08] [locomo] [#####---------------] task=1/10 task_id=conv-26 phase=qa-0058 items=57/199 calls=0 elapsed=21m34s eta=53m44s event=heartbeat waiting for model/runtime
+[10:25:16] [locomo] [#####---------------] task=1/10 task_id=conv-26 phase=qa-0058 items=58/199 calls=181 elapsed=21m42s eta=52m45s event=complete score=0.500 mean=0.617
+[10:25:16] [locomo] [#####---------------] task=1/10 task_id=conv-26 phase=qa-0059 items=58/199 calls=0 elapsed=21m42s eta=52m45s event=start item=59/199
+[10:25:27] [locomo] [#####---------------] task=1/10 task_id=conv-26 phase=qa-0059 items=59/199 calls=183 elapsed=21m52s eta=51m55s event=complete score=1.000 mean=0.623
+[10:25:27] [locomo] [#####---------------] task=1/10 task_id=conv-26 phase=qa-0060 items=59/199 calls=0 elapsed=21m52s eta=51m55s event=start item=60/199
+[10:25:41] [locomo] [######--------------] task=1/10 task_id=conv-26 phase=qa-0060 items=60/199 calls=185 elapsed=22m07s eta=51m15s event=complete score=0.000 mean=0.613
+[10:25:41] [locomo] [######--------------] task=1/10 task_id=conv-26 phase=qa-0061 items=60/199 calls=0 elapsed=22m07s eta=51m15s event=start item=61/199
+[10:25:53] [locomo] [######--------------] task=1/10 task_id=conv-26 phase=qa-0061 items=61/199 calls=187 elapsed=22m19s eta=50m30s event=complete score=1.000 mean=0.619
+[10:25:53] [locomo] [######--------------] task=1/10 task_id=conv-26 phase=qa-0062 items=61/199 calls=0 elapsed=22m19s eta=50m30s event=start item=62/199
+[10:26:07] [locomo] [######--------------] task=1/10 task_id=conv-26 phase=qa-0062 items=62/199 calls=189 elapsed=22m32s eta=49m49s event=complete score=0.667 mean=0.620
+[10:26:07] [locomo] [######--------------] task=1/10 task_id=conv-26 phase=qa-0063 items=62/199 calls=0 elapsed=22m32s eta=49m49s event=start item=63/199
+[10:26:17] [locomo] [######--------------] task=1/10 task_id=conv-26 phase=qa-0063 items=63/199 calls=191 elapsed=22m43s eta=49m03s event=complete score=1.000 mean=0.626
+[10:26:17] [locomo] [######--------------] task=1/10 task_id=conv-26 phase=qa-0064 items=63/199 calls=0 elapsed=22m43s eta=49m03s event=start item=64/199
+[10:26:29] [locomo] [######--------------] task=1/10 task_id=conv-26 phase=qa-0064 items=64/199 calls=193 elapsed=22m55s eta=48m21s event=complete score=1.000 mean=0.632
+[10:26:29] [locomo] [######--------------] task=1/10 task_id=conv-26 phase=qa-0065 items=64/199 calls=0 elapsed=22m55s eta=48m21s event=start item=65/199
+[10:26:43] [locomo] [######--------------] task=1/10 task_id=conv-26 phase=qa-0065 items=65/199 calls=195 elapsed=23m09s eta=47m44s event=complete score=0.133 mean=0.624
+[10:26:43] [locomo] [######--------------] task=1/10 task_id=conv-26 phase=qa-0066 items=65/199 calls=0 elapsed=23m09s eta=47m44s event=start item=66/199
+[10:26:58] [locomo] [######--------------] task=1/10 task_id=conv-26 phase=qa-0066 items=65/199 calls=0 elapsed=23m24s eta=48m15s event=heartbeat waiting for model/runtime
+[10:26:59] [locomo] [######--------------] task=1/10 task_id=conv-26 phase=qa-0066 items=66/199 calls=197 elapsed=23m24s eta=47m11s event=complete score=0.176 mean=0.617
+[10:26:59] [locomo] [######--------------] task=1/10 task_id=conv-26 phase=qa-0067 items=66/199 calls=0 elapsed=23m24s eta=47m11s event=start item=67/199
+[10:27:13] [locomo] [######--------------] task=1/10 task_id=conv-26 phase=qa-0067 items=67/199 calls=199 elapsed=23m39s eta=46m35s event=complete score=0.000 mean=0.608
+[10:27:13] [locomo] [######--------------] task=1/10 task_id=conv-26 phase=qa-0068 items=67/199 calls=0 elapsed=23m39s eta=46m35s event=start item=68/199
+[10:27:26] [locomo] [######--------------] task=1/10 task_id=conv-26 phase=qa-0068 items=68/199 calls=201 elapsed=23m52s eta=45m58s event=complete score=0.714 mean=0.610
+[10:27:26] [locomo] [######--------------] task=1/10 task_id=conv-26 phase=qa-0069 items=68/199 calls=0 elapsed=23m52s eta=45m58s event=start item=69/199
+[10:27:37] [locomo] [######--------------] task=1/10 task_id=conv-26 phase=qa-0069 items=69/199 calls=203 elapsed=24m03s eta=45m19s event=complete score=0.000 mean=0.601
+[10:27:37] [locomo] [######--------------] task=1/10 task_id=conv-26 phase=qa-0070 items=69/199 calls=0 elapsed=24m03s eta=45m19s event=start item=70/199
+[10:27:52] [locomo] [######--------------] task=1/10 task_id=conv-26 phase=qa-0070 items=69/199 calls=0 elapsed=24m18s eta=45m47s event=heartbeat waiting for model/runtime
+[10:27:52] [locomo] [#######-------------] task=1/10 task_id=conv-26 phase=qa-0070 items=70/199 calls=205 elapsed=24m18s eta=44m48s event=complete score=0.000 mean=0.592
+[10:27:52] [locomo] [#######-------------] task=1/10 task_id=conv-26 phase=qa-0071 items=70/199 calls=0 elapsed=24m18s eta=44m48s event=start item=71/199
+[10:28:07] [locomo] [#######-------------] task=1/10 task_id=conv-26 phase=qa-0071 items=70/199 calls=0 elapsed=24m33s eta=45m16s event=heartbeat waiting for model/runtime
+[10:28:14] [locomo] [#######-------------] task=1/10 task_id=conv-26 phase=qa-0071 items=71/199 calls=208 elapsed=24m40s eta=44m29s event=complete score=0.222 mean=0.587
+[10:28:14] [locomo] [#######-------------] task=1/10 task_id=conv-26 phase=qa-0072 items=71/199 calls=0 elapsed=24m40s eta=44m29s event=start item=72/199
+[10:28:29] [locomo] [#######-------------] task=1/10 task_id=conv-26 phase=qa-0072 items=71/199 calls=0 elapsed=24m55s eta=44m56s event=heartbeat waiting for model/runtime
+[10:28:35] [locomo] [#######-------------] task=1/10 task_id=conv-26 phase=qa-0072 items=72/199 calls=211 elapsed=25m01s eta=44m07s event=complete score=1.000 mean=0.593
+[10:28:35] [locomo] [#######-------------] task=1/10 task_id=conv-26 phase=qa-0073 items=72/199 calls=0 elapsed=25m01s eta=44m07s event=start item=73/199
+[10:28:47] [locomo] [#######-------------] task=1/10 task_id=conv-26 phase=qa-0073 items=73/199 calls=213 elapsed=25m13s eta=43m31s event=complete score=1.000 mean=0.598
+[10:28:47] [locomo] [#######-------------] task=1/10 task_id=conv-26 phase=qa-0074 items=73/199 calls=0 elapsed=25m13s eta=43m31s event=start item=74/199
+[10:28:59] [locomo] [#######-------------] task=1/10 task_id=conv-26 phase=qa-0074 items=74/199 calls=215 elapsed=25m25s eta=42m56s event=complete score=1.000 mean=0.604
+[10:28:59] [locomo] [#######-------------] task=1/10 task_id=conv-26 phase=qa-0075 items=74/199 calls=0 elapsed=25m25s eta=42m56s event=start item=75/199
+[10:29:13] [locomo] [#######-------------] task=1/10 task_id=conv-26 phase=qa-0075 items=75/199 calls=217 elapsed=25m39s eta=42m25s event=complete score=0.600 mean=0.604
+[10:29:13] [locomo] [#######-------------] task=1/10 task_id=conv-26 phase=qa-0076 items=75/199 calls=0 elapsed=25m39s eta=42m25s event=start item=76/199
+[10:29:28] [locomo] [#######-------------] task=1/10 task_id=conv-26 phase=qa-0076 items=75/199 calls=0 elapsed=25m54s eta=42m50s event=heartbeat waiting for model/runtime
+[10:29:34] [locomo] [#######-------------] task=1/10 task_id=conv-26 phase=qa-0076 items=76/199 calls=220 elapsed=26m00s eta=42m05s event=complete score=1.000 mean=0.609
+[10:29:34] [locomo] [#######-------------] task=1/10 task_id=conv-26 phase=qa-0077 items=76/199 calls=0 elapsed=26m00s eta=42m05s event=start item=77/199
+[10:29:49] [locomo] [#######-------------] task=1/10 task_id=conv-26 phase=qa-0077 items=76/199 calls=0 elapsed=26m15s eta=42m29s event=heartbeat waiting for model/runtime
+[10:29:54] [locomo] [#######-------------] task=1/10 task_id=conv-26 phase=qa-0077 items=77/199 calls=222 elapsed=26m20s eta=41m43s event=complete score=0.000 mean=0.601
+[10:29:54] [locomo] [#######-------------] task=1/10 task_id=conv-26 phase=qa-0078 items=77/199 calls=0 elapsed=26m20s eta=41m43s event=start item=78/199
+[10:30:09] [locomo] [#######-------------] task=1/10 task_id=conv-26 phase=qa-0078 items=77/199 calls=0 elapsed=26m35s eta=42m07s event=heartbeat waiting for model/runtime
+[10:30:16] [locomo] [#######-------------] task=1/10 task_id=conv-26 phase=qa-0078 items=78/199 calls=225 elapsed=26m41s eta=41m25s event=complete score=0.400 mean=0.598
+[10:30:16] [locomo] [#######-------------] task=1/10 task_id=conv-26 phase=qa-0079 items=78/199 calls=0 elapsed=26m41s eta=41m25s event=start item=79/199
+[10:30:30] [locomo] [#######-------------] task=1/10 task_id=conv-26 phase=qa-0079 items=79/199 calls=227 elapsed=26m56s eta=40m54s event=complete score=0.400 mean=0.596
+[10:30:30] [locomo] [#######-------------] task=1/10 task_id=conv-26 phase=qa-0080 items=79/199 calls=0 elapsed=26m56s eta=40m54s event=start item=80/199
+[10:30:43] [locomo] [########------------] task=1/10 task_id=conv-26 phase=qa-0080 items=80/199 calls=229 elapsed=27m09s eta=40m23s event=complete score=0.667 mean=0.597
+[10:30:43] [locomo] [########------------] task=1/10 task_id=conv-26 phase=qa-0081 items=80/199 calls=0 elapsed=27m09s eta=40m23s event=start item=81/199
+[10:30:57] [locomo] [########------------] task=1/10 task_id=conv-26 phase=qa-0081 items=81/199 calls=231 elapsed=27m23s eta=39m54s event=complete score=1.000 mean=0.602
+[10:30:57] [locomo] [########------------] task=1/10 task_id=conv-26 phase=qa-0082 items=81/199 calls=0 elapsed=27m23s eta=39m54s event=start item=82/199
+[10:31:12] [locomo] [########------------] task=1/10 task_id=conv-26 phase=qa-0082 items=81/199 calls=0 elapsed=27m38s eta=40m16s event=heartbeat waiting for model/runtime
+[10:31:16] [locomo] [########------------] task=1/10 task_id=conv-26 phase=qa-0082 items=82/199 calls=234 elapsed=27m42s eta=39m32s event=complete score=0.500 mean=0.601
+[10:31:16] [locomo] [########------------] task=1/10 task_id=conv-26 phase=qa-0083 items=82/199 calls=0 elapsed=27m42s eta=39m32s event=start item=83/199
+[10:31:27] [locomo] [########------------] task=1/10 task_id=conv-26 phase=qa-0083 items=83/199 calls=236 elapsed=27m53s eta=38m58s event=complete score=1.000 mean=0.605
+[10:31:27] [locomo] [########------------] task=1/10 task_id=conv-26 phase=qa-0084 items=83/199 calls=0 elapsed=27m53s eta=38m58s event=start item=84/199
+[10:31:40] [locomo] [########------------] task=1/10 task_id=conv-26 phase=qa-0084 items=84/199 calls=238 elapsed=28m05s eta=38m28s event=complete score=0.286 mean=0.602
+[10:31:40] [locomo] [########------------] task=1/10 task_id=conv-26 phase=qa-0085 items=84/199 calls=0 elapsed=28m06s eta=38m28s event=start item=85/199
+[10:31:51] [locomo] [########------------] task=1/10 task_id=conv-26 phase=qa-0085 items=85/199 calls=240 elapsed=28m17s eta=37m56s event=complete score=0.400 mean=0.599
+[10:31:51] [locomo] [########------------] task=1/10 task_id=conv-26 phase=qa-0086 items=85/199 calls=0 elapsed=28m17s eta=37m56s event=start item=86/199
+[10:32:06] [locomo] [########------------] task=1/10 task_id=conv-26 phase=qa-0086 items=85/199 calls=0 elapsed=28m32s eta=38m17s event=heartbeat waiting for model/runtime
+[10:32:16] [locomo] [########------------] task=1/10 task_id=conv-26 phase=qa-0086 items=86/199 calls=242 elapsed=28m41s eta=37m42s event=complete score=0.400 mean=0.597
+[10:32:16] [locomo] [########------------] task=1/10 task_id=conv-26 phase=qa-0087 items=86/199 calls=0 elapsed=28m42s eta=37m42s event=start item=87/199
+[10:32:29] [locomo] [########------------] task=1/10 task_id=conv-26 phase=qa-0087 items=87/199 calls=244 elapsed=28m55s eta=37m14s event=complete score=0.500 mean=0.596
+[10:32:29] [locomo] [########------------] task=1/10 task_id=conv-26 phase=qa-0088 items=87/199 calls=0 elapsed=28m55s eta=37m14s event=start item=88/199
+[10:32:44] [locomo] [########------------] task=1/10 task_id=conv-26 phase=qa-0088 items=88/199 calls=246 elapsed=29m10s eta=36m47s event=complete score=0.476 mean=0.594
+[10:32:44] [locomo] [########------------] task=1/10 task_id=conv-26 phase=qa-0089 items=88/199 calls=0 elapsed=29m10s eta=36m47s event=start item=89/199
+[10:32:56] [locomo] [########------------] task=1/10 task_id=conv-26 phase=qa-0089 items=89/199 calls=248 elapsed=29m22s eta=36m18s event=complete score=0.857 mean=0.597
+[10:32:56] [locomo] [########------------] task=1/10 task_id=conv-26 phase=qa-0090 items=89/199 calls=0 elapsed=29m22s eta=36m18s event=start item=90/199
+[10:33:11] [locomo] [########------------] task=1/10 task_id=conv-26 phase=qa-0090 items=89/199 calls=0 elapsed=29m37s eta=36m36s event=heartbeat waiting for model/runtime
+[10:33:15] [locomo] [#########-----------] task=1/10 task_id=conv-26 phase=qa-0090 items=90/199 calls=251 elapsed=29m41s eta=35m57s event=complete score=0.389 mean=0.595
+[10:33:15] [locomo] [#########-----------] task=1/10 task_id=conv-26 phase=qa-0091 items=90/199 calls=0 elapsed=29m41s eta=35m57s event=start item=91/199
+[10:33:30] [locomo] [#########-----------] task=1/10 task_id=conv-26 phase=qa-0091 items=90/199 calls=0 elapsed=29m56s eta=36m15s event=heartbeat waiting for model/runtime
+[10:33:30] [locomo] [#########-----------] task=1/10 task_id=conv-26 phase=qa-0091 items=91/199 calls=253 elapsed=29m56s eta=35m32s event=complete score=0.364 mean=0.592
+[10:33:30] [locomo] [#########-----------] task=1/10 task_id=conv-26 phase=qa-0092 items=91/199 calls=0 elapsed=29m56s eta=35m32s event=start item=92/199
+[10:33:43] [locomo] [#########-----------] task=1/10 task_id=conv-26 phase=qa-0092 items=92/199 calls=255 elapsed=30m09s eta=35m04s event=complete score=1.000 mean=0.597
+[10:33:43] [locomo] [#########-----------] task=1/10 task_id=conv-26 phase=qa-0093 items=92/199 calls=0 elapsed=30m09s eta=35m04s event=start item=93/199
+[10:33:55] [locomo] [#########-----------] task=1/10 task_id=conv-26 phase=qa-0093 items=93/199 calls=257 elapsed=30m20s eta=34m35s event=complete score=1.000 mean=0.601
+[10:33:55] [locomo] [#########-----------] task=1/10 task_id=conv-26 phase=qa-0094 items=93/199 calls=0 elapsed=30m20s eta=34m35s event=start item=94/199
+[10:34:07] [locomo] [#########-----------] task=1/10 task_id=conv-26 phase=qa-0094 items=94/199 calls=259 elapsed=30m33s eta=34m07s event=complete score=0.167 mean=0.597
+[10:34:07] [locomo] [#########-----------] task=1/10 task_id=conv-26 phase=qa-0095 items=94/199 calls=0 elapsed=30m33s eta=34m07s event=start item=95/199
+[10:34:22] [locomo] [#########-----------] task=1/10 task_id=conv-26 phase=qa-0095 items=94/199 calls=0 elapsed=30m48s eta=34m24s event=heartbeat waiting for model/runtime
+[10:34:29] [locomo] [#########-----------] task=1/10 task_id=conv-26 phase=qa-0095 items=95/199 calls=262 elapsed=30m54s eta=33m50s event=complete score=0.000 mean=0.590
+[10:34:29] [locomo] [#########-----------] task=1/10 task_id=conv-26 phase=qa-0096 items=95/199 calls=0 elapsed=30m54s eta=33m50s event=start item=96/199
+[10:34:43] [locomo] [#########-----------] task=1/10 task_id=conv-26 phase=qa-0096 items=96/199 calls=264 elapsed=31m09s eta=33m25s event=complete score=0.588 mean=0.590
+[10:34:43] [locomo] [#########-----------] task=1/10 task_id=conv-26 phase=qa-0097 items=96/199 calls=0 elapsed=31m09s eta=33m25s event=start item=97/199
+[10:34:55] [locomo] [#########-----------] task=1/10 task_id=conv-26 phase=qa-0097 items=97/199 calls=266 elapsed=31m20s eta=32m57s event=complete score=1.000 mean=0.595
+[10:34:55] [locomo] [#########-----------] task=1/10 task_id=conv-26 phase=qa-0098 items=97/199 calls=0 elapsed=31m20s eta=32m57s event=start item=98/199
+[10:35:06] [locomo] [#########-----------] task=1/10 task_id=conv-26 phase=qa-0098 items=98/199 calls=268 elapsed=31m32s eta=32m30s event=complete score=1.000 mean=0.599
+[10:35:06] [locomo] [#########-----------] task=1/10 task_id=conv-26 phase=qa-0099 items=98/199 calls=0 elapsed=31m32s eta=32m30s event=start item=99/199
+[10:35:18] [locomo] [#########-----------] task=1/10 task_id=conv-26 phase=qa-0099 items=99/199 calls=270 elapsed=31m44s eta=32m03s event=complete score=0.947 mean=0.602
+[10:35:18] [locomo] [#########-----------] task=1/10 task_id=conv-26 phase=qa-0100 items=99/199 calls=0 elapsed=31m44s eta=32m03s event=start item=100/199
+[10:35:31] [locomo] [##########----------] task=1/10 task_id=conv-26 phase=qa-0100 items=100/199 calls=272 elapsed=31m57s eta=31m38s event=complete score=0.353 mean=0.600
+[10:35:31] [locomo] [##########----------] task=1/10 task_id=conv-26 phase=qa-0101 items=100/199 calls=0 elapsed=31m57s eta=31m38s event=start item=101/199
+[10:35:46] [locomo] [##########----------] task=1/10 task_id=conv-26 phase=qa-0101 items=100/199 calls=0 elapsed=32m12s eta=31m53s event=heartbeat waiting for model/runtime
+[10:35:47] [locomo] [##########----------] task=1/10 task_id=conv-26 phase=qa-0101 items=101/199 calls=274 elapsed=32m13s eta=31m15s event=complete score=1.000 mean=0.604
+[10:35:47] [locomo] [##########----------] task=1/10 task_id=conv-26 phase=qa-0102 items=101/199 calls=0 elapsed=32m13s eta=31m16s event=start item=102/199
+[10:36:01] [locomo] [##########----------] task=1/10 task_id=conv-26 phase=qa-0102 items=102/199 calls=276 elapsed=32m27s eta=30m51s event=complete score=1.000 mean=0.608
+[10:36:01] [locomo] [##########----------] task=1/10 task_id=conv-26 phase=qa-0103 items=102/199 calls=0 elapsed=32m27s eta=30m51s event=start item=103/199
+[10:36:15] [locomo] [##########----------] task=1/10 task_id=conv-26 phase=qa-0103 items=103/199 calls=278 elapsed=32m41s eta=30m27s event=complete score=0.947 mean=0.611
+[10:36:15] [locomo] [##########----------] task=1/10 task_id=conv-26 phase=qa-0104 items=103/199 calls=0 elapsed=32m41s eta=30m27s event=start item=104/199
+[10:36:26] [locomo] [##########----------] task=1/10 task_id=conv-26 phase=qa-0104 items=104/199 calls=280 elapsed=32m52s eta=30m01s event=complete score=1.000 mean=0.615
+[10:36:26] [locomo] [##########----------] task=1/10 task_id=conv-26 phase=qa-0105 items=104/199 calls=0 elapsed=32m52s eta=30m01s event=start item=105/199
+[10:36:41] [locomo] [##########----------] task=1/10 task_id=conv-26 phase=qa-0105 items=104/199 calls=0 elapsed=33m07s eta=30m15s event=heartbeat waiting for model/runtime
+[10:36:48] [locomo] [##########----------] task=1/10 task_id=conv-26 phase=qa-0105 items=105/199 calls=283 elapsed=33m14s eta=29m45s event=complete score=1.000 mean=0.618
+[10:36:48] [locomo] [##########----------] task=1/10 task_id=conv-26 phase=qa-0106 items=105/199 calls=0 elapsed=33m14s eta=29m45s event=start item=106/199
+[10:37:03] [locomo] [##########----------] task=1/10 task_id=conv-26 phase=qa-0106 items=105/199 calls=0 elapsed=33m29s eta=29m59s event=heartbeat waiting for model/runtime
+[10:37:06] [locomo] [##########----------] task=1/10 task_id=conv-26 phase=qa-0106 items=106/199 calls=286 elapsed=33m32s eta=29m25s event=complete score=0.316 mean=0.615
+[10:37:06] [locomo] [##########----------] task=1/10 task_id=conv-26 phase=qa-0107 items=106/199 calls=0 elapsed=33m32s eta=29m25s event=start item=107/199
+[10:37:18] [locomo] [##########----------] task=1/10 task_id=conv-26 phase=qa-0107 items=107/199 calls=288 elapsed=33m44s eta=29m00s event=complete score=1.000 mean=0.619
+[10:37:18] [locomo] [##########----------] task=1/10 task_id=conv-26 phase=qa-0108 items=107/199 calls=0 elapsed=33m44s eta=29m00s event=start item=108/199
+[10:37:32] [locomo] [##########----------] task=1/10 task_id=conv-26 phase=qa-0108 items=108/199 calls=290 elapsed=33m58s eta=28m37s event=complete score=0.667 mean=0.619
+[10:37:32] [locomo] [##########----------] task=1/10 task_id=conv-26 phase=qa-0109 items=108/199 calls=0 elapsed=33m58s eta=28m37s event=start item=109/199
+[10:37:45] [locomo] [##########----------] task=1/10 task_id=conv-26 phase=qa-0109 items=109/199 calls=292 elapsed=34m11s eta=28m14s event=complete score=1.000 mean=0.623
+[10:37:45] [locomo] [##########----------] task=1/10 task_id=conv-26 phase=qa-0110 items=109/199 calls=0 elapsed=34m11s eta=28m14s event=start item=110/199
+[10:38:00] [locomo] [###########---------] task=1/10 task_id=conv-26 phase=qa-0110 items=110/199 calls=294 elapsed=34m26s eta=27m51s event=complete score=0.222 mean=0.619
+[10:38:00] [locomo] [###########---------] task=1/10 task_id=conv-26 phase=qa-0111 items=110/199 calls=0 elapsed=34m26s eta=27m51s event=start item=111/199
+[10:38:15] [locomo] [###########---------] task=1/10 task_id=conv-26 phase=qa-0111 items=110/199 calls=0 elapsed=34m41s eta=28m03s event=heartbeat waiting for model/runtime
+[10:38:16] [locomo] [###########---------] task=1/10 task_id=conv-26 phase=qa-0111 items=111/199 calls=297 elapsed=34m42s eta=27m30s event=complete score=0.286 mean=0.616
+[10:38:16] [locomo] [###########---------] task=1/10 task_id=conv-26 phase=qa-0112 items=111/199 calls=0 elapsed=34m42s eta=27m30s event=start item=112/199
+[10:38:28] [locomo] [###########---------] task=1/10 task_id=conv-26 phase=qa-0112 items=112/199 calls=299 elapsed=34m54s eta=27m06s event=complete score=0.333 mean=0.614
+[10:38:28] [locomo] [###########---------] task=1/10 task_id=conv-26 phase=qa-0113 items=112/199 calls=0 elapsed=34m54s eta=27m06s event=start item=113/199
+[10:38:41] [locomo] [###########---------] task=1/10 task_id=conv-26 phase=qa-0113 items=113/199 calls=301 elapsed=35m07s eta=26m43s event=complete score=0.000 mean=0.608
+[10:38:41] [locomo] [###########---------] task=1/10 task_id=conv-26 phase=qa-0114 items=113/199 calls=0 elapsed=35m07s eta=26m43s event=start item=114/199
+[10:38:54] [locomo] [###########---------] task=1/10 task_id=conv-26 phase=qa-0114 items=114/199 calls=303 elapsed=35m20s eta=26m21s event=complete score=0.957 mean=0.611
+[10:38:54] [locomo] [###########---------] task=1/10 task_id=conv-26 phase=qa-0115 items=114/199 calls=0 elapsed=35m20s eta=26m21s event=start item=115/199
+[10:39:07] [locomo] [###########---------] task=1/10 task_id=conv-26 phase=qa-0115 items=115/199 calls=305 elapsed=35m33s eta=25m58s event=complete score=1.000 mean=0.615
+[10:39:07] [locomo] [###########---------] task=1/10 task_id=conv-26 phase=qa-0116 items=115/199 calls=0 elapsed=35m33s eta=25m58s event=start item=116/199
+[10:39:19] [locomo] [###########---------] task=1/10 task_id=conv-26 phase=qa-0116 items=116/199 calls=307 elapsed=35m45s eta=25m34s event=complete score=0.632 mean=0.615
+[10:39:19] [locomo] [###########---------] task=1/10 task_id=conv-26 phase=qa-0117 items=116/199 calls=0 elapsed=35m45s eta=25m34s event=start item=117/199
+[10:39:31] [locomo] [###########---------] task=1/10 task_id=conv-26 phase=qa-0117 items=117/199 calls=309 elapsed=35m57s eta=25m12s event=complete score=0.762 mean=0.616
+[10:39:31] [locomo] [###########---------] task=1/10 task_id=conv-26 phase=qa-0118 items=117/199 calls=0 elapsed=35m57s eta=25m12s event=start item=118/199
+[10:39:43] [locomo] [###########---------] task=1/10 task_id=conv-26 phase=qa-0118 items=118/199 calls=311 elapsed=36m09s eta=24m49s event=complete score=1.000 mean=0.619
+[10:39:43] [locomo] [###########---------] task=1/10 task_id=conv-26 phase=qa-0119 items=118/199 calls=0 elapsed=36m09s eta=24m49s event=start item=119/199
+[10:39:55] [locomo] [###########---------] task=1/10 task_id=conv-26 phase=qa-0119 items=119/199 calls=313 elapsed=36m21s eta=24m26s event=complete score=1.000 mean=0.623
+[10:39:55] [locomo] [###########---------] task=1/10 task_id=conv-26 phase=qa-0120 items=119/199 calls=0 elapsed=36m21s eta=24m26s event=start item=120/199
+[10:40:07] [locomo] [############--------] task=1/10 task_id=conv-26 phase=qa-0120 items=120/199 calls=315 elapsed=36m33s eta=24m03s event=complete score=0.533 mean=0.622
+[10:40:07] [locomo] [############--------] task=1/10 task_id=conv-26 phase=qa-0121 items=120/199 calls=0 elapsed=36m33s eta=24m04s event=start item=121/199
+[10:40:20] [locomo] [############--------] task=1/10 task_id=conv-26 phase=qa-0121 items=121/199 calls=317 elapsed=36m46s eta=23m42s event=complete score=0.400 mean=0.620
+[10:40:20] [locomo] [############--------] task=1/10 task_id=conv-26 phase=qa-0122 items=121/199 calls=0 elapsed=36m46s eta=23m42s event=start item=122/199
+[10:40:34] [locomo] [############--------] task=1/10 task_id=conv-26 phase=qa-0122 items=122/199 calls=319 elapsed=37m00s eta=23m21s event=complete score=1.000 mean=0.623
+[10:40:34] [locomo] [############--------] task=1/10 task_id=conv-26 phase=qa-0123 items=122/199 calls=0 elapsed=37m00s eta=23m21s event=start item=123/199
+[10:40:49] [locomo] [############--------] task=1/10 task_id=conv-26 phase=qa-0123 items=122/199 calls=0 elapsed=37m15s eta=23m30s event=heartbeat waiting for model/runtime
+[10:40:50] [locomo] [############--------] task=1/10 task_id=conv-26 phase=qa-0123 items=123/199 calls=321 elapsed=37m16s eta=23m01s event=complete score=0.424 mean=0.622
+[10:40:50] [locomo] [############--------] task=1/10 task_id=conv-26 phase=qa-0124 items=123/199 calls=0 elapsed=37m16s eta=23m01s event=start item=124/199
+[10:41:05] [locomo] [############--------] task=1/10 task_id=conv-26 phase=qa-0124 items=123/199 calls=0 elapsed=37m31s eta=23m10s event=heartbeat waiting for model/runtime
+[10:41:09] [locomo] [############--------] task=1/10 task_id=conv-26 phase=qa-0124 items=124/199 calls=324 elapsed=37m35s eta=22m44s event=complete score=0.667 mean=0.622
+[10:41:09] [locomo] [############--------] task=1/10 task_id=conv-26 phase=qa-0125 items=124/199 calls=0 elapsed=37m35s eta=22m44s event=start item=125/199
+[10:41:23] [locomo] [############--------] task=1/10 task_id=conv-26 phase=qa-0125 items=125/199 calls=326 elapsed=37m49s eta=22m23s event=complete score=0.545 mean=0.621
+[10:41:23] [locomo] [############--------] task=1/10 task_id=conv-26 phase=qa-0126 items=125/199 calls=0 elapsed=37m49s eta=22m23s event=start item=126/199
+[10:41:34] [locomo] [############--------] task=1/10 task_id=conv-26 phase=qa-0126 items=126/199 calls=328 elapsed=38m00s eta=22m01s event=complete score=1.000 mean=0.624
+[10:41:34] [locomo] [############--------] task=1/10 task_id=conv-26 phase=qa-0127 items=126/199 calls=0 elapsed=38m00s eta=22m01s event=start item=127/199
+[10:41:49] [locomo] [############--------] task=1/10 task_id=conv-26 phase=qa-0127 items=126/199 calls=0 elapsed=38m15s eta=22m10s event=heartbeat waiting for model/runtime
+[10:42:01] [locomo] [############--------] task=1/10 task_id=conv-26 phase=qa-0127 items=127/199 calls=330 elapsed=38m26s eta=21m47s event=complete score=1.000 mean=0.627
+[10:42:01] [locomo] [############--------] task=1/10 task_id=conv-26 phase=qa-0128 items=127/199 calls=0 elapsed=38m26s eta=21m47s event=start item=128/199
+[10:42:15] [locomo] [############--------] task=1/10 task_id=conv-26 phase=qa-0128 items=128/199 calls=332 elapsed=38m41s eta=21m27s event=complete score=1.000 mean=0.630
+[10:42:15] [locomo] [############--------] task=1/10 task_id=conv-26 phase=qa-0129 items=128/199 calls=0 elapsed=38m41s eta=21m27s event=start item=129/199
+[10:42:30] [locomo] [############--------] task=1/10 task_id=conv-26 phase=qa-0129 items=128/199 calls=0 elapsed=38m56s eta=21m36s event=heartbeat waiting for model/runtime
+[10:42:31] [locomo] [############--------] task=1/10 task_id=conv-26 phase=qa-0129 items=129/199 calls=334 elapsed=38m57s eta=21m08s event=complete score=0.571 mean=0.630
+[10:42:31] [locomo] [############--------] task=1/10 task_id=conv-26 phase=qa-0130 items=129/199 calls=0 elapsed=38m57s eta=21m08s event=start item=130/199
+[10:42:42] [locomo] [#############-------] task=1/10 task_id=conv-26 phase=qa-0130 items=130/199 calls=336 elapsed=39m08s eta=20m46s event=complete score=1.000 mean=0.633
+[10:42:42] [locomo] [#############-------] task=1/10 task_id=conv-26 phase=qa-0131 items=130/199 calls=0 elapsed=39m08s eta=20m46s event=start item=131/199
+[10:42:54] [locomo] [#############-------] task=1/10 task_id=conv-26 phase=qa-0131 items=131/199 calls=338 elapsed=39m19s eta=20m24s event=complete score=1.000 mean=0.635
+[10:42:54] [locomo] [#############-------] task=1/10 task_id=conv-26 phase=qa-0132 items=131/199 calls=0 elapsed=39m19s eta=20m24s event=start item=132/199
+[10:43:05] [locomo] [#############-------] task=1/10 task_id=conv-26 phase=qa-0132 items=132/199 calls=340 elapsed=39m31s eta=20m03s event=complete score=1.000 mean=0.638
+[10:43:05] [locomo] [#############-------] task=1/10 task_id=conv-26 phase=qa-0133 items=132/199 calls=0 elapsed=39m31s eta=20m03s event=start item=133/199
+[10:43:19] [locomo] [#############-------] task=1/10 task_id=conv-26 phase=qa-0133 items=133/199 calls=342 elapsed=39m45s eta=19m43s event=complete score=1.000 mean=0.641
+[10:43:19] [locomo] [#############-------] task=1/10 task_id=conv-26 phase=qa-0134 items=133/199 calls=0 elapsed=39m45s eta=19m43s event=start item=134/199
+[10:43:31] [locomo] [#############-------] task=1/10 task_id=conv-26 phase=qa-0134 items=134/199 calls=344 elapsed=39m57s eta=19m22s event=complete score=0.000 mean=0.636
+[10:43:31] [locomo] [#############-------] task=1/10 task_id=conv-26 phase=qa-0135 items=134/199 calls=0 elapsed=39m57s eta=19m22s event=start item=135/199
+[10:43:42] [locomo] [#############-------] task=1/10 task_id=conv-26 phase=qa-0135 items=135/199 calls=346 elapsed=40m08s eta=19m01s event=complete score=0.629 mean=0.636
+[10:43:42] [locomo] [#############-------] task=1/10 task_id=conv-26 phase=qa-0136 items=135/199 calls=0 elapsed=40m08s eta=19m01s event=start item=136/199
+[10:43:54] [locomo] [#############-------] task=1/10 task_id=conv-26 phase=qa-0136 items=136/199 calls=348 elapsed=40m19s eta=18m40s event=complete score=1.000 mean=0.639
+[10:43:54] [locomo] [#############-------] task=1/10 task_id=conv-26 phase=qa-0137 items=136/199 calls=0 elapsed=40m19s eta=18m41s event=start item=137/199
+[10:44:05] [locomo] [#############-------] task=1/10 task_id=conv-26 phase=qa-0137 items=137/199 calls=350 elapsed=40m31s eta=18m20s event=complete score=0.750 mean=0.640
+[10:44:05] [locomo] [#############-------] task=1/10 task_id=conv-26 phase=qa-0138 items=137/199 calls=0 elapsed=40m31s eta=18m20s event=start item=138/199
+[10:44:19] [locomo] [#############-------] task=1/10 task_id=conv-26 phase=qa-0138 items=138/199 calls=352 elapsed=40m45s eta=18m00s event=complete score=0.333 mean=0.637
+[10:44:19] [locomo] [#############-------] task=1/10 task_id=conv-26 phase=qa-0139 items=138/199 calls=0 elapsed=40m45s eta=18m01s event=start item=139/199
+[10:44:34] [locomo] [#############-------] task=1/10 task_id=conv-26 phase=qa-0139 items=138/199 calls=0 elapsed=41m00s eta=18m07s event=heartbeat waiting for model/runtime
+[10:44:38] [locomo] [#############-------] task=1/10 task_id=conv-26 phase=qa-0139 items=139/199 calls=354 elapsed=41m04s eta=17m43s event=complete score=0.000 mean=0.633
+[10:44:38] [locomo] [#############-------] task=1/10 task_id=conv-26 phase=qa-0140 items=139/199 calls=0 elapsed=41m04s eta=17m43s event=start item=140/199
+[10:44:50] [locomo] [##############------] task=1/10 task_id=conv-26 phase=qa-0140 items=140/199 calls=356 elapsed=41m16s eta=17m23s event=complete score=0.917 mean=0.635
+[10:44:50] [locomo] [##############------] task=1/10 task_id=conv-26 phase=qa-0141 items=140/199 calls=0 elapsed=41m16s eta=17m23s event=start item=141/199
+[10:45:05] [locomo] [##############------] task=1/10 task_id=conv-26 phase=qa-0141 items=140/199 calls=0 elapsed=41m31s eta=17m29s event=heartbeat waiting for model/runtime
+[10:45:09] [locomo] [##############------] task=1/10 task_id=conv-26 phase=qa-0141 items=141/199 calls=358 elapsed=41m35s eta=17m06s event=complete score=0.000 mean=0.630
+[10:45:09] [locomo] [##############------] task=1/10 task_id=conv-26 phase=qa-0142 items=141/199 calls=0 elapsed=41m35s eta=17m06s event=start item=142/199
+[10:45:24] [locomo] [##############------] task=1/10 task_id=conv-26 phase=qa-0142 items=141/199 calls=0 elapsed=41m50s eta=17m12s event=heartbeat waiting for model/runtime
+[10:45:24] [locomo] [##############------] task=1/10 task_id=conv-26 phase=qa-0142 items=142/199 calls=360 elapsed=41m50s eta=16m47s event=complete score=0.556 mean=0.630
+[10:45:24] [locomo] [##############------] task=1/10 task_id=conv-26 phase=qa-0143 items=142/199 calls=0 elapsed=41m50s eta=16m47s event=start item=143/199
+[10:45:36] [locomo] [##############------] task=1/10 task_id=conv-26 phase=qa-0143 items=143/199 calls=362 elapsed=42m02s eta=16m27s event=complete score=0.000 mean=0.625
+[10:45:36] [locomo] [##############------] task=1/10 task_id=conv-26 phase=qa-0144 items=143/199 calls=0 elapsed=42m02s eta=16m27s event=start item=144/199
+[10:45:48] [locomo] [##############------] task=1/10 task_id=conv-26 phase=qa-0144 items=144/199 calls=364 elapsed=42m14s eta=16m07s event=complete score=0.500 mean=0.624
+[10:45:48] [locomo] [##############------] task=1/10 task_id=conv-26 phase=qa-0145 items=144/199 calls=0 elapsed=42m14s eta=16m07s event=start item=145/199
+[10:46:03] [locomo] [##############------] task=1/10 task_id=conv-26 phase=qa-0145 items=144/199 calls=0 elapsed=42m29s eta=16m13s event=heartbeat waiting for model/runtime
+[10:46:05] [locomo] [##############------] task=1/10 task_id=conv-26 phase=qa-0145 items=145/199 calls=366 elapsed=42m31s eta=15m50s event=complete score=0.286 mean=0.622
+[10:46:05] [locomo] [##############------] task=1/10 task_id=conv-26 phase=qa-0146 items=145/199 calls=0 elapsed=42m31s eta=15m50s event=start item=146/199
+[10:46:16] [locomo] [##############------] task=1/10 task_id=conv-26 phase=qa-0146 items=146/199 calls=368 elapsed=42m42s eta=15m30s event=complete score=0.364 mean=0.620
+[10:46:16] [locomo] [##############------] task=1/10 task_id=conv-26 phase=qa-0147 items=146/199 calls=0 elapsed=42m42s eta=15m30s event=start item=147/199
+[10:46:29] [locomo] [##############------] task=1/10 task_id=conv-26 phase=qa-0147 items=147/199 calls=370 elapsed=42m54s eta=15m10s event=complete score=0.455 mean=0.619
+[10:46:29] [locomo] [##############------] task=1/10 task_id=conv-26 phase=qa-0148 items=147/199 calls=0 elapsed=42m54s eta=15m10s event=start item=148/199
+[10:46:42] [locomo] [##############------] task=1/10 task_id=conv-26 phase=qa-0148 items=148/199 calls=372 elapsed=43m08s eta=14m51s event=complete score=0.258 mean=0.617
+[10:46:42] [locomo] [##############------] task=1/10 task_id=conv-26 phase=qa-0149 items=148/199 calls=0 elapsed=43m08s eta=14m51s event=start item=149/199
+[10:46:57] [locomo] [##############------] task=1/10 task_id=conv-26 phase=qa-0149 items=148/199 calls=0 elapsed=43m23s eta=14m57s event=heartbeat waiting for model/runtime
+[10:46:59] [locomo] [##############------] task=1/10 task_id=conv-26 phase=qa-0149 items=149/199 calls=374 elapsed=43m24s eta=14m34s event=complete score=0.316 mean=0.615
+[10:46:59] [locomo] [##############------] task=1/10 task_id=conv-26 phase=qa-0150 items=149/199 calls=0 elapsed=43m25s eta=14m34s event=start item=150/199
+[10:47:12] [locomo] [###############-----] task=1/10 task_id=conv-26 phase=qa-0150 items=150/199 calls=376 elapsed=43m38s eta=14m15s event=complete score=0.667 mean=0.615
+[10:47:12] [locomo] [###############-----] task=1/10 task_id=conv-26 phase=qa-0151 items=150/199 calls=0 elapsed=43m38s eta=14m15s event=start item=151/199
+[10:47:27] [locomo] [###############-----] task=1/10 task_id=conv-26 phase=qa-0151 items=150/199 calls=0 elapsed=43m53s eta=14m20s event=heartbeat waiting for model/runtime
+[10:47:29] [locomo] [###############-----] task=1/10 task_id=conv-26 phase=qa-0151 items=151/199 calls=378 elapsed=43m54s eta=13m57s event=complete score=0.087 mean=0.612
+[10:47:29] [locomo] [###############-----] task=1/10 task_id=conv-26 phase=qa-0152 items=151/199 calls=0 elapsed=43m54s eta=13m57s event=start item=152/199
+[10:47:44] [locomo] [###############-----] task=1/10 task_id=conv-26 phase=qa-0152 items=151/199 calls=0 elapsed=44m10s eta=14m02s event=heartbeat waiting for model/runtime
+[10:47:55] [locomo] [###############-----] task=1/10 task_id=conv-26 phase=qa-0152 items=152/199 calls=380 elapsed=44m21s eta=13m43s event=complete score=0.167 mean=0.609
+[10:47:56] [locomo] [###############-----] task=1/10 task_id=conv-26 phase=qa-0153 items=152/199 calls=0 elapsed=44m21s eta=13m43s event=start item=153/199
+[10:48:10] [locomo] [###############-----] task=1/10 task_id=conv-26 phase=qa-0153 items=153/199 calls=382 elapsed=44m36s eta=13m24s event=complete score=1.000 mean=0.611
+[10:48:10] [locomo] [###############-----] task=1/10 task_id=conv-26 phase=qa-0154 items=153/199 calls=0 elapsed=44m36s eta=13m24s event=start item=154/199
+[10:48:24] [locomo] [###############-----] task=1/10 task_id=conv-26 phase=qa-0154 items=154/199 calls=384 elapsed=44m50s eta=13m06s event=complete score=1.000 mean=0.614
+[10:48:24] [locomo] [###############-----] task=1/10 task_id=conv-26 phase=qa-0155 items=154/199 calls=0 elapsed=44m50s eta=13m06s event=start item=155/199
+[10:48:39] [locomo] [###############-----] task=1/10 task_id=conv-26 phase=qa-0155 items=154/199 calls=0 elapsed=45m05s eta=13m10s event=heartbeat waiting for model/runtime
+[10:48:41] [locomo] [###############-----] task=1/10 task_id=conv-26 phase=qa-0155 items=155/199 calls=386 elapsed=45m07s eta=12m48s event=complete score=1.000 mean=0.616
+[10:48:41] [locomo] [###############-----] task=1/10 task_id=conv-26 phase=qa-0156 items=155/199 calls=0 elapsed=45m07s eta=12m48s event=start item=156/199
+[10:48:55] [locomo] [###############-----] task=1/10 task_id=conv-26 phase=qa-0156 items=156/199 calls=388 elapsed=45m21s eta=12m30s event=complete score=1.000 mean=0.619
+[10:48:55] [locomo] [###############-----] task=1/10 task_id=conv-26 phase=qa-0157 items=156/199 calls=0 elapsed=45m21s eta=12m30s event=start item=157/199
+[10:49:09] [locomo] [###############-----] task=1/10 task_id=conv-26 phase=qa-0157 items=157/199 calls=390 elapsed=45m34s eta=12m11s event=complete score=1.000 mean=0.621
+[10:49:09] [locomo] [###############-----] task=1/10 task_id=conv-26 phase=qa-0158 items=157/199 calls=0 elapsed=45m34s eta=12m11s event=start item=158/199
+[10:49:23] [locomo] [###############-----] task=1/10 task_id=conv-26 phase=qa-0158 items=158/199 calls=393 elapsed=45m49s eta=11m53s event=complete score=1.000 mean=0.624
+[10:49:23] [locomo] [###############-----] task=1/10 task_id=conv-26 phase=qa-0159 items=158/199 calls=0 elapsed=45m49s eta=11m53s event=start item=159/199
+[10:49:38] [locomo] [###############-----] task=1/10 task_id=conv-26 phase=qa-0159 items=158/199 calls=0 elapsed=46m04s eta=11m57s event=heartbeat waiting for model/runtime
+[10:49:40] [locomo] [###############-----] task=1/10 task_id=conv-26 phase=qa-0159 items=159/199 calls=396 elapsed=46m06s eta=11m35s event=complete score=1.000 mean=0.626
+[10:49:40] [locomo] [###############-----] task=1/10 task_id=conv-26 phase=qa-0160 items=159/199 calls=0 elapsed=46m06s eta=11m35s event=start item=160/199
+[10:49:53] [locomo] [################----] task=1/10 task_id=conv-26 phase=qa-0160 items=160/199 calls=398 elapsed=46m19s eta=11m17s event=complete score=1.000 mean=0.628
+[10:49:53] [locomo] [################----] task=1/10 task_id=conv-26 phase=qa-0161 items=160/199 calls=0 elapsed=46m19s eta=11m17s event=start item=161/199
+[10:50:08] [locomo] [################----] task=1/10 task_id=conv-26 phase=qa-0161 items=160/199 calls=0 elapsed=46m34s eta=11m21s event=heartbeat waiting for model/runtime
+[10:50:10] [locomo] [################----] task=1/10 task_id=conv-26 phase=qa-0161 items=161/199 calls=401 elapsed=46m35s eta=10m59s event=complete score=1.000 mean=0.631
+[10:50:10] [locomo] [################----] task=1/10 task_id=conv-26 phase=qa-0162 items=161/199 calls=0 elapsed=46m35s eta=10m59s event=start item=162/199
+[10:50:24] [locomo] [################----] task=1/10 task_id=conv-26 phase=qa-0162 items=162/199 calls=403 elapsed=46m49s eta=10m41s event=complete score=0.000 mean=0.627
+[10:50:24] [locomo] [################----] task=1/10 task_id=conv-26 phase=qa-0163 items=162/199 calls=0 elapsed=46m49s eta=10m41s event=start item=163/199
+[10:50:39] [locomo] [################----] task=1/10 task_id=conv-26 phase=qa-0163 items=163/199 calls=405 elapsed=47m04s eta=10m23s event=complete score=1.000 mean=0.629
+[10:50:39] [locomo] [################----] task=1/10 task_id=conv-26 phase=qa-0164 items=163/199 calls=0 elapsed=47m04s eta=10m23s event=start item=164/199
+[10:50:54] [locomo] [################----] task=1/10 task_id=conv-26 phase=qa-0164 items=163/199 calls=0 elapsed=47m19s eta=10m27s event=heartbeat waiting for model/runtime
+[10:50:56] [locomo] [################----] task=1/10 task_id=conv-26 phase=qa-0164 items=164/199 calls=407 elapsed=47m21s eta=10m06s event=complete score=1.000 mean=0.631
+[10:50:56] [locomo] [################----] task=1/10 task_id=conv-26 phase=qa-0165 items=164/199 calls=0 elapsed=47m21s eta=10m06s event=start item=165/199
+[10:51:11] [locomo] [################----] task=1/10 task_id=conv-26 phase=qa-0165 items=164/199 calls=0 elapsed=47m37s eta=10m09s event=heartbeat waiting for model/runtime
+[10:51:14] [locomo] [################----] task=1/10 task_id=conv-26 phase=qa-0165 items=165/199 calls=410 elapsed=47m39s eta=9m49s event=complete score=1.000 mean=0.633
+[10:51:14] [locomo] [################----] task=1/10 task_id=conv-26 phase=qa-0166 items=165/199 calls=0 elapsed=47m40s eta=9m49s event=start item=166/199
+[10:51:29] [locomo] [################----] task=1/10 task_id=conv-26 phase=qa-0166 items=165/199 calls=0 elapsed=47m55s eta=9m52s event=heartbeat waiting for model/runtime
+[10:51:30] [locomo] [################----] task=1/10 task_id=conv-26 phase=qa-0166 items=166/199 calls=412 elapsed=47m56s eta=9m31s event=complete score=1.000 mean=0.636
+[10:51:30] [locomo] [################----] task=1/10 task_id=conv-26 phase=qa-0167 items=166/199 calls=0 elapsed=47m56s eta=9m31s event=start item=167/199
+[10:51:45] [locomo] [################----] task=1/10 task_id=conv-26 phase=qa-0167 items=166/199 calls=0 elapsed=48m11s eta=9m34s event=heartbeat waiting for model/runtime
+[10:51:50] [locomo] [################----] task=1/10 task_id=conv-26 phase=qa-0167 items=167/199 calls=415 elapsed=48m16s eta=9m15s event=complete score=1.000 mean=0.638
+[10:51:50] [locomo] [################----] task=1/10 task_id=conv-26 phase=qa-0168 items=167/199 calls=0 elapsed=48m16s eta=9m15s event=start item=168/199
+[10:52:05] [locomo] [################----] task=1/10 task_id=conv-26 phase=qa-0168 items=167/199 calls=0 elapsed=48m31s eta=9m17s event=heartbeat waiting for model/runtime
+[10:52:06] [locomo] [################----] task=1/10 task_id=conv-26 phase=qa-0168 items=168/199 calls=417 elapsed=48m32s eta=8m57s event=complete score=0.000 mean=0.634
+[10:52:06] [locomo] [################----] task=1/10 task_id=conv-26 phase=qa-0169 items=168/199 calls=0 elapsed=48m32s eta=8m57s event=start item=169/199
+[10:52:21] [locomo] [################----] task=1/10 task_id=conv-26 phase=qa-0169 items=168/199 calls=0 elapsed=48m47s eta=9m00s event=heartbeat waiting for model/runtime
+[10:52:24] [locomo] [################----] task=1/10 task_id=conv-26 phase=qa-0169 items=169/199 calls=420 elapsed=48m50s eta=8m40s event=complete score=1.000 mean=0.636
+[10:52:24] [locomo] [################----] task=1/10 task_id=conv-26 phase=qa-0170 items=169/199 calls=0 elapsed=48m50s eta=8m40s event=start item=170/199
+[10:52:39] [locomo] [################----] task=1/10 task_id=conv-26 phase=qa-0170 items=169/199 calls=0 elapsed=49m05s eta=8m42s event=heartbeat waiting for model/runtime
+[10:52:40] [locomo] [#################---] task=1/10 task_id=conv-26 phase=qa-0170 items=170/199 calls=423 elapsed=49m06s eta=8m22s event=complete score=1.000 mean=0.638
+[10:52:40] [locomo] [#################---] task=1/10 task_id=conv-26 phase=qa-0171 items=170/199 calls=0 elapsed=49m06s eta=8m22s event=start item=171/199
+[10:52:54] [locomo] [#################---] task=1/10 task_id=conv-26 phase=qa-0171 items=171/199 calls=425 elapsed=49m20s eta=8m04s event=complete score=1.000 mean=0.640
+[10:52:54] [locomo] [#################---] task=1/10 task_id=conv-26 phase=qa-0172 items=171/199 calls=0 elapsed=49m20s eta=8m04s event=start item=172/199
+[10:53:09] [locomo] [#################---] task=1/10 task_id=conv-26 phase=qa-0172 items=171/199 calls=0 elapsed=49m35s eta=8m07s event=heartbeat waiting for model/runtime
+[10:53:16] [locomo] [#################---] task=1/10 task_id=conv-26 phase=qa-0172 items=172/199 calls=427 elapsed=49m42s eta=7m48s event=complete score=1.000 mean=0.643
+[10:53:16] [locomo] [#################---] task=1/10 task_id=conv-26 phase=qa-0173 items=172/199 calls=0 elapsed=49m42s eta=7m48s event=start item=173/199
+[10:53:31] [locomo] [#################---] task=1/10 task_id=conv-26 phase=qa-0173 items=172/199 calls=0 elapsed=49m57s eta=7m50s event=heartbeat waiting for model/runtime
+[10:53:37] [locomo] [#################---] task=1/10 task_id=conv-26 phase=qa-0173 items=173/199 calls=430 elapsed=50m03s eta=7m31s event=complete score=1.000 mean=0.645
+[10:53:38] [locomo] [#################---] task=1/10 task_id=conv-26 phase=qa-0174 items=173/199 calls=0 elapsed=50m03s eta=7m31s event=start item=174/199
+[10:53:53] [locomo] [#################---] task=1/10 task_id=conv-26 phase=qa-0174 items=173/199 calls=0 elapsed=50m18s eta=7m33s event=heartbeat waiting for model/runtime
+[10:53:59] [locomo] [#################---] task=1/10 task_id=conv-26 phase=qa-0174 items=174/199 calls=433 elapsed=50m25s eta=7m14s event=complete score=1.000 mean=0.647
+[10:53:59] [locomo] [#################---] task=1/10 task_id=conv-26 phase=qa-0175 items=174/199 calls=0 elapsed=50m25s eta=7m14s event=start item=175/199
+[10:54:11] [locomo] [#################---] task=1/10 task_id=conv-26 phase=qa-0175 items=175/199 calls=435 elapsed=50m37s eta=6m56s event=complete score=1.000 mean=0.649
+[10:54:11] [locomo] [#################---] task=1/10 task_id=conv-26 phase=qa-0176 items=175/199 calls=0 elapsed=50m37s eta=6m56s event=start item=176/199
+[10:54:26] [locomo] [#################---] task=1/10 task_id=conv-26 phase=qa-0176 items=175/199 calls=0 elapsed=50m52s eta=6m58s event=heartbeat waiting for model/runtime
+[10:54:27] [locomo] [#################---] task=1/10 task_id=conv-26 phase=qa-0176 items=176/199 calls=437 elapsed=50m52s eta=6m38s event=complete score=1.000 mean=0.651
+[10:54:27] [locomo] [#################---] task=1/10 task_id=conv-26 phase=qa-0177 items=176/199 calls=0 elapsed=50m52s eta=6m38s event=start item=177/199
+[10:54:42] [locomo] [#################---] task=1/10 task_id=conv-26 phase=qa-0177 items=176/199 calls=0 elapsed=51m07s eta=6m40s event=heartbeat waiting for model/runtime
+[10:54:47] [locomo] [#################---] task=1/10 task_id=conv-26 phase=qa-0177 items=177/199 calls=439 elapsed=51m13s eta=6m22s event=complete score=1.000 mean=0.653
+[10:54:47] [locomo] [#################---] task=1/10 task_id=conv-26 phase=qa-0178 items=177/199 calls=0 elapsed=51m13s eta=6m22s event=start item=178/199
+[10:55:01] [locomo] [#################---] task=1/10 task_id=conv-26 phase=qa-0178 items=178/199 calls=441 elapsed=51m26s eta=6m04s event=complete score=1.000 mean=0.655
+[10:55:01] [locomo] [#################---] task=1/10 task_id=conv-26 phase=qa-0179 items=178/199 calls=0 elapsed=51m26s eta=6m04s event=start item=179/199
+[10:55:14] [locomo] [#################---] task=1/10 task_id=conv-26 phase=qa-0179 items=179/199 calls=443 elapsed=51m39s eta=5m46s event=complete score=0.000 mean=0.651
+[10:55:14] [locomo] [#################---] task=1/10 task_id=conv-26 phase=qa-0180 items=179/199 calls=0 elapsed=51m39s eta=5m46s event=start item=180/199
+[10:55:29] [locomo] [#################---] task=1/10 task_id=conv-26 phase=qa-0180 items=179/199 calls=0 elapsed=51m55s eta=5m48s event=heartbeat waiting for model/runtime
+[10:55:30] [locomo] [##################--] task=1/10 task_id=conv-26 phase=qa-0180 items=180/199 calls=445 elapsed=51m56s eta=5m28s event=complete score=1.000 mean=0.653
+[10:55:30] [locomo] [##################--] task=1/10 task_id=conv-26 phase=qa-0181 items=180/199 calls=0 elapsed=51m56s eta=5m28s event=start item=181/199
+[10:55:45] [locomo] [##################--] task=1/10 task_id=conv-26 phase=qa-0181 items=180/199 calls=0 elapsed=52m11s eta=5m30s event=heartbeat waiting for model/runtime
+[10:55:47] [locomo] [##################--] task=1/10 task_id=conv-26 phase=qa-0181 items=181/199 calls=448 elapsed=52m13s eta=5m11s event=complete score=1.000 mean=0.655
+[10:55:47] [locomo] [##################--] task=1/10 task_id=conv-26 phase=qa-0182 items=181/199 calls=0 elapsed=52m13s eta=5m11s event=start item=182/199
+[10:56:02] [locomo] [##################--] task=1/10 task_id=conv-26 phase=qa-0182 items=182/199 calls=450 elapsed=52m28s eta=4m54s event=complete score=1.000 mean=0.657
+[10:56:02] [locomo] [##################--] task=1/10 task_id=conv-26 phase=qa-0183 items=182/199 calls=0 elapsed=52m28s eta=4m54s event=start item=183/199
+[10:56:16] [locomo] [##################--] task=1/10 task_id=conv-26 phase=qa-0183 items=183/199 calls=452 elapsed=52m42s eta=4m36s event=complete score=1.000 mean=0.659
+[10:56:16] [locomo] [##################--] task=1/10 task_id=conv-26 phase=qa-0184 items=183/199 calls=0 elapsed=52m42s eta=4m36s event=start item=184/199
+[10:56:28] [locomo] [##################--] task=1/10 task_id=conv-26 phase=qa-0184 items=184/199 calls=454 elapsed=52m53s eta=4m18s event=complete score=1.000 mean=0.660
+[10:56:28] [locomo] [##################--] task=1/10 task_id=conv-26 phase=qa-0185 items=184/199 calls=0 elapsed=52m53s eta=4m18s event=start item=185/199
+[10:56:41] [locomo] [##################--] task=1/10 task_id=conv-26 phase=qa-0185 items=185/199 calls=456 elapsed=53m07s eta=4m01s event=complete score=0.000 mean=0.657
+[10:56:41] [locomo] [##################--] task=1/10 task_id=conv-26 phase=qa-0186 items=185/199 calls=0 elapsed=53m07s eta=4m01s event=start item=186/199
+[10:56:56] [locomo] [##################--] task=1/10 task_id=conv-26 phase=qa-0186 items=185/199 calls=0 elapsed=53m22s eta=4m02s event=heartbeat waiting for model/runtime
+[10:56:59] [locomo] [##################--] task=1/10 task_id=conv-26 phase=qa-0186 items=186/199 calls=459 elapsed=53m24s eta=3m43s event=complete score=1.000 mean=0.659
+[10:56:59] [locomo] [##################--] task=1/10 task_id=conv-26 phase=qa-0187 items=186/199 calls=0 elapsed=53m24s eta=3m44s event=start item=187/199
+[10:57:13] [locomo] [##################--] task=1/10 task_id=conv-26 phase=qa-0187 items=187/199 calls=461 elapsed=53m38s eta=3m26s event=complete score=0.000 mean=0.655
+[10:57:13] [locomo] [##################--] task=1/10 task_id=conv-26 phase=qa-0188 items=187/199 calls=0 elapsed=53m38s eta=3m26s event=start item=188/199
+[10:57:27] [locomo] [##################--] task=1/10 task_id=conv-26 phase=qa-0188 items=188/199 calls=463 elapsed=53m53s eta=3m09s event=complete score=1.000 mean=0.657
+[10:57:27] [locomo] [##################--] task=1/10 task_id=conv-26 phase=qa-0189 items=188/199 calls=0 elapsed=53m53s eta=3m09s event=start item=189/199
+[10:57:42] [locomo] [##################--] task=1/10 task_id=conv-26 phase=qa-0189 items=188/199 calls=0 elapsed=54m08s eta=3m10s event=heartbeat waiting for model/runtime
+[10:57:46] [locomo] [##################--] task=1/10 task_id=conv-26 phase=qa-0189 items=189/199 calls=465 elapsed=54m12s eta=2m52s event=complete score=0.000 mean=0.654
+[10:57:46] [locomo] [##################--] task=1/10 task_id=conv-26 phase=qa-0190 items=189/199 calls=0 elapsed=54m12s eta=2m52s event=start item=190/199
+[10:58:00] [locomo] [###################-] task=1/10 task_id=conv-26 phase=qa-0190 items=190/199 calls=467 elapsed=54m26s eta=2m34s event=complete score=1.000 mean=0.655
+[10:58:00] [locomo] [###################-] task=1/10 task_id=conv-26 phase=qa-0191 items=190/199 calls=0 elapsed=54m26s eta=2m34s event=start item=191/199
+[10:58:12] [locomo] [###################-] task=1/10 task_id=conv-26 phase=qa-0191 items=191/199 calls=469 elapsed=54m38s eta=2m17s event=complete score=1.000 mean=0.657
+[10:58:12] [locomo] [###################-] task=1/10 task_id=conv-26 phase=qa-0192 items=191/199 calls=0 elapsed=54m38s eta=2m17s event=start item=192/199
+[10:58:22] [locomo] [###################-] task=1/10 task_id=conv-26 phase=qa-0192 items=192/199 calls=471 elapsed=54m48s eta=1m59s event=complete score=1.000 mean=0.659
+[10:58:22] [locomo] [###################-] task=1/10 task_id=conv-26 phase=qa-0193 items=192/199 calls=0 elapsed=54m48s eta=1m59s event=start item=193/199
+[10:58:37] [locomo] [###################-] task=1/10 task_id=conv-26 phase=qa-0193 items=192/199 calls=0 elapsed=55m03s eta=2m00s event=heartbeat waiting for model/runtime
+[10:58:38] [locomo] [###################-] task=1/10 task_id=conv-26 phase=qa-0193 items=193/199 calls=473 elapsed=55m04s eta=1m42s event=complete score=1.000 mean=0.661
+[10:58:38] [locomo] [###################-] task=1/10 task_id=conv-26 phase=qa-0194 items=193/199 calls=0 elapsed=55m04s eta=1m42s event=start item=194/199
+[10:58:51] [locomo] [###################-] task=1/10 task_id=conv-26 phase=qa-0194 items=194/199 calls=475 elapsed=55m17s eta=1m25s event=complete score=0.000 mean=0.657
+[10:58:51] [locomo] [###################-] task=1/10 task_id=conv-26 phase=qa-0195 items=194/199 calls=0 elapsed=55m17s eta=1m25s event=start item=195/199
+[10:59:06] [locomo] [###################-] task=1/10 task_id=conv-26 phase=qa-0195 items=195/199 calls=477 elapsed=55m32s eta=1m08s event=complete score=1.000 mean=0.659
+[10:59:06] [locomo] [###################-] task=1/10 task_id=conv-26 phase=qa-0196 items=195/199 calls=0 elapsed=55m32s eta=1m08s event=start item=196/199
+[10:59:20] [locomo] [###################-] task=1/10 task_id=conv-26 phase=qa-0196 items=196/199 calls=479 elapsed=55m46s eta=51s event=complete score=1.000 mean=0.661
+[10:59:20] [locomo] [###################-] task=1/10 task_id=conv-26 phase=qa-0197 items=196/199 calls=0 elapsed=55m46s eta=51s event=start item=197/199
+[10:59:35] [locomo] [###################-] task=1/10 task_id=conv-26 phase=qa-0197 items=196/199 calls=0 elapsed=56m01s eta=51s event=heartbeat waiting for model/runtime
+[10:59:37] [locomo] [###################-] task=1/10 task_id=conv-26 phase=qa-0197 items=197/199 calls=481 elapsed=56m03s eta=34s event=complete score=0.000 mean=0.657
+[10:59:37] [locomo] [###################-] task=1/10 task_id=conv-26 phase=qa-0198 items=197/199 calls=0 elapsed=56m03s eta=34s event=start item=198/199
+[10:59:52] [locomo] [###################-] task=1/10 task_id=conv-26 phase=qa-0198 items=198/199 calls=483 elapsed=56m17s eta=17s event=complete score=1.000 mean=0.659
+[10:59:52] [locomo] [###################-] task=1/10 task_id=conv-26 phase=qa-0199 items=198/199 calls=0 elapsed=56m18s eta=17s event=start item=199/199
+[11:00:07] [locomo] [###################-] task=1/10 task_id=conv-26 phase=qa-0199 items=198/199 calls=0 elapsed=56m33s eta=17s event=heartbeat waiting for model/runtime
+[11:00:19] [locomo] [####################] task=1/10 task_id=conv-26 phase=qa-0199 items=199/199 calls=486 elapsed=56m45s eta=0s event=complete score=1.000 mean=0.661
+[11:00:19] [locomo] [####################] task=1/10 task_id=conv-26 phase=task items=1/1 calls=486 elapsed=56m45s eta=0s event=complete mean_f1=0.661 qa=199
+[11:00:19] complete locomo/conv-26: pass
+[11:00:19] skip terminal 2/10 locomo/conv-30: pass
+[11:00:19] skip terminal 3/10 locomo/conv-41: pass
+[11:00:19] skip terminal 4/10 locomo/conv-42: pass
+[11:00:19] skip terminal 5/10 locomo/conv-43: pass
+[11:00:19] skip terminal 6/10 locomo/conv-44: pass
+[11:00:19] skip terminal 7/10 locomo/conv-47: pass
+[11:00:19] skip terminal 8/10 locomo/conv-48: pass
+[11:00:19] skip terminal 9/10 locomo/conv-49: pass
+[11:00:19] skip terminal 10/10 locomo/conv-50: pass
+manifest=D:\agent_learning\cc-harness\eval\result\cc-only\locomo-memory\deepseek-v4-flash\full\manifest.json
+catalog=D:\agent_learning\cc-harness\eval\result\cc-only\locomo-memory\deepseek-v4-flash\full\catalog.json
+state=D:\agent_learning\cc-harness\eval\result\cc-only\locomo-memory\deepseek-v4-flash\full\state.json
+summary=D:\agent_learning\cc-harness\eval\result\cc-only\locomo-memory\deepseek-v4-flash\full\summary.json
+report=D:\agent_learning\cc-harness\eval\result\cc-only\locomo-memory\deepseek-v4-flash\full\report.md
+integrity=D:\agent_learning\cc-harness\eval\result\cc-only\locomo-memory\deepseek-v4-flash\full\integrity.json
+raw=D:\agent_learning\cc-harness\eval\result\cc-only\locomo-memory\deepseek-v4-flash\full\raw

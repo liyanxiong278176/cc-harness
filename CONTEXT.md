@@ -35,7 +35,7 @@ cc-harness 是在用户当前终端中运行的编码代理。其交互语言强
 treatment 与必要的隔离 judge 均使用经服务端身份验证的 `deepseek-v4-flash`；官方确定性指标保持不变，替代官方 reader 或语义 judge 的分数必须明确标为 DeepSeek adaptation，并保留全部原始预测供未来重新评分。使用官方数据集不等同于获得官方 leaderboard 成绩，模型或 judge 契约不一致时不得直接横向比较公开数字。_Avoid_: 隐藏 judge 替换、让 judge 继承被测记忆、把适配成绩标成官方成绩、为重新评分重复运行被测系统
 
 **可续跑上下文-记忆运行（Resumable Context-Memory Run）**:
-三个 benchmark 在统一结果根下拥有独立运行状态和 treatment 证据，并由总报告聚合；同一命令仅跳过完整性校验通过的已完成样本，从首个未完成的 attempt-1 继续。数据集、模型、配置、代码或任务目录摘要变化时拒绝混合续跑，三项成绩与机制门禁分别报告且不生成加权总分。_Avoid_: 仅凭目录存在跳过样本、把不同输入契约写入同一运行、Ctrl+C 后从头执行、用聚合分隐藏单项失败
+三个 benchmark 在统一结果根下拥有独立运行状态和 treatment 证据，并由总报告聚合；同一命令仅跳过完整性校验通过的已完成样本，并在同一未完成 attempt 内按已提交的摄入/QA 检查点继续。数据集、模型、配置、代码或任务目录摘要变化时拒绝混合续跑，三项成绩与机制门禁分别报告且不生成加权总分。_Avoid_: 仅凭目录存在跳过样本、把不同输入契约写入同一运行、Ctrl+C 后从头执行、用聚合分隐藏单项失败
 
 **上下文-记忆数据占用契约（Context-Memory Data Footprint Contract）**:
 当前活动套件仅准备 LongMemEval-S Cleaned、LoCoMo 与 MemoryAgentBench 所需的固定输入；下载按内容摘要去重并固定 revision、大小与 SHA-256，支持断点续传，数据和证据接近 50 GB 软上限时安全停止。LongMemEval-V2 的历史多模态数据不再由活动命令准备或聚合，原有文件与证据保留用于审计。_Avoid_: 每题复制完整轨迹库、静默删除历史证据、忽略图片后宣称 V2 成绩、未固定数据版本即继续旧运行
@@ -881,3 +881,335 @@ changes part of the interaction protocol to exercise a product capability. Its r
 changed component and cannot present the result as an official or directly comparable upstream
 score.
 _Avoid_: Official score, protocol-preserving score, hidden adaptation
+
+**Regraded Diagnostic Report**:
+An offline diagnostic artifact computed from the immutable raw predictions of an archived run
+after correcting a grader or reporting rule. It does not alter the archived evidence, is not a new
+formal benchmark score, and must not be pooled with results from a later protocol version.
+_Avoid_: Corrected formal score, rerun result, new-protocol full score
+
+**Memory-System Valid Trial**:
+A memory benchmark trial whose committed ingestion produced persistent memory atoms for source
+material containing extractable facts, and whose answer phase retained auditable activation and
+retrieval evidence. A trial with zero memory atoms is `invalid` for formal memory-effectiveness
+reporting even when its raw answer F1 is retained as diagnostic evidence.
+_Avoid_: High-F1 memory pass without memory evidence, zero-atom pass, product failure caused only by missing mechanism evidence
+
+**Checkpoint-Preserving QA Retry**:
+A retry of only the current uncommitted question after restoring its pre-question state. Committed
+session ingestion and committed answers are reused, transient provider failures receive at most
+three retries, and exhaustion makes the sample `invalid` rather than a product `fail`. A later
+resume continues the same logical attempt from that question.
+_Avoid_: Reingesting committed sessions, replaying committed questions, new attempt per interruption, API failure scored as product failure
+
+**LoCoMo Category-Aware Primary Score**:
+The formal adapted LoCoMo score applies partial F1 to category 1, stemmed token F1 to categories
+2-4, and the declared unanswerable/abstention rule to category 5. A null category-5 answer denotes
+expected abstention and must never be converted to the literal gold string `"None"`. Optional
+semantic judging is a separately labeled diagnostic and is never pooled into the primary score.
+_Avoid_: One scorer for every category, `None` token F1, semantic score presented as primary F1
+
+**LoCoMo Question-Category Semantics**:
+For the pinned `locomo10` fixture, category 1 is direct factual/count/list retrieval, category 2 is
+temporal reasoning, category 3 is evidence-grounded inference or commonsense prediction, category 4
+is cross-fact synthesis, and category 5 is intentionally unanswerable. These meanings come from the
+questions and empty-answer contract in the frozen fixture; they are separate from the numeric scoring
+rules above. Category-aware retrieval and answer guidance must follow these meanings without changing
+the scorer, so temporal improvements target category 2 rather than category 3.
+_Avoid_: Calling category 3 temporal, using date logic as a proxy for inference quality, or changing
+the primary scorer to make a category appear stronger
+
+**Evaluation Status Dimensions**:
+Reports separate `execution_status` (whether work completed), `evidence_status` (whether memory
+mechanism evidence is valid), and `quality_metrics` (F1, category scores and abstention accuracy).
+Completion never implies high quality, and a low quality score never implies an execution error.
+Without a controlled no-memory comparison these dimensions show participation and absolute quality,
+not causal improvement from memory.
+_Avoid_: One overloaded pass/fail field, pass meaning high score, mechanism evidence presented as causal uplift
+
+**Auditable Hybrid Memory Retrieval**:
+A retrieval path that combines lexical/BM25 and vector candidates, applies entity, temporal and
+source-session metadata constraints, reranks the merged candidates, and records the atom IDs,
+source sessions and relevance evidence actually injected into answer context.
+_Avoid_: Vector-only retrieval, opaque context injection, retrieved evidence without provenance
+
+**Bounded Multi-Hop Memory Retrieval**:
+An answer path with at most two retrieval rounds. The first round retrieves direct entities,
+events and temporal evidence; when evidence remains insufficient, a second round may expand only
+the retrieval query using newly identified entities or relations. Both rounds retain queries,
+atom hits and final evidence provenance.
+_Avoid_: Unbounded retrieval loops, unsupported first-round guessing, hidden query expansion
+
+**Evidence-Grounded Abstention**:
+An answer policy that responds only when retrieved conversation evidence directly supports the
+answer. Missing, conflicting or low-confidence evidence produces a short standardized abstention
+with a recorded reason (`no_evidence`, `conflicting_evidence` or `low_confidence`); model world
+knowledge must not fill facts absent from the conversation.
+_Avoid_: Guessing from model knowledge, literal `None`, unclassified refusal, per-test-answer threshold tuning
+
+**LoCoMo Context-and-Memory Claim**:
+The adapted LoCoMo run evaluates basic context management and cross-session long-term memory:
+session ordering, entity/event/time continuity, relevant-evidence selection, context-budgeted
+memory injection, QA isolation, resume consistency and final prompt assembly. Without a dedicated
+compression stress test or controlled comparison it does not establish compression superiority or
+a maximum supported context window.
+_Avoid_: Memory-only benchmark, no context coverage, compression superiority from LoCoMo alone
+
+**LoCoMo Protocol Smoke Run**:
+A non-reportable validation run that ingests every session from one conversation and answers a
+small category-spanning QA subset with the real configured model. It verifies memory persistence,
+retrieval, scoring, checkpoints and evidence before a formal full run, but never enters formal
+aggregate results.
+_Avoid_: Portfolio result, partial formal score, development result pooled into full
+
+**Validated LoCoMo Pre-Ingestion Snapshot**:
+An immutable, reusable memory state produced by ingesting all historical sessions for exactly one
+LoCoMo sample. It may be reused across runs only when the sample, model identity, ingestion
+contract, memory/context behavior, capability profile and evaluation protocol all match their
+recorded digests; a mismatch retains the old snapshot for audit and requires a new one.
+_Avoid_: Global shared memory, unchecked warm cache, reusing memory after implementation changes,
+cross-sample history
+
+**Cold-Equivalent Evaluation Cost**:
+The recorded cost and duration of producing a validated pre-ingestion snapshot plus the cost and
+duration of the evaluation that consumes it. It is the formal efficiency figure even when a run
+starts from an already prepared snapshot; snapshot preparation and warm-run figures remain
+separately visible.
+_Avoid_: Hiding preparation cost, reporting warm QA cost as end-to-end cost, silently amortizing a
+snapshot across runs
+
+**Resumable Pre-Ingestion Build**:
+The unpublished construction state for one validated LoCoMo pre-ingestion snapshot. It commits
+each completed historical session and may resume from the last contiguous commit, but no
+evaluation may consume it until all sessions and memory-evidence checks complete and the snapshot
+is atomically published.
+_Avoid_: Using a partial cache, restarting completed ingestion, publishing before validation,
+blocking unrelated sample builds
+
+**LoCoMo Snapshot Reuse-or-Build**:
+The default evaluation behavior that restores a strictly matching validated pre-ingestion snapshot,
+resumes its unpublished build when incomplete, or builds and publishes it when absent before QA
+begins. A separate preparation run may build the same snapshots without starting QA.
+_Avoid_: Requiring manual cache setup, silently using a stale snapshot, failing only because a
+valid cache has not been prepared
+
+**Source-Only LoCoMo Snapshot**:
+A validated pre-ingestion snapshot containing only state derived from one sample's historical
+conversation. Because it contains no benchmark questions, gold answers, grader metadata or prior
+predictions, the same matching snapshot may be consumed by smoke, portfolio and full QA scopes.
+_Avoid_: QA-seeded memory, profile-specific duplicate ingestion, cached model answers, grading
+metadata in memory
+
+**Exclusive LoCoMo Snapshot Build**:
+At most one live process may construct the snapshot for a given sample and cache identity. A
+duplicate launch is rejected before model work begins, while an abandoned build may be resumed
+from its last committed historical session after its former owner is proven absent.
+_Avoid_: Concurrent writers, duplicate ingestion charges, treating a live builder as abandoned,
+discarding recoverable build checkpoints
+
+**Retained LoCoMo Snapshot Evidence**:
+Validated snapshots and the evidence of their paid ingestion remain retained until explicit user
+pruning. Superseded identities are archived rather than deleted, and reaching the managed-data
+soft limit blocks new construction instead of silently removing existing evidence.
+_Avoid_: Automatic cache eviction, deleting paid evidence, overwriting an old identity, building
+past the managed-data limit
+
+**Verified LoCoMo Snapshot Promotion**:
+The publication of a source-only snapshot recovered from an earlier completed run after its full
+session coverage, sample and model identity, ingestion contract, stable memory scope, persistent
+atoms and launch evidence are revalidated. QA records, predictions and grader data are never
+promoted with it.
+_Avoid_: Copying an attempt wholesale, trusting directory presence, promoting partial ingestion,
+carrying smoke answers into a formal run
+
+**LoCoMo Snapshot Store**:
+The managed cache namespace that owns pre-ingestion builds, published source-only snapshots and
+their provenance independently of benchmark result roots. Clearing, archiving or starting a result
+run does not affect this store; only an explicit cache-pruning action may remove retained entries.
+_Avoid_: Storing reusable snapshots inside a run result, deleting cache while clearing scores,
+checking generated memory state into Git
+
+**Fresh LoCoMo QA Run**:
+A new immutable benchmark result run that begins its QA scope from the first question while
+retaining all earlier result evidence and restoring matching source-only pre-ingestion snapshots.
+It is distinct from resuming an interrupted run and from rebuilding historical memory.
+_Avoid_: Deleting the prior result, treating a fresh run as a cache refresh, reingesting history,
+mixing new QA records into an old run
+
+**Explicit LoCoMo Snapshot Refresh**:
+An intentional replacement build for either one named sample or the complete ten-sample set.
+Replacement is published per sample only after validation, preserves the prior version on failure,
+and complete-set refresh requires an additional explicit confirmation because it incurs live model
+cost across every sample.
+_Avoid_: Implicit refresh, destructive in-place rebuild, all-sample charges from a single ambiguous
+flag, discarding a valid snapshot after replacement failure
+
+**Validated LoCoMo Snapshot Admission**:
+The mandatory model-free verification performed before a published snapshot may seed a run. It
+proves identity and session coverage, persistent-memory readability and scope, critical-file
+integrity, and absence of QA or grading material; failed admission makes the snapshot unusable and
+retains corruption evidence for repair.
+_Avoid_: Trusting a completion marker alone, using a damaged database, skipping scope validation,
+admitting answer-contaminated state
+
+**LoCoMo Historical Fact Preservation**:
+The benchmark-scoped memory boundary that keeps facts from each imported historical session
+available as active evidence, while allowing exact duplicate removal only within that same session.
+It is separate from ordinary interactive-memory conflict resolution and never treats a cross-session
+semantic similarity as permission to delete or replace history.
+_Avoid_: Applying product-wide conflict deletion to benchmark history, treating one merged summary as
+complete session coverage, changing ordinary interactive-memory behavior to fix a benchmark fixture
+
+**LoCoMo Session Fact Atom**:
+A single independently retrievable claim from one imported LoCoMo session, anchored to that session's
+time and source; a session may contribute multiple atoms so its distinct facts remain separately available.
+_Avoid_: One atom standing for an entire conversation, cross-session merged summaries, facts without
+session or source provenance
+
+**LoCoMo Read-Only QA Boundary**:
+Within a LoCoMo evaluation, historical sessions are written during the ingestion stage and the QA
+stage reads that benchmark-scoped memory without creating, deleting, or modifying memories. This keeps
+later questions from changing the state used by earlier or later questions; ordinary product runtime
+memory remains writable outside the benchmark boundary.
+_Avoid_: Letting answer-time writes affect subsequent questions, mixing benchmark state with product
+memory, or claiming an online-learning result from a read-only QA run
+
+**LoCoMo Supporting Evidence**:
+The small, provenance-bearing set of benchmark-scoped memory atoms selected for a QA question and
+recorded with their identifiers and retrieval signals. It supports separate measurement of retrieval
+coverage and evidence quality from answer quality; an injected atom without question relevance is not
+supporting evidence.
+_Avoid_: Counting any non-empty injection as evidence, using reference answers during retrieval, or
+silently presenting unsupported guesses as recalled facts
+
+**LoCoMo Temporal Fact Versions**:
+Time-anchored facts from the same imported session remain available even when later events change or
+contradict earlier events. Only exact duplicates within that session may be removed; question-time and
+event-order signals decide which version supports an answer.
+_Avoid_: Treating a later fact as permission to erase history, collapsing temporal states into one value,
+or answering a time-specific question from an unanchored current-value summary
+
+**LoCoMo Context-Memory Dual Channel**:
+The evaluation boundary that keeps bounded working context (the current question and relevant ordered
+conversation turns) distinct from retrieved long-term memory (provenance- and time-anchored fact atoms).
+The benchmark reports each channel and their combined use separately; context trimming does not rewrite
+long-term memory.
+_Avoid_: Calling all prompt text memory, hiding context truncation inside retrieval scores, or treating a
+combined result as proof that either channel works alone
+
+**LoCoMo Joint Evaluation Mode**:
+The default live benchmark mode that evaluates bounded working context and retrieved long-term memory
+together on the same QA. It reports the combined system outcome and operational diagnostics, but does not
+claim a causal contribution from either channel without a separately authorized ablation.
+_Avoid_: Presenting a joint score as a memory-only or context-only score, silently running extra live
+control arms, or comparing joint runs with different questions or model settings
+
+**LoCoMo Joint Answer Provenance**:
+In joint mode, the answer prompt exposes working context and long-term memory as separate labeled
+inputs. The answer may synthesize supported information from both, resolves disagreements using time
+and source signals, and records when neither channel provides enough support; QA does not write back to
+long-term memory.
+_Avoid_: Blending sources without attribution, treating unsupported model knowledge as recalled history,
+or allowing answer generation to mutate the evaluated memory state
+
+**LoCoMo Joint Diagnostic Report**:
+The report for joint mode keeps one primary combined answer score while also recording context budget
+use and truncation, active fact-atom counts, retrieval and supporting-evidence coverage, answer-contract
+validity, latency, retries, model calls, tokens, cost, and failed or incomplete QA counts. Diagnostics
+explain the score but do not silently redefine it.
+_Avoid_: Replacing the primary score with a favorable diagnostic, omitting failed questions, or treating
+evidence injection and answer correctness as the same metric
+
+## Agent Runtime Language
+
+**Durable Agent Run（可持久代理运行）**:
+一个长程任务从创建到终止的唯一权威状态，拥有目标、生命周期以及所有工作、子运行、审批和完成证据的归属；消息、Todo、checkpoint、journal 与 memory 都是其记录或投影。
+_Avoid_: 以聊天消息、Todo 状态、摘要或某个 checkpoint 单独代表任务真实状态
+
+**Outcome Unknown（结果不明）**:
+一个有副作用的动作已经开始，但当前证据无法证明其成功或失败的运行状态；恢复流程必须先对账，不能把它自动视为失败并重试。
+_Avoid_: 未记录成功即认定失败、盲目重放写操作、用聊天摘要推断外部副作用结果
+
+**Isolated Child Run（隔离子运行）**:
+在独立 Git worktree 与分支中拥有候选变更的可持久子运行；它只能向父运行提交变更集和验证证据，由父运行决定是否接纳。
+_Avoid_: 多个写入型子代理共享工作区、子运行直接修改父运行工作树、未经接纳便把候选变更视为主任务成果
+
+**Lifecycle-Governed Run（生命周期治理运行）**:
+由完成、阻塞、审批、停滞、取消或不可恢复失败决定是否继续、且不以总 token、费用、调用次数或运行时长设完成上限的可持久代理运行；并发、单动作超时、速率、存储、安全和无进展熔断仍约束每个执行片段。
+_Avoid_: 以 `max_iter` 或累计消耗代表任务结束、把无硬完成预算解释为无安全限制、执行片段重启后清零累计消耗
+
+**Run Progress（运行进展）**:
+Durable Agent Run 中能够由验收、错误、变更、验证、子运行、阻塞条件、关键证据或已淘汰失败路径证明的有效状态改善；仅增加文本、调用和重复结果不构成进展。
+_Avoid_: 用 token 消耗代表进展、重复相同动作、无新证据的计划改写、创建无验收价值的 Todo、把相同错误再次出现视为探索
+
+**Stalled Run（停滞运行）**:
+在一次替代策略诊断后仍连续多个执行片段没有 Run Progress、因而释放 worker 并等待新策略或用户决定的运行状态。
+_Avoid_: 无进展时无限重试、停滞后原样继续、把暂时等待审批或外部条件误判为停滞
+
+**Local Run Store（本地运行存储）**:
+由本机 supervisor 单写、使用 SQLite/WAL 保存运行事件、租约、审批、队列和投影，并以内容摘要引用文件对象库中大型证据的权威持久层。
+_Avoid_: worker 直接修改权威数据库、把大型日志全部内嵌到状态行、事件先于对象完整落盘、要求外部数据库才能运行本机代理
+
+**Action-Scoped Capability（动作范围能力）**:
+由 supervisor 为一个已识别的 run action 临时授予、绑定工具、目标、参数范围和有效期的最小权限；worker 和 child run 默认不持有长期外部凭证。
+_Avoid_: worker 继承完整环境、child run 自动继承父凭证、一次审批变成永久授权、把凭证写入事件、消息、对象、日志或提交
+
+**Tool Recovery Contract（工具恢复契约）**:
+工具对其只读或副作用类别、安全重试或幂等语义、结果对账能力和取消能力的显式声明，供运行时决定调度、审批、中断和崩溃恢复；未知工具采用最保守语义。
+_Avoid_: 根据工具名称猜测副作用、把权限允许等同于可安全重试、未知 MCP 工具默认可信、取消请求发出即声称副作用已撤销
+
+**Goal Contract（目标契约）**:
+Durable Agent Run 在执行长程写入前确定的结构化目标事实，包含目标、验收标准、约束、允许与排除范围、必要证据和人工审核要求；明确任务可自动确认，关键歧义或高风险要求用户决定。
+_Avoid_: 从压缩后的聊天猜测完成条件、执行中被普通消息静默改写目标、缺少验收标准便开始长程修改、所有任务都要求形式化人工确认
+
+**Run Plan Graph（运行计划图）**:
+由父运行拥有、以依赖和文件所有权约束可执行顺序的可修订任务图；累计 child 数量不限定，但默认并发为三、最大 child 深度为二，超过深度的工作由上级重排为同级任务。
+_Avoid_: 无限递归派生代理、把并发限制当成任务总预算、依赖未满足便启动 child、文件所有权冲突的 child 并行写入
+
+**Advisory Memory Evidence（建议性记忆证据）**:
+带来源、时间、项目范围和置信状态的长期记忆候选，可辅助规划但不能修改 Goal Contract、授予权限或证明完成；采用后仍须以当前项目事实验证。
+_Avoid_: 把 memory 当作权威指令、从失败猜测直接沉淀事实、用记忆命中替代当前验证、无来源跨项目注入
+
+**Pinned Run Contract（固定运行契约）**:
+Durable Agent Run 创建时绑定的运行时版本、事件 schema、工具恢复契约摘要和模型配置；升级只能在可恢复点经显式迁移事件替换，不能让新旧 worker 同时解释或写入同一运行。
+_Avoid_: 长程任务中途静默换内核、升级后继续使用未验证事件、父子运行采用不兼容契约、旧 worker 在迁移后继续写入
+
+**Runtime Rebuild Release Gate（运行时重建发布门）**:
+新 Durable Agent Run 内核替换旧运行时前必须全部通过的不可抵消证据集合，覆盖遗留迁移、崩溃恢复、结果不明、租约、worktree、完成、审批、凭证、队列、停滞、跨平台、回滚和冻结对标。
+_Avoid_: 用综合分抵消数据损坏或安全越界、只验证正常路径、未通过回滚便一次性切换、用功能数量替代可复现证据
+
+**Evidence-Backed Completion（证据支持的完成）**:
+由验收标准、实际变更、验证结果、未解决错误、已接纳子运行以及必要人工批准共同支持的终态；模型只能提交完成候选，不能单方面宣布运行完成。
+_Avoid_: 最终回答声称完成即标记完成、把子运行 `done` 当作父运行已接纳、缺少必要验证时静默通过
+
+**Run Event（运行事件）**:
+对 Durable Agent Run 中一个已发生状态变化的不可变事实记录；当前运行状态由有序事件推导，快照只用于加速恢复而不取代事件事实。
+_Avoid_: 原地覆盖运行历史、把快照当作事实来源、从聊天摘要虚构缺失事件
+
+**Clean Runtime Rebuild（运行时重建）**:
+以全新的 Durable Agent Run 内核一次性取代旧代理运行时，同时通过一次性、幂等且可审计的导入保留能够由旧数据证明的用户状态。
+_Avoid_: 新旧运行时长期双写、为旧内部接口永久保留兼容层、重建时静默丢弃会话和记忆、为补齐新模型而虚构旧历史
+
+**Detached Local Run（脱离终端的本地运行）**:
+由本机 supervisor 持有并交给受租约约束的 worker 执行、生命周期独立于任一终端客户端的 Durable Agent Run；终端负责创建、监督、指导和审批，而不拥有运行本身。
+_Avoid_: 关闭 REPL 即取消任务、让客户端进程成为运行权威、无租约的多个 worker 同时执行同一运行、把本机后台执行描述成云端服务
+
+**Persistent Approval Request（持久审批请求）**:
+绑定具体动作、参数范围和风险原因的 Durable Agent Run 等待状态；等待期间运行释放 worker，批准只适用于原请求，拒绝要求重新规划，hard-deny 不可被审批覆盖。
+_Avoid_: 用户离线时自动允许、用一次批准授权变化后的动作、把拒绝当作工具故障、阻塞 worker 等待终端输入
+
+**Follow-up Run（后续运行）**:
+用户在当前运行期间提交、等待当前运行完成或取消后自动创建的独立 Durable Agent Run；它引用前序运行结果，但拥有自己的目标、预算和完成证据。
+_Avoid_: 把普通新消息静默注入正在运行的目标、让后续运行与未终止前序运行并发修改同一项目、把队列消息当作当前运行的即时指导
+
+**Run Interrupt（运行中断）**:
+用户明确要求当前运行停止的控制动作；它请求取消正在执行的动作，无法确认取消结果时保留 Outcome Unknown，而不是把普通后续消息解释为中断。
+_Avoid_: 每条新消息都杀死当前动作、把中断等同于已撤销外部副作用、无法确认取消时直接标记失败
+
+**Predecessor Gate（前序门）**:
+决定 Follow-up Run 能否根据前序运行终态自动启动的依赖规则；完成和带取消事实的允许路径可推进，阻塞、审批、预算耗尽和终结失败默认要求用户处理。
+_Avoid_: 前序失败后静默启动依赖任务、把等待审批视为终止、隐藏取消导致的成果不完整、未经明确授权跳过失败前序
+
+**Candidate Change Set（候选变更集）**:
+隔离子运行从固定基线生成、由本地 Git commit 标识并附带验证证据的待接纳成果；只有父运行将其应用到集成 worktree 并重新验证后，它才属于主任务成果。
+_Avoid_: 子运行提交即视为父任务完成、直接写入父工作树、只凭子运行局部测试接纳组合变更、冲突时丢弃来源关系

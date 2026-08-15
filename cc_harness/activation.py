@@ -3,11 +3,12 @@
 from __future__ import annotations
 
 import json
-import os
 import time
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any
+
+from cc_harness.atomic import atomic_write_text
 
 ACTIVATION_SCHEMA_VERSION = "cc-harness.activation.v1"
 
@@ -183,10 +184,7 @@ class ActivationManifest:
         }
 
     def write(self) -> None:
-        self.path.parent.mkdir(parents=True, exist_ok=True)
-        tmp = self.path.with_suffix(self.path.suffix + ".tmp")
-        tmp.write_text(
+        atomic_write_text(
+            self.path,
             json.dumps(self.payload(), ensure_ascii=False, indent=2, sort_keys=True) + "\n",
-            encoding="utf-8",
         )
-        os.replace(tmp, self.path)

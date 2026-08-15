@@ -33,6 +33,23 @@ def test_build_memory_extras_fail_soft_on_missing_env(monkeypatch, tmp_path):
     assert deps is None
 
 
+def test_build_memory_extras_read_only_omits_memory_save(monkeypatch, tmp_path):
+    async def _noop_init(self): self._db = None
+    monkeypatch.setattr("cc_harness.memory.store.MemoryStore.init_schema", _noop_init)
+    env = {
+        "OPENAI_API_KEY": "k", "OPENAI_BASE_URL": "u", "OPENAI_MODEL": "m",
+        "EMBEDDING_BASE_URL": "u", "EMBEDDING_API_KEY": "k", "EMBEDDING_MODEL": "bge",
+        "MEMORY_READ_ONLY": "true",
+    }
+    from cc_harness.memory.extras import build_memory_extras, close_memory_deps
+    extras, deps = asyncio.run(build_memory_extras(env, tmp_path / "mem.db"))
+    names = [entry["spec"]["function"]["name"] for entry in extras]
+    assert "memory_recall" in names
+    assert "memory_save" not in names
+    assert deps is not None and deps["read_only"] is True
+    asyncio.run(close_memory_deps(deps))
+
+
 def test_close_memory_deps_is_idempotent_and_continues_after_failure(caplog):
     from cc_harness.memory.extras import close_memory_deps
 

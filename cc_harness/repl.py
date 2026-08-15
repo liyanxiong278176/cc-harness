@@ -678,13 +678,24 @@ async def _after_turn_memory(state: ReplState, mem_cfg, scheduler=None) -> dict:
         return outcome
     store = state.mem_deps["store"]
     turn_idx = state.session_stats.turns
+    benchmark_session_id = os.getenv("MEMORY_BENCHMARK_SESSION_ID")
+    effective_session_id = benchmark_session_id or state.session_id
+    capture_messages = state.messages
+    if benchmark_session_id:
+        # A resumed LoCoMo runtime contains prior ingestion prompts. Capture
+        # only the current prompt/turn under the current historical session.
+        last_user = max(
+            (i for i, m in enumerate(state.messages) if m.get("role") == "user"),
+            default=0,
+        )
+        capture_messages = state.messages[last_user:]
 
     # L0: capture(幂等录制 conversation 表)
     if mem_cfg.capture_enabled:
         try:
             from cc_harness.memory.capture import capture
             outcome["captured"] = await capture(
-                store, state.session_id, state.messages, turn_idx=turn_idx
+                store, effective_session_id, capture_messages, turn_idx=turn_idx
             )
         except Exception as e:
             print_warn(Console(), f"memory capture failed: {e}")
@@ -700,7 +711,7 @@ async def _after_turn_memory(state: ReplState, mem_cfg, scheduler=None) -> dict:
             )
             try:
                 outcome["pipeline_enqueued"] = await worker.enqueue(
-                    state.session_id, turn_idx, state.messages[last_user:]
+                    effective_session_id, turn_idx, state.messages[last_user:]
                 )
             except Exception as e:
                 print_warn(Console(), f"memory pipeline enqueue failed: {e}")
@@ -710,7 +721,7 @@ async def _after_turn_memory(state: ReplState, mem_cfg, scheduler=None) -> dict:
             try:
                 await state.mem_deps["pipeline"].maybe_run(
                     state.messages, state.token_counter, context_window=1_000_000,
-                    session_id=state.session_id, turn_idx=turn_idx,
+                    session_id=effective_session_id, turn_idx=turn_idx,
                     every_n=mem_cfg.pipeline_every_n,
                 )
             except Exception as e:

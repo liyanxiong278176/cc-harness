@@ -1,0 +1,52 @@
+[
+  {
+    "path": "raw\\0002-locomo-conv-30\\attempt-1\\result.json",
+    "sha256": "375FF3C3C707B3AEC02D178156E88FAB9DDC2BFD8B1CCAE97CA60E932A16F7A6",
+    "size": 4120
+  },
+  {
+    "path": "raw\\0003-locomo-conv-41\\attempt-1\\result.json",
+    "sha256": "94247D2CEB4F1CEEB2A4476000DE6840758C62138B06E34136B7DDCF1EBB1D95",
+    "size": 4627
+  },
+  {
+    "path": "raw\\0004-locomo-conv-42\\attempt-1\\result.json",
+    "sha256": "D69AE37FB39CFEFD646EF862239DE5457943AED14C23849FA31657DC21E72EDB",
+    "size": 4521
+  },
+  {
+    "path": "raw\\0005-locomo-conv-43\\attempt-1\\result.json",
+    "sha256": "CB6A69EDBCED0CE8F716B0482AE847D7732990D18F53DB7092335C736EC8C989",
+    "size": 4519
+  },
+  {
+    "path": "raw\\0006-locomo-conv-44\\attempt-1\\result.json",
+    "sha256": "14B4AE634FBBECB2B8CAB56B15AC510F86A7453EC9FA5C19962ECAE3AE0DE329",
+    "size": 4506
+  },
+  {
+    "path": "raw\\0007-locomo-conv-47\\attempt-1\\result.json",
+    "sha256": "E3FB044B0C7B17A49CC8C719018971BAA960EFF3988D1376D7553E8B8804A9BA",
+    "size": 4563
+  },
+  {
+    "path": "raw\\0008-locomo-conv-48\\attempt-1\\result.json",
+    "sha256": "C9468650E4313D012B98B5D63A01A94D9CF088F5FA25C19192E96B796CD17E30",
+    "size": 891
+  },
+  {
+    "path": "raw\\0008-locomo-conv-48\\attempt-2\\result.json",
+    "sha256": "565C3BF3F546BE38724C44AA52A533767D0E7518F47984C46AF1E82028940E0E",
+    "size": 4599
+  },
+  {
+    "path": "raw\\0009-locomo-conv-49\\attempt-1\\result.json",
+    "sha256": "D09238E3D314377C47160B06F89922AB984BC5483E042BEE295EBC59AA071628",
+    "size": 4382
+  },
+  {
+    "path": "raw\\0010-locomo-conv-50\\attempt-1\\result.json",
+    "sha256": "6BE94819824D1D8BC4EB4BF6E155C05518700751247A59B4645D996B4F35843D",
+    "size": 4549
+  }
+]

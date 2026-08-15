@@ -10,6 +10,7 @@ import subprocess
 import time
 from contextlib import suppress
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any
 
 from .models import HarnessKind, LaunchEvidence, LaunchProfile
@@ -29,9 +30,15 @@ async def run_invocation(
     invocation: LaunchInvocation,
     *,
     timeout_seconds: float,
+    stdout_path: Path | None = None,
+    stderr_path: Path | None = None,
 ) -> CompletedLaunch:
     if timeout_seconds <= 0:
         raise ValueError("timeout_seconds must be positive")
+    for mirror_path in (stdout_path, stderr_path):
+        if mirror_path is not None:
+            mirror_path.parent.mkdir(parents=True, exist_ok=True)
+            mirror_path.write_bytes(b"")
     started = time.monotonic()
     process = await asyncio.create_subprocess_exec(
         *invocation.argv,
@@ -45,8 +52,12 @@ async def run_invocation(
     )
     assert process.stdout is not None and process.stderr is not None
     assert process.stdin is not None
-    stdout_task = asyncio.create_task(_read_bounded(process.stdout, profile.max_stdout_bytes))
-    stderr_task = asyncio.create_task(_read_bounded(process.stderr, profile.max_stderr_bytes))
+    stdout_task = asyncio.create_task(
+        _read_bounded(process.stdout, profile.max_stdout_bytes, stdout_path)
+    )
+    stderr_task = asyncio.create_task(
+        _read_bounded(process.stderr, profile.max_stderr_bytes, stderr_path)
+    )
     timed_out = False
     try:
         async with asyncio.timeout(timeout_seconds):
@@ -150,17 +161,30 @@ async def _terminate_process_tree(process: asyncio.subprocess.Process) -> None:
     await process.wait()
 
 
-async def _read_bounded(reader: asyncio.StreamReader, limit: int) -> tuple[bytes, bool]:
+async def _read_bounded(
+    reader: asyncio.StreamReader,
+    limit: int,
+    mirror_path: Path | None = None,
+) -> tuple[bytes, bool]:
     chunks: list[bytes] = []
     retained = 0
     truncated = False
-    while chunk := await reader.read(64 * 1024):
-        room = max(0, limit - retained)
-        if room:
-            chunks.append(chunk[:room])
-            retained += min(room, len(chunk))
-        if len(chunk) > room:
-            truncated = True
+    mirror = mirror_path.open("ab") if mirror_path is not None else None
+    try:
+        while chunk := await reader.read(64 * 1024):
+            room = max(0, limit - retained)
+            if room:
+                retained_chunk = chunk[:room]
+                chunks.append(retained_chunk)
+                retained += len(retained_chunk)
+                if mirror is not None:
+                    mirror.write(retained_chunk)
+                    mirror.flush()
+            if len(chunk) > room:
+                truncated = True
+    finally:
+        if mirror is not None:
+            mirror.close()
     return b"".join(chunks), truncated
 
 

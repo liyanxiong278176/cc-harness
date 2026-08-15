@@ -7,10 +7,12 @@
 - env MAX_RECALL_RETRIES=0 时退化为旧行为(1 次)
 - 错误路径(EmbeddingError) 不重试
 """
+import importlib
+
 import pytest
 
+from cc_harness.memory import tools as tools_mod
 from cc_harness.memory.tools import _rewrite_query
-
 
 # --- _rewrite_query ---
 
@@ -68,9 +70,11 @@ class _FakeRetriever:
     def __init__(self, queue):
         self._queue = list(queue)  # list[list[(Memory, dist)]]
         self._call_queries: list[str] = []
+        self._call_top_ks: list[int] = []
 
     async def search(self, query, top_k=5):
         self._call_queries.append(query)
+        self._call_top_ks.append(top_k)
         if not self._queue:
             return []
         return self._queue.pop(0)
@@ -86,8 +90,7 @@ async def test_retry_first_hit_no_retry(monkeypatch):
     """1st query 就有结果 → handler 不重试,直接返。"""
     monkeypatch.setenv("MAX_RECALL_RETRIES", "2")
     # Reload to pick up env (module-level constant)
-    import importlib
-    from cc_harness.memory import tools as tools_mod
+    # Reload to pick up the per-test retry environment.
     importlib.reload(tools_mod)
 
     mem = _FakeMemory("abc123", "Melanie paint sunrise 2022")
@@ -103,11 +106,26 @@ async def test_retry_first_hit_no_retry(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_recall_uses_retriever_configured_top_k(monkeypatch):
+    monkeypatch.setenv("MAX_RECALL_RETRIES", "0")
+    # Reload to pick up the per-test retry environment.
+    importlib.reload(tools_mod)
+
+    retriever = _FakeRetriever(queue=[[]])
+    retriever.top_k = 12
+
+    await tools_mod.memory_recall_handler(
+        {"query": "Caroline identity"}, cwd="/x", retriever=retriever
+    )
+
+    assert retriever._call_top_ks == [12]
+
+
+@pytest.mark.asyncio
 async def test_retry_first_empty_second_hit(monkeypatch):
     """1st 空 → 自动用 rewrite 重试 → 2nd 命中 → 返 2nd 结果。"""
     monkeypatch.setenv("MAX_RECALL_RETRIES", "2")
-    import importlib
-    from cc_harness.memory import tools as tools_mod
+    # Reload to pick up the per-test retry environment.
     importlib.reload(tools_mod)
 
     mem = _FakeMemory("def456", "Caroline supports transgender youth")
@@ -131,8 +149,7 @@ async def test_retry_first_empty_second_hit(monkeypatch):
 async def test_retry_all_empty_falls_back(monkeypatch):
     """全部 attempt 都空 → 兜底返 '(没有匹配的长期记忆)' 字符串。"""
     monkeypatch.setenv("MAX_RECALL_RETRIES", "2")
-    import importlib
-    from cc_harness.memory import tools as tools_mod
+    # Reload to pick up the per-test retry environment.
     importlib.reload(tools_mod)
 
     retriever = _FakeRetriever(queue=[[], [], []])  # 3 attempts all empty
@@ -149,8 +166,7 @@ async def test_retry_all_empty_falls_back(monkeypatch):
 async def test_retry_zero_disables_retry(monkeypatch):
     """MAX_RECALL_RETRIES=0 → 旧行为(只 1 次调用)。"""
     monkeypatch.setenv("MAX_RECALL_RETRIES", "0")
-    import importlib
-    from cc_harness.memory import tools as tools_mod
+    # Reload to pick up the per-test retry environment.
     importlib.reload(tools_mod)
 
     retriever = _FakeRetriever(queue=[[]])  # only 1 attempt
@@ -168,8 +184,7 @@ async def test_retry_embedding_error_no_retry(monkeypatch):
     """EmbeddingError 不应触发重试(每次都会失败,浪费)。"""
     from cc_harness.memory.embedding import EmbeddingError
     monkeypatch.setenv("MAX_RECALL_RETRIES", "2")
-    import importlib
-    from cc_harness.memory import tools as tools_mod
+    # Reload to pick up the per-test retry environment.
     importlib.reload(tools_mod)
 
     class _FailRetriever:

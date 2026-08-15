@@ -170,6 +170,50 @@ class RunStateStore:
         self, state: dict[str, Any], task: BenchmarkTask, sequence: int
     ) -> tuple[int, Path, dict[str, Any]]:
         trial = state["trials"][task.task_id]
+        # An interrupted attempt owns durable per-item evidence (for example a
+        # LoCoMo ingestion checkpoint).  Reuse that attempt on the next
+        # invocation so the adapter can continue in place instead of creating a
+        # new attempt and replaying the whole sample.
+        if trial.get("attempts"):
+            previous = trial["attempts"][-1]
+            previous_path = previous.get("path")
+            reusable_invalid = False
+            if previous.get("status") == TrialStatus.INVALID.value and isinstance(
+                previous_path, str
+            ):
+                previous_result = self.root / Path(previous_path) / "result.json"
+                try:
+                    payload = read_json(previous_result)
+                    reusable_invalid = bool(
+                        (payload.get("protocol") or {}).get("checkpoint_preserving")
+                    )
+                except (OSError, TypeError, ValueError):
+                    reusable_invalid = False
+            if (
+                previous.get("status") == TrialStatus.INTERRUPTED.value or reusable_invalid
+            ) and isinstance(previous_path, str):
+                attempt_root = self.root / Path(previous_path)
+                result_path = attempt_root / "result.json"
+                if reusable_invalid and result_path.is_file():
+                    retained = attempt_root / "infrastructure-results"
+                    retained.mkdir(parents=True, exist_ok=True)
+                    sequence_number = len(list(retained.glob("result-*.json"))) + 1
+                    os.replace(result_path, retained / f"result-{sequence_number:04d}.json")
+                    previous.setdefault("infrastructure_failures", []).append(
+                        {
+                            "result": (
+                                retained / f"result-{sequence_number:04d}.json"
+                            ).relative_to(self.root).as_posix(),
+                            "retained_at": utc_now(),
+                        }
+                    )
+                if attempt_root.is_dir() and not result_path.exists():
+                    previous["status"] = "running"
+                    previous["resumed_at"] = utc_now()
+                    previous["resume_count"] = int(previous.get("resume_count", 0)) + 1
+                    trial["status"] = "running"
+                    self.save(state)
+                    return int(previous["attempt"]), attempt_root, previous
         attempt = len(trial["attempts"]) + 1
         attempt_root = (
             self.root

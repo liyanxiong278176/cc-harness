@@ -481,6 +481,7 @@ def load_memory_config(
     (memory/config.py 末尾 re-export 本函数)。env 覆盖优先于 yaml。
 
     env: MEMORY_PIPELINE_EVERY_N / MEMORY_SCENARIO_MIN_ATOMS / MEMORY_PERSONA_TRIGGER_N
+    / MEMORY_RETRIEVER_TOP_K / MEMORY_INJECTION_TOKEN_BUDGET
     / MEMORY_RECALL_TOP_K / MEMORY_RECALL_TIMEOUT_S / MEMORY_LAYERED_INJECT
     / MEMORY_CAPTURE_ENABLED / MEMORY_PIPELINE_ENABLED
     / MEMORY_OFFLOAD_ENABLED / MEMORY_OFFLOAD_THRESHOLD / MEMORY_OFFLOAD_RATIO
@@ -498,6 +499,8 @@ def load_memory_config(
         ("pipeline_every_n", "MEMORY_PIPELINE_EVERY_N", int),
         ("scenario_min_atoms", "MEMORY_SCENARIO_MIN_ATOMS", int),
         ("persona_trigger_every_n", "MEMORY_PERSONA_TRIGGER_N", int),
+        ("retriever_top_k", "MEMORY_RETRIEVER_TOP_K", int),
+        ("injection_token_budget", "MEMORY_INJECTION_TOKEN_BUDGET", int),
         ("recall_top_k", "MEMORY_RECALL_TOP_K", int),
         ("recall_timeout_s", "MEMORY_RECALL_TIMEOUT_S", float),
         ("offload_threshold", "MEMORY_OFFLOAD_THRESHOLD", int),

@@ -1,7 +1,9 @@
 """Per-query top-k retrieval + injection-block formatting."""
 from __future__ import annotations
 
+import asyncio
 import logging
+import os
 import time
 from typing import TYPE_CHECKING
 
@@ -59,7 +61,15 @@ class MemoryRetriever:
         return weighted[:top_k]
 
     async def search_hybrid(
-        self, query: str, top_k: int = 5, alpha: float = 0.5, rrf_k: int = 60,
+        self,
+        query: str,
+        top_k: int = 5,
+        alpha: float = 0.5,
+        rrf_k: int = 60,
+        *,
+        entities: list[str] | None = None,
+        dates: list[str] | None = None,
+        session_ids: set[str] | None = None,
     ) -> list:
         """混合召回:vector + FTS5 → RRF 合并(Phase 4)。
 
@@ -74,17 +84,43 @@ class MemoryRetriever:
 
         FTS5 不可用时 → 退化为纯 vector search(向后兼容)。
         """
-        import asyncio
-        # 并行查两个
+        from cc_harness.memory.extract import extract_dates, extract_entities, extract_keywords
+        from cc_harness.memory.temporal import temporal_relevance
+
+        # LoCoMo category-aware modes add one bounded lexical variant.  This
+        # lets entity/date clues recover candidates that an all-token FTS query
+        # would miss without introducing an unbounded retrieval loop.
+        retrieval_mode = os.getenv("MEMORY_RETRIEVAL_MODE", "").casefold()
+        query_variants = [query]
+        if retrieval_mode in {"temporal", "inference", "multi_hop"}:
+            variant_parts = [
+                *extract_entities(query),
+                *extract_dates(query),
+                *extract_keywords(query, n=8),
+            ]
+            variant = " ".join(dict.fromkeys(item for item in variant_parts if item))
+            if variant and variant.casefold() != query.casefold():
+                query_variants.append(variant)
+
+        # 并行跑向量和一个或两个 FTS 变体。
         vec_task = asyncio.create_task(self._search_vec_only(query, top_k * 2))
-        fts_task = asyncio.create_task(self._search_fts_only(query, top_k * 2))
-        vec_results, fts_results = await asyncio.gather(vec_task, fts_task)
+        fts_tasks = [
+            asyncio.create_task(self._search_fts_only(item, top_k * 2))
+            for item in query_variants
+        ]
+        vec_results, *fts_batches = await asyncio.gather(vec_task, *fts_tasks)
 
         # 建 (id → (mem, vec_rank, fts_rank))
         scores: dict[str, tuple[Memory, float, float]] = {}
         for rank, (mem, _dist) in enumerate(vec_results, 1):
             scores[mem.id] = (mem, 1.0 / (rank + rrf_k), 0.0)
-        for rank, (mem, _bm25) in enumerate(fts_results, 1):
+        fts_ranks: dict[str, tuple[Memory, int]] = {}
+        for batch in fts_batches:
+            for rank, (mem, _bm25) in enumerate(batch, 1):
+                previous = fts_ranks.get(mem.id)
+                if previous is None or rank < previous[1]:
+                    fts_ranks[mem.id] = (mem, rank)
+        for mem, rank in fts_ranks.values():
             fts_score = 1.0 / (rank + rrf_k)
             if mem.id in scores:
                 mem, vec_s, _ = scores[mem.id]
@@ -93,13 +129,31 @@ class MemoryRetriever:
                 scores[mem.id] = (mem, 0.0, fts_score)
 
         # RRF 加权合并
+        query_entities = entities if entities is not None else extract_entities(query)
+        query_dates = dates if dates is not None else extract_dates(query)
         merged = []
         for mem, vec_s, fts_s in scores.values():
+            if session_ids is not None and mem.session_id not in session_ids:
+                continue
             rrf = alpha * vec_s + (1 - alpha) * fts_s
             age_days = max(0.0, (time.time() - mem.updated_at) / 86400.0)
             recency = 1.0 / (1.0 + age_days / 30.0)
             authority = 1.1 if mem.source in {"llm", "manual", "user"} else 1.0
-            merged.append((mem, rrf * recency * authority))
+            memory_text = mem.text.casefold()
+            entity_hits = sum(entity.casefold() in memory_text for entity in query_entities)
+            date_hits = sum(date.casefold() in memory_text for date in query_dates)
+            metadata_boost = 1.0 + min(entity_hits, 3) * 0.12 + min(date_hits, 2) * 0.18
+            if retrieval_mode == "temporal":
+                metadata_boost *= 1.0 + 0.8 * temporal_relevance(
+                    query,
+                    mem.text,
+                    getattr(mem, "provenance_json", "{}"),
+                )
+            elif retrieval_mode in {"inference", "multi_hop"}:
+                # Related entities help bounded inference; the answer prompt
+                # still requires explicit evidence and this never writes memory.
+                metadata_boost *= 1.0 + min(entity_hits, 3) * 0.08
+            merged.append((mem, rrf * recency * authority * metadata_boost))
         merged.sort(key=lambda x: -x[1])
         selected = merged[:top_k]
         if selected:

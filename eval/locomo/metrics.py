@@ -112,8 +112,8 @@ def compute_compaction_v2(results: list[dict]) -> dict:
 
 
 def compute_timeliness(results: list[dict]) -> dict:
-    """#2 时效性:category=3(Temporal)子集的 pass_rate + 中位数。纯聚合。"""
-    subset = [r for r in results if str(r.get("q_type")) == "3"]
+    """#2 时效性:category=2(Temporal)子集的 pass_rate + 中位数。纯聚合。"""
+    subset = [r for r in results if str(r.get("q_type")) == "2"]
     n = len(subset)
     if n == 0:
         return {"n": 0, "pass_rate": None, "f1_med": None, "semantic_f1_med": None}

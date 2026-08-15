@@ -12,11 +12,12 @@ Phase 2 (Q1 uplift): memory_recall_handler 自动多 query 重试 —
 自动重试用 entity/keyword 兜底召回,降低投降率。
 """
 from __future__ import annotations
+
 import os
 import re
+
 from cc_harness.mcp_client import ToolResult
 from cc_harness.memory.embedding import EmbeddingError
-
 
 # Phase 2: 重试上限。0 = 旧行为(不重试),2 = 最多 3 次(默认)。
 _MAX_RECALL_RETRIES = int(os.getenv("MAX_RECALL_RETRIES", "2"))
@@ -133,14 +134,15 @@ async def memory_recall_handler(args, *, cwd, retriever):
         # Phase 4: 优先用 search_hybrid(FTS5+vec RRF),retriever 缺此方法时回退 search。
         hybrid = getattr(retriever, "search_hybrid", None)
         use_hybrid = hybrid is not None
+        top_k = int(getattr(retriever, "top_k", 5))
         for attempt in range(_MAX_RECALL_RETRIES + 1):
             q = query if attempt == 0 else _rewrite_query(query, attempt - 1)
             if not q:
                 continue
             if use_hybrid:
-                results = await hybrid(q, top_k=5, alpha=_HYBRID_ALPHA)
+                results = await hybrid(q, top_k=top_k, alpha=_HYBRID_ALPHA)
             else:
-                results = await retriever.search(q, top_k=5)
+                results = await retriever.search(q, top_k=top_k)
             if results:
                 return ToolResult.success(_format_recall_results(results))
         # 全部尝试都空 → 兜底原行为
@@ -157,11 +159,58 @@ async def memory_recall_handler(args, *, cwd, retriever):
         )
 
 
-async def memory_save_handler(args, *, cwd, service):
+def _format_preserved_results(results) -> str:
+    added = sum(getattr(item, "action", "") == "HISTORY_ADD" for item in results)
+    duplicates = sum(getattr(item, "action", "") == "NOOP" for item in results)
+    errors = [str(getattr(item, "error", "")) for item in results if getattr(item, "error", None)]
+    lines = [
+        f"memory_save history result: facts_added={added} exact_duplicates={duplicates}",
+    ]
+    for item in results:
+        memory = getattr(item, "memory", None)
+        if memory is not None and getattr(item, "action", "") in {"HISTORY_ADD", "NOOP"}:
+            lines.append(
+                f"  {getattr(item, 'action', 'UNKNOWN')}: "
+                f"{getattr(memory, 'id', '')} {getattr(memory, 'text', '')}"
+            )
+    if errors:
+        lines.append("  errors: " + "; ".join(errors))
+    return "\n".join(lines)
+
+
+async def memory_save_handler(
+    args,
+    *,
+    cwd,
+    service,
+    history_mode: bool = False,
+    history_session_id: str | None = None,
+    history_timestamp: str | None = None,
+    history_sample_id: str | None = None,
+):
     text = (args.get("text") or "").strip()
     if not text:
         return ToolResult.error(display="text 不能为空", llm="[Tool Error] text 不能为空")
     try:
+        if history_mode:
+            if not history_session_id:
+                return ToolResult.error(
+                    display="LoCoMo history session id is missing",
+                    llm="[Tool Error] benchmark history session id is missing",
+                )
+            results = await service.save_preserved_facts(
+                text,
+                session_id=history_session_id,
+                provenance={
+                    "benchmark": "locomo",
+                    "sample_id": history_sample_id,
+                    "session_timestamp": history_timestamp,
+                },
+            )
+            rendered = _format_preserved_results(results)
+            if any(getattr(item, "error", None) for item in results):
+                return ToolResult.error(display=rendered, llm=rendered)
+            return ToolResult.success(rendered)
         result = await service.save(text, source="llm")
         return ToolResult.success(_format_save_result(result))
     except EmbeddingError as e:
