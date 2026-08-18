@@ -1,0 +1,47 @@
+{
+  "gates": [
+    {
+      "command": [
+        "D:\\agent_learning\\cc-harness\\.venv\\Scripts\\python.exe",
+        "-m",
+        "pytest",
+        "tests/runtime_rebuild",
+        "-q"
+      ],
+      "exit_code": 0,
+      "name": "runtime_rebuild_tests",
+      "output_tail": "........................................................................ [ 76%]\n......................                                                   [100%]Running teardown with pytest sessionfinish...",
+      "passed": true
+    },
+    {
+      "command": [
+        "D:\\python3.13\\Scripts\\ruff.EXE",
+        "check",
+        "cc_harness",
+        "tests",
+        "scripts"
+      ],
+      "exit_code": 0,
+      "name": "static_check",
+      "output_tail": "All checks passed!",
+      "passed": true
+    },
+    {
+      "command": [
+        "D:\\agent_learning\\cc-harness\\.venv\\Scripts\\python.exe",
+        "scripts/check_runtime_rebuild_migration.py",
+        "--dry-run",
+        "--fixture",
+        "D:\\agent_learning\\cc-harness\\tests\\runtime_rebuild\\fixtures\\legacy"
+      ],
+      "exit_code": 0,
+      "name": "migration_reconciliation",
+      "output_tail": "{\n  \"checks\": {\n    \"action_count\": 2,\n    \"artifact_digest\": \"sha256:599eb3f9c19ce6038dfefaedaad183bdad59e76c448073e708d587e18a53404a\",\n    \"checkpoint_labels\": [\n      \"initial-inspection\"\n    ],\n    \"memory_provenance_count\": 1,\n    \"memory_unverified_count\": 1,\n    \"message_count\": 2,\n    \"message_digests\": [\n      \"sha256:fdc2ee127c6f171800a043c6aac6fe1a91dca5698fc0b790e69be3051f7f5eb3\",\n      \"sha256:d2bdb5aec89db90146d48977c820d97098c5e71f6a1de36a258f657eb5fc18c5\"\n    ],\n    \"session_identity\": \"legacy-session-001\",\n    \"todo_statuses\": {\n      \"todo-001\": \"in_progress\",\n      \"todo-002\": \"done\"\n    }\n  },\n  \"errors\": [],\n  \"ok\": true,\n  \"source_digests\": {\n    \"action-journal.jsonl\": \"sha256:72305ab03ddd5d281f070535b73d849bb7d1e0772656039ba4c66c155cfee2c9\",\n    \"corrupt.json\": \"sha256:30feb911bdfa9b15f68aa8db33c2359c2f07855c91065a6c34604d7bd6821ca7\",\n    \"large-object.txt\": \"sha256:599eb3f9c19ce6038dfefaedaad183bdad59e76c448073e708d587e18a53404a\",\n    \"memory.jsonl\": \"sha256:de7a3a6cff5371fec87deecb472e2f70f4b691b6019c13070bd684f5c528e7dd\",\n    \"session-conflict.json\": \"sha256:9a405a33d832a7c693b031632e2dab33420c754f58939e5b02a694b8cd78c733\",\n    \"session.json\": \"sha256:61bff09025f0bddc79c04c879909c448fe8ccbbf3335105d628cd5aa5609fa0a\",\n    \"todo.yaml\": \"sha256:635287dbbde3165046517e340416c7139520941fa4395b76eab7d7b90dc21150\"\n  }\n}",
+      "passed": true
+    }
+  ],
+  "generated_at": "2026-08-18T02:43:58.271489+00:00",
+  "non_compensating": true,
+  "passed": true,
+  "schema_version": "runtime-rebuild-gate.v1"
+}

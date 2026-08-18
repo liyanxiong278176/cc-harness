@@ -115,6 +115,22 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--tui", choices=("fullscreen", "default"), default=None)
     parser.add_argument("--lang", choices=("zh-CN", "en"), default=None)
     parser.add_argument("--repl", action="store_true", help=argparse.SUPPRESS)
+    parser.add_argument(
+        "--runtime",
+        choices=("legacy", "durable"),
+        default=(os.getenv("CC_HARNESS_RUNTIME") if os.getenv("CC_HARNESS_RUNTIME") in {"legacy", "durable"} else "durable"),
+        help="execution runtime facade (durable is the rebuilt default; legacy is migration-only)",
+    )
+    parser.add_argument(
+        "--command",
+        choices=("run", "submit", "status", "list", "attach", "approve", "reject", "interrupt", "cancel", "resume", "follow-up", "rollback", "supervisor"),
+        default=None,
+    )
+    parser.add_argument("--run-id", default=None)
+    parser.add_argument("--message", default=None)
+    parser.add_argument("--approval-id", default=None)
+    parser.add_argument("--action-args-digest", default=None)
+    parser.add_argument("--data-root", type=Path, default=None, help=argparse.SUPPRESS)
     return parser
 
 
@@ -133,6 +149,8 @@ async def async_main(argv: list[str] | None = None) -> int:
     if not cwd.is_dir():
         Console(stderr=True).print(f"[red]working directory not found:[/red] {cwd}")
         return 2
+    if args.runtime == "durable":
+        return await _run_durable(args, cwd)
     additional_dirs = [Path(p).resolve() for p in args.add_dir]
     missing_dirs = [p for p in additional_dirs if not p.is_dir()]
     if missing_dirs:
@@ -216,6 +234,79 @@ async def async_main(argv: list[str] | None = None) -> int:
 
         app.queue.append(QueuedInput(args.prompt))
     return await app.run(version=_version())
+
+
+async def _run_durable(args, cwd: Path) -> int:
+    from cc_harness.durable_runtime import DurableRuntimeClient
+    from cc_harness.repl import run_durable_repl
+
+    client = await DurableRuntimeClient.create(cwd, data_root=args.data_root)
+    try:
+        command = args.command
+        if command == "supervisor":
+            await client.run_supervisor_forever(reasoning_effort=args.effort)
+            return 0
+        if command is None and sys.stdin.isatty():
+            await client.start_supervisor(reasoning_effort=args.effort)
+            await run_durable_repl(client, initial_prompt=args.prompt)
+            return 0
+        if command is None and args.prompt:
+            command = "run"
+        if command in {"run", "submit"}:
+            objective = args.prompt or args.message
+            if not objective:
+                Console(stderr=True, no_color=True).print("durable run requires a prompt")
+                return 2
+            run_id = await client.submit(objective)
+            print(json.dumps({"run_id": run_id}, ensure_ascii=False))
+            return 0
+        if command in {"status", "attach"}:
+            if not args.run_id:
+                Console(stderr=True, no_color=True).print("this durable command requires --run-id")
+                return 2
+            view = await client.coordinator.inspect(str(args.run_id))
+            print(json.dumps({"run_id": view.run_id, "status": view.status.value, "sequence": view.sequence}, ensure_ascii=False))
+            return 0
+        if command == "list":
+            views = await client.coordinator.list()
+            print(json.dumps([{"run_id": view.run_id, "status": view.status.value, "sequence": view.sequence} for view in views], ensure_ascii=False))
+            return 0
+        if not args.run_id:
+            Console(stderr=True, no_color=True).print("this durable command requires --run-id")
+            return 2
+        if command == "follow-up":
+            receipt = await client.coordinator.send(args.run_id, args.message or args.prompt or "")
+            print(json.dumps({"run_id": receipt.run_id, "follow_up_run_id": receipt.follow_up_run_id, "sequence": receipt.sequence}, ensure_ascii=False))
+        elif command == "interrupt":
+            receipt = await client.coordinator.interrupt(args.run_id, args.message or "client interrupt")
+            print(json.dumps({"run_id": receipt.run_id, "status": receipt.status.value, "sequence": receipt.sequence}, ensure_ascii=False))
+        elif command == "cancel":
+            receipt = await client.coordinator.cancel(args.run_id, args.message or "client cancel")
+            print(json.dumps({"run_id": receipt.run_id, "status": receipt.status.value, "sequence": receipt.sequence}, ensure_ascii=False))
+        elif command == "resume":
+            receipt = await client.coordinator.resume(args.run_id, args.message or "client resume")
+            print(json.dumps({"run_id": receipt.run_id, "status": receipt.status.value, "sequence": receipt.sequence}, ensure_ascii=False))
+        elif command == "rollback":
+            receipt = await client.coordinator.rollback(args.run_id, args.message or "client rollback")
+            print(json.dumps({"run_id": receipt.run_id, "status": receipt.status.value, "sequence": receipt.sequence}, ensure_ascii=False))
+        elif command == "approve":
+            if not args.approval_id or not args.action_args_digest:
+                Console(stderr=True, no_color=True).print("approve requires --approval-id and --action-args-digest")
+                return 2
+            decision = await client.coordinator.approve(run_id=args.run_id, approval_id=str(args.approval_id), action_args_digest=str(args.action_args_digest))
+            print(json.dumps({"run_id": decision.run_id, "approval_id": decision.approval_id, "status": decision.status}, ensure_ascii=False))
+        elif command == "reject":
+            if not args.approval_id:
+                Console(stderr=True, no_color=True).print("reject requires --approval-id")
+                return 2
+            decision = await client.coordinator.reject(run_id=args.run_id, approval_id=str(args.approval_id), reason=args.message or "client rejected")
+            print(json.dumps({"run_id": decision.run_id, "approval_id": decision.approval_id, "status": decision.status}, ensure_ascii=False))
+        else:
+            Console(stderr=True, no_color=True).print(f"unsupported durable command: {command}")
+            return 2
+        return 0
+    finally:
+        await client.close()
 
 
 async def _run_print(

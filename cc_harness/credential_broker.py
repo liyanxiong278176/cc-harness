@@ -4,7 +4,9 @@ from __future__ import annotations
 
 import json
 import os
+import secrets
 import time
+from dataclasses import dataclass
 from collections.abc import Mapping
 from pathlib import Path
 
@@ -13,6 +15,67 @@ from cc_harness.config import SandboxConfig, SandboxVaultBinding
 
 class CredentialBrokerError(RuntimeError):
     """Credential material could not be safely provisioned or revoked."""
+
+
+@dataclass(frozen=True)
+class ActionCapability:
+    """Non-secret capability reference safe to place in an event payload."""
+
+    capability_id: str
+    run_id: str
+    action_id: str
+    scope: tuple[str, ...]
+    expires_at: float
+
+
+class ActionScopedCapabilityBroker:
+    """Issue ephemeral action handles; credential material never leaves memory."""
+
+    def __init__(self) -> None:
+        self._handles: dict[str, tuple[ActionCapability, str]] = {}
+
+    def issue(
+        self,
+        *,
+        run_id: str,
+        action_id: str,
+        scope: tuple[str, ...],
+        secret: str,
+        ttl_seconds: float = 300.0,
+    ) -> ActionCapability:
+        if not secret:
+            raise CredentialBrokerError("cannot issue a capability without secret material")
+        capability = ActionCapability(
+            capability_id=f"cap_{secrets.token_urlsafe(18)}",
+            run_id=run_id,
+            action_id=action_id,
+            scope=tuple(scope),
+            expires_at=time.time() + max(1.0, ttl_seconds),
+        )
+        self._handles[capability.capability_id] = (capability, secret)
+        return capability
+
+    def resolve(self, capability_id: str, *, run_id: str, action_id: str, scope: str) -> str:
+        item = self._handles.get(capability_id)
+        if item is None:
+            raise CredentialBrokerError("capability is unknown or revoked")
+        capability, secret = item
+        if capability.run_id != run_id or capability.action_id != action_id:
+            raise CredentialBrokerError("capability is scoped to another action")
+        if time.time() >= capability.expires_at:
+            self.revoke(capability_id)
+            raise CredentialBrokerError("capability has expired")
+        if scope not in capability.scope:
+            raise CredentialBrokerError("capability scope does not permit this operation")
+        return secret
+
+    def revoke(self, capability_id: str) -> None:
+        self._handles.pop(capability_id, None)
+
+    def revoke_run(self, run_id: str) -> None:
+        for capability_id, (capability, _secret) in tuple(self._handles.items()):
+            if capability.run_id == run_id:
+                self._handles.pop(capability_id, None)
 
 
 def _host_is_allowed(host: str, allowed: list[str]) -> bool:

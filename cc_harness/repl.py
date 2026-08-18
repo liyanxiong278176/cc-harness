@@ -111,6 +111,56 @@ _HELP_TEXT = """\
 """
 
 
+async def run_durable_repl(client, *, initial_prompt: str | None = None) -> None:
+    """Minimal coordinator REPL used by the rebuilt client entrypoint.
+
+    Ordinary text is always a follow-up command; it is never passed to
+    ``run_turn`` or injected into a running model context.
+    """
+    from cc_harness.render import print_info
+
+    console = Console()
+    active_run_id: str | None = None
+    if initial_prompt:
+        active_run_id = await client.submit(initial_prompt)
+        print_info(console, f"queued run: {active_run_id}")
+    while True:
+        try:
+            raw = (await _read_user("> [durable] ")).strip()
+        except (EOFError, KeyboardInterrupt):
+            break
+        if not raw:
+            continue
+        if raw.casefold() in {"exit", "quit"}:
+            break
+        if raw == "/help":
+            print_info(console, "普通消息=follow-up; /status /interrupt /cancel /resume /approve /reject /list")
+            continue
+        if raw == "/list":
+            views = await client.coordinator.list()
+            print_info(console, "\n".join(f"{view.run_id} [{view.status.value}]" for view in views) or "(no runs)")
+            continue
+        if active_run_id is None:
+            active_run_id = await client.submit(raw)
+            print_info(console, f"queued run: {active_run_id}")
+            continue
+        if raw == "/status":
+            view = await client.coordinator.inspect(active_run_id)
+            print_info(console, f"{view.run_id} [{view.status.value}] seq={view.sequence}")
+        elif raw == "/interrupt":
+            await client.coordinator.interrupt(active_run_id, "client interrupt")
+        elif raw == "/cancel":
+            await client.coordinator.cancel(active_run_id, "client cancel")
+        elif raw == "/resume":
+            await client.coordinator.resume(active_run_id)
+        elif raw.startswith("/follow-up "):
+            receipt = await client.coordinator.send(active_run_id, raw.removeprefix("/follow-up "))
+            print_info(console, f"queued follow-up: {receipt.follow_up_run_id}")
+        else:
+            receipt = await client.coordinator.send(active_run_id, raw)
+            print_info(console, f"queued follow-up: {receipt.follow_up_run_id}")
+
+
 @dataclass
 class ReplState:
     mode: str = "coding"

@@ -2,8 +2,9 @@
 from __future__ import annotations
 import asyncio
 import json
+import re
 from contextlib import AsyncExitStack
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from mcp import ClientSession, StdioServerParameters
 from mcp.client.stdio import stdio_client
 from cc_harness.config import MCPServerConfig
@@ -31,14 +32,51 @@ class ToolResult:
     is_error: bool = False
     display_text: str = ""
     llm_text: str = ""
+    # Provenance is metadata carried alongside the legacy display/LLM strings;
+    # callers that only consume the three historical fields remain compatible.
+    source: str = "tool_result"
+    trusted: bool = False
+    capability: str = "unknown"
+    metadata: dict = field(default_factory=dict)
 
     @classmethod
-    def success(cls, text: str) -> "ToolResult":
-        return cls(is_error=False, display_text=text, llm_text=text)
+    def success(
+        cls,
+        text: str,
+        *,
+        source: str = "tool_result",
+        capability: str = "unknown",
+        metadata: dict | None = None,
+    ) -> "ToolResult":
+        return cls(
+            is_error=False,
+            display_text=text,
+            llm_text=text,
+            source=source,
+            trusted=False,
+            capability=capability,
+            metadata=dict(metadata or {}),
+        )
 
     @classmethod
-    def error(cls, display: str, llm: str) -> "ToolResult":
-        return cls(is_error=True, display_text=display, llm_text=llm)
+    def error(
+        cls,
+        display: str,
+        llm: str,
+        *,
+        source: str = "harness_error",
+        capability: str = "unknown",
+        metadata: dict | None = None,
+    ) -> "ToolResult":
+        return cls(
+            is_error=True,
+            display_text=display,
+            llm_text=llm,
+            source=source,
+            trusted=True,
+            capability=capability,
+            metadata=dict(metadata or {}),
+        )
 
 
 class MCPClient:
@@ -52,6 +90,7 @@ class MCPClient:
         self._stack = AsyncExitStack()
         self._sessions: dict[str, ClientSession] = {}
         self._tools: list[dict] = []
+        self._tool_capabilities: dict[str, dict] = {}
 
     async def start(self, init_timeout_s: float = INIT_TIMEOUT_S) -> None:
         """Connect to all servers concurrently, initialize sessions, list tools.
@@ -133,14 +172,42 @@ class MCPClient:
             listed = await session.list_tools()
             tools: list[dict] = []
             for tool in listed.tools:
+                description = tool.description or ""
+                contract = {
+                    "effect": "unknown",
+                    "requires_user_intent": True,
+                }
+                # Some MCP bridges prepend their own ``[server: ...]`` label
+                # before forwarding the tool description.  Accept that
+                # transport decoration while still requiring the explicit
+                # capability tag; never infer authority from a tool name.
+                match = re.match(
+                    r"^(?:\[server:\s*[^\]]+\]\s*)?"
+                    r"\[cc-harness-capability:([^\]]+)\]\s*([\s\S]*)$",
+                    description,
+                )
+                if match:
+                    contract["effect"] = match.group(1).strip().lower()
+                    description = match.group(2)
+                namespaced = f"mcp__{name}__{tool.name}"
                 tools.append({
                     "type": "function",
                     "function": {
-                        "name": f"mcp__{name}__{tool.name}",
-                        "description": f"[server: {name}] {tool.description or ''}".strip(),
+                        "name": namespaced,
+                        "description": f"[server: {name}] {description}".strip(),
                         "parameters": tool.inputSchema,
+                        # Missing server annotations stay unknown.  The
+                        # runtime never infers write/network authority from a
+                        # name substring.
+                        "x-cc-harness-capability": {
+                            "effect": "unknown",
+                            "requires_user_intent": True,
+                            "source": "mcp_contract",
+                            **contract,
+                        },
                     },
                 })
+                self._tool_capabilities[namespaced] = dict(contract)
 
             # Success: hand the local stack's contexts over to the main stack
             # so shutdown() will tear them down later.
@@ -214,6 +281,7 @@ class MCPClient:
             return ToolResult.error(
                 display=f"server '{server_name}' not connected",
                 llm=f"[Tool Error] server '{server_name}' not connected",
+                metadata={"server": server_name, "tool": tool_name},
             )
         try:
             result = await asyncio.wait_for(
@@ -224,11 +292,13 @@ class MCPClient:
             return ToolResult.error(
                 display=f"tool call timed out after {CALL_TIMEOUT_S}s",
                 llm=f"[Tool Error] timeout after {CALL_TIMEOUT_S}s",
+                metadata={"server": server_name, "tool": tool_name},
             )
         except Exception as e:
             return ToolResult.error(
                 display=f"tool call raised: {e}",
                 llm=f"[Tool Error] {type(e).__name__}: {e}",
+                metadata={"server": server_name, "tool": tool_name},
             )
 
         if getattr(result, "isError", False):
@@ -239,10 +309,23 @@ class MCPClient:
             return ToolResult.error(
                 display=f"tool returned error: {structured[:200]}",
                 llm=f"[Tool Error] {structured}",
+                metadata={"server": server_name, "tool": tool_name},
             )
 
         texts = [c.text for c in result.content if hasattr(c, "text")]
         text = "\n".join(texts) if texts else json.dumps(
             [c.model_dump() for c in result.content], ensure_ascii=False
         )
-        return ToolResult.success(text)
+        return ToolResult.success(
+            text,
+            source=f"mcp:{server_name}",
+            capability=(self._tool_capabilities.get(namespaced_name) or {}).get(
+                "effect", "unknown"
+            ),
+            metadata={
+                "server": server_name,
+                "tool": tool_name,
+                "capability": self._tool_capabilities.get(namespaced_name)
+                or {"effect": "unknown"},
+            },
+        )
