@@ -86,6 +86,9 @@ class InlineTerminalApp:
         self._stop = False
         self._last_idle_interrupt = 0.0
         self._active_task: asyncio.Task | None = None
+        self._command_task: asyncio.Task | None = None
+        self._command_label: str | None = None
+        self._command_started = 0.0
         self._kb = self._build_key_bindings()
         state_dir = runtime.cwd / ".cc-harness"
         state_dir.mkdir(parents=True, exist_ok=True)
@@ -99,7 +102,9 @@ class InlineTerminalApp:
             self.prompt_session = _InlinePromptSession(
                 history=FileHistory(str(state_dir / "input-history")),
                 auto_suggest=AutoSuggestFromHistory(),
-                completer=TerminalCompleter(runtime.cwd, lang=self.lang),
+                # Command help stays Chinese in the picker, matching the
+                # project-facing TUI even when the surrounding UI is English.
+                completer=TerminalCompleter(runtime.cwd, lang="zh-CN"),
                 # Keep slash commands discoverable without requiring Tab.
                 complete_while_typing=True,
                 multiline=True,
@@ -118,7 +123,7 @@ class InlineTerminalApp:
         prompt_task: asyncio.Task | None = None
         with patch_stdout(raw=True):
             while not self._stop:
-                if self._active_task is None and self.queue:
+                if self._active_task is None and self._command_task is None and self.queue:
                     item = self.queue.popleft()
                     self._active_task = asyncio.create_task(self._execute(item.text))
                 if prompt_task is None:
@@ -132,6 +137,8 @@ class InlineTerminalApp:
                 wait_for = {prompt_task}
                 if self._active_task is not None:
                     wait_for.add(self._active_task)
+                if self._command_task is not None:
+                    wait_for.add(self._command_task)
                 done, _ = await asyncio.wait(wait_for, return_when=asyncio.FIRST_COMPLETED)
 
                 if self._active_task is not None and self._active_task in done:
@@ -142,6 +149,18 @@ class InlineTerminalApp:
                     except asyncio.CancelledError:
                         self.renderer.warning(self._t("当前轮已取消。", "Current turn cancelled."))
                     except Exception as exc:  # noqa: BLE001 - terminal boundary reports provider failures
+                        self.renderer.error(str(exc))
+
+                if self._command_task is not None and self._command_task in done:
+                    task = self._command_task
+                    self._command_task = None
+                    self._command_label = None
+                    try:
+                        if task.result():
+                            self._stop = True
+                    except asyncio.CancelledError:
+                        self.renderer.warning(self._t("命令已取消。", "Command cancelled."))
+                    except Exception as exc:  # noqa: BLE001 - terminal boundary
                         self.renderer.error(str(exc))
 
                 if prompt_task in done:
@@ -160,10 +179,20 @@ class InlineTerminalApp:
                     if not raw:
                         continue
                     if raw.startswith("/"):
-                        if await self._handle_command(raw):
-                            self._stop = True
+                        if self._command_task is not None and not self._command_task.done():
+                            self.renderer.warning(self._t(
+                                "请先等待当前命令完成。",
+                                "Wait for the current command to finish.",
+                            ))
+                            continue
+                        self._command_label = raw.split(maxsplit=1)[0]
+                        self._command_started = time.monotonic()
+                        self._command_task = asyncio.create_task(self._handle_command(raw))
                         continue
-                    if self._active_task is not None:
+                    if (
+                        self._active_task is not None
+                        or self._command_task is not None
+                    ):
                         self.queue.append(QueuedInput(raw))
                         self.renderer.info(self._t(
                             f"消息已排队（{len(self.queue)}）",
@@ -178,6 +207,10 @@ class InlineTerminalApp:
             self._active_task.cancel()
             with contextlib.suppress(asyncio.CancelledError):
                 await self._active_task
+        if self._command_task is not None and not self._command_task.done():
+            self._command_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await self._command_task
         await self.runtime.close()
         return 0
 
@@ -206,6 +239,9 @@ class InlineTerminalApp:
         )
 
     async def _handle_interrupt(self) -> None:
+        if self._command_task is not None and not self._command_task.done():
+            self._command_task.cancel()
+            return
         if self._active_task is not None and not self._active_task.done():
             self._active_task.cancel()
             if self.queue:
@@ -243,8 +279,7 @@ class InlineTerminalApp:
             return True
         if name == "/help":
             for command in COMMANDS:
-                desc = command.description_zh if self.lang.startswith("zh") else command.description_en
-                self.console.print(f"[cyan]{command.name:<14}[/cyan] {desc}")
+                self.console.print(f"[cyan]{command.name:<14}[/cyan] {command.description_zh}")
         elif name == "/init":
             path, created = initialize_project_instructions(self.runtime.cwd)
             if created:
@@ -537,6 +572,13 @@ class InlineTerminalApp:
                 ("class:status.effort", effort),
                 ("class:status.dim", " · /effort" if width >= 92 else ""),
             ]
+        command_task = getattr(self, "_command_task", None)
+        if command_task is not None and not command_task.done():
+            elapsed = max(0.0, time.monotonic() - getattr(self, "_command_started", 0.0))
+            left_command = getattr(self, "_command_label", None) or "/命令"
+            left_command = f"⟳ 执行中 {left_command} · {elapsed:.1f}s"
+            right = []
+            left.extend([("class:status.warning", " · " + left_command)])
         return self._aligned_line(left, right, width)
 
     def _context_status(self, width: int) -> list[tuple[str, str]]:
@@ -686,6 +728,9 @@ class InlineTerminalApp:
         if buffer.complete_state is not None:
             buffer.cancel_completion()
             app.invalidate()
+            return
+        if self._command_task is not None and not self._command_task.done():
+            self._command_task.cancel()
             return
         if self._active_task is not None and not self._active_task.done():
             self._active_task.cancel()

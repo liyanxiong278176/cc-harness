@@ -11,7 +11,7 @@ def test_slash_completion_lists_commands_with_localized_description(tmp_path):
     completions = list(completer.get_completions(Document("/sta"), None))
 
     assert [item.text for item in completions] == ["/status"]
-    assert to_plain_text(completions[0].display_meta) == "显示会话状态"
+    assert to_plain_text(completions[0].display_meta) == "查看当前会话、模型和运行状态"
 
 
 def test_slash_completion_at_root_exposes_every_command(tmp_path):

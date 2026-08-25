@@ -104,6 +104,32 @@ def test_status_area_matches_reference_layering(tmp_path, monkeypatch):
     assert all(wcswidth(line) <= 146 for line in lines)
 
 
+def test_status_area_shows_elapsed_async_command(tmp_path, monkeypatch):
+    monkeypatch.setattr(
+        "cc_harness.terminal.app.shutil.get_terminal_size",
+        lambda fallback: os.terminal_size((146, 40)),
+    )
+    runtime = _runtime(tmp_path)
+    runtime.state.manifest = SimpleNamespace(name="eval")
+    app = InlineTerminalApp.__new__(InlineTerminalApp)
+    app.runtime = runtime
+    app.permission_mode = "default"
+    app.console = Console(force_terminal=False, width=146)
+    app.renderer = TerminalRenderer(app.console)
+    app.terminal_settings = TerminalUISettings()
+    app._session_name = ""
+    app._session_duration = lambda: 0
+    app.queue = deque()
+    app._active_task = None
+    app._command_task = SimpleNamespace(done=lambda: False)
+    app._command_label = "/compact"
+    app._command_started = 0.0
+
+    plain = "".join(text for _style, text, *_ in app._bottom_toolbar())
+
+    assert "执行中 /compact" in plain
+
+
 def test_prompt_frame_places_full_width_rule_above_prompt(monkeypatch):
     monkeypatch.setattr(
         "cc_harness.terminal.app.shutil.get_terminal_size",

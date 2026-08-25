@@ -164,6 +164,10 @@ class FullscreenTerminalApp(InlineTerminalApp):
                 self._active_task.cancel()
                 with contextlib.suppress(asyncio.CancelledError):
                     await self._active_task
+            if self._command_task is not None and not self._command_task.done():
+                self._command_task.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await self._command_task
             await self._persist_transcript()
             await self.runtime.close()
         return 0
@@ -174,7 +178,9 @@ class FullscreenTerminalApp(InlineTerminalApp):
         self.input_buffer = Buffer(
             history=FileHistory(str(state_dir / "input-history")),
             auto_suggest=AutoSuggestFromHistory(),
-            completer=TerminalCompleter(self.runtime.cwd, lang=self.lang),
+            # Command help stays Chinese in the picker, matching the
+            # project-facing TUI even when the surrounding UI is English.
+            completer=TerminalCompleter(self.runtime.cwd, lang="zh-CN"),
             # Show slash-command choices as soon as the user types "/".
             complete_while_typing=True,
             multiline=True,
@@ -303,7 +309,7 @@ class FullscreenTerminalApp(InlineTerminalApp):
             if now >= self._next_task_refresh:
                 await self._refresh_task_cache()
                 self._next_task_refresh = now + 1.0
-            if self._active_task is None and self.queue:
+            if self._active_task is None and self._command_task is None and self.queue:
                 item = self.queue.popleft()
                 self._active_task = asyncio.create_task(self._execute_queue_item(item))
             if self._active_task is not None and self._active_task.done():
@@ -332,17 +338,39 @@ class FullscreenTerminalApp(InlineTerminalApp):
         if not raw.strip():
             return False
         if raw.startswith("/"):
+            if self._command_task is not None and not self._command_task.done():
+                self.transcript.add_notice("请先等待当前命令完成。", "warning")
+                return False
             assert self._application is not None
-            self._application.create_background_task(self._dispatch_command(raw))
+            self._command_label = raw.split(maxsplit=1)[0]
+            self._command_started = time.monotonic()
+            task = self._application.create_background_task(self._dispatch_command(raw))
+            self._command_task = task
+            task.add_done_callback(self._command_finished)
             return False
         item = QueuedInput(raw, attachments=list(self._pending_clipboard))
         self._pending_clipboard = []
-        if self._active_task is not None and not self._active_task.done():
+        if (
+            self._active_task is not None and not self._active_task.done()
+        ) or (self._command_task is not None and not self._command_task.done()):
             self.queue.append(item)
             self.transcript.add_notice(f"Message queued ({len(self.queue)})", "info")
         else:
             self._active_task = asyncio.create_task(self._execute_queue_item(item))
         return False
+
+    def _command_finished(self, task: asyncio.Task) -> None:
+        if self._command_task is not task:
+            return
+        self._command_task = None
+        self._command_label = None
+        try:
+            error = task.exception()
+        except asyncio.CancelledError:
+            error = None
+        if error is not None:
+            self.transcript.add_notice(str(error), "error")
+        self._invalidate()
 
     async def _execute_queue_item(self, item: QueuedInput) -> None:
         if item.text.lstrip().startswith("!"):
