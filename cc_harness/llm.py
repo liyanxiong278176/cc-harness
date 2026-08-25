@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 from collections.abc import AsyncIterator
 from dataclasses import dataclass, field
 from typing import Any, Literal
@@ -9,6 +10,41 @@ from typing import Any, Literal
 from openai import AsyncOpenAI
 
 from cc_harness.tokens import UsageRecord
+
+
+_PROVIDER_RETRY_ATTEMPTS = 3
+_PROVIDER_RETRY_DELAYS = (1.0, 2.0)
+
+
+def _retryable_provider_error(exc: BaseException) -> bool:
+    """Classify transport/provider overload errors as safe stream retries."""
+
+    status = getattr(exc, "status_code", None)
+    if status in {408, 409, 429, 500, 502, 503, 504}:
+        return True
+    text = str(exc).casefold()
+    return any(
+        marker in text
+        for marker in (
+            "apiconnectionerror",
+            "apitimeouterror",
+            "connection reset",
+            "connection closed",
+            "connection aborted",
+            "incompleteread",
+            "incomplete read",
+            "incomplete chunked read",
+            "remoteprotocolerror",
+            "server disconnected",
+            "temporarily unavailable",
+            "provider proxy stream failure",
+            "status code 429",
+            "status code 500",
+            "status code 502",
+            "status code 503",
+            "status code 504",
+        )
+    )
 
 
 class ImageUnsupportedError(RuntimeError):
@@ -49,6 +85,7 @@ class StreamEvent:
     finish_reason: str | None = None
     pending: list[PendingToolCall] = field(default_factory=list)
     content: str = ""
+    reasoning_content: str = ""
     usage: UsageRecord | None = None
 
 
@@ -151,6 +188,29 @@ class LLMClient:
         await self._client.close()
 
     async def chat(
+        self,
+        messages: list[dict],
+        tools: list[dict] | None = None,
+    ) -> AsyncIterator[StreamEvent]:
+        """Stream a chat turn with bounded recovery for transport failures.
+
+        A provider can close an HTTP chunked response after sending only part
+        of a turn.  Retrying the same request is safe here because tool calls
+        are not dispatched until a complete ``done`` event is received by the
+        agent loop.
+        """
+
+        for attempt in range(_PROVIDER_RETRY_ATTEMPTS):
+            try:
+                async for event in self._chat_once(messages, tools):
+                    yield event
+                return
+            except Exception as exc:
+                if attempt + 1 >= _PROVIDER_RETRY_ATTEMPTS or not _retryable_provider_error(exc):
+                    raise
+                await asyncio.sleep(_PROVIDER_RETRY_DELAYS[attempt])
+
+    async def _chat_once(
         self,
         messages: list[dict],
         tools: list[dict] | None = None,
@@ -259,5 +319,6 @@ class LLMClient:
             finish_reason=finish_reason,
             pending=pending,
             content=content_str,
+            reasoning_content="".join(reasoning_parts),
             usage=usage,
         )

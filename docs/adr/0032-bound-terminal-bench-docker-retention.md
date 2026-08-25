@@ -1,6 +1,6 @@
 # ADR 0032: Bound Terminal-Bench Docker retention
 
-Status: Accepted
+Status: Superseded by ADR 0063
 
 Date: 2026-08-09
 

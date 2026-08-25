@@ -12,7 +12,6 @@ Bug 触发链(2026-07-30 LoCoMo full-run 复现):
 fail-soft(超时/超 cap → print_warn + 跳过,不抛)。
 """
 import asyncio
-import inspect
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -20,7 +19,6 @@ from pathlib import Path
 import pytest
 
 from cc_harness.llm import PendingToolCall, UsageRecord
-from cc_harness.mcp_client import ToolResult
 
 
 # --- Fixtures(沿用 tests/test_agent.py 的 FakeLLM/FakeMCP/FakeStreamEvent) ---

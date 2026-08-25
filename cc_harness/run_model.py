@@ -230,6 +230,7 @@ class PlanNode:
     depends_on: tuple[str, ...] = ()
     owned_paths: tuple[str, ...] = ()
     child_run_id: str | None = None
+    worktree_id: str | None = None
 
     def __post_init__(self) -> None:
         if not self.node_id or not self.kind:
@@ -245,6 +246,7 @@ class PlanNode:
             "depends_on": list(self.depends_on),
             "owned_paths": list(self.owned_paths),
             "child_run_id": self.child_run_id,
+            "worktree_id": self.worktree_id,
         }
 
     @classmethod
@@ -256,6 +258,7 @@ class PlanNode:
             depends_on=tuple(str(item) for item in data.get("depends_on") or ()),
             owned_paths=tuple(str(item) for item in data.get("owned_paths") or ()),
             child_run_id=data.get("child_run_id"),
+            worktree_id=(str(data["worktree_id"]) if data.get("worktree_id") else None),
         )
 
 
@@ -334,6 +337,12 @@ class PlanGraph:
         children = [node for node in selected if node.kind == "child"]
         if len(children) > self.max_concurrent_children:
             return False
+        if len(children) > 1:
+            worktrees = [node.worktree_id for node in children]
+            if any(not worktree for worktree in worktrees):
+                return False
+            if len(set(worktrees)) != len(worktrees):
+                return False
         for index, left in enumerate(selected):
             for right in selected[index + 1 :]:
                 if any(
@@ -736,6 +745,22 @@ class RunStateMachine:
         "ActionFailed",
         "ActionCancelled",
         "ActionOutcomeUnknown",
+        "PlanDiscoveryStarted",
+        "PlanDiscoveryCompleted",
+        "PlanNodeStarted",
+        "PlanNodeCompleted",
+        "PlanNodeBlocked",
+        "ModelInvocationStarted",
+        "AssistantMessageCommitted",
+        "AssistantMessageInterrupted",
+        "ToolObservationChunkCommitted",
+        "ToolObservationCommitted",
+        "ContextProjectionBuilt",
+        "ContextCompacted",
+        "MemoryCandidateRecorded",
+        "MemoryCheckpointCommitted",
+        "PredecessorHandoffCommitted",
+        "ChildDelegationCommitted",
         "ReconciliationStarted",
         "ReconciliationResolved",
         "ProgressRecorded",
@@ -772,6 +797,22 @@ class RunStateMachine:
         "ActionFailed": {RunStatus.RUNNING, RunStatus.BLOCKED, RunStatus.FAILED_RECOVERABLE},
         "ActionCancelled": {RunStatus.RUNNING, RunStatus.CANCEL_REQUESTED},
         "ActionOutcomeUnknown": {RunStatus.RUNNING, RunStatus.BLOCKED},
+        "PlanDiscoveryStarted": {RunStatus.DRAFT, RunStatus.QUEUED, RunStatus.RUNNING},
+        "PlanDiscoveryCompleted": {RunStatus.DRAFT, RunStatus.QUEUED, RunStatus.RUNNING},
+        "PlanNodeStarted": {RunStatus.QUEUED, RunStatus.RUNNING},
+        "PlanNodeCompleted": {RunStatus.QUEUED, RunStatus.RUNNING},
+        "PlanNodeBlocked": {RunStatus.QUEUED, RunStatus.RUNNING, RunStatus.BLOCKED},
+        "ModelInvocationStarted": {RunStatus.RUNNING},
+        "AssistantMessageCommitted": {RunStatus.RUNNING},
+        "AssistantMessageInterrupted": {RunStatus.RUNNING, RunStatus.CANCEL_REQUESTED},
+        "ToolObservationChunkCommitted": {RunStatus.RUNNING},
+        "ToolObservationCommitted": {RunStatus.RUNNING, RunStatus.BLOCKED},
+        "ContextProjectionBuilt": {RunStatus.RUNNING},
+        "ContextCompacted": {RunStatus.RUNNING},
+        "MemoryCandidateRecorded": set(RunStatus),
+        "MemoryCheckpointCommitted": set(RunStatus),
+        "PredecessorHandoffCommitted": set(RunStatus),
+        "ChildDelegationCommitted": {RunStatus.RUNNING, RunStatus.QUEUED},
         "ReconciliationStarted": {RunStatus.RUNNING, RunStatus.BLOCKED},
         "ReconciliationResolved": {RunStatus.RUNNING, RunStatus.BLOCKED},
         "ProgressRecorded": {RunStatus.RUNNING},

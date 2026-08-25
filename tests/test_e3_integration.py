@@ -83,19 +83,17 @@ async def test_e3_integration_full_round_trip_with_plan3_compression():
 
 
 # ---------------------------------------------------------------------------
-# 集成测试 2:E2 reflection 跨 session 召出(D5 memory_recall auto-recall)
+# 集成测试 2:跨 session 恢复不主动搜索 L1
 # ---------------------------------------------------------------------------
 
 
 @pytest.mark.asyncio
-async def test_e3_integration_e2_reflection_recalled_after_load(monkeypatch):
-    """E3 D5:session B 启动 load 后调 layered_recall 一次(retriever 被调过)。
+async def test_e3_integration_cross_session_load_defers_memory_recall(monkeypatch):
+    """恢复会话只恢复状态；L2/L3 留到首回合，L1 留给 memory_recall 工具。
 
     覆盖契约:
-      D5:新 session 启动时 _maybe_load_cross_session → layered_recall 自动
-        召出(自然涵盖 reflection / drift 记录)。mem_deps.retriever 触发
-        retriever.search 路径。assertion:layered_recall 被调过 + retriever
-        被调用(模拟 E2 reflection 流)。
+      启动阶段不能执行结果被丢弃的自动召回，也不能在用户/模型没有明确
+      需要时搜索 L1。首个真实用户回合负责建立会话级 L2/L3 快照。
     """
     from cc_harness.repl import _maybe_load_cross_session
 
@@ -166,13 +164,8 @@ async def test_e3_integration_e2_reflection_recalled_after_load(monkeypatch):
         state, console=MagicMock(), mcp=mcp, mode="coding",
     )
 
-    # 验证 layered_recall 被调过 + retriever 被调用(模拟 E2 reflection 流)
-    assert len(recall_called) >= 1, (
-        "E3 D5: layered_recall not called after load (mem_deps signaling failed)"
-    )
-    assert len(retriever_called) >= 1, (
-        "E3 D5: retriever.retrieve not called (E2 reflection recall path broken)"
-    )
+    assert recall_called == []
+    assert retriever_called == []
 
 
 # ---------------------------------------------------------------------------

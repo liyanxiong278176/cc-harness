@@ -136,3 +136,29 @@ async def test_message_source_events_are_append_only_while_projection_updates(tm
         assert await store.load("s1") == messages
     finally:
         await store.close()
+
+
+@pytest.mark.asyncio
+async def test_input_queue_is_durable_fifo_and_requeues_failures(tmp_path):
+    from cc_harness.session_store import SessionStore
+
+    store = await SessionStore(tmp_path).open()
+    try:
+        first = await store.enqueue_input("queued", {"user_text": "first"})
+        second = await store.enqueue_input("queued", {"user_text": "second"})
+        claimed = await store.claim_next_input("queued")
+        assert claimed is not None and claimed.queue_id == first.queue_id
+        assert claimed.status == "processing"
+        assert await store.requeue_input(first.queue_id, "compression unavailable")
+
+        retry = await store.claim_next_input("queued")
+        assert retry is not None and retry.queue_id == first.queue_id
+        assert retry.attempts == 2
+        assert await store.complete_input(retry.queue_id)
+
+        next_item = await store.claim_next_input("queued")
+        assert next_item is not None and next_item.queue_id == second.queue_id
+        await store.complete_input(next_item.queue_id)
+        assert await store.pending_inputs("queued") == ()
+    finally:
+        await store.close()

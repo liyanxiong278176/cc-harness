@@ -2,7 +2,12 @@ from types import SimpleNamespace
 
 import pytest
 
-from cc_harness.entrypoint import _run_print, async_main, build_parser
+from cc_harness.entrypoint import (
+    _has_usable_committed_final,
+    _run_print,
+    async_main,
+    build_parser,
+)
 
 
 def test_installed_cli_contract_parses_claude_style_flags(tmp_path):
@@ -145,3 +150,59 @@ async def test_print_json_preserves_structured_error(tmp_path, monkeypatch, caps
     assert await _run_print(Runtime(), "hello", "bypass-prompts", "json") == 1
     output = capsys.readouterr().out
     assert '"error": "provider unavailable"' in output
+
+
+@pytest.mark.asyncio
+async def test_usable_committed_final_requires_successful_last_observation():
+    artifacts = {
+        "final": '{"role":"assistant","content":"All checks pass."}',
+    }
+
+    class Store:
+        artifacts = SimpleNamespace(read_text=lambda digest: artifacts[digest])
+
+        async def read(self, run_id, *, limit):
+            del run_id, limit
+            return SimpleNamespace(
+                events=[
+                    SimpleNamespace(
+                        event_type="ToolObservationCommitted",
+                        payload={"status": "succeeded"},
+                    ),
+                    SimpleNamespace(
+                        event_type="AssistantMessageCommitted",
+                        payload={"message_artifact": "final"},
+                    ),
+                    SimpleNamespace(
+                        event_type="RunFailed",
+                        payload={"target_status": "failed_recoverable"},
+                    ),
+                ]
+            )
+
+    assert await _has_usable_committed_final(SimpleNamespace(store=Store()), "run")
+
+
+@pytest.mark.asyncio
+async def test_failed_last_observation_does_not_mask_recoverable_failure():
+    artifacts = {"final": '{"role":"assistant","content":"Let me test one more thing."}'}
+
+    class Store:
+        artifacts = SimpleNamespace(read_text=lambda digest: artifacts[digest])
+
+        async def read(self, run_id, *, limit):
+            del run_id, limit
+            return SimpleNamespace(
+                events=[
+                    SimpleNamespace(
+                        event_type="ToolObservationCommitted",
+                        payload={"status": "failed"},
+                    ),
+                    SimpleNamespace(
+                        event_type="AssistantMessageCommitted",
+                        payload={"message_artifact": "final"},
+                    ),
+                ]
+            )
+
+    assert not await _has_usable_committed_final(SimpleNamespace(store=Store()), "run")

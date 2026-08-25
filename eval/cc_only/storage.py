@@ -37,6 +37,71 @@ def digest_file(path: Path) -> str:
     return "sha256:" + digest.hexdigest()
 
 
+def _observability_resume_compatible(
+    manifest: dict[str, Any], immutable_contract: dict[str, Any]
+) -> bool:
+    """Allow an explicitly authorized resume after liveness-only instrumentation.
+
+    The adapter identity includes a dirty-worktree digest.  That is useful for
+    preventing accidental result mixing, but it also blocks resuming a run
+    when the only code change is supervisor observability.  Require an explicit
+    opt-in and compare every frozen field except that digest; scoring inputs,
+    model, dataset, Docker/runtime identities and time budgets must still be
+    byte-for-byte identical.
+    """
+
+    if os.environ.get("CC_HARNESS_ALLOW_OBSERVABILITY_RESUME") != "1":
+        return False
+    if manifest.get("benchmark") != "terminal-bench-2.1":
+        return False
+    previous = {
+        key: value
+        for key, value in manifest.items()
+        if key not in {"contract_digest", "created_at"}
+    }
+    current = dict(immutable_contract)
+    previous_identity = previous.get("adapter_run_identity")
+    current_identity = current.get("adapter_run_identity")
+    if not isinstance(previous_identity, dict) or not isinstance(current_identity, dict):
+        return False
+    previous_identity = dict(previous_identity)
+    current_identity = dict(current_identity)
+    previous_identity.pop("git_dirty_digest", None)
+    current_identity.pop("git_dirty_digest", None)
+    if previous_identity.get("wheel_sha256") != current_identity.get("wheel_sha256"):
+        # A functional harness repair is shipped through the frozen wheel.  It
+        # is allowed only with a second, explicit opt-in; the ordinary
+        # observability resume flag must never silently change the agent code
+        # used by an existing benchmark run.
+        if os.environ.get("CC_HARNESS_ALLOW_RESUME_ARTIFACT_REFRESH") != "1":
+            return False
+        previous_identity.pop("wheel_sha256", None)
+        current_identity.pop("wheel_sha256", None)
+    for identity in (previous_identity, current_identity):
+        backend = identity.get("execution_backend")
+        if not isinstance(backend, dict):
+            continue
+        storage = backend.get("docker_storage")
+        if not isinstance(storage, dict):
+            continue
+        source = storage.get("source")
+        if (
+            isinstance(source, str)
+            and storage.get("filesystem") == "ext4"
+            and storage.get("target") == "/var/lib/docker"
+        ):
+            normalized_backend = dict(backend)
+            normalized_storage = dict(storage)
+            normalized_storage["source"] = re.sub(
+                r"^/dev/sd[a-z]+(?=\[)", "/dev/sd*", source
+            )
+            normalized_backend["docker_storage"] = normalized_storage
+            identity["execution_backend"] = normalized_backend
+    previous["adapter_run_identity"] = previous_identity
+    current["adapter_run_identity"] = current_identity
+    return previous == current
+
+
 def atomic_json(path: Path, value: Any) -> None:
     atomic_bytes(path, canonical_json_bytes(value))
 
@@ -90,6 +155,66 @@ def safe_slug(value: str, *, maximum: int = 96) -> str:
     return (slug or "task")[:maximum]
 
 
+def task_path_slug(value: str, *, maximum: int = 12) -> str:
+    """Return a readable, collision-resistant slug safe for deep trial paths.
+
+    Windows creates temporary files below each trial workspace (for example,
+    activation manifests).  Keeping the task id's full slug in that path can
+    exceed the legacy MAX_PATH limit before the model process even starts.
+    Long ids therefore keep a short readable prefix plus a digest, while short
+    ids remain unchanged for backwards-compatible resume paths.
+    """
+    if maximum < 12:
+        raise ValueError("task path slug maximum must be at least 12")
+    full = safe_slug(value)
+    if len(full) <= maximum:
+        return full
+    digest = hashlib.sha256(value.encode("utf-8")).hexdigest()[:10]
+    prefix = safe_slug(value, maximum=maximum - len(digest) - 1)
+    return f"{prefix}-{digest}"
+
+
+_HARBOR_JOBS_ROOT_MAX_CHARS = 150
+
+
+def _compact_interrupted_attempt_path(
+    root: Path,
+    attempt_root: Path,
+    *,
+    sequence: int,
+    task: BenchmarkTask,
+    attempt: int,
+) -> tuple[Path, bool]:
+    """Move an old interrupted attempt to a short path before Harbor resumes it.
+
+    Harbor appends a timestamp, task slug and ``artifacts/logs/artifacts`` to
+    ``--jobs-dir``.  On Windows that suffix can exceed the legacy MAX_PATH
+    limit even though the cc-only attempt path itself is valid.  Resumable
+    attempts created by older versions may still carry the long slug, so
+    compact them in-place while retaining the same attempt number and all
+    evidence.
+    """
+    jobs_root = attempt_root / "jobs"
+    if len(str(jobs_root)) <= _HARBOR_JOBS_ROOT_MAX_CHARS:
+        return attempt_root, False
+    compact_root = (
+        root
+        / "raw"
+        / f"{sequence:04d}-{task_path_slug(task.task_id)}"
+        / f"attempt-{attempt}"
+    )
+    if compact_root == attempt_root:
+        return attempt_root, False
+    if compact_root.exists():
+        raise FileExistsError(
+            "short resumable attempt path already exists; refusing to merge evidence: "
+            f"{compact_root}"
+        )
+    compact_root.parent.mkdir(parents=True, exist_ok=True)
+    attempt_root.replace(compact_root)
+    return compact_root, True
+
+
 class RunStateStore:
     def __init__(self, output_root: Path) -> None:
         self.root = output_root.resolve()
@@ -120,10 +245,37 @@ class RunStateStore:
         if self.manifest_path.is_file():
             manifest = read_json(self.manifest_path)
             if manifest.get("contract_digest") != contract_digest:
-                raise ValueError(
-                    "existing result root has a different immutable input contract; "
-                    "use the original command or a different profile/result root"
+                if not _observability_resume_compatible(manifest, immutable_contract):
+                    raise ValueError(
+                        "existing result root has a different immutable input contract; "
+                        "use the original command or a different profile/result root"
+                    )
+                previous_digest = str(manifest.get("contract_digest") or "")
+                atomic_json(
+                    self.root / "resume-compatibility.json",
+                    {
+                        "schema_version": "eval.cc-only-observability-resume.v1",
+                        "reason": (
+                            "liveness-observability-and-authorized-artifact-refresh"
+                            if os.environ.get("CC_HARNESS_ALLOW_RESUME_ARTIFACT_REFRESH")
+                            == "1"
+                            else "liveness-observability-only-change"
+                        ),
+                        "authorized_by": [
+                            "CC_HARNESS_ALLOW_OBSERVABILITY_RESUME=1",
+                            *(
+                                ["CC_HARNESS_ALLOW_RESUME_ARTIFACT_REFRESH=1"]
+                                if os.environ.get("CC_HARNESS_ALLOW_RESUME_ARTIFACT_REFRESH")
+                                == "1"
+                                else []
+                            ),
+                        ],
+                        "previous_contract_digest": previous_digest,
+                        "current_contract_digest": contract_digest,
+                        "recorded_at": utc_now(),
+                    },
                 )
+                contract_digest = previous_digest
             existing_catalog = read_json(self.catalog_path)
             if existing_catalog.get("catalog_digest") != catalog["catalog_digest"]:
                 raise ValueError("existing frozen catalog does not match the current catalog")
@@ -167,14 +319,19 @@ class RunStateStore:
         atomic_json(self.state_path, state)
 
     def begin_attempt(
-        self, state: dict[str, Any], task: BenchmarkTask, sequence: int
+        self,
+        state: dict[str, Any],
+        task: BenchmarkTask,
+        sequence: int,
+        *,
+        reuse_interrupted: bool = True,
     ) -> tuple[int, Path, dict[str, Any]]:
         trial = state["trials"][task.task_id]
         # An interrupted attempt owns durable per-item evidence (for example a
         # LoCoMo ingestion checkpoint).  Reuse that attempt on the next
         # invocation so the adapter can continue in place instead of creating a
         # new attempt and replaying the whole sample.
-        if trial.get("attempts"):
+        if reuse_interrupted and trial.get("attempts"):
             previous = trial["attempts"][-1]
             previous_path = previous.get("path")
             reusable_invalid = False
@@ -193,7 +350,33 @@ class RunStateStore:
                 previous.get("status") == TrialStatus.INTERRUPTED.value or reusable_invalid
             ) and isinstance(previous_path, str):
                 attempt_root = self.root / Path(previous_path)
+                attempt_root, previous_path_changed = _compact_interrupted_attempt_path(
+                    self.root,
+                    attempt_root,
+                    sequence=sequence,
+                    task=task,
+                    attempt=int(previous.get("attempt") or 1),
+                )
+                if previous_path_changed:
+                    previous["path"] = attempt_root.relative_to(self.root).as_posix()
                 result_path = attempt_root / "result.json"
+                infrastructure_result = attempt_root / "infrastructure-result.json"
+                if infrastructure_result.is_file():
+                    retained = attempt_root / "infrastructure-results"
+                    retained.mkdir(parents=True, exist_ok=True)
+                    sequence_number = len(list(retained.glob("infrastructure-*.json"))) + 1
+                    os.replace(
+                        infrastructure_result,
+                        retained / f"infrastructure-{sequence_number:04d}.json",
+                    )
+                    previous.setdefault("infrastructure_failures", []).append(
+                        {
+                            "result": (
+                                retained / f"infrastructure-{sequence_number:04d}.json"
+                            ).relative_to(self.root).as_posix(),
+                            "retained_at": utc_now(),
+                        }
+                    )
                 if reusable_invalid and result_path.is_file():
                     retained = attempt_root / "infrastructure-results"
                     retained.mkdir(parents=True, exist_ok=True)
@@ -218,7 +401,7 @@ class RunStateStore:
         attempt_root = (
             self.root
             / "raw"
-            / f"{sequence:04d}-{safe_slug(task.task_id)}"
+            / f"{sequence:04d}-{task_path_slug(task.task_id)}"
             / f"attempt-{attempt}"
         )
         if attempt_root.exists():

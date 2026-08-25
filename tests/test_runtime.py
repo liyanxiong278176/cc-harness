@@ -231,6 +231,43 @@ async def test_run_user_turn_passes_runtime_iteration_budget_to_agent(tmp_path, 
 
 
 @pytest.mark.asyncio
+async def test_standard_runtime_honors_output_egress_guard_environment(
+    tmp_path, monkeypatch
+):
+    observed = {}
+
+    async def fake_run_turn(messages, llm, mcp, **kwargs):
+        del llm, mcp
+        observed.update(kwargs)
+        messages.append({"role": "assistant", "content": "done"})
+        return TurnTokenStats(iter_count=1)
+
+    monkeypatch.setattr("cc_harness.runtime.run_turn", fake_run_turn)
+    monkeypatch.setenv("CC_HARNESS_OUTPUT_EGRESS_GUARD", "1")
+
+    runtime = SessionRuntime()
+    runtime.cwd = tmp_path
+    runtime.llm = object()
+    runtime.mcp = object()
+    runtime.capability_profile = CapabilityProfile.named("standard")
+    runtime.memory_config = SimpleNamespace(layered_inject=False, offload_enabled=False)
+
+    async def emit(_event):
+        return None
+
+    async def confirm(_tool, _args, _reason):
+        return "yes"
+
+    await runtime.run_user_turn(
+        "finish the task",
+        event_emitter=emit,
+        confirm_handler=confirm,
+    )
+
+    assert observed["output_egress_guard"] is True
+
+
+@pytest.mark.asyncio
 async def test_context_only_runtime_does_not_require_long_term_memory_deps(tmp_path, monkeypatch):
     observed = {}
 

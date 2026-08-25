@@ -166,6 +166,7 @@ class LayeredMemoryWorker:
                 self.llm,
                 self.persona_path,
                 trigger_every_n=self.config.persona_trigger_every_n,
+                scenarios_dir=self.scenarios_dir,
             )
             artifact = self._write_artifact(
                 job_id,

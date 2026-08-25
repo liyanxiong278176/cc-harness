@@ -1,0 +1,28 @@
+{
+  "session_id": "legacy-session-001",
+  "project_root": "D:\\legacy\\demo-project",
+  "mode": "coding",
+  "title": "Legacy migration sample",
+  "status": "active",
+  "messages": [
+    {
+      "role": "user",
+      "content": "Implement the sample change and verify it.",
+      "created_at": 1723862400.0
+    },
+    {
+      "role": "assistant",
+      "content": "I inspected the project and recorded a checkpoint.",
+      "created_at": 1723862410.0
+    }
+  ],
+  "checkpoints": [
+    {
+      "index": 0,
+      "label": "initial-inspection",
+      "message_count": 2,
+      "event_count": 1,
+      "created_at": 1723862420.0
+    }
+  ]
+}

@@ -1,0 +1,10 @@
+{
+  "session_id": "legacy-session-001",
+  "message_index": 1,
+  "expected_conflict": true,
+  "legacy_content": {
+    "role": "assistant",
+    "content": "A conflicting historical representation.",
+    "created_at": 1723862411.0
+  }
+}

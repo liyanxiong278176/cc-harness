@@ -54,6 +54,42 @@ class FakeLLM:
         for ev in self.responses[idx]:
             yield ev
 
+
+@pytest.mark.asyncio
+async def test_deadline_finalization_disables_optional_tools(monkeypatch):
+    import time
+
+    from cc_harness import agent as agent_mod
+
+    captured_tools = []
+
+    class CapturingLLM(FakeLLM):
+        async def chat(self, messages, tools):
+            captured_tools.append(tools)
+            async for event in super().chat(messages, tools):
+                yield event
+
+    monkeypatch.setenv("CC_HARNESS_TASK_DEADLINE_EPOCH", str(time.time() + 10))
+    monkeypatch.setenv("CC_HARNESS_TASK_DEADLINE_RESERVE_S", "30")
+    llm = CapturingLLM(
+        responses=[
+            [
+                FakeStreamEvent(kind="content", text="done"),
+                FakeStreamEvent(kind="done", content="done", finish_reason="stop"),
+            ]
+        ]
+    )
+    mcp = FakeMCP(tools_spec=[], results={}, calls=[])
+
+    await agent_mod.run_turn(
+        [{"role": "user", "content": "finish the task"}],
+        llm,
+        mcp,
+        max_iter=2,
+    )
+
+    assert captured_tools == [[]]
+
 # --- Routing tests ---
 
 @pytest.mark.asyncio
@@ -1784,9 +1820,6 @@ async def test_live_panel_stop_called_only_once(monkeypatch, tmp_path):
     走 repl 的 finally 路径:在 state.live_panel 装上 spy,跑一次 REPL 退出,
     断言 spy.stop 被调恰好 1 次(原条件表达式会调 2 次:一次 iscoroutine + 真调)。
     """
-    import cc_harness.repl as repl_mod
-    from cc_harness.repl import run_repl
-
     # 间谍:统计 stop 调用次数
     call_count = {"n": 0}
 

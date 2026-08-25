@@ -1,0 +1,8 @@
+{
+  "schema_version": "cc-harness.memory-fixture.v1",
+  "run_id": "fixture-run",
+  "segment": 1,
+  "source_digest": "sha256:fixture-memory-source",
+  "captured_count": 2,
+  "untrusted": true
+}

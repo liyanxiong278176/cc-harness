@@ -1,0 +1,10 @@
+{
+  "schema_version": "cc-harness.context-fixture.v1",
+  "session_id": "session-001",
+  "source_digest": "sha256:fixture-context-source",
+  "coverage": {
+    "goal": true,
+    "recent_interactions": 4,
+    "working_state": true
+  }
+}

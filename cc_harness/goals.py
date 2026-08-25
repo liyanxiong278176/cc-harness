@@ -101,10 +101,32 @@ class GoalContractService:
             human_review=tuple(human_review),
         )
 
-    def assess(self, goal: GoalContract) -> GoalAssessment:
+    def assess(
+        self,
+        goal: GoalContract,
+        *,
+        goal_provenance: str = "user",
+    ) -> GoalAssessment:
+        """Assess a goal, with an explicit provenance escape hatch for sandboxes.
+
+        Official benchmark task statements may legitimately contain words such
+        as ``push`` or ``password`` (and filesystem paths such as ``/etc``)
+        because they describe the task's fixture. Those words must not silently
+        weaken the normal user-facing gate. The caller has to provide the
+        explicit ``official_benchmark`` provenance; only the goal-level
+        clarification/confirmation gate is bypassed. Tool policy, approvals,
+        command sandboxing, and output guards remain active.
+        """
+
+        trusted_benchmark = goal_provenance == "official_benchmark"
         text = " ".join((goal.objective, *goal.acceptance_criteria, *goal.constraints))
-        ambiguous = _contains_marker(text, _AMBIGUOUS_MARKERS)
-        high_risk = _contains_marker(text, _HIGH_RISK_MARKERS)
+        # A frozen benchmark statement is an externally-owned task contract,
+        # not an underspecified live user request. Do not stop the benchmark
+        # before its model call because a fixture path (for example ``/etc``)
+        # or a task phrase happens to match a generic goal marker. All
+        # action-level controls remain enforced after this goal gate.
+        ambiguous = () if trusted_benchmark else _contains_marker(text, _AMBIGUOUS_MARKERS)
+        high_risk = () if trusted_benchmark else _contains_marker(text, _HIGH_RISK_MARKERS)
         reasons: list[str] = []
         questions: list[str] = []
         if ambiguous:

@@ -1,0 +1,5 @@
+{
+  "summary": "The login/register fixture has separate registration and login routes.",
+  "source_digest": "sha256:fixture-context-source",
+  "untrusted": true
+}

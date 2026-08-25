@@ -79,8 +79,8 @@ class LocalSupervisor:
                 continue
         capacity = self.max_workers - len(self._active)
         if capacity > 0:
-            records = await self.store.list_runs({RunStatus.QUEUED.value})
-            for record in records[:capacity]:
+            records = await self._select_ready_records(capacity)
+            for record in records:
                 if record.run_id in self._active:
                     continue
                 worker = self.worker_factory(record.run_id)
@@ -92,6 +92,205 @@ class LocalSupervisor:
                 self._active[record.run_id] = (task, worker)
         queued = await self.store.list_runs({RunStatus.QUEUED.value})
         return SupervisorStats(tuple(sorted(self._active)), len(queued))
+
+    async def _select_ready_records(self, capacity: int):
+        """Select only dependency-ready work from the run PlanGraphs.
+
+        Root runs are serialized per project. Child runs can share capacity only
+        when their parent graph declares the nodes ready and their owned paths
+        are disjoint. Follow-ups use the predecessor gate and never inherit a
+        parent's full transcript as a scheduling shortcut.
+        """
+
+        records = await self.store.list_runs({RunStatus.QUEUED.value})
+        if not records:
+            return ()
+        all_records = await self.store.list_runs()
+        projections = {
+            record.run_id: await self.store.load_projection(record.run_id)
+            for record in all_records
+            if record.run_id not in self._active
+        }
+        active_records = [
+            record
+            for record in all_records
+            if record.status
+            in {
+                RunStatus.RUNNING.value,
+                RunStatus.CANCEL_REQUESTED.value,
+                RunStatus.AWAITING_APPROVAL.value,
+            }
+        ]
+        # The store is project-scoped: an active child/follow-up also occupies
+        # the project root gate, even if its parent root has yielded.
+        active_root = bool(active_records)
+        selected = []
+        selected_roots = 0
+        selected_child = False
+        selected_child_paths: list[str] = []
+        selected_child_worktrees: list[str] = []
+        active_child_paths: list[str] = []
+        active_child_worktrees: list[str] = []
+        active_unscoped_child = False
+        active_unisolated_child = False
+        for active in active_records:
+            if active.parent_run_id is None:
+                continue
+            paths = await self._record_owned_paths(active, projections)
+            worktree = await self._record_worktree(active, projections)
+            active_child_paths.extend(paths)
+            if worktree:
+                active_child_worktrees.append(worktree)
+            else:
+                active_unisolated_child = True
+            active_unscoped_child = active_unscoped_child or (not paths and not worktree)
+        selected_unscoped_child = False
+        selected_unisolated_child = False
+        for record in records:
+            if len(selected) >= capacity:
+                break
+            if record.run_id in self._active:
+                continue
+            projection = projections.get(record.run_id)
+            if projection is not None and projection.discovery_status == "awaiting":
+                continue
+            if record.parent_run_id is None:
+                if active_root or selected_roots or selected_child:
+                    continue
+                selected.append(record)
+                selected_roots += 1
+                continue
+            if selected_roots:
+                continue
+            if not await self._record_is_ready(
+                record,
+                all_records=all_records,
+                projections=projections,
+                selected_child_paths=selected_child_paths,
+            ):
+                continue
+            node_paths = await self._record_owned_paths(record, projections)
+            node_worktree = await self._record_worktree(record, projections)
+            if active_unscoped_child or selected_unscoped_child:
+                continue
+            if active_unisolated_child or selected_unisolated_child:
+                continue
+            if node_worktree and node_worktree in (*active_child_worktrees, *selected_child_worktrees):
+                continue
+            if any(
+                _paths_overlap(left, right)
+                for left in node_paths
+                for right in (*selected_child_paths, *active_child_paths)
+            ):
+                continue
+            # An unscoped child has no proof that it owns an isolated
+            # workspace. It may run alone, but it cannot join a parallel
+            # cohort with another active/selected child.
+            if not node_paths and (selected_child_paths or active_child_paths):
+                continue
+            if not node_worktree and (
+                selected_child_paths
+                or active_child_paths
+                or selected_child_worktrees
+                or active_child_worktrees
+            ):
+                continue
+            if not node_paths and any(
+                item.parent_run_id == record.parent_run_id for item in all_records
+                if item.run_id != record.run_id and item.status in {
+                    RunStatus.RUNNING.value,
+                    RunStatus.AWAITING_APPROVAL.value,
+                    RunStatus.CANCEL_REQUESTED.value,
+                }
+            ):
+                continue
+            selected.append(record)
+            selected_child = True
+            selected_child_paths.extend(node_paths)
+            if node_worktree:
+                selected_child_worktrees.append(node_worktree)
+            else:
+                selected_unisolated_child = True
+            selected_unscoped_child = selected_unscoped_child or (not node_paths and not node_worktree)
+        return tuple(selected)
+
+    async def _record_is_ready(self, record, *, all_records, projections, selected_child_paths) -> bool:
+        if record.predecessor_run_id:
+            predecessor = projections.get(record.predecessor_run_id)
+            if predecessor is None:
+                predecessor = await self.store.load_projection(record.predecessor_run_id)
+            if predecessor.status not in {
+                RunStatus.COMPLETED,
+                RunStatus.CANCELLED,
+                RunStatus.FAILED_TERMINAL,
+            }:
+                return False
+        parent = projections.get(record.parent_run_id)
+        if parent is None:
+            parent = await self.store.load_projection(record.parent_run_id)
+        if parent.discovery_status == "awaiting":
+            return False
+        child = next(
+            (item for item in parent.children if item.child_run_id == record.run_id),
+            None,
+        )
+        if child is None:
+            # A follow-up has a parent/predecessor but no child PlanNode.
+            return bool(record.predecessor_run_id)
+        node = next((item for item in parent.plan.nodes if item.node_id == child.node_id), None)
+        if node is None:
+            return False
+        completed = await self._completed_plan_nodes(parent.run_id, parent)
+        if any(dependency not in completed for dependency in node.depends_on):
+            return False
+        active_children = [
+            item
+            for item in all_records
+            if item.parent_run_id == record.parent_run_id
+            and item.status
+            in {RunStatus.RUNNING.value, RunStatus.CANCEL_REQUESTED.value, RunStatus.AWAITING_APPROVAL.value}
+        ]
+        if len(active_children) >= parent.plan.max_concurrent_children:
+            return False
+        return True
+
+    async def _completed_plan_nodes(self, run_id: str, projection) -> set[str]:
+        completed = {
+            todo.todo_id
+            for todo in projection.todos
+            if todo.status in {"done", "completed"}
+        }
+        page = await self.store.read(run_id, limit=100_000)
+        completed.update(
+            str(event.payload["node_id"])
+            for event in page.events
+            if event.event_type == "PlanNodeCompleted"
+        )
+        return completed
+
+    async def _record_owned_paths(self, record, projections) -> tuple[str, ...]:
+        if not record.parent_run_id:
+            return ()
+        parent = projections.get(record.parent_run_id)
+        if parent is None:
+            parent = await self.store.load_projection(record.parent_run_id)
+        child = next((item for item in parent.children if item.child_run_id == record.run_id), None)
+        if child is None:
+            return ()
+        node = next((item for item in parent.plan.nodes if item.node_id == child.node_id), None)
+        return tuple(node.owned_paths) if node is not None else ()
+
+    async def _record_worktree(self, record, projections) -> str | None:
+        if not record.parent_run_id:
+            return None
+        parent = projections.get(record.parent_run_id)
+        if parent is None:
+            parent = await self.store.load_projection(record.parent_run_id)
+        child = next((item for item in parent.children if item.child_run_id == record.run_id), None)
+        if child is None:
+            return None
+        node = next((item for item in parent.plan.nodes if item.node_id == child.node_id), None)
+        return node.worktree_id if node is not None else None
 
     async def stop(self, drain: bool = True) -> None:
         self._stopping = True
@@ -114,3 +313,9 @@ class LocalSupervisor:
             await asyncio.sleep(self.poll_interval)
 
 __all__ = ["LocalSupervisor", "SupervisorStats"]
+
+
+def _paths_overlap(left: str, right: str) -> bool:
+    a = left.replace("\\", "/").strip().rstrip("/") or "."
+    b = right.replace("\\", "/").strip().rstrip("/") or "."
+    return a == b or a.startswith(f"{b}/") or b.startswith(f"{a}/")

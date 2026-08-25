@@ -278,32 +278,101 @@ async def test_cluster_scenarios_below_min_atoms(tmp_path):
 
 @pytest.mark.asyncio
 async def test_generate_persona_writes_md(tmp_path):
-    """L1 总数达 trigger_every_n → 生成 persona md。"""
+    """L2 覆盖的 atom 数达 trigger_every_n → 生成带场景溯源的 persona。"""
     from cc_harness.memory.store import MemoryStore
     from cc_harness.memory.persona import generate_persona
     s = MemoryStore(db_path=tmp_path/"pe.db", embedding_dim=4)
     await s.init_schema()
     for i in range(3):
         await s.add(f"用户喜欢{i}", [0.1]*4, "pipeline", session_id="sess1")
+    ids = [memory.id for memory in await s.list_all()]
+    scenarios_dir = tmp_path / "scenarios"
+    scenarios_dir.mkdir()
+    scenario_id = "sess1-v0001"
+    (scenarios_dir / f"{scenario_id}.md").write_text(
+        "summary: 用户在讨论稳定偏好\natom_ids:\n"
+        + "\n".join(f"- {atom_id}" for atom_id in ids),
+        encoding="utf-8",
+    )
     persona_path = tmp_path / "persona.md"
-    out = await generate_persona(s, llm=None, persona_path=persona_path, trigger_every_n=3)
+    out = await generate_persona(
+        s, llm=None, persona_path=persona_path, trigger_every_n=3,
+        scenarios_dir=scenarios_dir,
+    )
     assert out is not None
+    assert out.scenario_ids == [scenario_id]
     assert persona_path.exists()
     txt = persona_path.read_text(encoding="utf-8")
     assert "画像" in txt
+    assert scenario_id in txt
     await s.close()
 
 
 @pytest.mark.asyncio
+async def test_generate_persona_uses_l2_summaries_not_l1_text(tmp_path):
+    """L3 prompt 只含 L2 摘要和场景 ID，不直接泄漏 L1 正文。"""
+    from types import SimpleNamespace
+
+    from cc_harness.memory.persona import generate_persona
+    from cc_harness.memory.store import MemoryStore
+
+    store = MemoryStore(db_path=tmp_path / "l2-only.db", embedding_dim=4)
+    await store.init_schema()
+    atom_id = (await store.add(
+        "L1-SHOULD-NOT-ENTER-PERSONA-PROMPT",
+        [0.1] * 4,
+        "pipeline",
+        session_id="sess1",
+    )).id
+    scenarios_dir = tmp_path / "scenarios"
+    scenarios_dir.mkdir()
+    scenario_id = "sess1-v0001"
+    (scenarios_dir / f"{scenario_id}.md").write_text(
+        f"summary: L2-SCENARIO-SUMMARY\natom_ids:\n- {atom_id}", encoding="utf-8"
+    )
+
+    class CapturingLLM:
+        messages = []
+
+        async def chat(self, messages, tools=None):
+            del tools
+            self.messages = messages
+            yield SimpleNamespace(kind="done", content="L3 persona")
+
+    llm = CapturingLLM()
+    persona = await generate_persona(
+        store,
+        llm,
+        tmp_path / "persona.md",
+        trigger_every_n=1,
+        scenarios_dir=scenarios_dir,
+    )
+    prompt = "\n".join(message["content"] for message in llm.messages)
+    assert persona is not None
+    assert scenario_id in prompt
+    assert "L2-SCENARIO-SUMMARY" in prompt
+    assert "L1-SHOULD-NOT-ENTER-PERSONA-PROMPT" not in prompt
+    await store.close()
+
+
+@pytest.mark.asyncio
 async def test_generate_persona_below_trigger(tmp_path):
-    """L1 不足 trigger_every_n → 返 None,不写 md。"""
+    """L2 覆盖的 atom 不足 trigger_every_n → 返 None,不写 md。"""
     from cc_harness.memory.store import MemoryStore
     from cc_harness.memory.persona import generate_persona
     s = MemoryStore(db_path=tmp_path/"pe2.db", embedding_dim=4)
     await s.init_schema()
-    await s.add("一条", [0.1]*4, "pipeline", session_id="sess1")  # 1 < 3
+    atom_id = (await s.add("一条", [0.1]*4, "pipeline", session_id="sess1")).id
+    scenarios_dir = tmp_path / "scenarios"
+    scenarios_dir.mkdir()
+    (scenarios_dir / "sess1-v0001.md").write_text(
+        f"summary: 一条场景\natom_ids:\n- {atom_id}", encoding="utf-8"
+    )
     persona_path = tmp_path / "persona.md"
-    out = await generate_persona(s, llm=None, persona_path=persona_path, trigger_every_n=3)
+    out = await generate_persona(
+        s, llm=None, persona_path=persona_path, trigger_every_n=3,
+        scenarios_dir=scenarios_dir,
+    )
     assert out is None and not persona_path.exists()
     await s.close()
 
@@ -326,21 +395,61 @@ async def test_layered_recall_timeout_skips(tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_layered_context_recall_does_not_search_l1(tmp_path):
+    """自动 L2/L3 注入关闭 atom 搜索；精确 L1 只能由 memory_recall 获取。"""
+    from cc_harness.memory.recall import layered_recall
+
+    class MustNotSearch:
+        async def search(self, q, top_k=5):
+            raise AssertionError("automatic context injection must not search L1")
+
+    result = await layered_recall(
+        MustNotSearch(), tmp_path / "persona.md", tmp_path / "scenarios", "query",
+        include_atoms=False,
+    )
+    assert result.atoms == []
+
+
+def test_layered_memory_fingerprint_changes_only_with_l2_l3_files(tmp_path):
+    from cc_harness.memory.recall import layered_memory_fingerprint
+
+    persona_path = tmp_path / "persona.md"
+    scenarios_dir = tmp_path / "scenarios"
+    scenarios_dir.mkdir()
+    empty = layered_memory_fingerprint(persona_path, scenarios_dir)
+    assert layered_memory_fingerprint(persona_path, scenarios_dir) == empty
+
+    persona_path.write_text("version: 1\nP1", encoding="utf-8")
+    with_persona = layered_memory_fingerprint(persona_path, scenarios_dir)
+    assert with_persona != empty
+    assert layered_memory_fingerprint(persona_path, scenarios_dir) == with_persona
+
+    (scenarios_dir / "s-v0001.md").write_text("summary: S1", encoding="utf-8")
+    assert layered_memory_fingerprint(persona_path, scenarios_dir) != with_persona
+
+
+@pytest.mark.asyncio
 async def test_drill_down_traceability(tmp_path):
     """溯源 Persona→Scenario→Atom→Conversation 全链。"""
     from cc_harness.memory.store import MemoryStore
-    from cc_harness.memory.recall import read_persona, read_top_scenarios
+    from cc_harness.memory.recall import read_persona, read_scenarios_by_ids
     s = MemoryStore(db_path=tmp_path / "dr.db", embedding_dim=4)
     await s.init_schema()
     mid = (await s.add("用户喜欢猫", [0.1] * 4, "pipeline", session_id="sess1")).id
     await s.add_conversation("sess1", 0, "user", "我养了只猫", 1.0)
     scen_dir = tmp_path / "scen"
     scen_dir.mkdir()
-    (scen_dir / "sess1-1.md").write_text(f"summary: 养宠\natom_ids:\n- {mid}", encoding="utf-8")
-    (tmp_path / "persona.md").write_text("# 画像\n爱宠物", encoding="utf-8")
+    scenario_id = "sess1-v0001"
+    (scen_dir / f"{scenario_id}.md").write_text(
+        f"summary: 养宠\natom_ids:\n- {mid}", encoding="utf-8"
+    )
+    (tmp_path / "persona.md").write_text(
+        f"# 画像\n爱宠物\n\nscenario_ids:\n- {scenario_id}", encoding="utf-8"
+    )
     pe = read_persona(tmp_path / "persona.md")
     assert pe and "宠物" in pe.summary
-    scs = read_top_scenarios(scen_dir, 5)
+    assert pe.scenario_ids == [scenario_id]
+    scs = read_scenarios_by_ids(scen_dir, pe.scenario_ids)
     assert mid in scs[0].atom_ids
     mem = await s.get(mid)
     assert mem and mem.session_id == "sess1"
@@ -375,19 +484,85 @@ async def test_run_turn_memory_layer_injects(tmp_path):
 
 @pytest.mark.asyncio
 async def test_injection_idempotent_across_turns(tmp_path):
-    """跨多 turn 注入:_refresh_system_prompt 每 turn 覆写 system → 不累积。turn2 最终只 1 处。"""
+    """同一会话版本未变只 recall 一次，并始终只有一个高层记忆块。"""
     from cc_harness.agent import run_turn
     from tests.test_agent import FakeLLM, FakeMCP, FakeStreamEvent
     from cc_harness.memory.models import RecallResult, Persona
 
+    calls = 0
+
     async def fake_recall(q, **kw):
+        nonlocal calls
+        calls += 1
         return RecallResult(persona=Persona("P1", [], "p"))
+    memory_layer = {"recall": fake_recall, "version": lambda: "v1", "cache": {}}
     events = [FakeStreamEvent(kind="done", content="ok", finish_reason="stop")]
     msgs = [{"role": "system", "content": "sys"}, {"role": "user", "content": "hi"}]
     await run_turn(msgs, FakeLLM(responses=[events]), FakeMCP(tools_spec=[], results={}, calls=[]),
-                   mode="plan", cwd=str(tmp_path), memory_layer={"recall": fake_recall})
+                   mode="plan", cwd=str(tmp_path), memory_layer=memory_layer, session_id="session-1")
     msgs.append({"role": "user", "content": "again"})
     await run_turn(msgs, FakeLLM(responses=[events]), FakeMCP(tools_spec=[], results={}, calls=[]),
-                   mode="plan", cwd=str(tmp_path), memory_layer={"recall": fake_recall})
-    # _refresh_system_prompt turn2 覆写 system 为纯基线 + 注入一次 → 只 1 处(拦累积)
+                   mode="plan", cwd=str(tmp_path), memory_layer=memory_layer, session_id="session-1")
+    assert calls == 1
     assert msgs[0]["content"].count("## 用户画像") == 1
+    assert msgs[0]["content"].count("<layered_memory>") == 1
+
+
+@pytest.mark.asyncio
+async def test_injection_replaces_snapshot_only_when_version_changes(tmp_path):
+    """L2/L3 指纹更新后重新 recall，并用新块替换旧块。"""
+    from cc_harness.agent import run_turn
+    from cc_harness.memory.models import Persona, RecallResult
+    from tests.test_agent import FakeLLM, FakeMCP, FakeStreamEvent
+
+    version = {"value": "v1"}
+    recalls = iter(["P1", "P2"])
+    calls = 0
+
+    async def fake_recall(q, **kw):
+        nonlocal calls
+        calls += 1
+        return RecallResult(persona=Persona(next(recalls), [], "p"))
+
+    memory_layer = {
+        "recall": fake_recall,
+        "version": lambda: version["value"],
+        "cache": {},
+    }
+    events = [FakeStreamEvent(kind="done", content="ok", finish_reason="stop")]
+    messages = [{"role": "system", "content": "sys"}, {"role": "user", "content": "hi"}]
+    await run_turn(
+        messages, FakeLLM(responses=[events]), FakeMCP(tools_spec=[], results={}, calls=[]),
+        mode="plan", cwd=str(tmp_path), memory_layer=memory_layer, session_id="session-1",
+    )
+    version["value"] = "v2"
+    messages.append({"role": "user", "content": "again"})
+    await run_turn(
+        messages, FakeLLM(responses=[events]), FakeMCP(tools_spec=[], results={}, calls=[]),
+        mode="plan", cwd=str(tmp_path), memory_layer=memory_layer, session_id="session-1",
+    )
+    assert calls == 2
+    assert "P2" in messages[0]["content"]
+    assert "P1" not in messages[0]["content"]
+    assert messages[0]["content"].count("<layered_memory>") == 1
+
+
+@pytest.mark.asyncio
+async def test_automatic_injection_never_adds_l1_atoms(tmp_path):
+    from types import SimpleNamespace
+
+    from cc_harness.agent import run_turn
+    from cc_harness.memory.models import Persona, RecallResult
+    from tests.test_agent import FakeLLM, FakeMCP, FakeStreamEvent
+
+    async def fake_recall(q, **kw):
+        atom = SimpleNamespace(text="L1-PRIVATE-DETAIL", session_id="s")
+        return RecallResult(persona=Persona("P", [], "p"), atoms=[atom])
+
+    events = [FakeStreamEvent(kind="done", content="ok", finish_reason="stop")]
+    messages = [{"role": "system", "content": "sys"}, {"role": "user", "content": "hi"}]
+    await run_turn(
+        messages, FakeLLM(responses=[events]), FakeMCP(tools_spec=[], results={}, calls=[]),
+        mode="plan", cwd=str(tmp_path), memory_layer={"recall": fake_recall},
+    )
+    assert "L1-PRIVATE-DETAIL" not in messages[0]["content"]

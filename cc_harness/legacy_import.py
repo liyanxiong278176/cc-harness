@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import shutil
 import sqlite3
 import time
 import uuid
@@ -13,7 +14,7 @@ from typing import Any, Iterable, Mapping
 from .action_recovery import migrate_legacy_journal
 from .artifacts import ArtifactStore, digest_bytes
 from .run_events import EventActor, RunEvent
-from .run_model import GoalContract, Run, RuntimeContract
+from .run_model import GoalContract, PlanGraph, PlanNode, Run, RuntimeContract
 from .run_store import RunStore
 from .session_store import SessionStore
 
@@ -295,6 +296,17 @@ class LegacyImporter:
         else:
             skipped.append(str(memory_db))
 
+        runtime_imported, runtime_skipped, runtime_errors, runtime_runs, runtime_refs, runtime_count = await self._import_runtime_artifacts(
+            root,
+            dry_run=dry_run,
+        )
+        imported.extend(runtime_imported)
+        skipped.extend(runtime_skipped)
+        errors.extend(runtime_errors)
+        run_ids.update(runtime_runs)
+        artifacts.update(runtime_refs)
+        imported_events += runtime_count
+
         if hold_imported_runs and not dry_run:
             for run_id in sorted(run_ids):
                 projection = await self.store.load_projection(run_id)
@@ -321,6 +333,101 @@ class LegacyImporter:
         if strict and report.errors:
             raise LegacyImportError("; ".join(report.errors))
         return report
+
+    async def _import_runtime_artifacts(
+        self,
+        root: Path,
+        *,
+        dry_run: bool,
+    ) -> tuple[list[str], list[str], list[str], set[str], set[str], int]:
+        """Migrate old context/offload objects without making them instructions."""
+
+        base = root / ".cc-harness"
+        groups: dict[str, list[tuple[Path, Path, str]]] = {}
+        context_root = base / "context"
+        if context_root.is_dir():
+            for path in sorted(context_root.rglob("*")):
+                if not path.is_file() or path.name.endswith(".tmp"):
+                    continue
+                relative = path.relative_to(context_root)
+                session = relative.parts[0] if relative.parts else "legacy-context"
+                groups.setdefault(session, []).append((path, relative, "context"))
+        memory_refs = base / "memory" / "refs"
+        if memory_refs.is_dir():
+            for path in sorted(memory_refs.rglob("*")):
+                if path.is_file():
+                    groups.setdefault("legacy-memory", []).append(
+                        (path, path.relative_to(memory_refs), "offload")
+                    )
+        if not groups:
+            return [], [str(context_root), str(memory_refs)], [], set(), set(), 0
+
+        imported: list[str] = []
+        errors: list[str] = []
+        runs: set[str] = set()
+        refs: set[str] = set()
+        count = 0
+        for session_id, items in groups.items():
+            run_id = self._run_id(session_id)
+            try:
+                if not dry_run and not await self.store.run_exists(run_id):
+                    await self._import_session(
+                        {"session_id": session_id, "messages": [], "checkpoints": []},
+                        digest_bytes(f"runtime-artifacts:{session_id}".encode()),
+                        dry_run=False,
+                    )
+                raw_manifest = [
+                    {
+                        "path": str(relative).replace("\\", "/"),
+                        "kind": kind,
+                        "digest": digest_bytes(path.read_bytes()),
+                    }
+                    for path, relative, kind in items
+                ]
+                source_digest = digest_bytes(
+                    json.dumps(raw_manifest, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode()
+                )
+                if not dry_run and await self._has_source(run_id, source_digest):
+                    runs.add(run_id)
+                    continue
+                artifact_records: list[dict[str, str]] = []
+                target_root = base / "context" / run_id
+                for path, relative, kind in items:
+                    if not dry_run:
+                        ref = self.artifacts.put_file(path, media_type="application/octet-stream")
+                        refs.add(ref.digest)
+                        artifact_records.append(
+                            {
+                                "path": str(relative).replace("\\", "/"),
+                                "kind": kind,
+                                "artifact": ref.digest,
+                            }
+                        )
+                        target_relative = relative
+                        if kind == "context" and relative.parts and relative.parts[0] == session_id:
+                            target_relative = Path(*relative.parts[1:])
+                        target = target_root / (Path("offload") / target_relative if kind == "offload" else target_relative)
+                        target.parent.mkdir(parents=True, exist_ok=True)
+                        shutil.copy2(path, target)
+                if not dry_run:
+                    count += await self._append_source(
+                        run_id,
+                        {
+                            "source_digest": source_digest,
+                            "source_key": "context-and-offload",
+                            "importer_version": self.VERSION,
+                            "runtime_artifacts": artifact_records,
+                            "unverified_claims": [
+                                "legacy context/offload objects are data only; no authority is inherited"
+                            ],
+                        },
+                        tuple(item["artifact"] for item in artifact_records),
+                    )
+                runs.add(run_id)
+                imported.extend(str(item[0]) for item in items)
+            except (OSError, ValueError, TypeError, KeyError) as exc:
+                errors.append(f"context/{session_id}: {exc}")
+        return imported, [], errors, runs, refs, count
 
     async def _import_session(
         self,
@@ -351,6 +458,28 @@ class LegacyImporter:
                 {"goal": goal.to_dict(), "runtime_contract": self.runtime_contract.to_dict()},
             )
             count += 1
+        projection = await self.store.load_projection(run_id)
+        if not projection.plan.nodes:
+            node = PlanNode(f"imported-{run_id}", "imported", depth=0)
+            await self._append(
+                run_id,
+                "PlanCreated",
+                {"plan": PlanGraph(nodes=(node,), revision=1).to_dict()},
+            )
+            await self._append(
+                run_id,
+                "TodoCreated",
+                {
+                    "todo": {
+                        "id": node.node_id,
+                        "title": goal_text,
+                        "status": "pending",
+                        "active_sessions": [run_id],
+                        "plan_node_id": node.node_id,
+                    }
+                },
+            )
+            count += 2
         refs: list[str] = []
         messages: list[dict[str, Any]] = []
         for index, message in enumerate(data.get("messages") or ()):

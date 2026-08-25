@@ -30,6 +30,28 @@ def digest_bytes(content: bytes) -> str:
     return f"sha256:{hashlib.sha256(content).hexdigest()}"
 
 
+def _extended_windows_path(path: Path) -> str | Path:
+    """Return an absolute extended-length path for Win32 filesystem calls."""
+
+    if os.name != "nt":
+        return path
+    value = str(path.resolve())
+    if value.startswith("\\\\?\\"):
+        return value
+    if value.startswith("\\\\"):
+        return "\\\\?\\UNC\\" + value[2:]
+    return "\\\\?\\" + value
+
+
+def _path_is_file(path: Path) -> bool:
+    return os.path.isfile(_extended_windows_path(path))
+
+
+def _read_path_bytes(path: Path) -> bytes:
+    with open(_extended_windows_path(path), "rb") as handle:
+        return handle.read()
+
+
 @dataclass(frozen=True)
 class ArtifactRef:
     digest: str
@@ -74,7 +96,7 @@ class ArtifactStore:
             )
         target = self.object_path(digest)
         target.parent.mkdir(parents=True, exist_ok=True)
-        if target.exists():
+        if _path_is_file(target):
             self._verify_path(target, digest, len(content))
         else:
             self._atomic_write(target, content, digest)
@@ -109,9 +131,9 @@ class ArtifactStore:
 
     def read(self, digest: str) -> bytes:
         target = self.object_path(digest)
-        if not target.is_file():
+        if not _path_is_file(target):
             raise ArtifactNotFound(digest)
-        content = target.read_bytes()
+        content = _read_path_bytes(target)
         self._verify_path(target, digest, len(content))
         return content
 
@@ -120,7 +142,7 @@ class ArtifactStore:
 
     def exists(self, digest: str) -> bool:
         target = self.object_path(digest)
-        return target.is_file() and self._is_valid_file(target, digest)
+        return _path_is_file(target) and self._is_valid_file(target, digest)
 
     def verify(self, digest: str) -> ArtifactRef:
         content = self.read(digest)
@@ -196,7 +218,7 @@ class ArtifactStore:
 
     @staticmethod
     def _verify_path(path: Path, digest: str, expected_size: int | None = None) -> None:
-        content = path.read_bytes()
+        content = _read_path_bytes(path)
         actual = digest_bytes(content)
         if actual != digest:
             raise ArtifactIntegrityError(f"artifact digest mismatch: {digest}")
@@ -221,7 +243,12 @@ class ArtifactStore:
                 handle.flush()
                 os.fsync(handle.fileno())
             ArtifactStore._verify_path(temporary, digest, len(content))
-            os.replace(temporary, target)
+            # The durable store commonly lives below an isolated HOME plus a
+            # project-id/object fan-out.  That can exceed the legacy MAX_PATH
+            # limit on Windows even though creating the temporary file worked.
+            # Use the Win32 extended-length form only at the atomic publish
+            # boundary; callers and persisted paths remain ordinary Paths.
+            os.replace(_extended_windows_path(temporary), _extended_windows_path(target))
             if os.name != "nt":
                 directory_fd = os.open(target.parent, os.O_RDONLY)
                 try:
@@ -234,7 +261,6 @@ class ArtifactStore:
             except FileNotFoundError:
                 pass
             raise
-
     def _write_metadata(self, digest: str, size_bytes: int, media_type: str) -> None:
         target = self.metadata_path(digest)
         payload = json.dumps(
@@ -252,10 +278,10 @@ class ArtifactStore:
 
     def _read_metadata(self, digest: str) -> dict[str, object]:
         path = self.metadata_path(digest)
-        if not path.is_file():
+        if not _path_is_file(path):
             return {}
         try:
-            data = json.loads(path.read_text(encoding="utf-8"))
+            data = json.loads(_read_path_bytes(path).decode("utf-8"))
         except (OSError, ValueError) as exc:
             raise ArtifactIntegrityError(f"invalid artifact metadata: {digest}") from exc
         if data.get("digest") != digest:

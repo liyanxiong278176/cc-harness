@@ -1,0 +1,4 @@
+2026-08-18T00:00:00Z register request accepted email=user@example.test
+2026-08-18T00:00:01Z password hash persisted result=success
+2026-08-18T00:00:02Z login request accepted email=user@example.test
+2026-08-18T00:00:03Z session issued result=success

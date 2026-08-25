@@ -58,6 +58,37 @@ def test_builds_version_pinned_claude_command(tmp_path: Path) -> None:
     assert not any("secret" in argument.lower() for argument in command)
 
 
+def test_builds_explicit_terminal_bench_budgets_and_agent_environment(tmp_path: Path) -> None:
+    command = build_harbor_command(
+        uvx="uvx",
+        project_root=tmp_path,
+        dataset="terminal-bench/terminal-bench-2-1@sha256:dataset",
+        task_name="terminal-bench/compile-compcert",
+        harness=HarnessKind.CC_HARNESS,
+        wheel_path=tmp_path / "cc_harness-0.1.0-py3-none-any.whl",
+        env_file=tmp_path / ".env",
+        jobs_dir=tmp_path / "jobs",
+        timeout_multiplier=2.0,
+        agent_timeout_multiplier=2.0,
+        agent_setup_timeout_multiplier=2.0,
+        environment_build_timeout_multiplier=2.0,
+        verifier_timeout_multiplier=2.0,
+        agent_env={"CC_HARNESS_TERMINAL_BENCH": "1", "MAX_ITERATIONS": "80"},
+    )
+
+    for option in (
+        "--timeout-multiplier",
+        "--agent-timeout-multiplier",
+        "--agent-setup-timeout-multiplier",
+        "--environment-build-timeout-multiplier",
+        "--verifier-timeout-multiplier",
+    ):
+        assert option in command
+        assert command[command.index(option) + 1] == "2.0"
+    assert "CC_HARNESS_TERMINAL_BENCH=1" in command
+    assert "MAX_ITERATIONS=80" in command
+
+
 def test_state_is_resumable_only_with_identical_config(tmp_path: Path) -> None:
     schedule = build_balanced_schedule(("task-one",), repetitions=1, random_seed=7)
     state_path = tmp_path / "state.json"

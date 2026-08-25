@@ -1035,8 +1035,8 @@ async def test_maybe_load_cross_session_cancels_in_progress_subagents():
 
 
 @pytest.mark.asyncio
-async def test_maybe_load_cross_session_calls_recall(monkeypatch):
-    """E3 D5: 启动 load 后调 layered_recall 一次。"""
+async def test_maybe_load_cross_session_defers_recall(monkeypatch):
+    """启动恢复不召回；首个用户回合才建立 L2/L3 会话快照。"""
     from cc_harness.repl import _maybe_load_cross_session, ReplState
     from cc_harness.project.models import Manifest, CrossSessionMode
     from cc_harness.memory.checkpoint import CheckpointRecord
@@ -1085,9 +1085,7 @@ async def test_maybe_load_cross_session_calls_recall(monkeypatch):
     assert len(state.tool_hash_snapshot["mcp__x__recall"]) == len("sha256:") + 64
     assert "+mcp__x__recall" in state.cross_session_tools_diff
 
-    # 验证 recall 被调过(若有 layered_recall)或至少不抛异常
-    if recall_called:
-        assert len(recall_called) >= 1
+    assert recall_called == []
     # 至少 state 不破 + mem_deps 保留
     assert state.mem_deps == {"service": MagicMock(), "retriever": MagicMock()} or state.mem_deps is not None
 

@@ -60,8 +60,12 @@ def test_goal_runtime_and_progress_round_trip() -> None:
 
 
 def test_plan_graph_rejects_cycles_and_enforces_depth_and_ownership() -> None:
-    graph = PlanGraph().add_node(PlanNode("child-a", "child", depth=1, owned_paths=("src/a.py",)))
-    graph = graph.add_node(PlanNode("child-b", "child", depth=1, owned_paths=("docs/",)))
+    graph = PlanGraph().add_node(
+        PlanNode("child-a", "child", depth=1, owned_paths=("src/a.py",), worktree_id="wt-a")
+    )
+    graph = graph.add_node(
+        PlanNode("child-b", "child", depth=1, owned_paths=("docs/",), worktree_id="wt-b")
+    )
     assert graph.can_run_parallel(("child-a", "child-b"))
     assert not graph.can_run_parallel(("child-a", "child-a"))
 

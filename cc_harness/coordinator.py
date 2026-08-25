@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import uuid
 from dataclasses import dataclass
 from typing import Any
@@ -11,7 +12,16 @@ from .artifacts import ArtifactStore
 from .followups import FollowUpService
 from .goals import GoalAssessment, GoalContractService
 from .run_events import EventActor, RunEvent
-from .run_model import CandidateChangeSet, GoalContract, PlanGraph, PlanNode, Run, RuntimeContract, RunStatus
+from .run_model import (
+    CandidateChangeSet,
+    EffectClass,
+    GoalContract,
+    PlanGraph,
+    PlanNode,
+    Run,
+    RuntimeContract,
+    RunStatus,
+)
 from .plan_graph import PlanGraphService
 from .run_projection import RunProjection
 from .run_store import RunStore
@@ -26,6 +36,11 @@ class RunRequest:
     excluded_scope: tuple[str, ...] = ()
     required_evidence: tuple[str, ...] = ()
     runtime_contract: RuntimeContract | None = None
+    plan_discovery: bool = False
+    # This is intentionally not inferred from task text.  Only an isolated
+    # official benchmark adapter may opt into this provenance, so words such
+    # as "push" in a fixture do not trigger the user-facing high-risk gate.
+    goal_provenance: str = "user"
 
 
 @dataclass(frozen=True)
@@ -85,10 +100,47 @@ class RunCoordinator:
             excluded_scope=request.excluded_scope,
             required_evidence=request.required_evidence,
         )
-        assessment = self.goals.assess(goal)
+        assessment = self.goals.assess(goal, goal_provenance=request.goal_provenance)
         await self.store.create_run(Run(run_id, goal, contract))
         actor = EventActor("client", "local-client")
-        await self._append(run_id, "RunCreated", {"goal": goal.to_dict(), "runtime_contract": contract.to_dict()}, actor)
+        await self._append(
+            run_id,
+            "RunCreated",
+            {
+                "goal": goal.to_dict(),
+                "runtime_contract": contract.to_dict(),
+                "goal_provenance": request.goal_provenance,
+            },
+            actor,
+        )
+        root_node = PlanNode(f"root-{run_id}", "root", depth=0)
+        root_plan = PlanGraph(nodes=(root_node,), revision=1)
+        await self._append(run_id, "PlanCreated", {"plan": root_plan.to_dict()}, actor)
+        await self._append(
+            run_id,
+            "TodoCreated",
+            {
+                "todo": {
+                    "id": root_node.node_id,
+                    "title": request.objective,
+                    "status": "pending",
+                    "active_sessions": [run_id],
+                    "plan_node_id": root_node.node_id,
+                }
+            },
+            actor,
+        )
+        if request.plan_discovery:
+            await self._append(
+                run_id,
+                "PlanDiscoveryStarted",
+                {
+                    "discovery_id": f"discovery-{run_id}",
+                    "mutation_gate": "read_only",
+                    "reason": "complex goal requires an explicit dependency plan",
+                },
+                actor,
+            )
         if assessment.accepted:
             await self._append(run_id, "GoalContractAccepted", {"goal": goal.to_dict()}, actor)
             await self._append(run_id, "RunQueued", {}, actor)
@@ -207,10 +259,90 @@ class RunCoordinator:
             max_child_depth=max_child_depth,
         )
         await self._append(run_id, "PlanCreated", {"plan": plan.to_dict()}, EventActor("coordinator", "local-coordinator"))
+        for node in plan.nodes:
+            await self._append(
+                run_id,
+                "TodoCreated",
+                {
+                    "todo": {
+                        "id": node.node_id,
+                        "title": node.node_id,
+                        "status": "pending",
+                        "active_sessions": [run_id],
+                        "plan_node_id": node.node_id,
+                    }
+                },
+                EventActor("coordinator", "local-coordinator"),
+            )
+        projection = await self.store.load_projection(run_id)
+        if projection.discovery_status == "awaiting":
+            await self._append(
+                run_id,
+                "PlanDiscoveryCompleted",
+                {
+                    "discovery_id": f"discovery-{run_id}",
+                    "result": "accepted",
+                    "plan_digest": plan.digest,
+                    "mutation_gate": "open",
+                },
+                EventActor("coordinator", "local-coordinator"),
+            )
+        return plan
+
+    async def complete_plan_discovery(
+        self,
+        run_id: str,
+        nodes: tuple[PlanNode, ...],
+        *,
+        max_concurrent_children: int = 3,
+        max_child_depth: int = 2,
+        reason: str = "read-only plan discovery completed",
+    ) -> PlanGraph:
+        """Commit a dependency plan and open mutations in one durable boundary."""
+
+        projection = await self.store.load_projection(run_id)
+        if projection.discovery_status != "awaiting":
+            raise ValueError("run is not waiting for plan discovery")
+        if any(
+            action.effect_class != "read_only"
+            and action.effect_class != EffectClass.READ_ONLY
+            for action in projection.actions
+        ):
+            raise ValueError("plan discovery cannot complete after a mutating action")
+        plan = self.plans.create(
+            nodes,
+            max_concurrent_children=max_concurrent_children,
+            max_child_depth=max_child_depth,
+        )
+        await self._append(
+            run_id,
+            "PlanCreated",
+            {"plan": plan.to_dict(), "discovery_reason": reason},
+            EventActor("coordinator", "local-coordinator"),
+        )
+        await self._append(
+            run_id,
+            "PlanDiscoveryCompleted",
+            {
+                "discovery_id": f"discovery-{run_id}",
+                "result": "accepted",
+                "plan_digest": plan.digest,
+                "mutation_gate": "open",
+            },
+            EventActor("coordinator", "local-coordinator"),
+        )
         return plan
 
     async def revise_plan(self, run_id: str, nodes: tuple[PlanNode, ...], *, reason: str) -> PlanGraph:
         view = await self.inspect(run_id)
+        if view.projection.discovery_status == "awaiting":
+            raise ValueError("plan mutation is blocked while discovery is active")
+        if any(
+            action.status.value in {"started", "succeeded"}
+            and action.effect_class not in {"read_only", EffectClass.READ_ONLY}
+            for action in view.projection.actions
+        ):
+            raise ValueError("plan mutation requires a quiescent run after mutating actions")
         revision = self.plans.revise(view.projection.plan, nodes, reason=reason)
         await self._append(
             run_id,
@@ -230,6 +362,8 @@ class RunCoordinator:
         depth: int = 1,
     ) -> ChildReceipt:
         parent = await self.inspect(parent_run_id)
+        if parent.projection.discovery_status == "awaiting":
+            raise ValueError("child delegation is blocked until plan discovery completes")
         self.plans.validate_child_depth(
             PlanGraph(
                 nodes=parent.projection.plan.nodes,
@@ -256,7 +390,61 @@ class RunCoordinator:
             {"child_run_id": child_id, "node_id": node_id, "depth": depth},
             EventActor("coordinator", "local-coordinator"),
         )
+        delegation = self.artifacts.put_text(
+            json.dumps(
+                {
+                    "schema_version": "cc-harness.child-delegation.v1",
+                    "parent_run_id": parent_run_id,
+                    "child_run_id": child_id,
+                    "node_id": node_id,
+                    "objective": objective,
+                    "acceptance_criteria": list(acceptance_criteria),
+                    "depth": depth,
+                    "allowed_scope": list(parent.projection.goal.allowed_scope if parent.projection.goal else ()),
+                    "excluded_scope": list(parent.projection.goal.excluded_scope if parent.projection.goal else ()),
+                },
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            ),
+            media_type="application/json; purpose=child-delegation",
+        )
+        await self._append(
+            parent_run_id,
+            "ChildDelegationCommitted",
+            {"child_run_id": child_id, "delegation_artifact": delegation.digest, "node_id": node_id},
+            EventActor("coordinator", "local-coordinator"),
+            artifact_refs=(delegation.digest,),
+        )
         await self._append(child_id, "RunCreated", {"goal": goal.to_dict(), "runtime_contract": contract.to_dict()}, EventActor("coordinator", "local-coordinator"))
+        await self._append(
+            child_id,
+            "PredecessorHandoffCommitted",
+            {
+                "predecessor_run_id": parent_run_id,
+                "handoff_artifact": delegation.digest,
+                "authorized_recall": [parent_run_id],
+                "node_id": node_id,
+            },
+            EventActor("coordinator", "local-coordinator"),
+            artifact_refs=(delegation.digest,),
+        )
+        child_plan = PlanGraph(nodes=(PlanNode(node_id, "child", depth=depth),), revision=1)
+        await self._append(child_id, "PlanCreated", {"plan": child_plan.to_dict()}, EventActor("coordinator", "local-coordinator"))
+        await self._append(
+            child_id,
+            "TodoCreated",
+            {
+                "todo": {
+                    "id": node_id,
+                    "title": objective,
+                    "status": "pending",
+                    "active_sessions": [child_id],
+                    "plan_node_id": node_id,
+                }
+            },
+            EventActor("coordinator", "local-coordinator"),
+        )
         await self._append(child_id, "GoalContractAccepted", {"goal": goal.to_dict()}, EventActor("coordinator", "local-coordinator"))
         await self._append(child_id, "RunQueued", {}, EventActor("coordinator", "local-coordinator"))
         return ChildReceipt(parent_run_id, child_id, node_id)
@@ -291,7 +479,15 @@ class RunCoordinator:
         queued = next(item for item in item.queue if item.follow_up_run_id == receipt.follow_up_run_id)
         return QueueReceipt(run_id, receipt.sequence, queued.message_artifact, receipt.follow_up_run_id)
 
-    async def _append(self, run_id: str, event_type: str, payload: dict[str, Any], actor: EventActor) -> RunEvent:
+    async def _append(
+        self,
+        run_id: str,
+        event_type: str,
+        payload: dict[str, Any],
+        actor: EventActor,
+        *,
+        artifact_refs: tuple[str, ...] = (),
+    ) -> RunEvent:
         projection = await self.store.load_projection(run_id)
         runtime_contract_digest = str(projection.runtime_contract_digest or "")
         if event_type == "RunCreated" and not runtime_contract_digest:
@@ -304,6 +500,7 @@ class RunCoordinator:
             runtime_contract_digest=runtime_contract_digest,
             payload=payload,
             lease_epoch=projection.lease_epoch if actor.kind == "worker" else 0,
+            artifact_refs=artifact_refs,
         )
         return await self.store.append(event, expected_sequence=projection.sequence)
 

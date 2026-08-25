@@ -16,6 +16,7 @@ from pathlib import Path
 from typing import Any
 
 from .artifacts import digest_bytes
+from .capability_gate import CapabilityContinuityResult, CapabilityGateReport
 from .legacy_import import LegacyImportReport, LegacyImporter
 from .migration_reconciliation import ReconciliationReport, reconcile_legacy_fixture
 from .run_store import RunStore
@@ -35,11 +36,18 @@ class CutoverReport:
     steps: tuple[str, ...]
     rollback_restore_path: Path | None = None
     object_manifest_path: Path | None = None
+    continuity: CapabilityContinuityResult | None = None
+    gate_report: CapabilityGateReport | None = None
 
     @property
     def ok(self) -> bool:
-        return (self.import_report is None or not self.import_report.blocking_errors) and (
-            self.reconciliation is None or self.reconciliation.ok
+        continuity_ok = self.continuity is None or self.continuity.eligible
+        gate_ok = self.gate_report is None or self.gate_report.passed
+        return (
+            (self.import_report is None or not self.import_report.blocking_errors)
+            and (self.reconciliation is None or self.reconciliation.ok)
+            and continuity_ok
+            and gate_ok
         )
 
     def to_dict(self) -> dict[str, Any]:
@@ -52,6 +60,8 @@ class CutoverReport:
             "steps": list(self.steps),
             "rollback_restore_path": str(self.rollback_restore_path) if self.rollback_restore_path else None,
             "object_manifest_path": str(self.object_manifest_path) if self.object_manifest_path else None,
+            "continuity": self.continuity.to_dict() if self.continuity else None,
+            "gate_report": self.gate_report.to_dict() if self.gate_report else None,
         }
 
 
@@ -89,6 +99,7 @@ class CutoverManager:
         backup_root: Path,
         old_db: Path | None = None,
         dry_run: bool = True,
+        gate_report: CapabilityGateReport | None = None,
     ) -> CutoverReport:
         if not dry_run:
             raise CutoverError("live cutover requires an explicit operator integration")
@@ -112,7 +123,15 @@ class CutoverManager:
         reconciliation = reconcile_legacy_fixture(legacy_fixture)
         steps.append("migration_reconciliation_completed")
         steps.extend(["new_supervisor_smoke_ready", "post_cutover_smoke_ready"])
-        return CutoverReport(rehearsal_id, True, backup_path, import_report, reconciliation, tuple(steps))
+        return CutoverReport(
+            rehearsal_id,
+            True,
+            backup_path,
+            import_report,
+            reconciliation,
+            tuple(steps),
+            gate_report=gate_report,
+        )
 
     async def cutover(
         self,
@@ -121,6 +140,8 @@ class CutoverManager:
         backup_root: Path | None = None,
         old_db: Path | None = None,
         operator_confirmation: str,
+        continuity: CapabilityContinuityResult | None = None,
+        gate_report: CapabilityGateReport | None = None,
     ) -> CutoverReport:
         """Perform the one-time local switch after explicit operator consent.
 
@@ -133,6 +154,14 @@ class CutoverManager:
 
         if operator_confirmation != "CUTOVER_DURABLE_RUNTIME":
             raise CutoverError("live cutover requires operator_confirmation=CUTOVER_DURABLE_RUNTIME")
+        if continuity is None or not continuity.eligible:
+            blockers = ", ".join(continuity.blockers) if continuity else "gate result missing"
+            raise CutoverError(
+                "live cutover requires a passing capability continuity gate: " + blockers
+            )
+        if gate_report is not None and not gate_report.passed:
+            blockers = ", ".join(gate_report.blockers)
+            raise CutoverError("live cutover requires a passing capability gate report: " + blockers)
         rehearsal_id = f"cutover-{int(time.time() * 1000)}"
         root = Path(backup_root or (self.project_root / ".cc-harness" / "backups"))
         backup_dir = root / rehearsal_id
@@ -208,6 +237,8 @@ class CutoverManager:
             reconciliation,
             tuple(steps),
             object_manifest_path=manifest_path,
+            continuity=continuity,
+            gate_report=gate_report,
         )
 
     def rollback_rehearsal(self, report: CutoverReport, restore_root: Path) -> CutoverReport:
@@ -226,6 +257,8 @@ class CutoverManager:
             steps,
             restore_path,
             report.object_manifest_path,
+            report.continuity,
+            report.gate_report,
         )
 
 

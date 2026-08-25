@@ -49,6 +49,8 @@ class ModelSegment:
     completion_candidate: Mapping[str, Any] | None = None
     progress: Mapping[str, Any] | None = None
     stop_reason: str = "model_stop"
+    usage: Mapping[str, int] = field(default_factory=dict)
+    reasoning_content: str = ""
 
     @classmethod
     def from_mapping(cls, value: Mapping[str, Any]) -> "ModelSegment":
@@ -65,6 +67,8 @@ class ModelSegment:
             ),
             progress=(dict(value["progress"]) if isinstance(value.get("progress"), Mapping) else None),
             stop_reason=str(value.get("stop_reason") or "model_stop"),
+            usage=(dict(value["usage"]) if isinstance(value.get("usage"), Mapping) else {}),
+            reasoning_content=str(value.get("reasoning_content") or ""),
         )
 
 
@@ -96,6 +100,8 @@ class SegmentOutcome:
     completion_candidate: CompletionCandidate | None = None
     progress: RunProgress | None = None
     stop_reason: str = "model_stop"
+    usage: Mapping[str, int] = field(default_factory=dict)
+    reasoning_content: str = ""
 
 
 class AgentKernel(Protocol):
@@ -134,11 +140,16 @@ class ReActKernel:
                     },
                 )
             )
-        candidate = (
-            CompletionCandidate.from_dict(segment.completion_candidate)
-            if segment.completion_candidate is not None
-            else None
-        )
+        candidate = None
+        if segment.completion_candidate is not None:
+            # Adapters should validate provider-shaped completion markers, but
+            # keep this seam defensive for custom adapters and replayed data.
+            # A malformed marker is a recoverable model protocol error, not a
+            # reason to leave the durable run RUNNING or crash its worker.
+            try:
+                candidate = CompletionCandidate.from_dict(segment.completion_candidate)
+            except (KeyError, TypeError, ValueError):
+                candidate = None
         progress = RunProgress.from_dict(segment.progress) if segment.progress is not None else None
         return SegmentOutcome(
             model_text=segment.text,
@@ -147,6 +158,8 @@ class ReActKernel:
             completion_candidate=candidate,
             progress=progress,
             stop_reason=segment.stop_reason,
+            usage=dict(segment.usage),
+            reasoning_content=segment.reasoning_content,
         )
 
     @staticmethod

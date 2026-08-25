@@ -73,3 +73,16 @@ def test_abandoned_temporary_files_can_be_cleaned(tmp_path) -> None:
     removed = store.cleanup_temporary_files()
     assert temp in removed
     assert not temp.exists()
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows extended-length path contract")
+def test_atomic_publish_supports_windows_paths_beyond_legacy_max_path(tmp_path) -> None:
+    deep = tmp_path
+    while len(str(deep / "objects" / ("f" * 64))) <= 280:
+        deep /= "isolated-durable-home"
+    store = ArtifactStore(deep / "objects")
+
+    ref = store.put(b"long-path durable evidence", media_type="text/plain")
+
+    assert store.read(ref.digest) == b"long-path durable evidence"
+    assert store.verify(ref.digest).media_type == "text/plain"

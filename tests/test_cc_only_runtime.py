@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import asyncio
 import json
+import urllib.error
+import urllib.request
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from types import SimpleNamespace
@@ -13,7 +15,19 @@ from eval.cc_only.adapters import (
     LoCoMoAdapter,
     Safety8Adapter,
     SweBenchVerifiedAdapter,
+    TerminalBench20Adapter,
     TerminalBenchAdapter,
+)
+from eval.cc_only.adapters.harbor import (
+    TERMINAL_BENCH_21_DATASET,
+    _cleanup_owned_harbor_resources,
+    _docker_healthcheck,
+    _docker_snapshot,
+    _harbor_failure_diagnostic,
+    _harbor_usage,
+    _terminal_bench_errored_grade,
+    _terminal_agent_timeout,
+    _transient_text,
 )
 from eval.cc_only.adapters.agentharm import _portfolio
 from eval.cc_only.adapters.common import capability_activation
@@ -41,9 +55,25 @@ from eval.cc_only.contracts import (
     TrialStatus,
 )
 from eval.cc_only.launch import build_cc_invocation
-from eval.cc_only.runner import _ensure_preflight, _safe_progress, run_benchmark
-from eval.cc_only.storage import RunStateStore, atomic_json, read_json
+from eval.cc_only.provider_proxy import ScopedProviderProxy, _upstream_url
+from eval.cc_only.runner import (
+    _classify_terminal_infrastructure,
+    _ensure_preflight,
+    _generation_attempt_count,
+    _retryable_infrastructure_result,
+    _safe_progress,
+    _terminal_cost_cny,
+    run_benchmark,
+)
+from eval.cc_only.storage import (
+    RunStateStore,
+    _observability_resume_compatible,
+    atomic_json,
+    read_json,
+    task_path_slug,
+)
 from eval.locomo.evaluator import token_f1
+from scripts.run_cc_only_benchmark import _known_run_error_message
 
 
 def test_frozen_catalog_sizes() -> None:
@@ -55,6 +85,323 @@ def test_frozen_catalog_sizes() -> None:
     assert len(SweBenchVerifiedAdapter().catalog(root, EvalProfile.FULL)) == 500
     assert len(TerminalBenchAdapter().catalog(root, EvalProfile.PORTFOLIO)) == 30
     assert len(TerminalBenchAdapter().catalog(root, EvalProfile.FULL)) == 89
+    assert len(TerminalBench20Adapter().catalog(root, EvalProfile.FULL)) == 89
+
+
+def test_terminal_bench_21_catalog_is_pinned_and_complete() -> None:
+    root = Path(__file__).resolve().parents[1]
+    adapter = TerminalBenchAdapter()
+    tasks = adapter.catalog(root, EvalProfile.FULL)
+
+    assert adapter.dataset == TERMINAL_BENCH_21_DATASET
+    assert TERMINAL_BENCH_21_DATASET.startswith(
+        "terminal-bench/terminal-bench-2-1@sha256:"
+    )
+    assert len({task.task_id for task in tasks}) == 89
+    assert all(task.group for task in tasks)
+    assert all(task.payload.get("source_digest") for task in tasks)
+    assert all(
+        str(task.payload.get("harbor_task_name")).startswith("terminal-bench/")
+        for task in tasks
+    )
+
+
+def test_terminal_agent_timeout_reads_only_public_task_metadata(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    task_root = (
+        tmp_path
+        / ".cache"
+        / "harbor"
+        / "tasks"
+        / "packages"
+        / "terminal-bench"
+        / "example"
+        / "abc"
+    )
+    task_root.mkdir(parents=True)
+    (task_root / "task.toml").write_text(
+        '[task]\nname = "terminal-bench/example"\n\n[agent]\ntimeout_sec = 900.0\n',
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(Path, "home", classmethod(lambda cls: tmp_path))
+
+    assert _terminal_agent_timeout("terminal-bench/example", "sha256:abc") == 900.0
+
+
+def test_terminal_bench_official_summary_counts_invalid_as_zero() -> None:
+    summary = TerminalBenchAdapter().summarize(
+        [
+            {
+                "status": "pass",
+                "group": "software-engineering",
+                "metrics": {"reward": 0.25},
+            },
+            {
+                "status": "invalid",
+                "group": "security",
+                "metrics": {},
+            },
+        ]
+    )
+
+    assert summary["successful_tasks"] == 1
+    assert summary["official_denominator"] == 89
+    assert summary["single_pass_accuracy"] == pytest.approx(1 / 89)
+    assert summary["by_category"]["security"]["accuracy"] == 0
+    assert summary["leaderboard_compatible"] is False
+
+
+def test_terminal_bench_preserves_verifier_pass_after_agent_timeout() -> None:
+    grade = _terminal_bench_errored_grade(
+        {
+            "n_errored_trials": 1,
+            "evals": {"terminal-bench": {"metrics": [{"mean": 1.0}]}},
+        },
+        {
+            "exception_info": {"exception_type": "AgentTimeoutError"},
+            "verifier_result": {"rewards": {"reward": 1.0}},
+        },
+    )
+
+    assert grade == (TrialStatus.PASS, 1.0)
+
+
+def test_terminal_bench_does_not_invent_grade_for_unverified_timeout() -> None:
+    grade = _terminal_bench_errored_grade(
+        {"n_errored_trials": 1, "evals": {}},
+        {"exception_info": {"exception_type": "AgentTimeoutError"}},
+    )
+
+    assert grade is None
+
+
+def test_terminal_bench_conservative_cost_uses_peak_cny_tariff() -> None:
+    cost = _terminal_cost_cny(
+        [
+            {
+                "usage": {
+                    "uncached_input_tokens": 1_000_000,
+                    "cache_creation_input_tokens": 1_000_000,
+                    "cache_read_input_tokens": 1_000_000,
+                    "output_tokens": 1_000_000,
+                }
+            }
+        ]
+    )
+
+    assert cost == pytest.approx(15.1)
+
+
+def test_terminal_bench_retries_named_rate_limit_exceptions() -> None:
+    assert _transient_text("ApiRateLimitError: provider returned 429") is True
+    assert _transient_text("ApiUsageLimitError: quota temporarily exceeded") is True
+    assert _transient_text("RateLimitError: too many requests") is True
+    assert _transient_text("curl: (56) Failure when receiving data from the peer") is True
+    assert _transient_text("http.client.IncompleteRead: incomplete chunked read") is True
+    assert _transient_text("provider proxy stream failure: IncompleteRead") is True
+    assert _transient_text("AgentTimeoutError: command timed out") is False
+
+
+def test_terminal_bench_retries_pypi_tls_disconnects() -> None:
+    diagnostic = (
+        "error: Failed to fetch: https://pypi.org/simple/multidict/; "
+        "peer closed connection without sending TLS close_notify"
+    )
+
+    assert _transient_text(diagnostic) is True
+
+
+def test_terminal_bench_retries_network_evidence_even_when_harbor_flag_is_false() -> None:
+    outcome = TrialOutcome(
+        status=TrialStatus.INVALID,
+        invalid_reason=(
+            "Failed to fetch https://pypi.org/simple/multidict/: "
+            "peer closed connection without sending TLS close_notify"
+        ),
+        protocol={
+            "exception_is_infrastructure": True,
+            "transient_infrastructure": False,
+        },
+    )
+
+    assert _classify_terminal_infrastructure(outcome) == "transient"
+
+    dependency_outage = TrialOutcome(
+        status=TrialStatus.INVALID,
+        invalid_reason="dependency download failed because of TLS close_notify",
+        protocol={
+            "exception_is_infrastructure": True,
+            "transient_infrastructure": False,
+        },
+    )
+    assert _classify_terminal_infrastructure(dependency_outage) == "transient"
+
+
+def test_terminal_bench_docker_healthcheck_retries_until_ready(monkeypatch) -> None:
+    calls = 0
+    sleeps: list[float] = []
+
+    class Completed:
+        def __init__(self, returncode: int, stdout: str = "", stderr: str = "") -> None:
+            self.returncode = returncode
+            self.stdout = stdout
+            self.stderr = stderr
+
+    def fake_run(_command, **_kwargs):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            return Completed(1, stderr="Cannot connect to the Docker daemon")
+        return Completed(0, stdout="/var/lib/docker\n")
+
+    monkeypatch.setattr("eval.cc_only.adapters.harbor.shutil.which", lambda _: "docker")
+    monkeypatch.setattr("eval.cc_only.adapters.harbor.subprocess.run", fake_run)
+    monkeypatch.setattr("eval.cc_only.adapters.harbor.time.sleep", sleeps.append)
+
+    result = _docker_healthcheck(attempts=3, backoffs=(0.25, 0.5))
+
+    assert result["ready"] is True
+    assert result["attempts"] == 2
+    assert calls == 2
+    assert sleeps == [0.25]
+
+
+def test_terminal_bench_preserves_agent_and_tool_call_telemetry() -> None:
+    usage = _harbor_usage(
+        {
+            "n_input_tokens": 100,
+            "n_cache_tokens": 80,
+            "n_output_tokens": 20,
+            "cost_usd": 0.25,
+        },
+        {"agent_result": {"metadata": {"model_calls": 7, "tool_calls": 9}}},
+    )
+
+    assert usage["model_calls"] == 7
+    assert usage["tool_calls"] == 9
+
+
+def test_terminal_bench_recovers_telemetry_from_rate_limit_error_text() -> None:
+    usage = _harbor_usage(
+        {},
+        {
+            "exception_info": {
+                "exception_message": '{"usage":{"model_calls":11,"tool_calls":13}}'
+            }
+        },
+    )
+
+    assert usage["model_calls"] == 11
+    assert usage["tool_calls"] == 13
+
+
+def test_terminal_bench_cleanup_stops_only_new_owned_running_containers(monkeypatch) -> None:
+    calls: list[list[str]] = []
+
+    class Completed:
+        returncode = 0
+        stderr = ""
+        stdout = ""
+
+    def fake_run(command, **kwargs):
+        del kwargs
+        calls.append(list(command))
+        return Completed()
+
+    monkeypatch.setattr("eval.cc_only.adapters.harbor.shutil.which", lambda _: "docker")
+    monkeypatch.setattr("eval.cc_only.adapters.harbor.subprocess.run", fake_run)
+    result = _cleanup_owned_harbor_resources(
+        {"available": True, "containers": {"old": {}}, "images": [], "volumes": []},
+        {
+            "available": True,
+            "containers": {
+                "old": {},
+                "owned": {
+                    "Labels": "com.docker.compose.project.config_files=harbor",
+                    "State": "running",
+                },
+                "unrelated": {"Labels": "compose.project=other", "State": "running"},
+            },
+            "images": [],
+            "volumes": [],
+        },
+    )
+
+    assert calls == [
+        ["docker", "stop", "--time", "10", "owned"],
+        ["docker", "rm", "owned"],
+    ]
+    assert result["stopped_containers"] == ["owned"]
+    assert result["removed_containers"] == ["owned"]
+    assert result["retained_candidates"] == [
+        {"id": "unrelated", "owned": False, "status": "running"}
+    ]
+
+
+def test_terminal_bench_docker_snapshot_uses_utf8_replacement(monkeypatch) -> None:
+    calls: list[dict[str, object]] = []
+
+    class Completed:
+        returncode = 0
+        stderr = ""
+        stdout = ""
+
+    def fake_run(command, **kwargs):
+        del command
+        calls.append(kwargs)
+        return Completed()
+
+    monkeypatch.setattr("eval.cc_only.adapters.harbor.shutil.which", lambda _: "docker")
+    monkeypatch.setattr("eval.cc_only.adapters.harbor.subprocess.run", fake_run)
+
+    snapshot = _docker_snapshot()
+
+    assert snapshot["available"] is True
+    assert calls
+    assert all(call["encoding"] == "utf-8" for call in calls)
+    assert all(call["errors"] == "replace" for call in calls)
+
+
+def test_terminal_bench_contract_mismatch_is_reported_without_traceback() -> None:
+    message = _known_run_error_message(
+        ValueError(
+            "existing result root has a different immutable input contract; "
+            "use the original command or a different profile/result root"
+        )
+    )
+
+    assert message is not None
+    assert "no model calls" in message
+    assert "--new-run" in message
+
+
+def test_terminal_provider_proxy_requires_scoped_token_and_allowed_endpoint() -> None:
+    proxy = ScopedProviderProxy(
+        upstream_base_url="https://api.example.invalid/v1",
+        upstream_api_key="real-secret",
+    )
+    proxy.start()
+    local_url = proxy.container_base_url.replace("host.docker.internal", "127.0.0.1")
+    try:
+        with pytest.raises(urllib.error.HTTPError) as unauthorized:
+            urllib.request.urlopen(local_url + "/models", timeout=2)  # noqa: S310
+        assert unauthorized.value.code == 401
+
+        request = urllib.request.Request(
+            local_url + "/files",
+            headers={"Authorization": f"Bearer {proxy.token}"},
+        )
+        with pytest.raises(urllib.error.HTTPError) as forbidden:
+            urllib.request.urlopen(request, timeout=2)  # noqa: S310
+        assert forbidden.value.code == 404
+    finally:
+        proxy.close()
+
+    assert (
+        _upstream_url("https://api.deepseek.com/v1", "/v1/chat/completions?x=1")
+        == "https://api.deepseek.com/v1/chat/completions?x=1"
+    )
 
 
 def test_progress_sink_failure_is_fail_soft() -> None:
@@ -70,6 +417,128 @@ def test_progress_sink_failure_is_fail_soft() -> None:
     progress("second")
 
     assert calls == ["first"]
+
+
+def test_persisted_provider_balance_failure_is_retryable(tmp_path: Path) -> None:
+    result = tmp_path / "raw" / "result.json"
+    result.parent.mkdir(parents=True)
+    result.write_text(
+        json.dumps(
+            {
+                "status": "fail",
+                "failure_reason": "APIStatusError: 402 Insufficient Balance",
+                "protocol": {"official_checker": False},
+            }
+        ),
+        encoding="utf-8",
+    )
+    trial = {"status": "fail", "result": "raw/result.json"}
+    assert _retryable_infrastructure_result(tmp_path, trial) is True
+
+    trial["result"] = "raw/missing.json"
+    assert _retryable_infrastructure_result(tmp_path, trial) is False
+
+
+def test_terminal_infrastructure_classification_stops_deterministic_retries() -> None:
+    environment = TrialOutcome(
+        status=TrialStatus.INVALID,
+        invalid_reason="ModuleNotFoundError: No module named 'exceptiongroup'",
+        protocol={"exception_is_infrastructure": True},
+    )
+    transient = TrialOutcome(
+        status=TrialStatus.INVALID,
+        invalid_reason="provider proxy stream failure",
+        protocol={"exception_is_infrastructure": True, "transient_infrastructure": True},
+    )
+
+    assert _classify_terminal_infrastructure(environment) == "environment_not_ready"
+    assert _classify_terminal_infrastructure(transient) == "transient"
+
+
+def test_resume_artifact_refresh_requires_explicit_opt_in(monkeypatch) -> None:
+    previous = {
+        "benchmark": "terminal-bench-2.1",
+        "adapter_run_identity": {
+            "git_dirty_digest": "old-dirty",
+            "wheel_sha256": "old-wheel",
+            "dataset": "pinned",
+        },
+    }
+    current = {
+        "benchmark": "terminal-bench-2.1",
+        "adapter_run_identity": {
+            "git_dirty_digest": "new-dirty",
+            "wheel_sha256": "new-wheel",
+            "dataset": "pinned",
+        },
+    }
+    monkeypatch.setenv("CC_HARNESS_ALLOW_OBSERVABILITY_RESUME", "1")
+    monkeypatch.delenv("CC_HARNESS_ALLOW_RESUME_ARTIFACT_REFRESH", raising=False)
+    assert _observability_resume_compatible(previous, current) is False
+
+    monkeypatch.setenv("CC_HARNESS_ALLOW_RESUME_ARTIFACT_REFRESH", "1")
+    assert _observability_resume_compatible(previous, current) is True
+
+
+def test_terminal_infrastructure_classification_reads_nested_harbor_evidence(
+    tmp_path: Path,
+) -> None:
+    job_root = tmp_path / "job"
+    trial_root = job_root / "task__abc"
+    (trial_root / "agent").mkdir(parents=True)
+    (trial_root / "agent" / "cc-harness.stderr").write_text(
+        "requests.exceptions.SSLError: UNEXPECTED_EOF_WHILE_READING\n",
+        encoding="utf-8",
+    )
+    diagnostic = _harbor_failure_diagnostic(
+        job_root,
+        {"stats": {"n_errored_trials": 1}},
+        {
+            "exception_info": {
+                "exception_type": "NonZeroAgentExitCodeError",
+                "exception_message": "command failed",
+            }
+        },
+    )
+    transient = TrialOutcome(
+        status=TrialStatus.INVALID,
+        invalid_reason="Harbor trial errored",
+        protocol={
+            "exception_is_infrastructure": True,
+            "failure_diagnostic": diagnostic,
+        },
+    )
+
+    assert "UNEXPECTED_EOF" in diagnostic
+    assert _classify_terminal_infrastructure(transient) == "transient"
+
+
+def test_terminal_infrastructure_classification_detects_nested_verifier_import_error(
+    tmp_path: Path,
+) -> None:
+    job_root = tmp_path / "job"
+    trial_root = job_root / "task__abc"
+    trial_root.mkdir(parents=True)
+    diagnostic = _harbor_failure_diagnostic(
+        job_root,
+        {"stats": {"n_errored_trials": 1}},
+        {
+            "exception_info": {
+                "exception_type": "NonZeroAgentExitCodeError",
+                "exception_message": "ModuleNotFoundError: No module named 'typing_extensions'",
+            }
+        },
+    )
+    outcome = TrialOutcome(
+        status=TrialStatus.INVALID,
+        invalid_reason="Harbor trial errored",
+        protocol={
+            "exception_is_infrastructure": True,
+            "failure_diagnostic": diagnostic,
+        },
+    )
+
+    assert _classify_terminal_infrastructure(outcome) == "environment_not_ready"
 
 
 def test_locomo_answer_contract_keeps_audit_text_out_of_token_f1() -> None:
@@ -368,6 +837,81 @@ def test_store_reuses_interrupted_attempt_without_overwriting(tmp_path: Path) ->
     assert resumed_root == attempt_root
     assert record["resume_count"] == 1
     assert record["status"] == "running"
+
+
+def test_terminal_interrupted_attempt_restarts_from_frozen_task_state(tmp_path: Path) -> None:
+    store = RunStateStore(tmp_path / "terminal-result")
+    task = BenchmarkTask("terminal-bench/fixture")
+    state = store.initialize(
+        contract={"benchmark": "terminal-bench-2.1"}, tasks=(task,)
+    )
+    attempt, first_root, first_record = store.begin_attempt(
+        state, task, 1, reuse_interrupted=False
+    )
+    first_record["status"] = TrialStatus.INTERRUPTED.value
+
+    resumed_attempt, resumed_root, resumed_record = store.begin_attempt(
+        state, task, 1, reuse_interrupted=False
+    )
+
+    assert attempt == 1
+    assert resumed_attempt == 2
+    assert resumed_root != first_root
+    assert resumed_record.get("resume_count", 0) == 0
+
+
+def test_interrupted_checkpoint_does_not_consume_single_attempt_budget() -> None:
+    trial = {
+        "attempts": [
+            {"retry_generation": 0, "status": TrialStatus.INTERRUPTED.value},
+            {"retry_generation": 0, "status": TrialStatus.PASS.value},
+            {"retry_generation": 1, "status": TrialStatus.FAIL.value},
+        ]
+    }
+
+    assert _generation_attempt_count(trial, 0) == 1
+    assert _generation_attempt_count(trial, 1) == 1
+
+
+def test_task_path_slug_bounds_long_ids_and_keeps_distinct_trials() -> None:
+    first = "standard/attacked/workspace/user_task_0/injection_task_0/direct"
+    second = first.rsplit("/", 1)[0] + "/ignore_previous"
+
+    first_slug = task_path_slug(first)
+    second_slug = task_path_slug(second)
+
+    assert len(first_slug) <= 28
+    assert len(second_slug) <= 28
+    assert first_slug != second_slug
+    assert first_slug.rsplit("-", 1)[-1] != second_slug.rsplit("-", 1)[-1]
+
+
+def test_store_compacts_legacy_long_interrupted_attempt_path(tmp_path: Path) -> None:
+    store = RunStateStore(tmp_path / "result")
+    task = BenchmarkTask("terminal-bench/llm-inference-batching-scheduler")
+    state = store.initialize(contract={"benchmark": "terminal-bench-2.1"}, tasks=(task,))
+    _attempt, original_root, record = store.begin_attempt(
+        state, task, 15, reuse_interrupted=False
+    )
+    legacy_root = (
+        store.root
+        / "raw"
+        / "0015-terminal-bench-ll-a9fef79c2a"
+        / "attempt-1"
+    )
+    legacy_root.parent.mkdir(parents=True, exist_ok=True)
+    original_root.replace(legacy_root)
+    record["path"] = legacy_root.relative_to(store.root).as_posix()
+    record["status"] = TrialStatus.INTERRUPTED.value
+    state["trials"][task.task_id]["status"] = "pending"
+
+    resumed_attempt, resumed_root, resumed_record = store.begin_attempt(state, task, 15)
+
+    assert resumed_attempt == 1
+    assert resumed_root != legacy_root
+    assert len(str(resumed_root / "jobs")) <= 150
+    assert resumed_record["path"] == resumed_root.relative_to(store.root).as_posix()
+    assert not legacy_root.exists()
 
 
 def test_store_reuses_checkpoint_preserving_invalid_attempt(tmp_path: Path) -> None:
@@ -858,6 +1402,146 @@ def test_check_only_task_limit_uses_isolated_subset_contract(tmp_path: Path) -> 
     manifest = read_json(output / "manifest.json")
     assert len(catalog["tasks"]) == 1
     assert manifest["task_limit"] == 1
+
+
+def test_terminal_infrastructure_exhaustion_defers_task_without_stopping_batch(
+    tmp_path: Path,
+) -> None:
+    class Adapter:
+        slug = "terminal-bench-2.1"
+        title = "Terminal-Bench fixture"
+        protocol_version = "fixture.v1"
+        capability_profile = "clean-coding"
+        adaptations = ()
+        max_automatic_attempts = 2
+        infrastructure_ready = False
+        executed: list[str] = []
+
+        def catalog(self, _project_root, _profile):
+            return (
+                BenchmarkTask("terminal-bench/infrastructure-fixture"),
+                BenchmarkTask("terminal-bench/healthy-fixture"),
+            )
+
+        def check(self, _project_root, _profile, _tasks):
+            return CheckResult(ready=True, details={"tasks": 2})
+
+        async def execute(self, context):
+            self.executed.append(context.task.task_id)
+            if (
+                context.task.task_id == "terminal-bench/infrastructure-fixture"
+                and not self.infrastructure_ready
+            ):
+                return TrialOutcome(
+                    status=TrialStatus.INVALID,
+                    invalid_reason="provider proxy stream failure",
+                    protocol={"exception_is_infrastructure": True},
+                )
+            return TrialOutcome(status=TrialStatus.PASS, metrics={"reward": 1.0})
+
+        def summarize(self, _outcomes):
+            return {}
+
+    output = tmp_path / "result"
+    adapter = Adapter()
+    asyncio.run(
+        run_benchmark(
+            adapter,
+            tmp_path,
+            output,
+            profile=EvalProfile.FULL,
+            cooldown_scale=0,
+        )
+    )
+
+    state = read_json(output / "state.json")
+    trial = state["trials"]["terminal-bench/infrastructure-fixture"]
+    assert trial["status"] == "pending"
+    assert "result" not in trial
+    assert len(trial["attempts"]) == 1
+    assert trial["attempts"][0]["resume_count"] == 1
+    for attempt in trial["attempts"]:
+        assert attempt["status"] == "interrupted"
+        evidence = output / attempt["infrastructure_evidence"]
+        assert evidence.is_file()
+        assert read_json(evidence)["status"] == "invalid"
+        assert not (evidence.parent / "result.json").exists()
+    retained = list((output / trial["attempts"][0]["path"] / "infrastructure-results").glob("infrastructure-*.json"))
+    assert len(retained) == 1
+    assert state["trials"]["terminal-bench/healthy-fixture"]["status"] == "pass"
+    assert adapter.executed[-1] == "terminal-bench/healthy-fixture"
+    first_summary = read_json(output / "summary.json")
+    assert first_summary["status"] == "incomplete"
+    assert first_summary["counts"] == {"pass": 1, "fail": 0, "invalid": 0, "pending": 1}
+    assert first_summary["pending_tasks"] == [
+        "terminal-bench/infrastructure-fixture"
+    ]
+    assert first_summary["infrastructure_events"][-1]["reason"] == (
+        "terminal_infrastructure_deferred"
+    )
+
+    adapter.infrastructure_ready = True
+    adapter.executed.clear()
+    asyncio.run(run_benchmark(adapter, tmp_path, output, profile=EvalProfile.FULL))
+    resumed_state = read_json(output / "state.json")
+    resumed_trial = resumed_state["trials"]["terminal-bench/infrastructure-fixture"]
+    assert resumed_trial["status"] == "pass"
+    assert resumed_state["retry_generation"] == 1
+    assert adapter.executed == ["terminal-bench/infrastructure-fixture"]
+    final_summary = read_json(output / "summary.json")
+    assert final_summary["status"] == "complete"
+    assert final_summary["counts"] == {"pass": 2, "fail": 0, "invalid": 0, "pending": 0}
+    assert final_summary["pending_tasks"] == []
+
+
+def test_exact_task_manifest_selects_frozen_ids_without_name_guessing(tmp_path: Path) -> None:
+    class Adapter:
+        slug = "exact-selection"
+        title = "Exact selection"
+        protocol_version = "fixture.v1"
+        capability_profile = "benchmark-one-shot"
+        adaptations = ()
+
+        def catalog(self, _project_root, _profile):
+            return tuple(BenchmarkTask(f"task/{index}") for index in range(3))
+
+        def check(self, _project_root, _profile, tasks):
+            assert len(tasks) == 3
+            return CheckResult(ready=True, details={"catalog_tasks": len(tasks)})
+
+        async def execute(self, _context):
+            raise AssertionError("check-only mode must not execute a model trial")
+
+        def summarize(self, _outcomes):
+            return {}
+
+    manifest_path = tmp_path / "regression.json"
+    manifest_path.write_text(
+        json.dumps(
+            {
+                "tasks": [
+                    {"task_id": "task/2", "reason": "baseline failure"},
+                    {"task_id": "task/0", "reason": "control"},
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+    output = tmp_path / "result"
+    asyncio.run(
+        run_benchmark(
+            Adapter(),
+            tmp_path,
+            output,
+            profile=EvalProfile.FULL,
+            check_only=True,
+            task_manifest=manifest_path,
+        )
+    )
+    catalog = read_json(output / "catalog.json")
+    manifest = read_json(output / "manifest.json")
+    assert [item["task_id"] for item in catalog["tasks"]] == ["task/2", "task/0"]
+    assert manifest["task_selection"] == ["task/2", "task/0"]
 
 
 def test_rerun_sample_only_reopens_selected_terminal_trial(tmp_path: Path, monkeypatch) -> None:

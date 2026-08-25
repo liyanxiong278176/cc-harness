@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import contextlib
 import io
 import json
@@ -13,8 +14,6 @@ from datetime import datetime
 from pathlib import Path
 from typing import Awaitable, Callable
 
-from openai import AsyncOpenAI
-
 from cc_harness.activation import ActivationManifest, CapabilityProfile
 from cc_harness.agent import run_turn
 from cc_harness.atomic import atomic_write_text
@@ -22,18 +21,15 @@ from cc_harness.config import (
     AppConfig,
     ConfigError,
     ExecutorBackend,
-    load_context_config,
     load_executor_config,
-    load_l2_config,
-    load_l5_config,
+    load_context_config,
     load_layered_config,
-    load_policy_config,
 )
+from cc_harness.capability_services import SharedCapabilityServices
 from cc_harness.context import ContextProjection
 from cc_harness.l2 import REFUSAL_TEMPLATE, scan_user_input
-from cc_harness.l5 import build_l5_engine
 from cc_harness.llm import LLMClient
-from cc_harness.loop_control import LoopControlConfig
+from cc_harness.loop_control import LoopControlConfig, completion_contract_from_instruction
 from cc_harness.mcp_client import MCPClient
 from cc_harness.policy import PolicyEngine
 from cc_harness.repl import ReplState, _after_turn_memory, _after_turn_todo, _extract_final_text
@@ -48,6 +44,12 @@ def _effective_resume_mode(requested_mode: str | None, saved_mode: str | None) -
     """Keep an explicit mode when resuming; otherwise use the saved mode."""
 
     return requested_mode or saved_mode or "coding"
+
+
+def _env_flag(name: str) -> bool:
+    """Return whether a boolean runtime environment flag is enabled."""
+
+    return os.getenv(name, "").strip().lower() in {"1", "true", "yes", "on"}
 
 
 @dataclass
@@ -81,9 +83,17 @@ class SessionRuntime:
         self.capability_profile = CapabilityProfile.named("standard")
         self.activation_manifest: ActivationManifest | None = None
         self.context_projection: ContextProjection | None = None
+        # ``None`` is retained for lightweight tests/callers that construct a
+        # runtime directly instead of going through ``create``.  A fully
+        # initialized runtime captures one value and reuses it for the
+        # activation artifact and every ``run_turn`` invocation.
+        self.output_egress_guard_enabled: bool | None = None
         self.max_iterations: int | None = 20
         self.warnings: list[RuntimeWarning] = []
         self._closed = False
+        self.shared_services: SharedCapabilityServices | None = None
+        self._turn_lock = asyncio.Lock()
+        self._queue_waiters: dict[int, tuple[asyncio.Future, EventEmitter, ConfirmHandler]] = {}
 
     @classmethod
     async def create(
@@ -147,6 +157,10 @@ class SessionRuntime:
             if isinstance(profile_name, CapabilityProfile)
             else CapabilityProfile.named(profile_name)
         )
+        self.output_egress_guard_enabled = (
+            self.capability_profile.name == "hardened-safety"
+            or _env_flag("CC_HARNESS_OUTPUT_EGRESS_GUARD")
+        )
         self.bare = self.capability_profile.name == "clean-coding"
         if self.capability_profile.name == "hardened-safety" and host_execution:
             raise ValueError("hardened-safety cannot be combined with host execution")
@@ -160,31 +174,28 @@ class SessionRuntime:
         self.mcp = MCPClient(self.config.mcp_servers)
 
         policy_path = self.cwd / "policy.yaml"
-        policy_cfg = load_policy_config(policy_path)
-        self.policy = PolicyEngine(
-            project_root=self.cwd,
-            enabled=policy_cfg.enabled,
+        context_config = load_context_config(
+            model=self.config.openai_model,
+            require_known=self.capability_profile.name == "context-eval",
+        )
+        self.shared_services = SharedCapabilityServices.load(
+            self.cwd,
+            self.config,
+            profile=self.capability_profile,
             additional_roots=self.additional_dirs,
+            host_execution=host_execution,
+            context_config=context_config,
         )
-        self.e1_decompose_enabled = policy_cfg.e1_decompose_enabled
-        self.l5 = build_l5_engine(load_l5_config(policy_path))
-        self.l2_config = load_l2_config(policy_path)
-        self.l2_client = (
-            AsyncOpenAI(
-                api_key=self.config.openai_api_key,
-                base_url=self.config.openai_base_url,
-            )
-            if self.l2_config.enabled
-            else None
-        )
-        self.l2_model = os.getenv("JUDGE_MODEL") or self.config.openai_model
+        self.policy = self.shared_services.policy
+        self.e1_decompose_enabled = self.shared_services.e1_decompose_enabled
+        self.l5 = self.shared_services.l5
+        self.l2_config = self.shared_services.l2_config
+        self.l2_client = self.shared_services.l2_client
+        self.l2_model = self.shared_services.l2_model
 
         self.state = ReplState(
             mode=_effective_resume_mode(mode, None),
-            context_config=load_context_config(
-                model=self.config.openai_model,
-                require_known=self.capability_profile.name == "context-eval",
-            ),
+            context_config=context_config,
             session_id=session_id or f"session-{int(time.time())}-{uuid.uuid4().hex[:8]}",
         )
         self.state.project_root = self.cwd
@@ -227,6 +238,8 @@ class SessionRuntime:
         self.context_projection = ContextProjection(
             self.state.messages,
             artifact_dir=self.cwd / ".cc-harness" / "context" / self.state.session_id,
+            state_db_path=self.session_store.db_path if self.session_store is not None else None,
+            context_id=self.state.session_id,
         )
 
         configured = len(self.config.mcp_servers)
@@ -292,6 +305,12 @@ class SessionRuntime:
             l5_enabled=self.l5 is not None,
             pii_active=bool(getattr(self.l5, "pii_active", False)),
             profile=self.capability_profile.name,
+            provenance_enforced=(
+                self.capability_profile.name == "hardened-safety"
+                or os.getenv("CC_HARNESS_SECURITY_MODE", "").strip().lower()
+                in {"strict", "hardened", "security"}
+            ),
+            output_egress_guard=bool(self.output_egress_guard_enabled),
         )
         safety_artifact = self.cwd / ".cc-harness" / "safety" / f"{self.state.session_id}.json"
         atomic_write_text(
@@ -306,6 +325,12 @@ class SessionRuntime:
                     "l2_enabled": bool(self.l2_config and self.l2_config.enabled),
                     "l5_enabled": self.l5 is not None,
                     "pii_active": bool(getattr(self.l5, "pii_active", False)),
+                    "provenance_enforced": (
+                        self.capability_profile.name == "hardened-safety"
+                        or os.getenv("CC_HARNESS_SECURITY_MODE", "").strip().lower()
+                        in {"strict", "hardened", "security"}
+                    ),
+                    "output_egress_guard": bool(self.output_egress_guard_enabled),
                 },
                 ensure_ascii=False,
                 indent=2,
@@ -339,9 +364,13 @@ class SessionRuntime:
         from cc_harness.memory.config import load_memory_config
         from cc_harness.memory.offload.runtime import build_context_offload
 
-        self.memory_config = load_memory_config(
-            self.cwd / "policy.yaml",
-            environ=self.config.runtime_environment if self.config else None,
+        self.memory_config = (
+            self.shared_services.memory_config
+            if self.shared_services is not None
+            else load_memory_config(
+                self.cwd / "policy.yaml",
+                environ=self.config.runtime_environment if self.config else None,
+            )
         )
         if self.capability_profile.name == "memory-eval":
             self.memory_config.pipeline_every_n = 1
@@ -351,6 +380,11 @@ class SessionRuntime:
             llm=self.llm,
             memory_config=self.memory_config,
             context_config=self.state.context_config,
+            history_reader=(
+                (lambda: self.session_store.load(self.state.session_id))
+                if self.session_store is not None else None
+            ),
+            state_db_path=(self.session_store.db_path if self.session_store is not None else None),
         )
         self.state.memory_extras = extras
         self.state.mem_deps = deps
@@ -396,9 +430,13 @@ class SessionRuntime:
         from cc_harness.memory.config import load_memory_config
         from cc_harness.memory.extras import build_memory_extras
 
-        self.memory_config = load_memory_config(
-            self.cwd / "policy.yaml",
-            environ=self.config.runtime_environment if self.config else None,
+        self.memory_config = (
+            self.shared_services.memory_config
+            if self.shared_services is not None
+            else load_memory_config(
+                self.cwd / "policy.yaml",
+                environ=self.config.runtime_environment if self.config else None,
+            )
         )
         if self.capability_profile.name == "memory-eval":
             self.memory_config.pipeline_every_n = 1
@@ -588,6 +626,103 @@ class SessionRuntime:
         confirm_handler: ConfirmHandler,
         message_content=None,
     ):
+        """Queue and execute one input through the current session serially.
+
+        The queue write happens before taking the execution lock.  Therefore a
+        message arriving while compaction or a model/tool turn is running is
+        durable immediately, receives a queue event, and cannot enter the
+        active context until the current turn has finished.
+        """
+        if self.session_store is None:
+            return await self._execute_user_turn(
+                user_text,
+                event_emitter=event_emitter,
+                confirm_handler=confirm_handler,
+                message_content=message_content,
+            )
+
+        item = await self.session_store.enqueue_input(
+            self.state.session_id,
+            {
+                "user_text": user_text,
+                "message_content": message_content,
+            },
+        )
+        loop = asyncio.get_running_loop()
+        future = loop.create_future()
+        self._queue_waiters[item.queue_id] = (future, event_emitter, confirm_handler)
+        try:
+            await event_emitter(
+                {
+                    "type": "input_queued",
+                    "queue_id": item.queue_id,
+                    "session_id": self.state.session_id,
+                    "status": "queued",
+                    "ts": time.time(),
+                }
+            )
+        except Exception:
+            # A renderer failure must not make a durable input disappear.
+            pass
+
+        async with self._turn_lock:
+            await self.session_store.recover_processing_inputs(self.state.session_id)
+            await self._drain_input_queue(
+                fallback=(event_emitter, confirm_handler),
+            )
+        return await future
+
+    async def _drain_input_queue(
+        self,
+        *,
+        fallback: tuple[EventEmitter, ConfirmHandler],
+    ) -> None:
+        """Consume the durable FIFO while holding the per-session turn lock."""
+        assert self.session_store is not None
+        while True:
+            item = await self.session_store.claim_next_input(self.state.session_id)
+            if item is None:
+                return
+            waiter_entry = self._queue_waiters.pop(item.queue_id, None)
+            future, event_emitter, confirm_handler = (
+                waiter_entry
+                if waiter_entry is not None
+                else (None, fallback[0], fallback[1])
+            )
+            payload = item.payload
+            try:
+                result = await self._execute_user_turn(
+                    str(payload.get("user_text") or ""),
+                    event_emitter=event_emitter,
+                    confirm_handler=confirm_handler,
+                    message_content=payload.get("message_content"),
+                )
+                compaction = getattr(result, "compaction", None)
+                compaction_error = getattr(compaction, "error", None)
+                if compaction_error:
+                    await self.session_store.requeue_input(item.queue_id, compaction_error)
+                    if future is not None and not future.done():
+                        future.set_result(result)
+                    # Keep later inputs queued until a later retry can commit a
+                    # valid current projection.
+                    return
+                await self.session_store.complete_input(item.queue_id)
+                if future is not None and not future.done():
+                    future.set_result(result)
+            except BaseException as exc:
+                await self.session_store.requeue_input(item.queue_id, str(exc))
+                if future is not None and not future.done():
+                    future.set_exception(exc)
+                return
+
+    async def _execute_user_turn(
+        self,
+        user_text: str,
+        *,
+        event_emitter: EventEmitter,
+        confirm_handler: ConfirmHandler,
+        message_content=None,
+    ):
         assert self.llm is not None and self.mcp is not None
         one_shot = self.capability_profile.one_shot
         if self.activation_manifest is not None:
@@ -623,12 +758,14 @@ class SessionRuntime:
             text = scan.wrapped_text
 
         content = message_content if message_content is not None else text
+        message_start = len(self.state.messages)
+        turn_counter_before = self.state.turn_counter
         self.state.messages.append({"role": "user", "content": content})
         self.state.turn_counter += 1
         memory_deps = self.state.mem_deps or {}
         recall = memory_deps.get("recall")
         memory_layer = (
-            {"recall": recall}
+            memory_deps.get("layered_injection") or {"recall": recall}
             if (
                 not one_shot
                 and recall is not None
@@ -722,7 +859,10 @@ class SessionRuntime:
                 confirm_handler=confirm_handler,
                 direct_render=False,
                 max_iter=1 if one_shot else self.max_iterations,
-                loop_control_config=LoopControlConfig(enabled=self.capability_profile.loop_control),
+                loop_control_config=LoopControlConfig(
+                    enabled=self.capability_profile.loop_control,
+                    completion_contract=completion_contract_from_instruction(user_text),
+                ),
                 context_artifact_dir=(
                     None
                     if one_shot
@@ -731,7 +871,28 @@ class SessionRuntime:
                 context_projection=None if one_shot else self.context_projection,
                 refresh_system_prompt=not one_shot,
                 retry_empty_response=not one_shot,
+                security_mode=(
+                    "strict"
+                    if self.capability_profile.name == "hardened-safety"
+                    else None
+                ),
+                output_egress_guard=(
+                    self.output_egress_guard_enabled
+                    if self.output_egress_guard_enabled is not None
+                    else (
+                        self.capability_profile.name == "hardened-safety"
+                        or _env_flag("CC_HARNESS_OUTPUT_EGRESS_GUARD")
+                    )
+                ),
             )
+            compaction_error = getattr(getattr(stats, "compaction", None), "error", None)
+            if compaction_error:
+                # The durable queue item must remain pending.  Roll back only
+                # the in-memory projection of this attempted input before the
+                # finally/save path runs, so a retry cannot duplicate it.
+                self.state.messages[:] = self.state.messages[:message_start]
+                self.state.turn_counter = turn_counter_before
+                return stats
             if self.capability_profile.safety and self.l2_config and self.l2_config.enabled:
                 stats.auxiliary_model_calls += scan.model_calls
                 if scan.usage is not None:

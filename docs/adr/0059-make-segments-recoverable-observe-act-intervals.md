@@ -1,0 +1,3 @@
+# Make execution segments recoverable observe-act intervals
+
+An Execution Segment advances one PlanGraph node through one or more committed model-observation-action rounds and ends at a task boundary rather than after one model call or an arbitrary time slice. Model-visible assistant output and provider-neutral Tool Observations are committed before dispatch or use; small observations return in full, large ones use stable cursors, older Run history remains explicitly recallable, file mutations are fenced by observed digests, commands report actual workspace effects, and only independent reads batch in parallel. This preserves exact crash recovery and causal tool feedback without storing hidden reasoning or blindly replaying uncertain effects.

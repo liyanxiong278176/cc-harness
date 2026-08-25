@@ -42,6 +42,22 @@ EVENT_TYPES = frozenset(
         "WorkerHeartbeat",
         "RunSegmentStarted",
         "RunSegmentFinished",
+        "PlanDiscoveryStarted",
+        "PlanDiscoveryCompleted",
+        "PlanNodeStarted",
+        "PlanNodeCompleted",
+        "PlanNodeBlocked",
+        "ModelInvocationStarted",
+        "AssistantMessageCommitted",
+        "AssistantMessageInterrupted",
+        "ToolObservationChunkCommitted",
+        "ToolObservationCommitted",
+        "ContextProjectionBuilt",
+        "ContextCompacted",
+        "MemoryCandidateRecorded",
+        "MemoryCheckpointCommitted",
+        "PredecessorHandoffCommitted",
+        "ChildDelegationCommitted",
         "PlanCreated",
         "PlanRevised",
         "ChildRunCreated",
@@ -96,6 +112,39 @@ _REQUIRED_PAYLOAD_FIELDS: dict[str, tuple[str, ...]] = {
     "WorkerHeartbeat": ("heartbeat_at",),
     "RunSegmentStarted": ("segment",),
     "RunSegmentFinished": ("segment",),
+    "PlanDiscoveryStarted": ("discovery_id",),
+    "PlanDiscoveryCompleted": ("discovery_id", "result"),
+    "PlanNodeStarted": ("node_id",),
+    "PlanNodeCompleted": ("node_id",),
+    "PlanNodeBlocked": ("node_id", "reason"),
+    "ModelInvocationStarted": ("invocation_id", "segment", "round"),
+    "AssistantMessageCommitted": ("message_id", "message_artifact", "segment", "round"),
+    "AssistantMessageInterrupted": ("message_id", "reason"),
+    "ToolObservationChunkCommitted": (
+        "observation_id",
+        "chunk_index",
+        "observation_artifact",
+        "complete",
+    ),
+    "ToolObservationCommitted": (
+        "observation_id",
+        "action_id",
+        "attempt",
+        "observation_artifact",
+        "status",
+        "complete",
+    ),
+    "ContextProjectionBuilt": (
+        "projection_id",
+        "source_message_count",
+        "projected_message_count",
+        "projection_digest",
+    ),
+    "ContextCompacted": ("projection_id", "tier", "source_digest"),
+    "MemoryCandidateRecorded": ("candidate_id", "source_digest", "status"),
+    "MemoryCheckpointCommitted": ("checkpoint_id", "source_digest", "captured_count"),
+    "PredecessorHandoffCommitted": ("predecessor_run_id", "handoff_artifact"),
+    "ChildDelegationCommitted": ("child_run_id", "delegation_artifact"),
     "RunYielded": ("segment",),
     "PlanCreated": ("plan",),
     "PlanRevised": ("plan",),
@@ -418,6 +467,14 @@ class EventValidator:
                 "progress",
                 "attempt",
                 "segment",
+                "result",
+                "status",
+                "complete",
+                "round",
+                "chunk_index",
+                "source_message_count",
+                "projected_message_count",
+                "captured_count",
             }
         }
         for field_name in string_fields:
@@ -428,6 +485,33 @@ class EventValidator:
         if event.event_type in {"RunSegmentStarted", "RunSegmentFinished", "RunYielded"}:
             if not isinstance(payload["segment"], int) or payload["segment"] < 0:
                 raise EventValidationError("segment must be a non-negative integer")
+        if event.event_type == "ModelInvocationStarted":
+            if not isinstance(payload["segment"], int) or payload["segment"] < 0:
+                raise EventValidationError("model invocation segment must be non-negative")
+            if not isinstance(payload["round"], int) or payload["round"] < 0:
+                raise EventValidationError("model invocation round must be non-negative")
+        if event.event_type == "ToolObservationChunkCommitted":
+            if not isinstance(payload["chunk_index"], int) or payload["chunk_index"] < 0:
+                raise EventValidationError("observation chunk_index must be non-negative")
+            if not isinstance(payload["complete"], bool):
+                raise EventValidationError("observation complete must be boolean")
+        if event.event_type == "ToolObservationCommitted":
+            if not isinstance(payload["attempt"], int) or payload["attempt"] < 1:
+                raise EventValidationError("observation attempt must be a positive integer")
+            _require_string(payload["status"], "payload.status")
+        if event.event_type in {"ToolObservationCommitted"} and not isinstance(
+            payload["complete"], bool
+        ):
+            raise EventValidationError("observation complete must be boolean")
+        if event.event_type in {"ContextProjectionBuilt"}:
+            for name in ("source_message_count", "projected_message_count"):
+                if not isinstance(payload[name], int) or payload[name] < 0:
+                    raise EventValidationError(f"{name} must be a non-negative integer")
+        if event.event_type == "MemoryCheckpointCommitted":
+            if not isinstance(payload["captured_count"], int) or payload["captured_count"] < 0:
+                raise EventValidationError("captured_count must be a non-negative integer")
+        if event.event_type == "MemoryCandidateRecorded":
+            _require_string(payload["status"], "payload.status")
         if event.event_type in {"PlanCreated", "PlanRevised"} and not isinstance(
             payload["plan"], Mapping
         ):

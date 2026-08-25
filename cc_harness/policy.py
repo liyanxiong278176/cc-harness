@@ -12,11 +12,13 @@ from __future__ import annotations
 
 import os
 from collections.abc import Iterator
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from enum import Enum
 from pathlib import Path
 from urllib.parse import unquote, urlparse
 from urllib.request import url2pathname
+
+from cc_harness.security import build_action_plan
 
 
 class Action(str, Enum):
@@ -30,6 +32,7 @@ class Decision:
     action: Action
     rule_id: str
     reason: str
+    evidence: dict = field(default_factory=dict)
 
     @property
     def allow(self) -> bool:
@@ -195,18 +198,80 @@ class PolicyEngine:
         *,
         enabled: bool = True,
         additional_roots: list[Path] | tuple[Path, ...] | None = None,
+        provenance_mode: bool = False,
     ) -> None:
         self.project_root = project_root.resolve(strict=False)
         self.additional_roots = tuple(
             Path(root).resolve(strict=False) for root in (additional_roots or ())
         )
         self.enabled = enabled
+        # Opt-in so existing callers preserve the historical permission
+        # prompts.  Strict benchmark/production profiles enable it explicitly;
+        # it extends this policy engine rather than creating a second gate.
+        self.provenance_mode = provenance_mode
         self.allowlist = Allowlist()
 
     def evaluate(self, tool_name: str, args: dict, ctx: dict) -> Decision:
         root = Path(ctx.get("project_root", self.project_root)).resolve(strict=False)
         cls = _classify(tool_name)
         allowed_roots = (root, *self.additional_roots)
+
+        provenance_decision: Decision | None = None
+        provenance_capability = None
+        provenance_evidence: dict = {}
+        if bool(ctx.get("provenance_mode", self.provenance_mode)):
+            plan = build_action_plan(
+                tool_name,
+                args,
+                messages=ctx.get("messages"),
+                tool_results=ctx.get("tool_results"),
+                tool_result_records=ctx.get("tool_result_records"),
+                capability_metadata=ctx.get("capability_metadata"),
+            )
+            provenance_capability = plan.capability
+            evidence = plan.audit_record()
+            provenance_evidence = evidence
+            # Credentials and policy/permission controls remain hard denied.
+            # This is deliberately narrower than the old "any unknown field"
+            # deny, so ordinary external-write requests can reach confirmation
+            # instead of being misclassified as an attack.
+            if plan.capability.credential and plan.has_untrusted_fields:
+                provenance_decision = Decision(
+                    Action.DENY,
+                    "untrusted_credential_argument",
+                    "拒绝使用无法追溯来源的凭据或敏感参数",
+                    evidence,
+                )
+            elif plan.capability.high_risk and plan.untrusted_tool_fields:
+                provenance_decision = Decision(
+                    Action.DENY,
+                    "untrusted_tool_argument",
+                    "拒绝把带指令污染的工具结果带入高风险动作参数",
+                    evidence,
+                )
+            elif plan.hard_boundary_fields:
+                provenance_decision = Decision(
+                    Action.DENY,
+                    "untrusted_security_control",
+                    "拒绝让不可信字段改变策略、权限或秘密边界",
+                    evidence,
+                )
+            # A declared read capability may continue with tainted values;
+            # taint is retained in the audit record and cannot grant a write.
+            elif plan.capability.effect.value != "read" and plan.has_untrusted_fields:
+                provenance_decision = Decision(
+                    Action.ASK,
+                    "untrusted_action_confirmation",
+                    "动作参数来源不完整，需要用户确认后继续",
+                    evidence,
+                )
+            elif plan.capability.high_risk and not plan.fields:
+                provenance_decision = Decision(
+                    Action.ASK,
+                    "provenance_unknown",
+                    "高风险工具缺少可验证的参数来源，需要用户明确授权",
+                    evidence,
+                )
 
         # Hard safety runs before every convenience control. Neither an allowlist
         # entry nor enabled=false may approve an undeclared root or credential path.
@@ -231,6 +296,9 @@ class PolicyEngine:
                     f"拒绝直接访问敏感凭据路径: {target}",
                 )
 
+        if provenance_decision is not None:
+            return provenance_decision
+
         if not self.enabled:
             return Decision(Action.ALLOW, "policy_prompts_disabled", "普通权限询问已关闭")
 
@@ -241,7 +309,16 @@ class PolicyEngine:
         # All declared paths passed hard safety above. Read-like tools can now
         # be allowed without relying on tool-name classification for containment.
         if cls in ("docs", "git_read", "fs_read", "fs_other"):
-            return Decision(Action.ALLOW, f"{cls}_allow", "")
+            return Decision(Action.ALLOW, f"{cls}_allow", "", provenance_evidence)
+
+        if provenance_capability is not None:
+            if provenance_capability.effect.value == "read":
+                return Decision(
+                    Action.ALLOW,
+                    "declared_read_capability_allow",
+                    "",
+                    provenance_evidence,
+                )
 
         # shell / fs_write / network / git_write / unknown → ask
         reason = {
@@ -260,3 +337,28 @@ class PolicyEngine:
             except Exception:
                 pass
         return Decision(Action.ASK, f"{cls}_ask", reason)
+
+    def evaluate_shadow(self, tool_name: str, args: dict, ctx: dict) -> Decision:
+        """Evaluate the counterfactual without executing any tool.
+
+        This is intentionally a policy-only diagnostic.  It keeps path and
+        credential hard checks, but disables provenance-derived denials so a
+        development report can tell whether the provenance rule was the
+        direct gate.  Callers must never dispatch the returned decision as an
+        authorization result.
+        """
+
+        shadow_ctx = dict(ctx)
+        shadow_ctx["provenance_mode"] = False
+        decision = self.evaluate(tool_name, args, shadow_ctx)
+        evidence = dict(decision.evidence)
+        evidence["shadow"] = True
+        evidence["shadow_of_provenance_mode"] = bool(
+            ctx.get("provenance_mode", self.provenance_mode)
+        )
+        return Decision(
+            decision.action,
+            f"shadow:{decision.rule_id}",
+            decision.reason,
+            evidence,
+        )

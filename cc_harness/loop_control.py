@@ -55,6 +55,23 @@ _TEST_COMMAND_RE = re.compile(
     r"dotnet\s+test|mvn(?:w)?\s+test|gradle(?:w)?\s+test)(?:\s|$)",
     re.IGNORECASE,
 )
+_SERVICE_HEALTH_COMMAND_RE = re.compile(
+    r"(?:curl|wget)\b[^\n]*(?:localhost|127\.0\.0\.1|0\.0\.0\.0)|"
+    r"(?:grpcurl|nc\s+-z|netcat\s+-z|systemctl\s+is-active|service\s+\S+\s+status)",
+    re.IGNORECASE,
+)
+_EXPLICIT_ARTIFACT_RE = re.compile(r"(?<![\w.-])(/app/[A-Za-z0-9_./-]+)")
+_ARTIFACT_DIRECTIVE_RE = re.compile(
+    r"\b(?:create|write|save|store|produce|generate|output|place|put|"
+    r"创建|写入|保存|生成|输出|放到|存储)\b",
+    re.IGNORECASE,
+)
+_SERVICE_REQUEST_RE = re.compile(
+    r"\b(?:server|service|daemon|listen(?:ing)?|endpoint|grpc|smtp|"
+    r"webserver|web server|服务器|服务|监听|端口)\b|"
+    r"https?://(?:localhost|127\.0\.0\.1)",
+    re.IGNORECASE,
+)
 _SHELL_MUTATION_RE = re.compile(
     r"(?:^|[;&|]\s*)(?:cp|copy|mv|move|rm|del|mkdir|rmdir|touch|"
     r"git\s+(?:apply|checkout|restore|reset|clean)|"
@@ -133,7 +150,31 @@ class CompletionContract:
     required_paths: tuple[str, ...] = ()
     require_verification_after_code_changes: bool = True
     require_session_todos_complete: bool = True
+    require_service_health_check: bool = False
     max_rechecks: int = 2
+
+
+def completion_contract_from_instruction(instruction: str) -> CompletionContract:
+    """Derive only explicit, user-visible completion obligations.
+
+    The extractor deliberately ignores arbitrary paths mentioned as inputs. A
+    path becomes required only when its line also contains a create/output
+    directive. This keeps the contract useful for benchmark and normal coding
+    tasks without consulting hidden tests or verifier files.
+    """
+
+    required: list[str] = []
+    for line in instruction.splitlines():
+        if not _ARTIFACT_DIRECTIVE_RE.search(line):
+            continue
+        for match in _EXPLICIT_ARTIFACT_RE.finditer(line):
+            path = match.group(1).rstrip(".,:;)]}'\"")
+            if path not in required:
+                required.append(path)
+    return CompletionContract(
+        required_paths=tuple(required),
+        require_service_health_check=bool(_SERVICE_REQUEST_RE.search(instruction)),
+    )
 
 
 @dataclass
@@ -146,6 +187,8 @@ class WorkingState:
     last_mutation_sequence: int = 0
     last_verification_sequence: int = 0
     last_verification_ok: bool | None = None
+    last_service_health_sequence: int = 0
+    last_service_health_ok: bool | None = None
     last_tool_name: str = ""
     last_error_kind: str | None = None
     unresolved_errors: list[dict[str, Any]] = field(default_factory=list)
@@ -178,6 +221,9 @@ class WorkingState:
         if _is_verification_call(tool_name, args):
             self.last_verification_sequence = self.sequence
             self.last_verification_ok = not is_error
+        if _is_service_health_call(tool_name, args):
+            self.last_service_health_sequence = self.sequence
+            self.last_service_health_ok = not is_error
 
         kind = error_kind or (classify_tool_error(result_text) if is_error else None)
         self.last_error_kind = kind.value if kind else None
@@ -208,6 +254,8 @@ class WorkingState:
             "last_mutation_sequence": self.last_mutation_sequence,
             "last_verification_sequence": self.last_verification_sequence,
             "last_verification_ok": self.last_verification_ok,
+            "last_service_health_sequence": self.last_service_health_sequence,
+            "last_service_health_ok": self.last_service_health_ok,
             "last_tool_name": self.last_tool_name,
             "last_error_kind": self.last_error_kind,
             "unresolved_errors": list(self.unresolved_errors),
@@ -231,6 +279,8 @@ class WorkingState:
             last_mutation_sequence=int(data.get("last_mutation_sequence", 0)),
             last_verification_sequence=int(data.get("last_verification_sequence", 0)),
             last_verification_ok=data.get("last_verification_ok"),
+            last_service_health_sequence=int(data.get("last_service_health_sequence", 0)),
+            last_service_health_ok=data.get("last_service_health_ok"),
             last_tool_name=str(data.get("last_tool_name") or ""),
             last_error_kind=data.get("last_error_kind"),
             unresolved_errors=list(data.get("unresolved_errors") or []),
@@ -292,6 +342,11 @@ class CompletionVerifier:
             ]
             if incomplete:
                 issues.append("session TODOs are incomplete: " + ", ".join(sorted(incomplete)))
+        if self.contract.require_service_health_check and state.last_service_health_ok is not True:
+            issues.append(
+                "service task has no successful local health check; probe its requested endpoint "
+                "or process status before finishing"
+            )
         return CompletionReport(not issues, tuple(issues))
 
 
@@ -501,6 +556,15 @@ def _is_mutating_call(tool_name: str, args: dict[str, Any]) -> bool:
 def _is_verification_call(tool_name: str, args: dict[str, Any]) -> bool:
     command = args.get("command")
     return tool_name == "run_command" and isinstance(command, str) and bool(_TEST_COMMAND_RE.search(command))
+
+
+def _is_service_health_call(tool_name: str, args: dict[str, Any]) -> bool:
+    command = args.get("command")
+    return (
+        tool_name == "run_command"
+        and isinstance(command, str)
+        and bool(_SERVICE_HEALTH_COMMAND_RE.search(command))
+    )
 
 
 def _tool_path(args: dict[str, Any]) -> str:

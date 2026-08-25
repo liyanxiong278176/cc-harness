@@ -2,12 +2,13 @@
 
 from __future__ import annotations
 
+import json
 import uuid
 from dataclasses import dataclass
 
 from .artifacts import ArtifactStore
 from .run_events import EventActor, RunEvent
-from .run_model import GoalContract, Run, RuntimeContract, predecessor_gate
+from .run_model import GoalContract, PlanGraph, PlanNode, Run, RuntimeContract, predecessor_gate
 from .run_projection import QueueProjection
 from .run_store import RunStore
 
@@ -126,6 +127,27 @@ class FollowUpService:
             acceptance_criteria=("follow-up request addressed",),
             constraints=constraints,
         )
+        handoff = self.artifacts.put_text(
+            json.dumps(
+                {
+                    "schema_version": "cc-harness.predecessor-handoff.v1",
+                    "predecessor_run_id": predecessor_run_id,
+                    "follow_up_run_id": follow_up_run_id,
+                    "message": message,
+                    "predecessor_status": predecessor.status.value,
+                    "authorized_recall": {
+                        "run_ids": [predecessor_run_id],
+                        "include_transcript": False,
+                        "include_artifacts": True,
+                    },
+                    "constraints": list(constraints),
+                },
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            ),
+            media_type="application/json; purpose=predecessor-handoff",
+        )
         if not await self.store.run_exists(follow_up_run_id):
             await self.store.create_run(
                 Run(
@@ -145,13 +167,59 @@ class FollowUpService:
             raise ValueError("follow-up id already belongs to another goal")
         if child.runtime_contract_digest is not None and child.runtime_contract_digest != contract.digest:
             raise ValueError("follow-up id already belongs to another runtime contract")
+        existing_events = (await self.store.read(follow_up_run_id, limit=100_000)).events
+        event_types = {event.event_type for event in existing_events}
         if child.sequence == 0:
             await self._append_new_run(follow_up_run_id, "RunCreated", {"goal": goal.to_dict(), "runtime_contract": contract.to_dict()}, contract)
         child = await self.store.load_projection(follow_up_run_id)
-        if child.sequence == 1:
+        if "PredecessorHandoffCommitted" not in event_types:
+            await self._append_new_run(
+                follow_up_run_id,
+                "PredecessorHandoffCommitted",
+                {
+                    "predecessor_run_id": predecessor_run_id,
+                    "handoff_artifact": handoff.digest,
+                    "authorized_recall": [predecessor_run_id],
+                },
+                contract,
+                artifact_refs=(handoff.digest,),
+            )
+            event_types.add("PredecessorHandoffCommitted")
+        child = await self.store.load_projection(follow_up_run_id)
+        if "PlanCreated" not in event_types:
+            plan = PlanGraph(
+                nodes=(PlanNode(f"follow-up-{follow_up_run_id}", "follow_up"),),
+                revision=1,
+            )
+            await self._append_new_run(
+                follow_up_run_id,
+                "PlanCreated",
+                {"plan": plan.to_dict()},
+                contract,
+            )
+            event_types.add("PlanCreated")
+        child = await self.store.load_projection(follow_up_run_id)
+        if "TodoCreated" not in event_types:
+            await self._append_new_run(
+                follow_up_run_id,
+                "TodoCreated",
+                {
+                    "todo": {
+                        "id": f"follow-up-{follow_up_run_id}",
+                        "title": message,
+                        "status": "pending",
+                        "active_sessions": [follow_up_run_id],
+                        "plan_node_id": f"follow-up-{follow_up_run_id}",
+                    }
+                },
+                contract,
+            )
+            event_types.add("TodoCreated")
+        child = await self.store.load_projection(follow_up_run_id)
+        if "GoalContractAccepted" not in event_types:
             await self._append_new_run(follow_up_run_id, "GoalContractAccepted", {"goal": goal.to_dict()}, contract)
         child = await self.store.load_projection(follow_up_run_id)
-        if child.sequence == 2:
+        if "RunQueued" not in event_types:
             await self._append_new_run(follow_up_run_id, "RunQueued", {}, contract)
         predecessor = await self.store.load_projection(predecessor_run_id)
         await self.store.append(
@@ -165,6 +233,8 @@ class FollowUpService:
         event_type: str,
         payload: dict[str, object],
         contract: RuntimeContract,
+        *,
+        artifact_refs: tuple[str, ...] = (),
     ) -> None:
         projection = await self.store.load_projection(run_id)
         event = RunEvent.create(
@@ -174,6 +244,7 @@ class FollowUpService:
             actor=self.actor,
             runtime_contract_digest=contract.digest,
             payload=payload,
+            artifact_refs=artifact_refs,
         )
         await self.store.append(event, expected_sequence=projection.sequence)
 

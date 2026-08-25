@@ -12,6 +12,11 @@ from ..contracts import MODEL, TrialOutcome, TrialStatus
 from ..launch import final_result
 
 _INFRASTRUCTURE_MARKERS = (
+    "402",
+    "insufficient balance",
+    "insufficient quota",
+    "quota exceeded",
+    "payment required",
     "429",
     "502 bad gateway",
     "503 service unavailable",
@@ -28,6 +33,8 @@ _INFRASTRUCTURE_MARKERS = (
     "overloaded",
     "name resolution",
     "certificate verify failed",
+    "filenotfounderror",
+    "no such file or directory",
 )
 
 

@@ -10,7 +10,7 @@ import shutil
 import subprocess
 import time
 import uuid
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -363,6 +363,20 @@ def build_harbor_command(
     wheel_path: Path,
     env_file: Path,
     jobs_dir: Path,
+    uv_bootstrap_path: Path | None = None,
+    verifier_bootstrap_path: Path | None = None,
+    tiktoken_bootstrap_path: Path | None = None,
+    install_only: bool = False,
+    delete: bool | None = None,
+    force_build: bool | None = None,
+    timeout_multiplier: float | None = None,
+    agent_timeout_multiplier: float | None = None,
+    agent_setup_timeout_multiplier: float | None = None,
+    environment_build_timeout_multiplier: float | None = None,
+    verifier_timeout_multiplier: float | None = None,
+    agent_env: dict[str, str] | None = None,
+    extra_docker_compose_paths: Sequence[Path] | None = None,
+    allowed_agent_hosts: Sequence[str] | None = None,
 ) -> list[str]:
     command = [
         uvx,
@@ -384,6 +398,16 @@ def build_harbor_command(
                 f"wheel_path={wheel_path}",
             ]
         )
+        if uv_bootstrap_path is not None:
+            command.extend(["--agent-kwarg", f"uv_bootstrap_path={uv_bootstrap_path}"])
+        if verifier_bootstrap_path is not None:
+            command.extend(
+                ["--agent-kwarg", f"verifier_bootstrap_path={verifier_bootstrap_path}"]
+            )
+        if tiktoken_bootstrap_path is not None:
+            command.extend(
+                ["--agent-kwarg", f"tiktoken_bootstrap_path={tiktoken_bootstrap_path}"]
+            )
     elif harness is HarnessKind.CLAUDE_CODE:
         command.extend(
             ["--agent", "claude-code", "--agent-kwarg", f"version={CLAUDE_CODE_VERSION}"]
@@ -406,6 +430,38 @@ def build_harbor_command(
             "--yes",
         ]
     )
+    for option, value in (
+        ("--timeout-multiplier", timeout_multiplier),
+        ("--agent-timeout-multiplier", agent_timeout_multiplier),
+        ("--agent-setup-timeout-multiplier", agent_setup_timeout_multiplier),
+        ("--environment-build-timeout-multiplier", environment_build_timeout_multiplier),
+        ("--verifier-timeout-multiplier", verifier_timeout_multiplier),
+    ):
+        if value is None:
+            continue
+        if not isinstance(value, (int, float)) or value <= 0:
+            raise ValueError(f"{option} must be a positive number")
+        command.extend([option, str(value)])
+    for key, value in sorted((agent_env or {}).items()):
+        if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", key):
+            raise ValueError(f"invalid Harbor agent environment name: {key}")
+        if not isinstance(value, str):
+            raise TypeError(f"Harbor agent environment value must be text: {key}")
+        if "\n" in value or "\r" in value:
+            raise ValueError(f"Harbor agent environment value contains a newline: {key}")
+        command.extend(["--agent-env", f"{key}={value}"])
+    for path in extra_docker_compose_paths or ():
+        command.extend(["--extra-docker-compose", str(path)])
+    for host in allowed_agent_hosts or ():
+        if not host or "\n" in host or "\r" in host:
+            raise ValueError("invalid Harbor allowed agent host")
+        command.extend(["--allow-agent-host", host])
+    if install_only:
+        command.append("--install-only")
+    if delete is not None:
+        command.append("--delete" if delete else "--no-delete")
+    if force_build is not None:
+        command.append("--force-build" if force_build else "--no-force-build")
     return command
 
 

@@ -76,7 +76,7 @@ async def build_memory_extras(
             memory_recall_handler, memory_save_handler,
         )
         from cc_harness.memory.pipeline import MemoryPipeline
-        from cc_harness.memory.recall import layered_recall
+        from cc_harness.memory.recall import layered_memory_fingerprint, layered_recall
         from cc_harness.llm import LLMClient
     except ImportError as e:
         print(f"[memory] import failed: {e}; running without memory tools")
@@ -160,10 +160,33 @@ async def build_memory_extras(
         extras.append(
             {"spec": MEMORY_SAVE_SPEC, "handler": memory_save_handler, "deps": {"service": service}}
         )
+
+    async def _context_recall(_q="", **kw):
+        """Automatic session injection reads L2/L3 only; L1 stays tool-driven."""
+        return await layered_recall(
+            retriever, persona_path, scenarios_dir, "",
+            top_k=kw.get(
+                "top_k", memory_config.recall_top_k if memory_config else 5
+            ),
+            timeout_s=kw.get(
+                "timeout_s", memory_config.recall_timeout_s if memory_config else 5.0
+            ),
+            include_atoms=False,
+        )
+
+    def _context_version():
+        return layered_memory_fingerprint(persona_path, scenarios_dir)
+
+    layered_injection = {
+        "recall": _context_recall,
+        "version": _context_version,
+        "cache": {},
+    }
     deps: dict = {
         "service": service, "retriever": retriever, "pipeline": pipeline,
         "recall": _recall, "store": store,
         "persona_path": persona_path, "scenarios_dir": scenarios_dir,
+        "layered_injection": layered_injection,
         "read_only": read_only,
         "history_mode": history_mode,
     }

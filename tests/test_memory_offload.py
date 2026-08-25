@@ -292,6 +292,38 @@ async def test_node_id_traceability(tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_source_ref_traceability_and_manifest_object_path(tmp_path):
+    """The stable pointer form resolves content-addressed manifest objects."""
+    from cc_harness.memory.offload.offload import maybe_offload
+    from cc_harness.memory.offload.read_ref import read_ref_handler
+    from cc_harness.tokens import TokenCounter
+
+    refs_dir = tmp_path / "refs"
+    manifest = tmp_path / "nodes.jsonl"
+    out = await maybe_offload(
+        "manifest evidence " * 1000,
+        "run_command",
+        {},
+        2000,
+        refs_dir,
+        None,
+        TokenCounter(),
+        manifest_path=manifest,
+        session_id="s1",
+    )
+    assert out is not None
+    assert f"source_ref=node:{out.node_id}" in out.pointer_msg
+    assert f"refs/objects/{out.content_digest.removeprefix('sha256:')}.md" in out.pointer_msg
+    result = await read_ref_handler(
+        {"source_ref": f"node:{out.node_id}"},
+        cwd=str(tmp_path),
+        refs_dir=refs_dir,
+        manifest_path=manifest,
+    )
+    assert "manifest evidence" in result.llm_text
+
+
+@pytest.mark.asyncio
 async def test_extras_deps_has_offload(tmp_path, monkeypatch):
     """build_memory_extras deps 含 offload 锭(self-contained:mock 依赖)。"""
     import os

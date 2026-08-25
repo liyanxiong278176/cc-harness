@@ -1,0 +1,33 @@
+{
+  "schema_version": 1,
+  "fixtures": {
+    "session.json": {
+      "sha256": "sha256:61bff09025f0bddc79c04c879909c448fe8ccbbf3335105d628cd5aa5609fa0a",
+      "expected": "import one legacy session, two messages, and one checkpoint"
+    },
+    "session-conflict.json": {
+      "sha256": "sha256:9a405a33d832a7c693b031632e2dab33420c754f58939e5b02a694b8cd78c733",
+      "expected": "record a conflict without overwriting the canonical message"
+    },
+    "todo.yaml": {
+      "sha256": "sha256:635287dbbde3165046517e340416c7139520941fa4395b76eab7d7b90dc21150",
+      "expected": "import two Todo facts with one in_progress and one done"
+    },
+    "memory.jsonl": {
+      "sha256": "sha256:de7a3a6cff5371fec87deecb472e2f70f4b691b6019c13070bd684f5c528e7dd",
+      "expected": "import one provenance-backed advisory memory and mark one unverified"
+    },
+    "action-journal.jsonl": {
+      "sha256": "sha256:72305ab03ddd5d281f070535b73d849bb7d1e0772656039ba4c66c155cfee2c9",
+      "expected": "import one completed action and one incomplete action without replay"
+    },
+    "corrupt.json": {
+      "sha256": "sha256:30feb911bdfa9b15f68aa8db33c2359c2f07855c91065a6c34604d7bd6821ca7",
+      "expected": "reject source with a recoverable parse error"
+    },
+    "large-object.txt": {
+      "sha256": "sha256:599eb3f9c19ce6038dfefaedaad183bdad59e76c448073e708d587e18a53404a",
+      "expected": "store by content digest and preserve object bytes"
+    }
+  }
+}

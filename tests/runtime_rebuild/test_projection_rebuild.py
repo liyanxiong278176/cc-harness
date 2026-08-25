@@ -155,6 +155,45 @@ def test_projection_rebuilds_run_todo_plan_working_and_child_views() -> None:
     assert projection.evidence[0].digest == "sha256:test"
 
 
+def test_projection_indexes_committed_tool_observation_artifact() -> None:
+    events = projection_events()[:8]
+    events.extend(
+        [
+            make_event(
+                9,
+                "ToolObservationCommitted",
+                {
+                    "observation_id": "observation-1",
+                    "action_id": "action-1",
+                    "attempt": 1,
+                    "tool_name": "Write",
+                    "observation_artifact": "sha256:observation",
+                    "status": "succeeded",
+                    "complete": True,
+                    "provenance": ["native", "workspace"],
+                },
+                lease_epoch=1,
+            ),
+            make_event(
+                10,
+                "ActionSucceeded",
+                {
+                    "action_id": "action-1",
+                    "attempt": 1,
+                    "result_artifact": "sha256:result",
+                },
+                lease_epoch=1,
+            ),
+        ]
+    )
+    projection = ProjectionBuilder().rebuild(events)
+
+    assert projection.observations[0].observation_id == "observation-1"
+    assert projection.observations[0].observation_artifact == "sha256:observation"
+    assert projection.observations[0].provenance == ("native", "workspace")
+    assert RunProjection.from_dict(projection.to_dict()).digest == projection.digest
+
+
 def test_snapshot_incremental_replay_has_same_digest_as_full_replay() -> None:
     events = projection_events()
     builder = ProjectionBuilder()

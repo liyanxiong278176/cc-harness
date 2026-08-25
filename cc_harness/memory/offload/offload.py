@@ -5,17 +5,20 @@
 ② LLM 一句话摘要(llm=None / LLM 失败 / 空 content → fail-soft 取前 200 字);
 ③ messages 历史里只留一行 `pointer_msg`(`node={node_id}`)。
 
-`node_id` 由 `gen_id()` 生成一次、三处复用(refs 文件名 / pointer_msg / refs_path),
-保证 `read_ref(node_id)` 能 100% 还原原文 —— "三处一致"是 Q4 的核心不变量。
+`node_id` 由 `gen_id()` 生成一次，并作为稳定 `source_ref` 写入 pointer、manifest
+和读取工具；原文路径可以是传统的 `refs/{node_id}.md`，也可以是 manifest
+模式下的内容寻址对象。
 """
 from __future__ import annotations
 import hashlib
 import json
 import os
+import sqlite3
 import time
 from pathlib import Path
 from uuid import uuid4
 
+from cc_harness.atomic import atomic_write_text
 from cc_harness.memory.offload.models import OffloadResult
 
 
@@ -37,6 +40,7 @@ async def maybe_offload(
     *,
     manifest_path: Path | str | None = None,
     session_id: str | None = None,
+    state_db_path: Path | str | None = None,
 ) -> OffloadResult | None:
     """token 严格 > threshold → 卸载;否则 None。
 
@@ -55,9 +59,6 @@ async def maybe_offload(
     if token_counter.count_text(result_text) <= threshold:
         return None
 
-    if len(result_text) > 256 * 1024:
-        raise ValueError("result_text exceeds 256KB hard limit")
-
     content_digest = "sha256:" + hashlib.sha256(result_text.encode("utf-8")).hexdigest()
     node_id = gen_id()
     refs_path = Path(refs_dir)
@@ -69,9 +70,7 @@ async def maybe_offload(
     )
     ref_file.parent.mkdir(parents=True, exist_ok=True)
     if not ref_file.exists():
-        tmp = ref_file.with_suffix(ref_file.suffix + ".tmp")
-        tmp.write_text(result_text, encoding="utf-8")
-        os.replace(tmp, ref_file)
+        atomic_write_text(ref_file, result_text, encoding="utf-8")
 
     if llm is not None:
         try:
@@ -82,15 +81,20 @@ async def maybe_offload(
             summary = result_text[:200]
     else:
         summary = result_text[:200]  # fail-soft:前 200 字,不调 LLM
+    summary = " ".join(summary.splitlines())[:200]
 
+    try:
+        relative_ref = ref_file.relative_to(refs_path).as_posix()
+    except ValueError:
+        # ``ref_file`` is created beneath ``refs_path`` above; keep a safe
+        # fallback if a custom Path implementation violates that invariant.
+        relative_ref = f"{node_id}.md"
     pointer_msg = (
-        f"[offloaded node={node_id} digest={content_digest} "
-        f"summary='{summary}' (refs/{node_id}.md)]"
+        f"[offloaded node={node_id} source_ref=node:{node_id} digest={content_digest} "
+        f"summary='{summary}' (refs/{relative_ref})]"
     )
     if manifest_path is not None:
-        _append_manifest(
-            Path(manifest_path),
-            {
+        record = {
                 "schema_version": "cc-harness.offload-node.v1",
                 "node_id": node_id,
                 "content_digest": content_digest,
@@ -103,8 +107,15 @@ async def maybe_offload(
                 "refs_path": str(ref_file),
                 "result_ref": str(ref_file),
                 "created_at": time.time(),
-            },
-        )
+            }
+        if state_db_path is not None:
+            _commit_sqlite_manifest(Path(state_db_path), str(session_id or ""), record)
+            try:
+                _append_manifest(Path(manifest_path), record)
+            except OSError:
+                pass
+        else:
+            _append_manifest(Path(manifest_path), record)
     return OffloadResult(
         node_id=node_id,
         summary=summary,
@@ -121,6 +132,50 @@ def _append_manifest(path: Path, record: dict) -> None:
         handle.write(json.dumps(record, ensure_ascii=False, sort_keys=True) + "\n")
         handle.flush()
         os.fsync(handle.fileno())
+
+
+def _commit_sqlite_manifest(db_path: Path, context_id: str, record: dict) -> None:
+    """Publish node metadata transactionally; the object body stays on disk."""
+    db_path.parent.mkdir(parents=True, exist_ok=True)
+    with sqlite3.connect(db_path, timeout=30.0) as db:
+        db.execute("PRAGMA journal_mode=WAL")
+        db.execute("PRAGMA busy_timeout=30000")
+        db.executescript(
+            """
+            CREATE TABLE IF NOT EXISTS context_offload_node (
+                context_id TEXT NOT NULL,
+                node_id TEXT NOT NULL,
+                content_digest TEXT NOT NULL,
+                result_ref TEXT NOT NULL,
+                payload_json TEXT NOT NULL,
+                created_at REAL NOT NULL,
+                PRIMARY KEY (context_id, node_id)
+            );
+            CREATE TRIGGER IF NOT EXISTS context_offload_node_no_update
+            BEFORE UPDATE ON context_offload_node BEGIN
+                SELECT RAISE(ABORT, 'offload nodes are immutable');
+            END;
+            CREATE TRIGGER IF NOT EXISTS context_offload_node_no_delete
+            BEFORE DELETE ON context_offload_node BEGIN
+                SELECT RAISE(ABORT, 'offload nodes are immutable');
+            END;
+            """
+        )
+        db.execute("BEGIN IMMEDIATE")
+        db.execute(
+            "INSERT OR IGNORE INTO context_offload_node"
+            "(context_id, node_id, content_digest, result_ref, payload_json, created_at) "
+            "VALUES (?, ?, ?, ?, ?, ?)",
+            (
+                context_id,
+                str(record["node_id"]),
+                str(record["content_digest"]),
+                str(record["result_ref"]),
+                json.dumps(record, ensure_ascii=False, sort_keys=True, separators=(",", ":")),
+                float(record["created_at"]),
+            ),
+        )
+        db.commit()
 
 
 async def _llm_summary(llm, result_text: str) -> str:

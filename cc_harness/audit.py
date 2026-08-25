@@ -5,8 +5,11 @@
 from __future__ import annotations
 import json
 import time
+from collections.abc import Mapping
 from pathlib import Path
 from rich.console import Console
+
+from cc_harness.security import SECURITY_POLICY_VERSION
 
 _console = Console()
 
@@ -22,6 +25,7 @@ def log_decision(
     rule_id: str,
     reason: str,
     mode: str,
+    security: Mapping[str, object] | None = None,
 ) -> None:
     """追加一条决策记录。任何 IO 异常都吞掉(只 warn)。"""
     entry = {
@@ -34,7 +38,10 @@ def log_decision(
         "rule_id": rule_id,
         "reason": reason,
         "mode": mode,
+        "policy_version": SECURITY_POLICY_VERSION,
     }
+    if security:
+        entry["security"] = dict(security)
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
         with path.open("a", encoding="utf-8") as f:

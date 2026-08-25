@@ -1,0 +1,17 @@
+{
+  "schema_version": "terminal-bench-2.1-development-freeze.v1",
+  "dataset": "terminal-bench/terminal-bench-2-1@sha256:7d7bdc1cbedad549fc1140404bd4dc45e5fd0ea7c4186773687d177ad3a0699a",
+  "selection_manifest": "eval/harbor/catalogs/terminal_bench_2_1_easy_medium.json",
+  "result_root": "eval/result/cc-only/terminal-bench-2.1/deepseek-v4-flash/full-new-260823221106-selected-14d6f90dbe",
+  "role": "development",
+  "tasks": 59,
+  "pass": 44,
+  "fail": 15,
+  "invalid": 0,
+  "selected_set_accuracy": 0.7457627118644068,
+  "notes": [
+    "This set was inspected, reclassified from retained official verifier evidence, and used to guide project improvements.",
+    "It must not be presented as an untouched independent test score.",
+    "The 30 hard tasks remain the one-shot holdout."
+  ]
+}

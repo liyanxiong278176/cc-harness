@@ -96,6 +96,7 @@ def _cfg(**kw):
         protect_zone_tokens=8_192,
         snip_head_lines=5,
         snip_tail_lines=1,
+        output_reserve_tokens=0,
     )
     base.update(kw)
     return ContextConfig(**base)
@@ -387,7 +388,7 @@ async def test_maybe_compact_ratio_below_tier1():
 async def test_maybe_compact_tier1_only():
     """Ratio >= tier1 but after Snip drops below tier2 → SNIP."""
     _, _, _, _, _, _, _, maybe_compact, _ = _import_context()
-    cfg = _cfg(context_window=100, tier1_threshold=0.6, tier2_threshold=0.8,
+    cfg = _cfg(context_window=300, tier1_threshold=0.6, tier2_threshold=0.8,
                protect_zone_tokens=5, snip_head_lines=2, snip_tail_lines=1)
     lines = [f"line{i}" for i in range(30)]
     msgs = [
@@ -406,7 +407,7 @@ async def test_maybe_compact_tier1_only():
 async def test_maybe_compact_tier1_then_tier2():
     """Tier1 can't reduce (single-line tool) → Tier2 placeholder kicks in → PRUNE."""
     _, _, _, _, _, _, _, maybe_compact, _ = _import_context()
-    cfg = _cfg(context_window=100, tier1_threshold=0.6, tier2_threshold=0.8,
+    cfg = _cfg(context_window=240, tier1_threshold=0.6, tier2_threshold=0.8,
                tier3_threshold=0.95, protect_zone_tokens=5)
     msgs = [
         {"role": "tool", "content": "x" * 200},  # single line → Tier1 no-op
@@ -457,9 +458,9 @@ async def test_apply_tier3_summarize_no_previous_summary():
     ]
     stats = await apply_tier3_summarize(msgs, 3, cfg, llm)
     assert stats.summarized is True
-    assert msgs[1].get("role") == "assistant"
+    assert msgs[1].get("role") == "system"
     assert msgs[1].get(SUMMARY_MARKER_KEY) is True
-    assert msgs[1]["content"] == "new summary text"
+    assert msgs[1]["content"].endswith("new summary text")
 
 
 @pytest.mark.asyncio
@@ -476,7 +477,7 @@ async def test_apply_tier3_summarize_found_previous():
     ]
     stats = await apply_tier3_summarize(msgs, 3, cfg, llm)
     assert stats.summarized is True
-    assert msgs[1]["content"] == "updated summary"
+    assert msgs[1]["content"].endswith("updated summary")
     assert msgs[1].get(SUMMARY_MARKER_KEY) is True
     # Only one summary message should exist (old replaced)
     summary_count = sum(1 for m in msgs if m.get(SUMMARY_MARKER_KEY))
@@ -497,7 +498,7 @@ async def test_apply_tier3_summarize_inserts_after_system():
     await apply_tier3_summarize(msgs, 2, cfg, llm)
     assert msgs[0]["role"] == "system"
     assert msgs[1].get(SUMMARY_MARKER_KEY) is True
-    assert msgs[1]["content"] == "summary"
+    assert msgs[1]["content"].endswith("summary")
 
 
 @pytest.mark.asyncio
@@ -596,7 +597,7 @@ async def test_apply_tier3_summarize_preserves_user_code_blocks():
 
 
 @pytest.mark.asyncio
-async def test_apply_tier3_summarize_truncates_large_delta():
+async def test_apply_tier3_summarize_chunks_large_delta_without_gaps():
     """delta 超 summarize_max_output_tokens*4 → 截断到 70% + 前缀标记(spec 236-237)。
 
     用小 config(summarize_max_output_tokens=10 → cap=40)省构造:
@@ -615,10 +616,10 @@ async def test_apply_tier3_summarize_truncates_large_delta():
         msgs, protect_until=len(msgs) - 1, config=cfg, llm=llm, counter=FakeCounter()
     )
     user_prompt = llm.last_messages[1]["content"]
-    assert "delta truncated" in user_prompt
-    assert "earlier messages omitted" in user_prompt
+    assert "delta truncated" not in user_prompt
+    assert llm.call_count > 1
     # keep_budget=7 → only the most recent delta message fits → 49 omitted
-    assert "49 earlier messages omitted" in user_prompt
+    assert "earlier messages omitted" not in user_prompt
 
 
 # ============================================================
@@ -714,10 +715,6 @@ async def test_apply_tier3_summarize_replaces_delta_with_summary():
         {"role": "assistant", "content": "reply-2"},
         {"role": "user", "content": "recent-protect"},
     ]
-    pre_len = len(msgs)
-    pre_count_user = sum(1 for m in msgs if m.get("role") == "user")
-    pre_count_assistant = sum(1 for m in msgs if m.get("role") == "assistant")
-
     await apply_tier3_summarize(msgs, 5, cfg, llm)
 
     # 1. summary 必须存在
@@ -777,7 +774,7 @@ async def test_apply_tier3_summarize_incremental_replaces_old_and_delta():
     await apply_tier3_summarize(msgs, 4, cfg, llm)
     assert len(msgs) == 3
     assert msgs[1].get(SUMMARY_MARKER_KEY) is True
-    assert msgs[1]["content"] == "v2 summary"
+    assert msgs[1]["content"].endswith("v2 summary")
     assert msgs[-1]["content"] == "protect"
     # round-3 / answer-3 都已删
     for m in msgs:
@@ -788,7 +785,6 @@ async def test_apply_tier3_summarize_incremental_replaces_old_and_delta():
 @pytest.mark.asyncio
 async def test_maybe_compact_tier3_drops_message_count_and_tokens():
     """Finding 3 fix: maybe_compact Tier3 cascade 跑完,消息数与 token 数必须下降。"""
-    from cc_harness.context import CompactionStats
     _, _, _, _, _, _, _, maybe_compact, _ = _import_context()
     cfg = _cfg(context_window=100, tier1_threshold=0.1, tier2_threshold=0.2,
                tier3_threshold=0.3, protect_zone_tokens=5)
@@ -833,10 +829,10 @@ async def test_context_projection_preserves_originals_and_versions_summary(tmp_p
     ]
     original = deepcopy(source)
     config = _cfg(
-        context_window=200,
-        tier1_threshold=0.1,
-        tier2_threshold=0.2,
-        tier3_threshold=0.3,
+        context_window=4000,
+        tier1_threshold=0.05,
+        tier2_threshold=0.1,
+        tier3_threshold=0.15,
         protect_zone_tokens=5,
     )
     projection = ContextProjection(source, artifact_dir=tmp_path)
@@ -865,10 +861,10 @@ async def test_context_projection_restores_latest_projection_and_increments_vers
         {"role": "user", "content": "current requirement"},
     ]
     config = _cfg(
-        context_window=200,
-        tier1_threshold=0.1,
-        tier2_threshold=0.2,
-        tier3_threshold=0.3,
+        context_window=4000,
+        tier1_threshold=0.02,
+        tier2_threshold=0.05,
+        tier3_threshold=0.1,
         protect_zone_tokens=5,
     )
     first = ContextProjection(source, artifact_dir=tmp_path)
@@ -928,3 +924,118 @@ def test_context_projection_drops_orphaned_provider_tool_results(tmp_path):
         for message in projection.messages
     )
     assert projection.messages[-1]["content"] == "current"
+
+
+@pytest.mark.asyncio
+async def test_compaction_selects_one_tier_without_cascade():
+    from cc_harness.context import CompactionTier, maybe_compact
+
+    cfg = _cfg(
+        context_window=100,
+        tier1_threshold=0.6,
+        tier2_threshold=0.8,
+        tier3_threshold=0.95,
+        protect_zone_tokens=5,
+    )
+    messages = [
+        {"role": "tool", "content": "x" * 85},
+        {"role": "user", "content": "go"},
+        {"role": "assistant", "content": "tail"},
+    ]
+    llm = FakeLLM(content="must not be called")
+    stats = await maybe_compact(messages, None, FakeCounter(), cfg, llm)
+
+    assert stats.tier == CompactionTier.PRUNE
+    assert stats.summarized is False
+    assert llm.call_count == 0
+    assert messages[0]["content"] == "[Old tool result content cleared]"
+
+
+@pytest.mark.asyncio
+async def test_authoritative_summary_prompt_ignores_lossy_projection(tmp_path):
+    from cc_harness.context import ContextProjection
+
+    source = [
+        {"role": "system", "content": "sys"},
+        {"role": "tool", "content": "ORIGINAL-FACT\n" * 40},
+        {"role": "assistant", "content": "old answer"},
+        {"role": "user", "content": "recent"},
+    ]
+    cfg = _cfg(
+        context_window=2000,
+        tier1_threshold=0.1,
+        tier2_threshold=0.2,
+        tier3_threshold=0.25,
+        protect_zone_tokens=5,
+    )
+    llm = FakeLLM(content="authoritative summary")
+    projection = ContextProjection(source, artifact_dir=tmp_path)
+    stats = await projection.compact(source, None, FakeCounter(), cfg, llm)
+
+    assert stats.summarized is True
+    assert "ORIGINAL-FACT" in llm.last_messages[1]["content"]
+    assert any(message.get("_compaction_summary") for message in projection.messages)
+    manifest = (tmp_path / "summary-v0001.json").read_text(encoding="utf-8")
+    assert "source_refs" in manifest and "coverage_range" in manifest
+    assert (tmp_path / "current.json").is_file()
+
+
+@pytest.mark.asyncio
+async def test_non_summary_compaction_also_persists_current_pointer(tmp_path):
+    from cc_harness.context import CompactionTier, ContextProjection
+
+    source = [
+        {"role": "system", "content": "sys"},
+        {"role": "tool", "content": "line\n" * 9},
+        {"role": "assistant", "content": "done"},
+        {"role": "user", "content": "keep this request"},
+    ]
+    cfg = _cfg(
+        context_window=1000,
+        tier1_threshold=0.05,
+        tier2_threshold=0.8,
+        tier3_threshold=0.95,
+        protect_zone_tokens=5,
+    )
+    projection = ContextProjection(source, artifact_dir=tmp_path)
+    stats = await projection.compact(source, None, FakeCounter(), cfg, FakeLLM())
+
+    assert stats.tier == CompactionTier.SNIP
+    assert stats.artifact_path is not None
+    assert (tmp_path / "compaction-v0001.json").is_file()
+    pointer = json.loads((tmp_path / "current.json").read_text(encoding="utf-8"))
+    assert pointer["artifact"] == "compaction-v0001.json"
+
+
+@pytest.mark.asyncio
+async def test_summary_keeps_offload_source_ref_visible_to_model(tmp_path):
+    from cc_harness.context import ContextProjection
+
+    source = [
+        {"role": "system", "content": "sys"},
+        {
+            "role": "assistant",
+            "content": "",
+            "tool_calls": [{"id": "c1", "type": "function", "function": {"name": "read", "arguments": "{}"}}],
+        },
+        {
+            "role": "tool",
+            "tool_call_id": "c1",
+            "content": "[offloaded node=n1 source_ref=node:n1 digest=sha256:x summary='preview']\n" + "x" * 200,
+        },
+        {"role": "assistant", "content": "old answer"},
+        {"role": "user", "content": "recent"},
+    ]
+    cfg = _cfg(
+        context_window=2000,
+        tier1_threshold=0.05,
+        tier2_threshold=0.2,
+        tier3_threshold=0.3,
+        protect_zone_tokens=5,
+    )
+    projection = ContextProjection(source, artifact_dir=tmp_path)
+    await projection.compact(source, None, FakeCounter(), cfg, FakeLLM())
+
+    pointers = [m for m in projection.messages if m.get("_compaction_pointer")]
+    assert len(pointers) == 1
+    assert "source_ref=node:n1" in pointers[0]["content"]

@@ -1,0 +1,43 @@
+{
+  "schema_version": "terminal-bench-2.1-difficulty-selection.v1",
+  "dataset": "terminal-bench/terminal-bench-2-1@sha256:7d7bdc1cbedad549fc1140404bd4dc45e5fd0ea7c4186773687d177ad3a0699a",
+  "selection": {
+    "difficulty": ["hard"],
+    "trial_count_per_task": 1,
+    "official_task_count": 89,
+    "selected_task_count": 30,
+    "holdout": true
+  },
+  "tasks": [
+    {"task_id": "terminal-bench/bn-fit-modify"},
+    {"task_id": "terminal-bench/cancel-async-tasks"},
+    {"task_id": "terminal-bench/circuit-fibsqrt"},
+    {"task_id": "terminal-bench/configure-git-webserver"},
+    {"task_id": "terminal-bench/dna-assembly"},
+    {"task_id": "terminal-bench/extract-moves-from-video"},
+    {"task_id": "terminal-bench/feal-differential-cryptanalysis"},
+    {"task_id": "terminal-bench/feal-linear-cryptanalysis"},
+    {"task_id": "terminal-bench/fix-code-vulnerability"},
+    {"task_id": "terminal-bench/fix-ocaml-gc"},
+    {"task_id": "terminal-bench/gpt2-codegolf"},
+    {"task_id": "terminal-bench/install-windows-3.11"},
+    {"task_id": "terminal-bench/llm-inference-batching-scheduler"},
+    {"task_id": "terminal-bench/make-doom-for-mips"},
+    {"task_id": "terminal-bench/make-mips-interpreter"},
+    {"task_id": "terminal-bench/mcmc-sampling-stan"},
+    {"task_id": "terminal-bench/model-extraction-relu-logits"},
+    {"task_id": "terminal-bench/password-recovery"},
+    {"task_id": "terminal-bench/path-tracing"},
+    {"task_id": "terminal-bench/path-tracing-reverse"},
+    {"task_id": "terminal-bench/polyglot-rust-c"},
+    {"task_id": "terminal-bench/protein-assembly"},
+    {"task_id": "terminal-bench/regex-chess"},
+    {"task_id": "terminal-bench/sam-cell-seg"},
+    {"task_id": "terminal-bench/sparql-university"},
+    {"task_id": "terminal-bench/torch-pipeline-parallelism"},
+    {"task_id": "terminal-bench/torch-tensor-parallelism"},
+    {"task_id": "terminal-bench/train-fasttext"},
+    {"task_id": "terminal-bench/video-processing"},
+    {"task_id": "terminal-bench/write-compressor"}
+  ]
+}

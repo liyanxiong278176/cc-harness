@@ -16,6 +16,7 @@ from cc_harness.loop_control import (
     ToolScheduler,
     WorkingState,
     classify_tool_error,
+    completion_contract_from_instruction,
 )
 
 
@@ -46,6 +47,33 @@ async def test_completion_verifier_requires_path_and_post_mutation_test(tmp_path
     state.observe(
         "run_command", {"command": "python -m pytest"},
         is_error=False, result_text="1 passed",
+    )
+    assert (await verifier.verify(state)).passed is True
+
+
+def test_completion_contract_extracts_outputs_but_not_inputs() -> None:
+    contract = completion_contract_from_instruction(
+        "Read /app/input.json.\nWrite the final answer to /app/output.json."
+    )
+    assert contract.required_paths == ("/app/output.json",)
+    assert contract.require_service_health_check is False
+
+
+@pytest.mark.asyncio
+async def test_completion_contract_requires_successful_service_health_probe(tmp_path: Path) -> None:
+    contract = completion_contract_from_instruction(
+        "Implement a gRPC server and keep it listening on port 50051."
+    )
+    state = WorkingState.new(tmp_path)
+    verifier = CompletionVerifier(contract)
+    assert contract.require_service_health_check is True
+    assert (await verifier.verify(state)).passed is False
+
+    state.observe(
+        "run_command",
+        {"command": "grpcurl -plaintext localhost:50051 list"},
+        is_error=False,
+        result_text="service.Api",
     )
     assert (await verifier.verify(state)).passed is True
 

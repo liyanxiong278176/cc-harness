@@ -385,10 +385,11 @@ def load_executor_config(path: Path) -> ExecutorConfig:
 
 
 class ContextConfig(BaseModel):
-    """4-tier 上下文压缩配置(Plan3)。context_window=1M(deepseek-v4-flash 真实窗口)。
+    """Context compaction configuration.
 
-    threshold = 占窗口比例,触发各 tier:tier1(0.6)Snip / tier2(0.8)Prune /
-    tier3(0.95)Summarize。protect_zone_tokens = 最近 N token 不压缩。
+    Thresholds are measured against the usable input budget after output/tool
+    reserves.  A single invocation selects one mutually-exclusive tier:
+    tier1(0.6) Snip / tier2(0.8) Prune / tier3(0.95) Summary.
     """
     enabled: bool = True
     context_window: int = 1_000_000            # deepseek-v4-flash 真实窗口
@@ -400,6 +401,10 @@ class ContextConfig(BaseModel):
     snip_head_lines: int = 5
     snip_tail_lines: int = 1
     summarize_max_output_tokens: int = 2_000
+    output_reserve_tokens: int = 8_192
+    tool_schema_reserve_tokens: int = 0
+    summary_retry_limit: int = 2
+    compaction_lease_ttl_seconds: float = 300.0
     fail_closed: bool = True
     context_window_source: str = "legacy-default"
     context_window_verified: bool = False
@@ -420,6 +425,12 @@ class ContextConfig(BaseModel):
             raise ValueError("protect_zone_tokens must be non-negative")
         if self.context_window <= 0:
             raise ValueError("context_window must be positive")
+        if self.output_reserve_tokens < 0 or self.tool_schema_reserve_tokens < 0:
+            raise ValueError("context reserves must be non-negative")
+        if self.summary_retry_limit < 0:
+            raise ValueError("summary_retry_limit must be non-negative")
+        if self.compaction_lease_ttl_seconds <= 0:
+            raise ValueError("compaction_lease_ttl_seconds must be positive")
         return self
 
 
@@ -433,13 +444,17 @@ def load_context_config(
     """从 CONTEXT_* env 构造;缺省默认(1M 窗口)。
 
     path 暂不读(policy.yaml 无 context 段);env 覆盖:CONTEXT_ENABLED / CONTEXT_WINDOW /
-    CONTEXT_TIER1/2/3 / CONTEXT_PROTECT_TOKENS。
+    CONTEXT_TIER1/2/3 / CONTEXT_PROTECT_TOKENS / CONTEXT_OUTPUT_RESERVE_TOKENS /
+    CONTEXT_TOOL_RESERVE_TOKENS / CONTEXT_COMPACTION_LEASE_TTL_SECONDS。
     """
     env = os.environ if environ is None else environ
     enabled = env.get("CONTEXT_ENABLED")
     cw = env.get("CONTEXT_WINDOW")
     t1, t2, t3 = env.get("CONTEXT_TIER1"), env.get("CONTEXT_TIER2"), env.get("CONTEXT_TIER3")
     pt = env.get("CONTEXT_PROTECT_TOKENS")
+    output_reserve = env.get("CONTEXT_OUTPUT_RESERVE_TOKENS")
+    tool_reserve = env.get("CONTEXT_TOOL_RESERVE_TOKENS")
+    lease_ttl = env.get("CONTEXT_COMPACTION_LEASE_TTL_SECONDS")
     kw: dict = {}
     if enabled is not None and enabled.strip():
         kw["enabled"] = enabled.strip().lower() in ("1", "true", "yes", "on")
@@ -468,6 +483,12 @@ def load_context_config(
         kw["tier3_threshold"] = float(t3)
     if pt:
         kw["protect_zone_tokens"] = int(pt)
+    if output_reserve:
+        kw["output_reserve_tokens"] = int(output_reserve)
+    if tool_reserve:
+        kw["tool_schema_reserve_tokens"] = int(tool_reserve)
+    if lease_ttl:
+        kw["compaction_lease_ttl_seconds"] = float(lease_ttl)
     return ContextConfig(**kw)
 
 

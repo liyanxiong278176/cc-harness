@@ -1,0 +1,6 @@
+This is a deterministic legacy offload object used to exercise content-addressed import.
+It contains no secret material and must be copied by digest rather than trusted by name.
+0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef
+0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef
+0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef
+0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef

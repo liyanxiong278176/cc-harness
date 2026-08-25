@@ -1,0 +1,10 @@
+session_id: legacy-session-001
+items:
+  - id: todo-001
+    title: Implement sample change
+    status: in_progress
+    active_sessions: [legacy-session-001]
+  - id: todo-002
+    title: Run verification
+    status: done
+    active_sessions: [legacy-session-001]

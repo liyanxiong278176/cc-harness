@@ -73,9 +73,18 @@ cc_harness/memory/*.db
 
 # Local benchmark evidence, downloaded datasets, and pinned upstream checkouts.
 /eval/result/
+/eval/cache/
+/eval/regressions/
 /eval/cc_only/data/
 /eval/cc_only/upstream/
 /eval/context_memory/data/
+
+# Local frontend build/install output (this workspace has no tracked frontend source).
+/web/
+*.tsbuildinfo
+
+# Temporary local worker/debug output.
+/.tmp-wsl-worker.log
 
 # Local agent/runtime state and tool caches.
 /.cc-harness/

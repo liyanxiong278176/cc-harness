@@ -89,3 +89,42 @@ async def test_worker_recovers_interrupted_running_job(tmp_path):
     assert await cur.fetchone() == ("done", 2)
     await worker.stop()
     await store.close()
+
+
+@pytest.mark.asyncio
+async def test_worker_builds_persona_from_generated_scenario(tmp_path):
+    """后台链路严格按 L1 → L2 → L3，并持久化精确场景版本 ID。"""
+    from cc_harness.memory.recall import read_persona, read_scenarios_by_ids
+
+    store = MemoryStore(tmp_path / "memory.db", embedding_dim=4)
+    await store.init_schema()
+    atom_id = (await store.add(
+        "用户偏好简洁回答", [0.1] * 4, "pipeline", session_id="session-1"
+    )).id
+    config = SimpleNamespace(
+        pipeline_every_n=1,
+        scenario_min_atoms=1,
+        persona_trigger_every_n=1,
+    )
+    worker = LayeredMemoryWorker(
+        store=store,
+        pipeline=_Pipeline(),
+        config=config,
+        context_window=128_000,
+        scenarios_dir=tmp_path / "scenarios",
+        persona_path=tmp_path / "persona.md",
+        artifact_dir=tmp_path / "pipeline",
+    )
+    await worker.start()
+    assert await worker.enqueue("session-1", 1, [{"role": "user", "content": "remember"}])
+    assert await worker.flush(timeout_s=2.0)
+
+    persona = read_persona(tmp_path / "persona.md")
+    assert persona is not None
+    assert persona.scenario_ids == ["session-1-v0001"]
+    scenarios = read_scenarios_by_ids(tmp_path / "scenarios", persona.scenario_ids)
+    assert len(scenarios) == 1
+    assert scenarios[0].atom_ids == [atom_id]
+
+    await worker.stop()
+    await store.close()

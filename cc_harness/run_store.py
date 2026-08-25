@@ -50,6 +50,8 @@ class RunRecordView:
     status: str
     sequence: int
     runtime_contract_digest: str
+    parent_run_id: str | None = None
+    predecessor_run_id: str | None = None
 
 
 @dataclass(frozen=True)
@@ -428,7 +430,8 @@ class RunStore:
 
     async def list_runs(self, statuses: set[str] | None = None) -> tuple[RunRecordView, ...]:
         query = (
-            "SELECT run_id, status, last_sequence, runtime_contract_digest "
+            "SELECT run_id, status, last_sequence, runtime_contract_digest, "
+            "parent_run_id, predecessor_run_id "
             "FROM run_record"
         )
         params: tuple[Any, ...] = ()
@@ -439,7 +442,38 @@ class RunStore:
             params = ordered
         query += " ORDER BY updated_at, run_id"
         cursor = await self._require_db().execute(query, params)
-        return tuple(RunRecordView(str(row[0]), str(row[1]), int(row[2]), str(row[3])) for row in await cursor.fetchall())
+        return tuple(
+            RunRecordView(
+                str(row[0]),
+                str(row[1]),
+                int(row[2]),
+                str(row[3]),
+                (str(row[4]) if row[4] else None),
+                (str(row[5]) if row[5] else None),
+            )
+            for row in await cursor.fetchall()
+        )
+
+    async def load_run_record(self, run_id: str) -> RunRecordView:
+        """Load durable run lineage used by context recall authorization."""
+
+        cursor = await self._require_db().execute(
+            """SELECT run_id, status, last_sequence, runtime_contract_digest,
+                      parent_run_id, predecessor_run_id
+               FROM run_record WHERE run_id = ?""",
+            (run_id,),
+        )
+        row = await cursor.fetchone()
+        if row is None:
+            raise RunNotFound(run_id)
+        return RunRecordView(
+            str(row[0]),
+            str(row[1]),
+            int(row[2]),
+            str(row[3]),
+            (str(row[4]) if row[4] else None),
+            (str(row[5]) if row[5] else None),
+        )
 
     async def current_lease(self, run_id: str) -> Lease | None:
         await self._ensure_run(run_id)

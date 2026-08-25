@@ -1,0 +1,4 @@
+{"session_id":"legacy-session-001","action_id":"action-001","event":"intent","tool":"Read","args":{"path":"README.md"},"created_at":1723862440.0}
+{"session_id":"legacy-session-001","action_id":"action-001","event":"started","tool":"Read","created_at":1723862441.0}
+{"session_id":"legacy-session-001","action_id":"action-002","event":"intent","tool":"run_command","args":{"command":"pytest -q"},"created_at":1723862442.0}
+{"session_id":"legacy-session-001","action_id":"action-002","event":"result","status":"success","result":"12 passed","created_at":1723862443.0}

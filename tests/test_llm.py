@@ -1,8 +1,15 @@
+import http.client
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
-from cc_harness.llm import ImageUnsupportedError, LLMClient, PendingToolCall, accumulate_delta
+from cc_harness.llm import (
+    ImageUnsupportedError,
+    LLMClient,
+    PendingToolCall,
+    StreamEvent,
+    accumulate_delta,
+)
 
 def test_pending_tool_call_index_optional():
     p = PendingToolCall()
@@ -213,3 +220,23 @@ async def test_chat_reports_provider_without_image_support_clearly():
     with pytest.raises(ImageUnsupportedError, match="does not support image attachments"):
         async for _event in client.chat(messages, tools=[]):
             pass
+
+
+@pytest.mark.asyncio
+async def test_chat_retries_incomplete_provider_stream(monkeypatch):
+    client = LLMClient(api_key="sk-test", model="gpt-4o-mini", base_url=None)
+    attempts = 0
+
+    async def flaky_once(messages, tools):
+        nonlocal attempts
+        del messages, tools
+        attempts += 1
+        if attempts < 3:
+            raise http.client.IncompleteRead(b"partial")
+        yield StreamEvent(kind="done", content="recovered", finish_reason="stop")
+
+    monkeypatch.setattr("cc_harness.llm._PROVIDER_RETRY_DELAYS", (0.0, 0.0))
+    monkeypatch.setattr(client, "_chat_once", flaky_once)
+    events = [event async for event in client.chat([], [])]
+    assert attempts == 3
+    assert events[-1].content == "recovered"

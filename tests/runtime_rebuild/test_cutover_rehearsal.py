@@ -1,8 +1,10 @@
 import sqlite3
+from types import SimpleNamespace
 from pathlib import Path
 
 import pytest
 
+from cc_harness.capability_gate import evaluate_capability_continuity
 from cc_harness.cutover import CutoverError, CutoverManager
 
 
@@ -55,6 +57,13 @@ async def test_live_cutover_requires_explicit_confirmation_and_preserves_backup(
         backup_root=tmp_path / "backups",
         old_db=old_db,
         operator_confirmation="CUTOVER_DURABLE_RUNTIME",
+        continuity=evaluate_capability_continuity(
+            [
+                SimpleNamespace(event_type="ModelInvocationStarted", payload={}, actor="worker"),
+                SimpleNamespace(event_type="ContextProjectionBuilt", payload={}, actor="worker"),
+                SimpleNamespace(event_type="ToolObservationCommitted", payload={}, actor="worker"),
+            ]
+        ),
     )
     assert report.ok
     assert report.dry_run is False

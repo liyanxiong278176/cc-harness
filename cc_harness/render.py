@@ -296,7 +296,7 @@ def print_cross_session_summary(
 #    matching ``RenderDriver`` method, with the ``ToolCallEnd.duration_ms``
 #    field threaded all the way through.
 # ---------------------------------------------------------------------------
-from cc_harness.render_protocol import (
+from cc_harness.render_protocol import (  # noqa: E402
     FinalText,
     ModeChanged,
     PermissionModeChanged,

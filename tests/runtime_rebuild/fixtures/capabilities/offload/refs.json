@@ -1,0 +1,8 @@
+{
+  "schema_version": "cc-harness.offload-fixture.v1",
+  "node_id": "offload-login-log-001",
+  "content_digest": "sha256:fixture-large-log",
+  "complete": false,
+  "next_cursor": "128",
+  "pointer": "Use ContinueToolResult with observation_id=fixture-observation and next_cursor=128."
+}

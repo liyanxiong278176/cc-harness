@@ -172,6 +172,51 @@ class ChildProjection:
 
 
 @dataclass(frozen=True)
+class ToolObservationProjection:
+    """Index of a committed observation; the artifact remains authoritative."""
+
+    observation_id: str
+    action_id: str
+    attempt: int
+    tool_name: str
+    observation_artifact: str
+    status: str
+    complete: bool
+    next_cursor: str | None = None
+    recovery: str = "none"
+    provenance: tuple[str, ...] = ()
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "observation_id": self.observation_id,
+            "action_id": self.action_id,
+            "attempt": self.attempt,
+            "tool_name": self.tool_name,
+            "observation_artifact": self.observation_artifact,
+            "status": self.status,
+            "complete": self.complete,
+            "next_cursor": self.next_cursor,
+            "recovery": self.recovery,
+            "provenance": list(self.provenance),
+        }
+
+    @classmethod
+    def from_dict(cls, data: Mapping[str, Any]) -> "ToolObservationProjection":
+        return cls(
+            observation_id=str(data["observation_id"]),
+            action_id=str(data["action_id"]),
+            attempt=int(data["attempt"]),
+            tool_name=str(data["tool_name"]),
+            observation_artifact=str(data["observation_artifact"]),
+            status=str(data["status"]),
+            complete=bool(data.get("complete", True)),
+            next_cursor=(str(data["next_cursor"]) if data.get("next_cursor") else None),
+            recovery=str(data.get("recovery") or "none"),
+            provenance=tuple(str(item) for item in data.get("provenance") or ()),
+        )
+
+
+@dataclass(frozen=True)
 class WorkingStateProjection:
     modified_paths: tuple[str, ...] = ()
     read_paths: tuple[str, ...] = ()
@@ -215,7 +260,10 @@ class RunProjection:
     runtime_contract: RuntimeContract | None = None
     runtime_contract_digest: str | None = None
     plan: PlanGraph = field(default_factory=PlanGraph)
+    discovery_status: str = "not_required"
+    mutation_gate: str = "open"
     actions: tuple[ActionAttempt, ...] = ()
+    observations: tuple[ToolObservationProjection, ...] = ()
     approvals: tuple[ApprovalProjection, ...] = ()
     todos: tuple[TodoProjection, ...] = ()
     queue: tuple[QueueProjection, ...] = ()
@@ -240,7 +288,10 @@ class RunProjection:
             "runtime_contract": self.runtime_contract.to_dict() if self.runtime_contract else None,
             "runtime_contract_digest": self.runtime_contract_digest,
             "plan": self.plan.to_dict(),
+            "discovery_status": self.discovery_status,
+            "mutation_gate": self.mutation_gate,
             "actions": [_action_to_dict(item) for item in self.actions],
+            "observations": [item.to_dict() for item in self.observations],
             "approvals": [item.to_dict() for item in self.approvals],
             "todos": [item.to_dict() for item in self.todos],
             "queue": [item.to_dict() for item in self.queue],
@@ -267,7 +318,13 @@ class RunProjection:
             ),
             runtime_contract_digest=data.get("runtime_contract_digest"),
             plan=PlanGraph.from_dict(data.get("plan") or {}),
+            discovery_status=str(data.get("discovery_status", "not_required")),
+            mutation_gate=str(data.get("mutation_gate", "open")),
             actions=tuple(_action_from_dict(item) for item in data.get("actions") or ()),
+            observations=tuple(
+                ToolObservationProjection.from_dict(item)
+                for item in data.get("observations") or ()
+            ),
             approvals=tuple(ApprovalProjection.from_dict(item) for item in data.get("approvals") or ()),
             todos=tuple(TodoProjection.from_dict(item) for item in data.get("todos") or ()),
             queue=tuple(QueueProjection.from_dict(item) for item in data.get("queue") or ()),
@@ -338,7 +395,10 @@ class _MutableProjection:
     runtime_contract: RuntimeContract | None = None
     runtime_contract_digest: str | None = None
     plan: PlanGraph = field(default_factory=PlanGraph)
+    discovery_status: str = "not_required"
+    mutation_gate: str = "open"
     actions: dict[tuple[str, int], ActionAttempt] = field(default_factory=dict)
+    observations: dict[tuple[str, int], ToolObservationProjection] = field(default_factory=dict)
     approvals: dict[str, ApprovalProjection] = field(default_factory=dict)
     todos: dict[str, TodoProjection] = field(default_factory=dict)
     queue: dict[str, QueueProjection] = field(default_factory=dict)
@@ -360,7 +420,10 @@ class _MutableProjection:
             runtime_contract=projection.runtime_contract,
             runtime_contract_digest=projection.runtime_contract_digest,
             plan=projection.plan,
+            discovery_status=projection.discovery_status,
+            mutation_gate=projection.mutation_gate,
             actions={(item.action_id, item.attempt): item for item in projection.actions},
+            observations={(item.action_id, item.attempt): item for item in projection.observations},
             approvals={item.approval_id: item for item in projection.approvals},
             todos={item.todo_id: item for item in projection.todos},
             queue={item.follow_up_run_id: item for item in projection.queue},
@@ -382,7 +445,10 @@ class _MutableProjection:
             runtime_contract=self.runtime_contract,
             runtime_contract_digest=self.runtime_contract_digest,
             plan=self.plan,
+            discovery_status=self.discovery_status,
+            mutation_gate=self.mutation_gate,
             actions=tuple(self.actions[key] for key in sorted(self.actions)),
+            observations=tuple(self.observations[key] for key in sorted(self.observations)),
             approvals=tuple(self.approvals[key] for key in sorted(self.approvals)),
             todos=tuple(self.todos[key] for key in sorted(self.todos)),
             queue=tuple(self.queue[key] for key in sorted(self.queue)),
@@ -441,6 +507,12 @@ class ProjectionBuilder:
             current_status=state.status,
             goal=state.goal,
         )
+        if event.event_type == "PlanRevised" and state.discovery_status == "awaiting":
+            raise ProjectionError("plan mutation is blocked while read-only discovery is active")
+        if event.event_type == "ActionPlanned" and state.mutation_gate == "read_only":
+            effect = str(event.payload.get("effect_class", EffectClass.UNKNOWN.value))
+            if effect != EffectClass.READ_ONLY.value:
+                raise ProjectionError("mutating action is blocked by the discovery mutation gate")
 
     def _apply(self, event: RunEvent, state: _MutableProjection) -> None:
         payload = event.payload
@@ -480,6 +552,12 @@ class ProjectionBuilder:
                 if isinstance(payload.get("new_runtime_contract"), Mapping)
                 else None
             )
+        elif event.event_type == "PlanDiscoveryStarted":
+            state.discovery_status = "awaiting"
+            state.mutation_gate = "read_only"
+        elif event.event_type == "PlanDiscoveryCompleted":
+            state.discovery_status = "completed"
+            state.mutation_gate = "open"
         elif event.event_type == "RunClaimed":
             state.active_worker_id = str(payload["worker_id"])
             state.lease_epoch = event.lease_epoch
@@ -496,6 +574,8 @@ class ProjectionBuilder:
             state.active_worker_id = None
         elif event.event_type == "PlanCreated" or event.event_type == "PlanRevised":
             state.plan = PlanGraph.from_dict(payload["plan"])
+        elif event.event_type == "ToolObservationCommitted":
+            self._apply_observation(event, state)
         elif event.event_type.startswith("Action"):
             self._apply_action(event, state)
         elif event.event_type.startswith("Reconciliation"):
@@ -553,9 +633,33 @@ class ProjectionBuilder:
                 status="done",
                 updated_sequence=event.sequence,
             )
-
         state.sequence = event.sequence
         state.last_event_id = event.event_id
+
+    @staticmethod
+    def _apply_observation(event: RunEvent, state: _MutableProjection) -> None:
+        payload = event.payload
+        key = (str(payload["action_id"]), int(payload["attempt"]))
+        if key in state.observations:
+            raise ProjectionError(
+                f"observation already committed: {payload['action_id']}/{payload['attempt']}"
+            )
+        if key not in state.actions:
+            raise ProjectionError(
+                f"observation has no planned action: {payload['action_id']}/{payload['attempt']}"
+            )
+        state.observations[key] = ToolObservationProjection(
+            observation_id=str(payload["observation_id"]),
+            action_id=key[0],
+            attempt=key[1],
+            tool_name=str(payload.get("tool_name") or state.actions[key].tool_name),
+            observation_artifact=str(payload["observation_artifact"]),
+            status=str(payload["status"]),
+            complete=bool(payload["complete"]),
+            next_cursor=(str(payload["next_cursor"]) if payload.get("next_cursor") else None),
+            recovery=str(payload.get("recovery") or "none"),
+            provenance=tuple(str(item) for item in payload.get("provenance") or ()),
+        )
 
     def _apply_action(self, event: RunEvent, state: _MutableProjection) -> None:
         payload = event.payload
@@ -752,6 +856,7 @@ __all__ = [
     "ProjectionError",
     "QueueProjection",
     "RunProjection",
+    "ToolObservationProjection",
     "TodoProjection",
     "WorkingStateProjection",
 ]

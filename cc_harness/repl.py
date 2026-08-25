@@ -562,7 +562,8 @@ async def run_repl(
             from cc_harness.agent import run_turn
             # Q3 Task8: memory_layer 注入(kill-switch:layered_inject or 无 mem_deps → None)
             memory_layer = (
-                {"recall": state.mem_deps["recall"]}
+                state.mem_deps.get("layered_injection")
+                or {"recall": state.mem_deps["recall"]}
                 if state.mem_deps and mem_cfg.layered_inject
                 else None
             )
@@ -794,6 +795,7 @@ async def _after_turn_memory(state: ReplState, mem_cfg, scheduler=None) -> dict:
             await generate_persona(
                 store, None, state.mem_deps["persona_path"],
                 trigger_every_n=mem_cfg.persona_trigger_every_n,
+                scenarios_dir=state.mem_deps["scenarios_dir"],
             )
         except Exception as e:
             print_warn(Console(), f"memory persona failed: {e}")
@@ -1039,18 +1041,8 @@ async def _maybe_load_cross_session(state, console, mcp, mode) -> None:
         in_progress_subagents=state.subagent_cancelled,
     )
 
-    # E3 D5:启动后自动 memory_recall(query=project name) — silent fallback
-    if state.mem_deps:
-        try:
-            from cc_harness.memory.recall import layered_recall
-            retriever = state.mem_deps.get("retriever")
-            persona_path = state.mem_deps.get("persona_path")
-            scenarios_dir = state.mem_deps.get("scenarios_dir")
-            query = str(state.project_root.name) if state.project_root else ""
-            if retriever is not None and persona_path is not None and scenarios_dir is not None:
-                await layered_recall(retriever, persona_path, scenarios_dir, query)
-        except Exception:
-            pass  # silent fallback — repl 启动不挂
+    # L2/L3 由首个真实用户回合生成会话快照；这里不再做一次结果被丢弃的
+    # 启动召回，也不在用户/模型没有提出需要时自动搜索 L1。
 
 
 def _sha256_of_tool(tool: dict) -> str:

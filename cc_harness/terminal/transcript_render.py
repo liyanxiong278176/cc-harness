@@ -5,7 +5,7 @@ import json
 import re
 from io import StringIO
 
-from rich.console import Console, Group
+from rich.console import Console
 from rich.markdown import Markdown
 from rich.padding import Padding
 from rich.table import Table

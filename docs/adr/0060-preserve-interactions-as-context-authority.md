@@ -1,0 +1,3 @@
+# Preserve existing capabilities in one shared runtime
+
+Durable Agent Loop replaces execution ownership, persistence and recovery while consuming one shared AgentCapabilityRuntime for the existing production context compaction, offload/read-ref retrieval, memory recall/capture/maintenance/reflection/drift, policy and L2/L5 provenance, tools, MCP, planning and activation evidence. Immutable Run interaction history remains context authority; existing compaction and memory algorithms are adapted to Run events and artifacts rather than rewritten, copied into a reduced parallel stack, or accessed by nesting legacy `run_turn()`. Summaries and memory remain rebuildable or advisory views, with provenance preserved through every transformation.

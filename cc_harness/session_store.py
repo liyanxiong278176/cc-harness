@@ -35,6 +35,17 @@ class TerminalCheckpoint:
     created_at: float
 
 
+@dataclass(frozen=True)
+class QueuedInput:
+    queue_id: int
+    session_id: str
+    payload: dict
+    status: str
+    created_at: float
+    attempts: int = 0
+    last_error: str | None = None
+
+
 class SessionStore:
     """SQLite store scoped to ``<working-dir>/.cc-harness``."""
 
@@ -79,6 +90,19 @@ class SessionStore:
                 PRIMARY KEY (session_id, event_sequence),
                 FOREIGN KEY (session_id) REFERENCES session(id) ON DELETE CASCADE
             );
+            CREATE TABLE IF NOT EXISTS session_input_queue (
+                queue_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                session_id TEXT NOT NULL,
+                payload_json TEXT NOT NULL,
+                status TEXT NOT NULL DEFAULT 'queued',
+                attempts INTEGER NOT NULL DEFAULT 0,
+                last_error TEXT,
+                created_at REAL NOT NULL,
+                claimed_at REAL,
+                completed_at REAL
+            );
+            CREATE INDEX IF NOT EXISTS idx_session_input_queue_order
+                ON session_input_queue(session_id, status, queue_id);
             CREATE TABLE IF NOT EXISTS session_event (
                 session_id TEXT NOT NULL,
                 event_index INTEGER NOT NULL,
@@ -126,6 +150,121 @@ class SessionStore:
         await self._db.commit()
         self._restrict_permissions(self.db_path)
         return self
+
+    async def enqueue_input(self, session_id: str, payload: dict) -> QueuedInput:
+        """Durably append one user input before it can enter the active context."""
+        assert self._db is not None
+        created_at = time.time()
+        cursor = await self._db.execute(
+            "INSERT INTO session_input_queue "
+            "(session_id, payload_json, status, created_at) VALUES (?, ?, 'queued', ?)",
+            (session_id, json.dumps(payload, ensure_ascii=True, sort_keys=True), created_at),
+        )
+        await self._db.commit()
+        queue_id = int(cursor.lastrowid)
+        return QueuedInput(queue_id, session_id, dict(payload), "queued", created_at)
+
+    async def claim_next_input(self, session_id: str) -> QueuedInput | None:
+        """Atomically claim the oldest queued input for one session."""
+        assert self._db is not None
+        await self._db.execute("BEGIN IMMEDIATE")
+        try:
+            cursor = await self._db.execute(
+                "SELECT queue_id, session_id, payload_json, status, created_at, attempts, last_error "
+                "FROM session_input_queue WHERE session_id = ? AND status = 'queued' "
+                "ORDER BY queue_id LIMIT 1",
+                (session_id,),
+            )
+            row = await cursor.fetchone()
+            if row is None:
+                await self._db.commit()
+                return None
+            now = time.time()
+            await self._db.execute(
+                "UPDATE session_input_queue SET status='processing', attempts=attempts+1, claimed_at=? "
+                "WHERE queue_id = ? AND status = 'queued'",
+                (now, int(row[0])),
+            )
+            await self._db.commit()
+            return QueuedInput(
+                queue_id=int(row[0]),
+                session_id=str(row[1]),
+                payload=dict(json.loads(row[2])),
+                status="processing",
+                created_at=float(row[4]),
+                attempts=int(row[5]) + 1,
+                last_error=row[6],
+            )
+        except BaseException:
+            await self._db.rollback()
+            raise
+
+    async def complete_input(self, queue_id: int) -> bool:
+        """Mark an input consumed only after its turn has finished."""
+        assert self._db is not None
+        cursor = await self._db.execute(
+            "UPDATE session_input_queue SET status='completed', completed_at=? "
+            "WHERE queue_id = ? AND status = 'processing'",
+            (time.time(), int(queue_id)),
+        )
+        await self._db.commit()
+        return cursor.rowcount == 1
+
+    async def requeue_input(self, queue_id: int, error: str | None = None) -> bool:
+        """Return a failed input to FIFO; the payload is never discarded."""
+        assert self._db is not None
+        cursor = await self._db.execute(
+            "UPDATE session_input_queue SET status='queued', last_error=?, claimed_at=NULL "
+            "WHERE queue_id = ? AND status = 'processing'",
+            (str(error)[:2000] if error else None, int(queue_id)),
+        )
+        await self._db.commit()
+        return cursor.rowcount == 1
+
+    async def cancel_input(self, queue_id: int, reason: str = "cancelled by user") -> bool:
+        """Explicitly cancel one queued input without deleting its audit record."""
+        assert self._db is not None
+        cursor = await self._db.execute(
+            "UPDATE session_input_queue SET status='cancelled', last_error=?, completed_at=? "
+            "WHERE queue_id=? AND status='queued'",
+            (str(reason)[:2000], time.time(), int(queue_id)),
+        )
+        await self._db.commit()
+        return cursor.rowcount == 1
+
+    async def pending_inputs(self, session_id: str) -> tuple[QueuedInput, ...]:
+        """Return queued/processing inputs in arrival order for recovery."""
+        assert self._db is not None
+        cursor = await self._db.execute(
+            "SELECT queue_id, session_id, payload_json, status, created_at, attempts, last_error "
+            "FROM session_input_queue WHERE session_id = ? AND status IN ('queued','processing') "
+            "ORDER BY queue_id",
+            (session_id,),
+        )
+        return tuple(
+            QueuedInput(
+                queue_id=int(row[0]),
+                session_id=str(row[1]),
+                payload=dict(json.loads(row[2])),
+                status=str(row[3]),
+                created_at=float(row[4]),
+                attempts=int(row[5]),
+                last_error=row[6],
+            )
+            for row in await cursor.fetchall()
+        )
+
+    async def recover_processing_inputs(self, session_id: str) -> int:
+        """Requeue inputs left in ``processing`` by a crashed runtime."""
+        assert self._db is not None
+        cursor = await self._db.execute(
+            "UPDATE session_input_queue SET status='queued', "
+            "last_error=COALESCE(last_error, 'recovered after runtime restart'), claimed_at=NULL "
+            "WHERE session_id = ? AND status = 'processing'",
+            (session_id,),
+        )
+        await self._db.commit()
+        return cursor.rowcount
 
     async def save(
         self,
@@ -426,6 +565,12 @@ class SessionStore:
 
     async def delete(self, session_id: str) -> None:
         assert self._db is not None
+        # The input queue intentionally has no FK so inputs can be durably
+        # accepted before the first session snapshot exists. Once a session is
+        # explicitly deleted, remove its queued/processing records as well.
+        await self._db.execute(
+            "DELETE FROM session_input_queue WHERE session_id = ?", (session_id,)
+        )
         await self._db.execute("DELETE FROM session WHERE id = ?", (session_id,))
         await self._db.commit()
         attachment_dir = self.attachments_root / session_id
