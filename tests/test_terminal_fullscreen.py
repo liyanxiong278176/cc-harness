@@ -70,6 +70,12 @@ def test_fullscreen_owns_alternate_screen_and_real_input_buffer(fullscreen_app):
     assert fullscreen_app._application.layout.current_control.buffer is fullscreen_app.input_buffer
 
 
+def test_fullscreen_captures_mouse_only_for_command_menu(fullscreen_app):
+    assert fullscreen_app._application.mouse_support() is False
+    fullscreen_app.input_buffer.complete_state = object()
+    assert fullscreen_app._application.mouse_support() is True
+
+
 @pytest.mark.asyncio
 async def test_busy_submit_queues_real_prompt(fullscreen_app):
     fullscreen_app._active_task = asyncio.Future()

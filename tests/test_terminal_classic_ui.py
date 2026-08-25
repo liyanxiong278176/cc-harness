@@ -135,6 +135,7 @@ def test_prompt_and_status_styles_do_not_paint_a_background():
     for selector in ("", "bottom-toolbar", "bottom-toolbar.text"):
         assert "bg:ansidefault" in rules[selector]
         assert "noreverse" in rules[selector]
+    assert rules["completion-menu.completion.current"] == "bg:#3b4252 #ffffff bold"
     merged = merge_styles([default_ui_style(), prompt_style])
     attrs = merged.get_attrs_for_style_str(
         "class:bottom-toolbar class:bottom-toolbar.text class:status.model"

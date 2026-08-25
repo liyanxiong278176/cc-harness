@@ -282,10 +282,14 @@ class FullscreenTerminalApp(InlineTerminalApp):
             style=self._fullscreen_style(),
             key_bindings=self._build_fullscreen_key_bindings(),
             full_screen=True,
-            # Native terminal selection is the default.  Mouse reporting is
-            # opt-in because prompt_toolkit capture otherwise consumes drag
-            # events before Windows Terminal/ConHost can select text.
-            mouse_support=self.terminal_settings.capture_mouse,
+            # Keep native terminal selection by default.  While the command
+            # menu is open, capture mouse events so its rows can be hovered
+            # and clicked like Claude Code; otherwise drag-select remains
+            # owned by Windows Terminal/ConHost.
+            mouse_support=Condition(
+                lambda: self.terminal_settings.capture_mouse
+                or self.input_buffer.complete_state is not None
+            ),
             refresh_interval=0.1,
             min_redraw_interval=0.03,
             paste_mode=False,

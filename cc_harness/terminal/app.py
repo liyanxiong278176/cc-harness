@@ -629,6 +629,11 @@ class InlineTerminalApp:
             "bottom-toolbar.text": "#d0d0d0 bg:ansidefault noreverse",
             "input.border": "#777777",
             "input.prompt": "#d0d0d0 bold",
+            "completion-menu": "bg:#20242b #d6deeb",
+            "completion-menu.completion": "bg:#20242b #d6deeb",
+            "completion-menu.completion.current": "bg:#3b4252 #ffffff bold",
+            "completion-menu.meta.completion": "#8f9baa",
+            "completion-menu.meta.completion.current": "#ffffff",
             "status.border": "#777777",
             "status.model": "#00d7d7",
             "status.separator": "#888888",
@@ -678,6 +683,10 @@ class InlineTerminalApp:
         self.runtime.llm.reasoning_effort_supported = None
 
     def _handle_escape(self, buffer, app) -> None:
+        if buffer.complete_state is not None:
+            buffer.cancel_completion()
+            app.invalidate()
+            return
         if self._active_task is not None and not self._active_task.done():
             self._active_task.cancel()
             return
