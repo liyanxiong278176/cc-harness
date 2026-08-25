@@ -1,0 +1,3 @@
+# Default to a focus workspace with an on-demand run inspector
+
+The fullscreen TUI keeps the transcript and prompt as the default workspace and exposes workflow, token, context, file, and failure diagnostics through one on-demand Run Inspector. This progressive-disclosure boundary preserves day-to-day readability while still making operational evidence accessible; abnormal usage, context pressure, or failures may alert in the status area but must not automatically replace the user's workspace. The classic renderer consumes the same state but exposes it through textual summaries and slash commands rather than imitating fullscreen sidebars, drawers, mouse interaction, or local refresh behavior.

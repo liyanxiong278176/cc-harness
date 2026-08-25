@@ -23,7 +23,8 @@ def test_subagent_hints_injected_after_htn_parent_create(tmp_path):
     ]
     _refresh_system_prompt(messages, str(tmp_path), "coding")
     assert "<subagent_hints>" in messages[0]["content"]
-    assert "len(sub_specs)" in messages[0]["content"]  # 关键澄清:N = len(sub_specs)
+    assert "dispatch_subagent" in messages[0]["content"]
+    assert "Agent Runtime" in messages[0]["content"]
 
 
 def test_subagent_hints_not_injected_in_plan_mode(tmp_path):

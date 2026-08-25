@@ -60,6 +60,20 @@ def test_layered_config_propagates_memory_environment_with_same_precedence(tmp_p
     assert cfg.runtime_environment["EMBEDDING_MODEL"] == "project-embedding"
 
 
+def test_layered_config_propagates_tool_bundle_selection(tmp_path):
+    project = tmp_path / "project"
+    project.mkdir()
+    (project / ".env").write_text(
+        "OPENAI_API_KEY=k\nOPENAI_BASE_URL=https://api\nOPENAI_MODEL=m\n"
+        "CC_HARNESS_TOOL_BUNDLES=core,web\n",
+        encoding="utf-8",
+    )
+
+    cfg = load_layered_config(project, user_root=tmp_path / "none", environ={})
+
+    assert cfg.runtime_environment["CC_HARNESS_TOOL_BUNDLES"] == "core,web"
+
+
 def test_layered_config_allows_missing_mcp_but_requires_model(tmp_path):
     project = tmp_path / "project"
     project.mkdir()

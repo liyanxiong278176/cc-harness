@@ -32,6 +32,8 @@ from cc_harness.llm import LLMClient
 from cc_harness.loop_control import LoopControlConfig, completion_contract_from_instruction
 from cc_harness.mcp_client import MCPClient
 from cc_harness.policy import PolicyEngine
+from cc_harness.project_instructions import load_project_instructions
+from cc_harness.tool_bundles import parse_tool_bundles
 from cc_harness.repl import ReplState, _after_turn_memory, _after_turn_todo, _extract_final_text
 from cc_harness.session_store import SessionRecord, SessionStore
 from cc_harness.tools import init_session_executor, shutdown_session_executor
@@ -83,6 +85,10 @@ class SessionRuntime:
         self.capability_profile = CapabilityProfile.named("standard")
         self.activation_manifest: ActivationManifest | None = None
         self.context_projection: ContextProjection | None = None
+        # Safe prompt diagnostics only; never store/render prompt text here.
+        self.prompt_metadata: dict[str, object] = {}
+        self.project_instructions = None
+        self.tool_bundles = None
         # ``None`` is retained for lightweight tests/callers that construct a
         # runtime directly instead of going through ``create``.  A fully
         # initialized runtime captures one value and reuses it for the
@@ -147,6 +153,7 @@ class SessionRuntime:
         if max_iterations is not None and not 1 <= max_iterations <= 100:
             raise ValueError("max_iterations must be between 1 and 100")
         self.cwd = Path(cwd).resolve()
+        self.project_instructions = load_project_instructions(self.cwd)
         self.additional_dirs = tuple(Path(p).resolve() for p in (additional_dirs or []))
         self.max_iterations = max_iterations
         if bare and capability_profile not in (None, "clean-coding"):
@@ -165,6 +172,12 @@ class SessionRuntime:
         if self.capability_profile.name == "hardened-safety" and host_execution:
             raise ValueError("hardened-safety cannot be combined with host execution")
         self.config = load_layered_config(self.cwd)
+        # Resolve bundle selection through the same process/project/user
+        # precedence as the other runtime settings.  The default remains the
+        # small core bundle when no value is configured.
+        self.tool_bundles = parse_tool_bundles(
+            self.config.runtime_environment.get("CC_HARNESS_TOOL_BUNDLES")
+        )
         self.llm = LLMClient(
             api_key=self.config.openai_api_key,
             model=self.config.openai_model,
@@ -787,7 +800,21 @@ class SessionRuntime:
         prompt_capabilities = {
             "todo_available": self.state.todo_service is not None,
             "subagent_available": self.state.todo_service is not None,
-            "visible_thought_required": not self.bare,
+            # Reasoning depth is controlled by the provider/API.  The TUI may
+            # show elapsed time, but production prompts never require visible
+            # chain-of-thought text before a tool call.
+            "visible_thought_required": False,
+        }
+        completion_contract = completion_contract_from_instruction(user_text)
+        runtime_contract = {
+            "acceptance": list(completion_contract.required_paths),
+            "artifacts": list(completion_contract.required_paths),
+            "verification": (
+                "required after code changes"
+                if completion_contract.require_verification_after_code_changes else "optional"
+            ),
+            "blockers": [],
+            "next_action": "continue until acceptance and verification are evidenced",
         }
         try:
 
@@ -861,8 +888,15 @@ class SessionRuntime:
                 max_iter=1 if one_shot else self.max_iterations,
                 loop_control_config=LoopControlConfig(
                     enabled=self.capability_profile.loop_control,
-                    completion_contract=completion_contract_from_instruction(user_text),
+                    completion_contract=completion_contract,
                 ),
+                runtime_contract=runtime_contract,
+                project_instructions=(
+                    self.project_instructions.text
+                    if self.project_instructions is not None else None
+                ),
+                allow_read_only_tools=not one_shot,
+                tool_bundles=self.tool_bundles,
                 context_artifact_dir=(
                     None
                     if one_shot
@@ -885,6 +919,8 @@ class SessionRuntime:
                     )
                 ),
             )
+            if getattr(stats, "prompt_metadata", None):
+                self.prompt_metadata = dict(stats.prompt_metadata)
             compaction_error = getattr(getattr(stats, "compaction", None), "error", None)
             if compaction_error:
                 # The durable queue item must remain pending.  Roll back only
@@ -904,6 +940,23 @@ class SessionRuntime:
                     )
                     stats.api_completion_tokens += scan.usage.completion_tokens
                     stats.api_total_tokens += scan.usage.total_tokens
+                    if scan.usage.reported_cost is None:
+                        stats.api_reported_cost = None
+                        stats.api_reported_cost_currency = None
+                    elif stats.api_reported_cost is None:
+                        stats.api_reported_cost = scan.usage.reported_cost
+                        stats.api_reported_cost_currency = scan.usage.reported_cost_currency
+                    elif stats.api_reported_cost_currency in (
+                        None, scan.usage.reported_cost_currency
+                    ):
+                        stats.api_reported_cost += scan.usage.reported_cost
+                        stats.api_reported_cost_currency = (
+                            stats.api_reported_cost_currency
+                            or scan.usage.reported_cost_currency
+                        )
+                    else:
+                        stats.api_reported_cost = None
+                        stats.api_reported_cost_currency = None
                     stats.api_reported = True
             self.state.session_stats.add(
                 stats,

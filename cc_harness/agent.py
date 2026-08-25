@@ -16,6 +16,7 @@ Modes (see task #4 / #6):
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import io
 import json
 import logging
@@ -44,6 +45,7 @@ from cc_harness.loop_control import (
 from cc_harness.mcp_client import ToolResult
 from cc_harness.native_tools import NATIVE_FILE_TOOLS
 from cc_harness.policy import Action, PolicyEngine
+from cc_harness.tool_bundles import bundle_digest, select_tool_specs
 from cc_harness.reflection.events import (  # E2 T2.2:反思事件工厂
     empty_turn_loop,
     max_iter_reached,
@@ -80,19 +82,11 @@ _VALID_MODES = ("coding", "plan", "design", "chat")
 
 SUBAGENT_HINTS_BLOCK = """
 <subagent_hints>
-你最近创建了 HTN parent task(有 children 的父任务)。如果有多个独立子任务可并行完成,考虑用 `dispatch_subagent` tool fan-out 派 subagent 并行跑:
-- 调 `dispatch_subagent(task_id=<parent_id>, sub_specs=[{title, criteria}, ...])`
-- 派发数 N = len(sub_specs)(根据你的 todo 列表动态传),不是默认派 3 个
-- subagent 共享 TodoService, 完成门自动验入(改 children 状态)
-- N 个 subagent 真并行(默认上限 3 个;实际派发数 = sub_specs 长度,根据你的 todo 列表动态传 N,需要更多可覆盖 max_fan_out 到 ≤10)
-- 完成后回填摘要(标题 + 状态 + 末轮结果 + 文件路径)
-
-不要 fan-out:
-- 1 个任务(没必要)
-- 强依赖串行的任务(应改用 depends_on)
-- 嵌套 > 2 层(硬拒)
-
-完成 fan-out 后, 父任务可在 children 全 done 后标 done (聚合由 C 完成门把关)。
+你最近创建了 HTN parent task(有 children 的父任务)。只有在子任务真正独立、
+并行或专业化收益明确、合并边界和验收条件清晰时,才考虑用
+`dispatch_subagent` tool fan-out。请求只携带目标、验收条件、必要证据引用、
+约束和授权工具；Agent Runtime 决定并发、递归深度、预算、权限和生命周期。
+强依赖或共享同一文件的工作留在主 Agent；完成后回填事实摘要和证据引用。
 </subagent_hints>
 """
 
@@ -213,14 +207,19 @@ async def run_turn(
     retry_empty_response: bool = True,
     security_mode: str | None = None,
     output_egress_guard: bool | None = None,
+    runtime_contract: dict | None = None,
+    project_instructions: str | None = None,
+    allow_read_only_tools: bool = False,
+    tool_bundles: frozenset[str] | None = None,
 ) -> TurnTokenStats:
     """Run one user turn in the given mode.
 
     In `coding` mode: full ReAct loop with tool execution.
     In `chat` mode: same as coding (tools enabled, full ReAct loop).
-    In `plan` mode: one-shot LLM call (no tools passed, tool_calls dropped if any).
-    In `design` mode: same as plan, plus the final assistant content is
-        persisted to `design_dir` (default: ~/.cc-harness/designs/).
+    In `plan`/`design` mode: direct callers use a one-shot call with no tools;
+    the long-lived runtime may explicitly enable a read-only tool bundle.
+    Design mode also persists final assistant content to `design_dir` (default:
+    ~/.cc-harness/designs/).
 
     `extra_native_specs` lets callers inject native-style tools alongside the
     built-in NATIVE_TOOLS (e.g. the locomo runner's memory_recall / memory_save).
@@ -392,7 +391,7 @@ async def run_turn(
         _prompt_capabilities = {
             "todo_available": True,
             "subagent_available": True,
-            "visible_thought_required": True,
+            "visible_thought_required": False,
         }
         if prompt_capabilities:
             _prompt_capabilities.update(prompt_capabilities)
@@ -427,6 +426,8 @@ async def run_turn(
                 resume_task=resume_task,
                 todo_hints=todo_hints,
                 tool_diff=tool_diff,  # E3 D7
+                 runtime_contract=runtime_contract,
+                 project_instructions=project_instructions,
             )
         else:
             _refresh_system_prompt(
@@ -436,6 +437,8 @@ async def run_turn(
                 resume_task=resume_task,
                 todo_hints=todo_hints,
                 tool_diff=tool_diff,  # E3 D7
+                 runtime_contract=runtime_contract,
+                 project_instructions=project_instructions,
             )
 
     # --- Q3 Task7: 会话级 L2/L3 快照注入 ---
@@ -603,17 +606,17 @@ async def run_turn(
             )
         return out.sanitized_text
 
-    # In plan/design mode, the LLM should not see any tool definitions, so
-    # it physically cannot emit tool_calls. In coding mode, expose both the
-    # MCP tool set and the native tool registry (built-in + caller-injected).
-    if mode in ("coding", "chat"):
+    # Coding/chat expose the full capability bundle.  Plan/design may opt into
+    # a filtered read-only bundle for fact gathering; the default remains no
+    # tools for direct callers and one-shot plan generation.
+    if mode in ("coding", "chat") or (mode in ("plan", "design") and allow_read_only_tools):
         # --- D1 Task 7: todo_service → 自动构造 SubAgentRunner + 注入 extras ---
         # 共享 4 资源(decision 6: llm / mcp / todo_service / policy) + l5
         # (D1 Task 4 fix);runner 注入 dispatch_subagent entry 的 deps dict。
         # 合并而非替换 caller 的 extra_native_specs(REPL 既有 memory_extras
         # 又传 todo_service 时不丢 memory_extras)。fail-soft: 构造异常时
         # 跳过 auto-build,继续走默认路径,不崩主循环。
-        if todo_service is not None:
+        if mode in ("coding", "chat") and todo_service is not None:
             try:
                 from cc_harness.project.extras import inject_todo_tools
                 from cc_harness.project.subagent import get_default_runner
@@ -671,6 +674,28 @@ async def run_turn(
             )
             extra_spec["function"] = extra_function
             tool_specs.append(extra_spec)
+        if tool_bundles is not None:
+            tool_specs = select_tool_specs(
+                tool_specs,
+                tool_bundles,
+                native_names=(
+                    set(NATIVE_TOOLS)
+                    | {
+                        str((entry.get("spec", {}).get("function") or {}).get("name") or "")
+                        for entry in (extra_native_specs or [])
+                    }
+                ),
+            )
+        if mode in ("plan", "design"):
+            def _read_only_spec(spec: dict) -> bool:
+                function = spec.get("function") or {}
+                name = str(function.get("name") or "")
+                capability = function.get("x-cc-harness-capability") or {}
+                effect = str(capability.get("effect") or "").strip().lower()
+                return effect in {"read", "read_only"} or name in {
+                    "Read", "Glob", "Grep", "memory_recall"
+                }
+            tool_specs = [spec for spec in tool_specs if _read_only_spec(spec)]
     else:
         tool_specs = None
 
@@ -969,6 +994,47 @@ async def run_turn(
         if counter is None:
             counter = TokenCounter()
         cats = counter.categorize(messages, tools=tool_specs)
+        reported_costs = [u.reported_cost for u in iter_usages]
+        reported_currencies = {u.reported_cost_currency for u in iter_usages}
+        has_complete_cost = bool(reported_costs) and all(cost is not None for cost in reported_costs)
+        reported_cost = sum(reported_costs) if has_complete_cost else None
+        reported_currency = (
+            next(iter(reported_currencies))
+            if has_complete_cost and len(reported_currencies) == 1 else None
+        )
+        system_content = next(
+            (
+                message.get("content")
+                for message in messages
+                if message.get("role") == "system" and isinstance(message.get("content"), str)
+            ),
+            "",
+        )
+        from cc_harness.prompt_rules import production_rule_metadata
+        rule_metadata = production_rule_metadata()
+        prompt_metadata = {
+            "version": "core-v2",
+            "digest": hashlib.sha256(system_content.encode("utf-8")).hexdigest(),
+            "system_tokens": cats["system_prompt"],
+            "rules_version": rule_metadata["version"],
+            "rules_digest": rule_metadata["digest"],
+            "rules_count": rule_metadata["rule_count"],
+            "project_instruction_digest": (
+                hashlib.sha256(project_instructions.encode("utf-8")).hexdigest()
+                if project_instructions else None
+            ),
+            "tool_bundle_digest": bundle_digest(tool_specs or [], tool_bundles),
+            "tool_bundle_count": len(tool_specs or []),
+        }
+        prompt_metadata["cache_epoch"] = hashlib.sha256(
+            "|".join(
+                (
+                    str(prompt_metadata["version"]),
+                    str(prompt_metadata["rules_digest"]),
+                    str(prompt_metadata["tool_bundle_digest"]),
+                )
+            ).encode("utf-8")
+        ).hexdigest()[:20]
         return TurnTokenStats(
             user_input=cats["user_input"],
             tool_calls=cats["tool_calls"],
@@ -986,10 +1052,13 @@ async def run_turn(
             ),
             api_completion_tokens=sum(u.completion_tokens for u in iter_usages),
             api_total_tokens=sum(u.total_tokens for u in iter_usages),
+            api_reported_cost=reported_cost,
+            api_reported_cost_currency=reported_currency,
             iter_count=len(iter_usages),
             api_reported=bool(iter_usages),
             tool_call_log=tool_call_log,
             compaction=last_compaction,
+            prompt_metadata=prompt_metadata,
         )
 
     async def _stream_one_turn(
@@ -1265,8 +1334,12 @@ async def run_turn(
         # 2. Compute routing
         has_tool_calls = (finish_reason == "tool_calls") and bool(pending)
 
-        if has_tool_calls and mode in ("coding", "chat"):
-            # Coding mode: full ReAct loop with tool execution.
+        if has_tool_calls and (
+            mode in ("coding", "chat")
+            or (mode in ("plan", "design") and allow_read_only_tools)
+        ):
+            # Execute the selected capability bundle.  Plan/design can only
+            # reach this branch with the explicitly filtered read-only set.
             # 3. Build assistant message (with tool_calls; content may be None)
             if content:
                 content = _redact(content, "thought")
@@ -1860,9 +1933,12 @@ async def run_turn(
             # 5. Continue the loop — feed tool results back to LLM
             continue
 
-        # Either: (a) coding/chat mode with no tool_calls → final answer, or
-        #         (b) plan/design mode regardless of tool_calls → force final
-        if has_tool_calls and mode not in ("coding", "chat"):
+        # Either: a mode with no tool_calls → final answer, or an unexpected
+        # plan/design tool call when read-only inspection was not enabled.
+        if has_tool_calls and not (
+            mode in ("coding", "chat")
+            or (mode in ("plan", "design") and allow_read_only_tools)
+        ):
             # Defensive: the LLM shouldn't emit tool_calls in plan/design
             # (we passed no tool specs), but if it does, drop them and warn.
             print_warn(console, f"mode={mode}: dropping {len(pending)} unexpected tool call(s)")
@@ -2058,7 +2134,9 @@ def _refresh_system_prompt(messages: list[dict], cwd: str, mode: str,
                            resume_task: "TodoTask | None" = None,
                            todo_hints: list[str] | None = None,
                            prior_messages: list[dict] | None = None,  # E3 D1
-                           tool_diff: list[str] | None = None) -> None:  # E3 D7
+                           tool_diff: list[str] | None = None,
+                           runtime_contract: dict | None = None,
+                           project_instructions: str | None = None) -> None:  # E3 D7
     """Insert or update the system prompt at messages[0] for the current mode.
 
     `extra_ctx` (Phase 1 Q1 uplift) is merged into the composer ctx so callers
@@ -2086,7 +2164,7 @@ def _refresh_system_prompt(messages: list[dict], cwd: str, mode: str,
     prompt_capabilities = {
         "todo_available": True,
         "subagent_available": True,
-        "visible_thought_required": True,
+        "visible_thought_required": False,
     }
     if extra_ctx:
         prompt_capabilities.update(
@@ -2096,9 +2174,13 @@ def _refresh_system_prompt(messages: list[dict], cwd: str, mode: str,
                 if key in extra_ctx
             }
         )
-    if extra_ctx:
+    if extra_ctx or runtime_contract is not None or project_instructions is not None:
         from cc_harness.prompts import PromptComposer
-        ctx = {"cwd": cwd, **extra_ctx}
+        ctx = {"cwd": cwd, **(extra_ctx or {})}
+        if runtime_contract is not None:
+            ctx["runtime_contract"] = runtime_contract
+        if project_instructions is not None:
+            ctx["project_instructions"] = project_instructions
         prompt = PromptComposer(mode=mode, ctx=ctx).render()
     else:
         prompt = build_system_prompt(cwd, mode=mode)

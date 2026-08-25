@@ -3,25 +3,48 @@
 from __future__ import annotations
 
 import json
+from pathlib import Path
 from typing import Any, Mapping
 
+from .project_instructions import load_project_instructions
+from .prompts import PromptComposer
 from .run_projection import RunProjection
 from .run_store import RunStore
 from .tool_observation import ToolObservation
 
 
-def objective_messages(projection: RunProjection) -> tuple[dict[str, Any], ...]:
+def objective_messages(
+    projection: RunProjection,
+    *,
+    cwd: str | Path | None = None,
+    project_instructions: str | None = None,
+) -> tuple[dict[str, Any], ...]:
     """Return the mandatory instruction and objective portion of a run context."""
+
+    system_content = "You are a durable coding agent."
+    if cwd is not None:
+        if project_instructions is None:
+            layer = load_project_instructions(Path(cwd))
+            project_instructions = layer.text if layer is not None else None
+        system_content = PromptComposer(
+            mode="coding",
+            ctx={
+                "cwd": str(cwd),
+                "todo_available": True,
+                "subagent_available": True,
+                "project_instructions": project_instructions,
+            },
+        ).render()
 
     if projection.goal is None:
         return (
-            {"role": "system", "content": "You are a durable coding agent.", "_context_mandatory": True},
+            {"role": "system", "content": system_content, "_context_mandatory": True},
             {"role": "user", "content": "Continue the durable run.", "_context_mandatory": True},
         )
     criteria = "\n".join(f"- {item}" for item in projection.goal.acceptance_criteria)
     constraints = "\n".join(f"- {item}" for item in projection.goal.constraints) or "- none"
     return (
-        {"role": "system", "content": "You are a durable coding agent.", "_context_mandatory": True},
+        {"role": "system", "content": system_content, "_context_mandatory": True},
         {
             "role": "user",
             "content": (

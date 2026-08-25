@@ -26,6 +26,8 @@ class UsageRecord:
     total_tokens: int
     cache_read_prompt_tokens: int = 0
     cache_creation_prompt_tokens: int = 0
+    reported_cost: float | None = None
+    reported_cost_currency: str | None = None
 
     @property
     def uncached_prompt_tokens(self) -> int:
@@ -36,25 +38,66 @@ class UsageRecord:
             - self.cache_creation_prompt_tokens,
         )
 
+    @property
+    def cache_miss_prompt_tokens(self) -> int:
+        """Normalized cache misses (DeepSeek calls this prompt_cache_miss_tokens)."""
+        return self.uncached_prompt_tokens
+
     @classmethod
     def from_api(cls, usage: Any) -> UsageRecord | None:
         if usage is None:
             return None
-        prompt_tokens = int(getattr(usage, "prompt_tokens", 0) or 0)
-        details = getattr(usage, "prompt_tokens_details", None)
-        cache_read = int(getattr(details, "cached_tokens", 0) or 0)
-        cache_creation = int(getattr(details, "cache_write_tokens", 0) or 0)
-        cache_read = min(prompt_tokens, max(0, cache_read))
-        cache_creation = min(prompt_tokens - cache_read, max(0, cache_creation))
+
+        def value(obj: Any, key: str, default: Any = None) -> Any:
+            if isinstance(obj, dict):
+                return obj.get(key, default)
+            return getattr(obj, key, default)
+
+        def nonnegative_int(raw: Any) -> int:
+            try:
+                return max(0, int(raw or 0))
+            except (TypeError, ValueError):
+                return 0
+
+        prompt_tokens = nonnegative_int(value(usage, "prompt_tokens", 0))
+        details = value(usage, "prompt_tokens_details", None)
+        cache_read = value(usage, "prompt_cache_hit_tokens", None)
+        if cache_read is None:
+            cache_read = value(details, "cached_tokens", 0)
+        cache_creation = value(usage, "cache_creation_input_tokens", None)
+        if cache_creation is None:
+            cache_creation = value(usage, "cache_write_tokens", None)
+        if cache_creation is None:
+            cache_creation = value(details, "cache_write_tokens", 0)
+        reported_cost = value(usage, "cost", None)
+        if reported_cost is None:
+            reported_cost = value(usage, "total_cost", None)
+        try:
+            normalized_cost = float(reported_cost) if reported_cost is not None else None
+        except (TypeError, ValueError):
+            normalized_cost = None
+        currency = value(usage, "cost_currency", None) or value(usage, "currency", None)
+        if currency is not None:
+            currency = str(currency)
+        cache_read = min(prompt_tokens, nonnegative_int(cache_read))
+        cache_creation = min(prompt_tokens - cache_read, nonnegative_int(cache_creation))
         return cls(
             prompt_tokens=prompt_tokens,
-            completion_tokens=int(getattr(usage, "completion_tokens", 0) or 0),
-            total_tokens=int(getattr(usage, "total_tokens", 0) or 0),
+            completion_tokens=nonnegative_int(value(usage, "completion_tokens", 0)),
+            total_tokens=nonnegative_int(value(usage, "total_tokens", 0)),
             cache_read_prompt_tokens=cache_read,
             cache_creation_prompt_tokens=cache_creation,
+            reported_cost=normalized_cost,
+            reported_cost_currency=currency,
         )
 
     def __add__(self, other: UsageRecord) -> UsageRecord:
+        if self.reported_cost is None or other.reported_cost is None:
+            cost = None
+        elif self.reported_cost_currency not in (None, other.reported_cost_currency):
+            cost = None
+        else:
+            cost = self.reported_cost + other.reported_cost
         return UsageRecord(
             prompt_tokens=self.prompt_tokens + other.prompt_tokens,
             completion_tokens=self.completion_tokens + other.completion_tokens,
@@ -64,6 +107,11 @@ class UsageRecord:
             ),
             cache_creation_prompt_tokens=(
                 self.cache_creation_prompt_tokens + other.cache_creation_prompt_tokens
+            ),
+            reported_cost=cost,
+            reported_cost_currency=(
+                (self.reported_cost_currency or other.reported_cost_currency)
+                if cost is not None else None
             ),
         )
 
@@ -164,6 +212,8 @@ class TurnTokenStats:
     api_cache_creation_prompt_tokens: int = 0
     api_completion_tokens: int = 0
     api_total_tokens: int = 0
+    api_reported_cost: float | None = None
+    api_reported_cost_currency: str | None = None
     # Metadata
     iter_count: int = 0
     auxiliary_model_calls: int = 0
@@ -171,6 +221,7 @@ class TurnTokenStats:
     tool_call_log: list = field(default_factory=list)  # [{name, args, ok, result}], Plan1 收集
     compaction: Any = None  # Plan3: CompactionStats obj (context.py) or None
     error: str | None = None  # D1 Task 4 fix:run_turn fatal error message(if any)
+    prompt_metadata: dict | None = None  # safe version/digest only; never prompt text
 
     @property
     def breakdown_subtotal(self) -> int:
@@ -206,6 +257,12 @@ class SessionTokenStats:
     api_cache_creation_prompt_tokens: int = 0
     api_completion_tokens: int = 0
     api_total_tokens: int = 0
+    api_reported_cost: float | None = None
+    api_reported_cost_currency: str | None = None
+    # ``api_cost_complete`` is false once any observed API usage omitted a
+    # provider-reported cost.  We never infer a price from token counts.
+    api_cost_complete: bool = True
+    api_cost_observed: bool = False
     iters_total: int = 0
     auxiliary_model_calls: int = 0
     turns_with_usage: int = 0
@@ -271,6 +328,21 @@ class SessionTokenStats:
         self.api_cache_creation_prompt_tokens += turn.api_cache_creation_prompt_tokens
         self.api_completion_tokens += turn.api_completion_tokens
         self.api_total_tokens += turn.api_total_tokens
+        if turn.api_reported:
+            self.api_cost_observed = True
+            if turn.api_reported_cost is None or not self.api_cost_complete:
+                self.api_cost_complete = False
+                self.api_reported_cost = None
+                self.api_reported_cost_currency = None
+            elif self.api_reported_cost_currency not in (None, turn.api_reported_cost_currency):
+                self.api_cost_complete = False
+                self.api_reported_cost = None
+                self.api_reported_cost_currency = None
+            else:
+                self.api_reported_cost = (self.api_reported_cost or 0.0) + turn.api_reported_cost
+                self.api_reported_cost_currency = (
+                    self.api_reported_cost_currency or turn.api_reported_cost_currency
+                )
         self.iters_total += turn.iter_count
         self.auxiliary_model_calls += turn.auxiliary_model_calls
         if turn.api_reported:

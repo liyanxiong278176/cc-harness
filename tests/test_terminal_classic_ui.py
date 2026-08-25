@@ -86,7 +86,7 @@ def test_status_area_matches_reference_layering(tmp_path, monkeypatch):
 
     plain = "".join(text for _style, text, *_ in app._bottom_toolbar())
     lines = plain.splitlines()
-    assert len(lines) == 4
+    assert len(lines) == 5
     assert set(lines[0]) == {"─"}
     assert "[MiniMax-M3[1m]]" in lines[1]
     assert "eval git:(master*)" in lines[1]
@@ -96,10 +96,11 @@ def test_status_area_matches_reference_layering(tmp_path, monkeypatch):
     assert "● high · /effort" in lines[1]
     assert "Context" in lines[2]
     assert "0%" in lines[2]
-    assert "bypass permissions on" in lines[3]
-    assert "shift+tab to cycle" in lines[3]
+    assert "API usage  unavailable" in lines[3]
+    assert "bypass permissions on" in lines[4]
+    assert "shift+tab to cycle" in lines[4]
     # A todo service alone is not evidence that subagents exist.
-    assert "← for agents" not in lines[3]
+    assert "← for agents" not in lines[4]
     assert all(wcswidth(line) <= 146 for line in lines)
 
 

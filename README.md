@@ -1,8 +1,9 @@
 # cc-harness
 
-一个在当前终端中运行的 coding agent。界面采用与 Claude Code 相同类型的
-inline terminal session：启动卡片、对话与工具活动都写入终端滚动区，退出后
-仍可查看，不会切换到 Textual 全屏应用。
+一个在当前终端中运行的 coding agent。默认使用可恢复的 Durable Runtime；需要
+直接操作当前会话时，legacy 兼容入口提供 focus-first fullscreen workspace，
+对话和工具活动在同一个 alternate screen 中呈现，退出后恢复调用者的 shell。
+项目不依赖 Textual。
 
 ## 安装与启动
 
@@ -28,6 +29,8 @@ API key，并保存到 `~/.cc-harness/.env`。配置优先级为：进程环境�
 
 ```powershell
 cc-harness                         # 在当前目录开始新会话
+cc-harness --runtime legacy        # 直接打开 fullscreen focus workspace
+cc-harness --runtime legacy --tui default # 兼容的原生 scrollback 视图
 cc-harness -c                      # 继续当前目录最近的会话
 cc-harness -r                      # 选择当前目录的历史会话
 cc-harness -r SESSION_ID           # 继续指定会话
@@ -48,6 +51,8 @@ cc-harness -p "summarize this repo" # 非交互打印模式
 - `Enter` 提交；`Alt+Enter`、`Ctrl+J` 或行尾 `\` 插入换行。超过 800 字符或 2 行的粘贴会折叠为可展开标记，不会自动提交。
 - `Shift+Tab` 在 `default`、`auto-edit`、`bypass-prompts` 之间切换。
 - `Ctrl+O` 查看完整对话与工具活动；`Ctrl+S` 暂存/恢复草稿；`Ctrl+L` 清屏重绘。
+- `F2` 或 `/inspector` 打开 Run Inspector；左右键切换 Overview、Timeline、Token、Context、Files、Errors 标签。
+- Inspector 只显示版本、摘要、token/cache 计数、digest、耗时和错误数量；永不显示有效提示词、规则正文、来源映射或可重建片段。
 - `Alt+P` 选择模型；`Alt+T` 切换推理强度；`Alt+V` 从剪贴板附加图片。
 - `Ctrl+C` 取消当前请求或清空当前输入；`Ctrl+D` 或 `/exit` 保存并退出。
 - 连按两次 `Esc` 会清空并暂存当前草稿；空输入时打开对话检查点恢复选择。
@@ -74,10 +79,24 @@ cc-harness -p "summarize this repo" # 非交互打印模式
 /help /init /release-notes /status /clear /resume /exit
 /coding /plan /design /chat /mode
 /model /effort /permissions /verbose
-/context /compact /tools /mcp
+/context /compact /tools /mcp /usage /inspector
 ```
 
 `/init` 在当前目录创建 `CC-HARNESS.md` 项目指令文件；`/release-notes` 显示内置版本记录。若文件已经存在，`/init` 不会覆盖。
+
+### 工具能力包与费用
+
+默认只把小型 core 工具包放入模型请求；Web、MCP 和领域工具必须显式启用，
+以保持稳定的工具 schema 前缀并提高供应商 KV cache 命中率。配置同样遵循
+进程环境变量 > 项目 `.env` > 用户 `~/.cc-harness/.env`：
+
+```text
+CC_HARNESS_TOOL_BUNDLES=core,web
+```
+
+费用只显示供应商 API 返回的直接 cost/currency 字段；供应商没有返回直接费用
+时显示 `unavailable`，不会按 token 单价估算。`/usage` 与 Inspector 的 Token
+页同时展示 API 输入、输出、缓存命中和直接费用状态。
 
 ## 会话与安全
 
@@ -94,14 +113,20 @@ cc-harness -p "summarize this repo" # 非交互打印模式
 ```text
 cc-harness / python main.py
   -> entrypoint.py
-  -> SessionRuntime              # 配置、模型、MCP、策略、memory、session
-  -> InlineTerminalApp           # prompt_toolkit 输入与队列
-  -> TerminalRenderer            # Rich 输出到当前终端滚动区
-  -> agent.run_turn              # 单一结构化事件流
+  -> DurableRuntimeClient         # 默认：可恢复任务、supervisor、审批、事件
+  -> durable REPL                 # 轻量控制面，不复制运行状态
+
+legacy 兼容入口
+  -> SessionRuntime               # 配置、模型、MCP、策略、memory、session
+  -> FullscreenTerminalApp        # focus workspace + Run Inspector
+  -> InlineTerminalApp            # `/tui default` 兼容 scrollback 视图
+  -> agent.run_turn               # 单一结构化事件流
 ```
 
-Textual 不再是运行时依赖。兼容模块 `cc_harness.tui.driver` 只负责把旧调用方桥接到
-新的 inline terminal session。
+提示词采用版本化稳定前缀 + 动态运行时后缀；外部规则已经过审核、适配并固定在
+本地 registry，生产运行时不会联网拉取提示词更新。TUI 的可观测信息只引用安全
+元数据（版本、不可逆 digest、token/cache 计数、压缩统计和错误事实），不会泄露
+生产提示词正文。
 
 ## 测试
 

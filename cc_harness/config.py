@@ -91,6 +91,7 @@ def load_config(env_path: Path, mcp_json_path: Path) -> AppConfig:
             key: value
             for key, value in os.environ.items()
             if key.startswith(("MEMORY_", "EMBEDDING_"))
+            or key == "CC_HARNESS_TOOL_BUNDLES"
         },
     )
 
@@ -126,8 +127,11 @@ def load_layered_config(
     layered_runtime_env = {
         key: selected
         for key in set(user_env) | set(project_env) | set(process_env)
-        if key.startswith(("MEMORY_", "EMBEDDING_"))
-        and (selected := value(key)) is not None
+            if (
+                key.startswith(("MEMORY_", "EMBEDDING_"))
+                or key == "CC_HARNESS_TOOL_BUNDLES"
+            )
+            and (selected := value(key)) is not None
     }
 
     api_key = value("OPENAI_API_KEY")

@@ -72,6 +72,14 @@ class _ResumeModal:
     selected: int = 0
 
 
+@dataclass
+class _InspectorState:
+    tab: int = 0
+
+
+_INSPECTOR_TABS = ("Overview", "Timeline", "Token", "Context", "Files", "Errors")
+
+
 class _MouseTranscriptControl(FormattedTextControl):
     def __init__(self, owner: FullscreenTerminalApp, *args, **kwargs) -> None:
         self.owner = owner
@@ -101,6 +109,7 @@ class FullscreenTerminalApp(InlineTerminalApp):
         self._modal: _PermissionModal | None = None
         self._rewind_modal: _RewindModal | None = None
         self._resume_modal: _ResumeModal | None = None
+        self._inspector: _InspectorState | None = None
         self._active_checkpoint_index: int | None = None
         self._detailed = self.verbose
         self._focus = False
@@ -239,7 +248,7 @@ class FullscreenTerminalApp(InlineTerminalApp):
             self._input_window,
             Window(
                 FormattedTextControl(self._status_fragments),
-                height=4,
+                height=5,
                 dont_extend_height=True,
             ),
         ])
@@ -422,6 +431,8 @@ class FullscreenTerminalApp(InlineTerminalApp):
             await self._show_tasks(agents_only=True)
         elif raw.strip().lower() == "/diff":
             self.transcript.add_notice(await self._session_diff(), "info")
+        elif raw.strip().lower() in {"/inspector", "/run-inspector"}:
+            self._toggle_inspector()
         else:
             # Inline command handlers intentionally print permanent output.
             # Capture that projection and commit it as a fullscreen notice so
@@ -727,6 +738,8 @@ class FullscreenTerminalApp(InlineTerminalApp):
         return FormattedText(fragments)
 
     def _overlay_fragments(self):
+        if self._inspector is not None:
+            return self._inspector_fragments()
         if self._rewind_modal is not None:
             return self._rewind_fragments()
         if self._resume_modal is not None:
@@ -734,7 +747,71 @@ class FullscreenTerminalApp(InlineTerminalApp):
         return self._modal_fragments()
 
     def _overlay_active(self) -> bool:
-        return any((self._modal, self._rewind_modal, self._resume_modal))
+        return any((self._modal, self._rewind_modal, self._resume_modal, self._inspector))
+
+    def _toggle_inspector(self) -> None:
+        self._inspector = None if self._inspector is not None else _InspectorState()
+        self._invalidate()
+
+    def _inspector_fragments(self):
+        inspector = self._inspector
+        if inspector is None:
+            return FormattedText([])
+        width = self._terminal_width()
+        tab = _INSPECTOR_TABS[inspector.tab]
+        fragments: list[tuple[str, str]] = [
+            ("class:inspector.border", "─" * width + "\n"),
+            ("class:inspector.title", f"Run Inspector · {tab}\n"),
+            ("class:inspector.tabs", "  " + "  ".join(
+                f"[{name}]" if name == tab else name for name in _INSPECTOR_TABS
+            ) + "\n"),
+        ]
+        fragments.extend(self._inspector_tab_lines(tab))
+        fragments.append(("class:inspector.dim", "←/→ switch tab · F2 or Esc close\n"))
+        return FormattedText(fragments)
+
+    def _inspector_tab_lines(self, tab: str) -> list[tuple[str, str]]:
+        state = self.runtime.state
+        stats = getattr(state, "session_stats", None)
+        metadata = getattr(self.runtime, "prompt_metadata", {}) or {}
+        if tab == "Overview":
+            lines = [
+                f"  model: {getattr(getattr(self.runtime, 'llm', None), 'model', '?')}",
+                f"  mode: {getattr(state, 'mode', '?')} · queued: {len(self.queue)}",
+                f"  turns: {len(self.transcript.turns)} · active: {'yes' if self.transcript.active_turn else 'no'}",
+            ]
+        elif tab == "Timeline":
+            active = self.transcript.active_turn
+            lines = [
+                f"  turns: {len(self.transcript.turns)}",
+                f"  current: {getattr(active, 'status', 'idle')}",
+                f"  events: {len(self.transcript.events)}",
+            ]
+        elif tab == "Token":
+            lines = [
+                f"  API input: {int(getattr(stats, 'api_prompt_tokens', 0) or 0):,}",
+                f"  API output: {int(getattr(stats, 'api_completion_tokens', 0) or 0):,}",
+                f"  cache hit: {int(getattr(stats, 'api_cache_read_prompt_tokens', 0) or 0):,}",
+                f"  cost: {self._usage_text().split(' cost=', 1)[-1] if 'cost=' in self._usage_text() else 'unavailable'}",
+            ]
+        elif tab == "Context":
+            lines = [
+                f"  context: {self._context_tokens():,} / {getattr(state.context_config, 'context_window', 0):,}",
+                f"  prompt version: {metadata.get('version', 'unknown')}",
+                f"  prompt digest: {str(metadata.get('digest', 'unknown'))[:16]}…",
+                f"  cache epoch: {metadata.get('cache_epoch', 'unknown')}",
+                f"  tool bundle: {str(metadata.get('tool_bundle_digest', 'unknown'))[:16]}…",
+                "  prompt text: hidden",
+            ]
+        elif tab == "Files":
+            lines = [f"  changed files: use /diff ({len(getattr(self.transcript, 'events', []))} events tracked)"]
+        else:
+            errors = sum(
+                1 for turn in self.transcript.turns
+                if getattr(turn, "status", "") == "error" or getattr(turn, "error", "")
+            )
+            lines = [f"  recorded turn errors: {errors}", "  error details remain in the transcript/event store"]
+        return [("class:inspector.text", line[: self._terminal_width()] + "\n") for line in lines]
 
     def _rewind_fragments(self):
         modal = self._rewind_modal
@@ -934,6 +1011,8 @@ class FullscreenTerminalApp(InlineTerminalApp):
         )
         def modal_up(event) -> None:
             del event
+            if self._inspector is not None:
+                return
             if self._rewind_modal is not None:
                 modal = self._rewind_modal
                 modal.selected = (modal.selected - 1) % len(modal.checkpoints)
@@ -951,6 +1030,8 @@ class FullscreenTerminalApp(InlineTerminalApp):
         )
         def modal_down(event) -> None:
             del event
+            if self._inspector is not None:
+                return
             if self._rewind_modal is not None:
                 modal = self._rewind_modal
                 modal.selected = (modal.selected + 1) % len(modal.checkpoints)
@@ -989,7 +1070,10 @@ class FullscreenTerminalApp(InlineTerminalApp):
 
         @kb.add("escape")
         def escape(event) -> None:
-            if self._modal is not None:
+            if self._inspector is not None:
+                self._inspector = None
+                self._invalidate()
+            elif self._modal is not None:
                 self._resolve_modal("no")
             elif self._rewind_modal is not None:
                 if not self._rewind_modal.future.done():
@@ -1028,6 +1112,25 @@ class FullscreenTerminalApp(InlineTerminalApp):
             del event
             self._detailed = not self._detailed
             self._jump_bottom()
+
+        @kb.add("f2")
+        def inspector(event) -> None:
+            del event
+            self._toggle_inspector()
+
+        @kb.add("left", filter=Condition(lambda: self._inspector is not None))
+        def inspector_left(event) -> None:
+            del event
+            assert self._inspector is not None
+            self._inspector.tab = (self._inspector.tab - 1) % len(_INSPECTOR_TABS)
+            self._invalidate()
+
+        @kb.add("right", filter=Condition(lambda: self._inspector is not None))
+        def inspector_right(event) -> None:
+            del event
+            assert self._inspector is not None
+            self._inspector.tab = (self._inspector.tab + 1) % len(_INSPECTOR_TABS)
+            self._invalidate()
 
         @kb.add("c-t")
         def tasks(event) -> None:
@@ -1169,6 +1272,8 @@ class FullscreenTerminalApp(InlineTerminalApp):
         return max(40, shutil.get_terminal_size(fallback=(80, 24)).columns)
 
     def _modal_height(self) -> int:
+        if self._inspector is not None:
+            return 8
         if self._rewind_modal is not None:
             return 4 + len(self._rewind_modal.checkpoints)
         if self._resume_modal is not None:
@@ -1241,6 +1346,11 @@ class FullscreenTerminalApp(InlineTerminalApp):
             "modal.dim": "#888888",
             "modal.selected": "#ffffff bold",
             "modal.risk": "#ffd75f",
+            "inspector.border": "#5f87af",
+            "inspector.title": "#87d7ff bold",
+            "inspector.tabs": "#afd7ff",
+            "inspector.text": "#d0d0d0",
+            "inspector.dim": "#888888",
             "jump": "#ffffff bg:#444444",
             "task.title": "#888888 bold",
             "task": "#888888",

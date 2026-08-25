@@ -31,6 +31,7 @@ COMMANDS = (
     CommandSpec("/permissions", "Show or set permission mode", "显示或设置权限模式"),
     CommandSpec("/verbose", "Toggle detailed output", "切换详细输出"),
     CommandSpec("/context", "Show context usage", "显示上下文使用量"),
+    CommandSpec("/usage", "Show API token/cache usage", "显示 API Token/缓存用量"),
     CommandSpec("/compact", "Compact conversation context", "压缩对话上下文"),
     CommandSpec("/tools", "List available tools", "列出可用工具"),
     CommandSpec("/mcp", "Show MCP status", "显示 MCP 状态"),
@@ -39,6 +40,7 @@ COMMANDS = (
     CommandSpec("/diff", "Show files changed this session", "显示本会话文件变更"),
     CommandSpec("/tasks", "Show real task state", "显示真实任务状态"),
     CommandSpec("/agents", "Show real agent state", "显示真实代理状态"),
+    CommandSpec("/inspector", "Open the run inspector", "打开运行检查器"),
     CommandSpec("/tui", "Show or select the terminal renderer", "显示或选择终端渲染器"),
 )
 

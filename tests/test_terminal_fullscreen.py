@@ -167,6 +167,21 @@ def test_conversation_projection_switches_to_compact_header_after_submit(fullscr
     assert "cc-harness" in compact
 
 
+def test_inspector_context_exposes_metadata_but_not_prompt_text(fullscreen_app):
+    fullscreen_app.runtime.prompt_metadata = {
+        "version": "core-v2",
+        "digest": "a" * 64,
+        "cache_epoch": "epoch-1",
+        "tool_bundle_digest": "b" * 64,
+        "effective_prompt": "must never be rendered",
+    }
+    lines = fullscreen_app._inspector_tab_lines("Context")
+    text = "".join(fragment[1] for fragment in lines)
+    assert "prompt text: hidden" in text
+    assert "must never be rendered" not in text
+    assert "core-v2" in text
+
+
 def test_rewind_overlay_is_an_in_app_card(fullscreen_app):
     loop = asyncio.new_event_loop()
     try:

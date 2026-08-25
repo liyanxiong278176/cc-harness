@@ -82,6 +82,7 @@ class RunWorker:
         capability_runtime: AgentCapabilityRuntime | None = None,
         persist_interactions: bool = True,
         activation_manifest: ActivationManifest | None = None,
+        project_instructions: str | None = None,
     ) -> None:
         self.store = store
         self.kernel = kernel
@@ -97,6 +98,7 @@ class RunWorker:
         self.capability_runtime = capability_runtime
         self.persist_interactions = persist_interactions
         self.activation_manifest = activation_manifest
+        self.project_instructions = project_instructions
         self._active_node_id: str | None = None
         self._event_lock = asyncio.Lock()
 
@@ -1339,9 +1341,12 @@ class RunWorker:
         # goal. This predicate only rejects an empty candidate locally.
         return bool(candidate.evidence and candidate.acceptance_criteria)
 
-    @staticmethod
-    def _default_messages(projection: RunProjection) -> Sequence[Mapping[str, Any]]:
-        return objective_messages(projection)
+    def _default_messages(self, projection: RunProjection) -> Sequence[Mapping[str, Any]]:
+        return objective_messages(
+            projection,
+            cwd=self.store.project_root,
+            project_instructions=self.project_instructions,
+        )
 
     async def _messages_for_projection(
         self,

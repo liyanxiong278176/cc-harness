@@ -230,7 +230,11 @@ class InlineTerminalApp:
             self.renderer.warning(self._t(f"未知命令：{name}", f"Unknown command: {name}"))
             return False
         busy = self._active_task is not None and not self._active_task.done()
-        safe_while_busy = {"/help", "/status", "/mode", "/permissions", "/verbose", "/context"}
+        safe_while_busy = {
+            "/help", "/status", "/mode", "/permissions", "/verbose", "/context",
+            "/inspector",
+        }
+        safe_while_busy.add("/usage")
         if busy and name not in safe_while_busy:
             self.renderer.warning(self._t("请先等待或取消当前轮。", "Wait for or cancel the active turn first."))
             return False
@@ -291,6 +295,10 @@ class InlineTerminalApp:
             used = self._context_tokens()
             total = self.runtime.state.context_config.context_window
             self.renderer.info(f"context: {used:,} / {total:,} ({used / total:.1%})")
+        elif name == "/usage":
+            self.renderer.info(self._usage_text())
+        elif name == "/inspector":
+            self.renderer.info(self._inspector_text())
         elif name == "/compact":
             from cc_harness.context import maybe_compact
             tools = await self.runtime.mcp.list_tools()
@@ -477,6 +485,7 @@ class InlineTerminalApp:
         fragments: list[tuple[str, str]] = [("class:status.border", "─" * width + "\n")]
         fragments.extend(self._identity_status(width))
         fragments.extend(self._context_status(width))
+        fragments.extend(self._usage_status(width))
         fragments.extend(self._permission_status(width))
         return FormattedText(fragments)
 
@@ -545,6 +554,30 @@ class InlineTerminalApp:
             ("class:status.context.empty", "░" * (18 - filled)),
             (context_style, f"  {ratio:.0%}"),
         ]
+        return self._aligned_line(left, [], width)
+
+    def _usage_status(self, width: int) -> list[tuple[str, str]]:
+        stats = getattr(self.runtime.state, "session_stats", None)
+        if stats is None or not getattr(stats, "turns_with_usage", 0):
+            left = [("class:status.dim", "API usage  unavailable")]
+            return self._aligned_line(left, [], width)
+        prompt = int(getattr(stats, "api_prompt_tokens", 0) or 0)
+        completion = int(getattr(stats, "api_completion_tokens", 0) or 0)
+        cache = int(getattr(stats, "api_cache_read_prompt_tokens", 0) or 0)
+        cache_rate = cache / prompt if prompt else 0.0
+        left = [
+            ("class:status.dim", "API  "),
+            ("class:status.context", f"in {self._compact_number(prompt)}"),
+            ("class:status.dim", f" · out {self._compact_number(completion)}"),
+            ("class:status.dim", f" · cache {cache_rate:.0%}"),
+        ]
+        cost = getattr(stats, "api_reported_cost", None)
+        currency = getattr(stats, "api_reported_cost_currency", None)
+        if cost is None:
+            left.append(("class:status.dim", " · cost unavailable"))
+        else:
+            label = f"{currency + ' ' if currency else ''}{cost:g}"
+            left.append(("class:status.dim", f" · cost {label}"))
         return self._aligned_line(left, [], width)
 
     def _permission_status(self, width: int) -> list[tuple[str, str]]:
@@ -740,6 +773,42 @@ class InlineTerminalApp:
             f"model={self.runtime.llm.model} mode={self.runtime.state.mode} "
             f"permissions={self.permission_mode} cwd={self.runtime.cwd} "
             f"session={self.runtime.state.session_id} queued={len(self.queue)}"
+            f" usage={self._usage_text()}"
+        )
+
+    def _usage_text(self) -> str:
+        stats = getattr(self.runtime.state, "session_stats", None)
+        if stats is None or not getattr(stats, "turns_with_usage", 0):
+            return "API usage unavailable"
+        prompt = int(getattr(stats, "api_prompt_tokens", 0) or 0)
+        completion = int(getattr(stats, "api_completion_tokens", 0) or 0)
+        cache = int(getattr(stats, "api_cache_read_prompt_tokens", 0) or 0)
+        result = (
+            f"API input={prompt:,} output={completion:,} "
+            f"cache_hit={cache:,}/{prompt:,}"
+        )
+        cost = getattr(stats, "api_reported_cost", None)
+        if cost is not None:
+            currency = getattr(stats, "api_reported_cost_currency", None) or ""
+            result += f" cost={currency + ' ' if currency else ''}{cost:g}"
+        else:
+            result += " cost=unavailable"
+        return result
+
+    def _inspector_text(self) -> str:
+        """Print safe run metadata; never print effective prompt content."""
+        metadata = getattr(self.runtime, "prompt_metadata", {}) or {}
+        stats = getattr(self.runtime.state, "session_stats", None)
+        return (
+            "Inspector: "
+            f"model={getattr(self.runtime.llm, 'model', 'unknown')} "
+            f"prompt_version={metadata.get('version', 'unknown')} "
+            f"prompt_digest={str(metadata.get('digest', 'unknown'))[:16]}… "
+            f"cache_epoch={metadata.get('cache_epoch', 'unknown')} "
+            f"rules={metadata.get('rules_version', 'unknown')} "
+            f"context={self._context_tokens():,} "
+            f"api_tokens={int(getattr(stats, 'api_total_tokens', 0) or 0):,} "
+            "prompt_text=hidden"
         )
 
     def _context_tokens(self) -> int:

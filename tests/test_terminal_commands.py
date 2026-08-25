@@ -9,6 +9,7 @@ def test_help_completion_and_dispatch_share_one_wired_registry():
         "/model", "/effort", "/permissions", "/verbose",
         "/context", "/compact", "/tools", "/mcp",
         "/rewind", "/focus", "/diff", "/tasks", "/agents", "/tui",
+        "/usage", "/inspector",
     }
     assert {command.name for command in COMMANDS} == expected
     assert set(COMMAND_MAP) == expected

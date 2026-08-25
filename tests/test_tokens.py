@@ -5,6 +5,31 @@ from cc_harness.tokens import (
 )
 
 
+def test_usage_record_normalizes_deepseek_cache_fields_and_direct_cost_only():
+    usage = UsageRecord.from_api({
+        "prompt_tokens": 100,
+        "prompt_cache_hit_tokens": 40,
+        "completion_tokens": 10,
+        "total_tokens": 110,
+        "cost": "0.25",
+        "currency": "USD",
+    })
+    assert usage is not None
+    assert usage.cache_read_prompt_tokens == 40
+    assert usage.cache_miss_prompt_tokens == 60
+    assert usage.reported_cost == 0.25
+    assert usage.reported_cost_currency == "USD"
+
+
+def test_session_cost_is_unknown_if_any_observed_api_call_lacks_provider_cost():
+    stats = SessionTokenStats()
+    stats.add(TurnTokenStats(api_reported=True, api_reported_cost=0.1, api_reported_cost_currency="USD"))
+    assert stats.api_reported_cost == 0.1
+    stats.add(TurnTokenStats(api_reported=True))
+    assert stats.api_reported_cost is None
+    assert stats.api_cost_complete is False
+
+
 # --- UsageRecord ---
 
 def test_usage_record_from_api_with_full_usage():

@@ -49,7 +49,7 @@ class ModelSegment:
     completion_candidate: Mapping[str, Any] | None = None
     progress: Mapping[str, Any] | None = None
     stop_reason: str = "model_stop"
-    usage: Mapping[str, int] = field(default_factory=dict)
+    usage: Mapping[str, Any] = field(default_factory=dict)
     reasoning_content: str = ""
 
     @classmethod
@@ -100,7 +100,7 @@ class SegmentOutcome:
     completion_candidate: CompletionCandidate | None = None
     progress: RunProgress | None = None
     stop_reason: str = "model_stop"
-    usage: Mapping[str, int] = field(default_factory=dict)
+    usage: Mapping[str, Any] = field(default_factory=dict)
     reasoning_content: str = ""
 
 

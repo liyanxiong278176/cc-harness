@@ -19,6 +19,8 @@ from .config import load_layered_config
 from .coordinator import RunCoordinator, RunRequest
 from .credential_broker import ActionScopedCapabilityBroker, CredentialBrokerError
 from .interaction_history import materialize_interaction_messages
+from .project_instructions import load_project_instructions
+from .tool_bundles import parse_tool_bundles, select_tool_specs
 from .llm import LLMClient
 from .mcp_client import MCPClient, ToolResult
 from .native_tools import NATIVE_FILE_TOOLS
@@ -143,8 +145,9 @@ def _workspace_change_set(
 class DurableModelAdapter(ModelAdapter):
     """Translate the existing streaming LLM seam into one model segment."""
 
-    def __init__(self, llm: LLMClient) -> None:
+    def __init__(self, llm: LLMClient, *, tool_bundles=None) -> None:
         self.llm = llm
+        self.tool_bundles = tool_bundles
 
     @staticmethod
     def _provider_messages(messages: Sequence[Mapping[str, Any]]) -> list[dict[str, Any]]:
@@ -233,23 +236,53 @@ class DurableModelAdapter(ModelAdapter):
                 if raw is not None:
                     candidate = raw
                     text = _COMPLETION_BLOCK.sub("", text).strip()
+        usage_payload: dict[str, Any] = (
+            {
+                "input_tokens": usage.prompt_tokens,
+                "uncached_input_tokens": usage.uncached_prompt_tokens,
+                "cache_creation_input_tokens": usage.cache_creation_prompt_tokens,
+                "cache_read_input_tokens": usage.cache_read_prompt_tokens,
+                "output_tokens": usage.completion_tokens,
+                "model_calls": 1,
+            }
+            if usage is not None else {"model_calls": 1}
+        )
+        if usage is not None:
+            usage_payload["reported_cost"] = usage.reported_cost
+            usage_payload["reported_cost_currency"] = usage.reported_cost_currency
+        from .prompt_rules import production_rule_metadata
+        from .tool_bundles import bundle_digest
+        system_content = next(
+            (
+                message.get("content")
+                for message in messages
+                if message.get("role") == "system" and isinstance(message.get("content"), str)
+            ),
+            "",
+        )
+        prompt_meta = {
+            "version": "core-v2",
+            "digest": hashlib.sha256(system_content.encode("utf-8")).hexdigest(),
+            "rules_digest": production_rule_metadata()["digest"],
+            "tool_bundle_digest": bundle_digest(list(tools), self.tool_bundles),
+            "tool_bundle_count": len(tools),
+        }
+        prompt_meta["cache_epoch"] = hashlib.sha256(
+            "|".join(
+                (
+                    str(prompt_meta["version"]),
+                    str(prompt_meta["rules_digest"]),
+                    str(prompt_meta["tool_bundle_digest"]),
+                )
+            ).encode("utf-8")
+        ).hexdigest()[:20]
+        usage_payload["prompt_metadata"] = prompt_meta
         return ModelSegment(
             text=text,
             tool_calls=tuple(calls),
             completion_candidate=candidate,
             stop_reason=finish_reason,
-            usage=(
-                {
-                    "input_tokens": usage.prompt_tokens,
-                    "uncached_input_tokens": usage.uncached_prompt_tokens,
-                    "cache_creation_input_tokens": usage.cache_creation_prompt_tokens,
-                    "cache_read_input_tokens": usage.cache_read_prompt_tokens,
-                    "output_tokens": usage.completion_tokens,
-                    "model_calls": 1,
-                }
-                if usage is not None
-                else {"model_calls": 1}
-            ),
+            usage=usage_payload,
             reasoning_content=reasoning_content,
         )
 
@@ -278,6 +311,8 @@ class DurableRuntimeClient:
         self._activation_manifest: ActivationManifest | None = None
         self._workspace_command_lock = asyncio.Lock()
         self._execution_started = False
+        self.project_instructions = None
+        self.tool_bundles = None
 
     @classmethod
     async def create(
@@ -328,6 +363,10 @@ class DurableRuntimeClient:
         if self.supervisor is not None:
             return self.supervisor
         config = load_layered_config(self.cwd)
+        self.tool_bundles = parse_tool_bundles(
+            config.runtime_environment.get("CC_HARNESS_TOOL_BUNDLES")
+        )
+        self.project_instructions = load_project_instructions(self.cwd)
         activation_path = self.cwd / ".cc-harness" / "activation" / "durable-runtime.json"
         activation_path.parent.mkdir(parents=True, exist_ok=True)
         self._activation_manifest = ActivationManifest(
@@ -402,7 +441,7 @@ class DurableRuntimeClient:
             native_tools=True,
             mcp_tool_count=len(self._mcp._tools),
         )
-        model = DurableModelAdapter(self._llm)
+        model = DurableModelAdapter(self._llm, tool_bundles=self.tool_bundles)
         kernel = ReActKernel(model)
         base_worker_id = worker_id or f"supervisor-{os.getpid()}"
         counter = 0
@@ -438,6 +477,10 @@ class DurableRuntimeClient:
                 continue_segments=True,
                 capability_runtime=self._capabilities,
                 activation_manifest=self._activation_manifest,
+                project_instructions=(
+                    self.project_instructions.text
+                    if self.project_instructions is not None else None
+                ),
             )
 
         self.supervisor = LocalSupervisor(
@@ -601,6 +644,18 @@ class DurableRuntimeClient:
                 contracts.from_mcp_metadata(name, metadata)
                 self._security_capability_metadata[name] = metadata
                 specs.append(copied)
+        if self.tool_bundles is not None:
+            native_names = {
+                "run_command",
+                "ContinueToolResult",
+                "RecallRunContext",
+                *NATIVE_FILE_TOOLS,
+            }
+            native_names.update(
+                str((extra.get("spec") or {}).get("function", {}).get("name") or "")
+                for extra in (extras or ())
+            )
+            specs = select_tool_specs(specs, self.tool_bundles, native_names=native_names)
         return tuple(specs), contracts, handlers, handler_deps
 
     @staticmethod

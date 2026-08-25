@@ -172,7 +172,8 @@ def test_build_system_prompt_signature_accepts_mode_and_extra_ctx():
 def test_build_system_prompt_plan_mode_includes_override():
     out = build_system_prompt("/x", mode="plan")
     assert "Plan 模式" in out
-    assert "禁止调用任何工具" in out
+    assert "可以使用只读工具" in out
+    assert "不得修改文件" in out
     assert "## 目标" in out  # plan format hint
     # Coding-specific sections should NOT appear in plan mode
     # (TODO block and tool discipline are coding-only)
@@ -183,7 +184,8 @@ def test_build_system_prompt_plan_mode_includes_override():
 def test_build_system_prompt_design_mode_includes_override():
     out = build_system_prompt("/x", mode="design")
     assert "Design 模式" in out
-    assert "禁止调用任何工具" in out
+    assert "可以使用只读工具" in out
+    assert "默认不写入项目" in out
     assert "mermaid" in out
     assert "变体" in out
     assert "**Tweaks**" in out
@@ -197,7 +199,8 @@ def test_build_system_prompt_coding_mode_excludes_plan_and_design_overrides():
     assert "Plan 模式" not in out
     assert "Design 模式" not in out
     # Coding sections ARE present
-    assert "📝 TODO" in out
+    assert "## 工作计划" in out
+    assert "不要在普通文本中手工伪造 TODO 标记" in out
     assert "工具使用纪律" in out
 
 
@@ -222,21 +225,16 @@ def test_bare_capabilities_remove_unavailable_todo_and_visible_thought_contracts
     assert "不允许直接调工具" not in out
     assert "工具使用纪律" in out
     assert "工具能力诚实" in out
-    assert "不要在文本中输出 `Action:" in out
+    assert "不要在文本中输出" in out and "`Action:" in out
 
 
-def test_composed_prompt_preserves_all_12_legacy_rules():
-    """Semantic equivalence: every concept from the original 12 rules must
-    still appear in the composed output. Catches accidental drops during
-    the section migration (#3b)."""
+def test_composed_prompt_preserves_the_audited_rule_contract():
+    """The new contract removes visible chain-of-thought and fake TODOs."""
     out = build_system_prompt("/x")
     must_contain = [
         # rule 1 + 4 + 11: format markers (思考, 行动, 观察, 结果, Action)
         "思考", "行动", "观察", "结果", "Action:",
-        # rule 2: 1-2 sentence thinking before tool use
-        "1-2 句",
-        # rule 3: TODO block
-        "📝 TODO",
+        # no forced visible chain-of-thought or hand-written TODO markers
         # rule 5: don't force tool calls
         "不要硬塞工具调用",
         # rule 6: don't retry same failed call
@@ -247,15 +245,17 @@ def test_composed_prompt_preserves_all_12_legacy_rules():
         "不要编造文件内容",
         # rule 9: conciseness
         "简洁",
-        # rule 10: progress notes for long tasks
-        "10 步",
+        # progress notes are tied to real progress, not a call-count threshold
         # rule 12: tool honesty
         "工具能力诚实", "合适的工具",
+        "审计后的生产规则", "修改前先读取", "完成前用与验收条件匹配的最小验证",
         # identity + cwd injection
         "MCP",
     ]
     for needle in must_contain:
         assert needle in out, f"missing rule concept: {needle!r}"
+    assert "1-2 句" not in out
+    assert "📝 TODO" not in out
 
 
 def test_instruction_hierarchy_renders_in_all_modes():
@@ -332,7 +332,8 @@ def test_coding_mode_unaffected():
     """coding prompt 不受 chat section 影响。"""
     from cc_harness.prompts import build_system_prompt
     prompt = build_system_prompt("/tmp", mode="coding")
-    assert "TODO 块" in prompt  # coding 仍有
+    assert "工作计划" in prompt
+    assert "TODO 块" not in prompt
 
 
 # --- Tier 3 summary prompts (Plan3 Task3) ---
