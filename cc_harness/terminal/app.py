@@ -674,8 +674,12 @@ class InlineTerminalApp:
             "completion-menu": "bg:#20242b #d6deeb",
             "completion-menu.completion": "bg:#20242b #d6deeb",
             "completion-menu.completion.current": "bg:#3b4252 #ffffff bold",
-            "completion-menu.meta.completion": "#8f9baa",
-            "completion-menu.meta.completion.current": "#ffffff",
+            # Keep the metadata column on the same dark surface as the
+            # command column.  prompt-toolkit renders metadata as a child
+            # fragment, so it must set its background explicitly instead of
+            # relying on the parent completion-menu style.
+            "completion-menu.meta.completion": "bg:#20242b #e5e9f0",
+            "completion-menu.meta.completion.current": "bg:#3b4252 #ffffff bold",
             "status.border": "#777777",
             "status.model": "#00d7d7",
             "status.separator": "#888888",
