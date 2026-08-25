@@ -118,8 +118,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--runtime",
         choices=("legacy", "durable"),
-        default=(os.getenv("CC_HARNESS_RUNTIME") if os.getenv("CC_HARNESS_RUNTIME") in {"legacy", "durable"} else "durable"),
-        help="execution runtime facade (durable is the rebuilt default; legacy is migration-only)",
+        default=(os.getenv("CC_HARNESS_RUNTIME") if os.getenv("CC_HARNESS_RUNTIME") in {"legacy", "durable"} else "legacy"),
+        help="execution runtime facade (legacy fullscreen TUI by default; durable is explicit)",
     )
     parser.add_argument(
         "--command",

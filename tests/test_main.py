@@ -75,3 +75,17 @@ def test_package_entrypoint_propagates_system_exit(monkeypatch) -> None:
 
     with pytest.raises(SystemExit, match="7"):
         module.main()
+
+
+def test_package_entrypoint_defaults_to_fullscreen_legacy(monkeypatch) -> None:
+    from cc_harness.entrypoint import build_parser
+
+    monkeypatch.delenv("CC_HARNESS_RUNTIME", raising=False)
+    assert build_parser().parse_args([]).runtime == "legacy"
+
+
+def test_package_entrypoint_can_select_durable_runtime(monkeypatch) -> None:
+    from cc_harness.entrypoint import build_parser
+
+    monkeypatch.setenv("CC_HARNESS_RUNTIME", "durable")
+    assert build_parser().parse_args([]).runtime == "durable"

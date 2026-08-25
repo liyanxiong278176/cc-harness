@@ -1,8 +1,8 @@
 # cc-harness
 
-一个在当前终端中运行的 coding agent。默认使用可恢复的 Durable Runtime；需要
-直接操作当前会话时，legacy 兼容入口提供 focus-first fullscreen workspace，
-对话和工具活动在同一个 alternate screen 中呈现，退出后恢复调用者的 shell。
+一个在当前终端中运行的 coding agent。默认打开 focus-first fullscreen workspace，
+对话和工具活动在同一个 alternate screen 中呈现，退出后恢复调用者的 shell；
+需要可恢复任务控制面时，可显式选择 Durable Runtime。
 项目不依赖 Textual。
 
 ## 安装与启动
@@ -28,8 +28,8 @@ API key，并保存到 `~/.cc-harness/.env`。配置优先级为：进程环境�
 ## 常用启动方式
 
 ```powershell
-cc-harness                         # 在当前目录开始新会话
-cc-harness --runtime legacy        # 直接打开 fullscreen focus workspace
+cc-harness                         # 默认打开 fullscreen focus workspace
+cc-harness --runtime durable       # 使用可恢复 Durable Runtime 控制面
 cc-harness --runtime legacy --tui default # 兼容的原生 scrollback 视图
 cc-harness -c                      # 继续当前目录最近的会话
 cc-harness -r                      # 选择当前目录的历史会话
