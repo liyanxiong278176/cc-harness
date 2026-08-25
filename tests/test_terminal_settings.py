@@ -18,3 +18,10 @@ def test_project_terminal_setting_round_trip_preserves_other_keys(tmp_path):
     value = json.loads(settings.read_text(encoding="utf-8"))
     assert value["ui"]["custom_line"] == "keep me"
     assert value["other"] == {"safe": True}
+
+
+def test_mouse_capture_is_opt_in_for_native_terminal_selection(tmp_path):
+    settings = tmp_path / ".cc-harness" / "settings.json"
+    settings.parent.mkdir(parents=True)
+    settings.write_text(json.dumps({"ui": {"capture_mouse": True}}), encoding="utf-8")
+    assert load_terminal_settings(tmp_path, user_root=tmp_path / "user").capture_mouse is True

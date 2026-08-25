@@ -9,6 +9,10 @@ from pathlib import Path
 @dataclass(frozen=True)
 class TerminalUISettings:
     tui: str = "fullscreen"
+    # Leave terminal mouse reporting off so the host terminal can perform
+    # native drag-to-select/copy.  Enable explicitly when wheel scrolling is
+    # preferred over native selection.
+    capture_mouse: bool = False
     custom_line: str = "🛩️  冲鸭"
     show_project: bool = True
     show_git: bool = True

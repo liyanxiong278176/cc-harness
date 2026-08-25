@@ -52,6 +52,8 @@ cc-harness -p "summarize this repo" # 非交互打印模式
 - `Shift+Tab` 在 `default`、`auto-edit`、`bypass-prompts` 之间切换。
 - `Ctrl+O` 查看完整对话与工具活动；`Ctrl+S` 暂存/恢复草稿；`Ctrl+L` 清屏重绘。
 - `F2` 或 `/inspector` 打开 Run Inspector；左右键切换 Overview、Timeline、Token、Context、Files、Errors 标签。
+- 全屏 TUI 默认保留终端原生鼠标拖拽选择/复制；若更需要鼠标滚轮滚动，可在
+  `.cc-harness/settings.json` 的 `ui` 下设置 `"capture_mouse": true`，此时终端原生选择可能需要按住终端的修饰键。
 - Inspector 只显示版本、摘要、token/cache 计数、digest、耗时和错误数量；永不显示有效提示词、规则正文、来源映射或可重建片段。
 - `Alt+P` 选择模型；`Alt+T` 切换推理强度；`Alt+V` 从剪贴板附加图片。
 - `Ctrl+C` 取消当前请求或清空当前输入；`Ctrl+D` 或 `/exit` 保存并退出。

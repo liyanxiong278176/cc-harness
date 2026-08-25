@@ -281,7 +281,10 @@ class FullscreenTerminalApp(InlineTerminalApp):
             style=self._fullscreen_style(),
             key_bindings=self._build_fullscreen_key_bindings(),
             full_screen=True,
-            mouse_support=True,
+            # Native terminal selection is the default.  Mouse reporting is
+            # opt-in because prompt_toolkit capture otherwise consumes drag
+            # events before Windows Terminal/ConHost can select text.
+            mouse_support=self.terminal_settings.capture_mouse,
             refresh_interval=0.1,
             min_redraw_interval=0.03,
             paste_mode=False,

@@ -560,6 +560,11 @@ class SessionRuntime:
         deps = self.state.mem_deps
         if not deps or self.memory_config is None:
             return
+        # Memory construction is fail-soft.  A stale/partial dependency map
+        # must not produce a second misleading warning for services that
+        # require the unavailable memory service.
+        if any(key not in deps for key in ("store", "service")):
+            return
         try:
             from cc_harness.memory.maintenance.scheduler import MaintenanceScheduler
 
