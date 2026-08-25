@@ -99,8 +99,9 @@ class InlineTerminalApp:
             self.prompt_session = _InlinePromptSession(
                 history=FileHistory(str(state_dir / "input-history")),
                 auto_suggest=AutoSuggestFromHistory(),
-                completer=TerminalCompleter(runtime.cwd),
-                complete_while_typing=False,
+                completer=TerminalCompleter(runtime.cwd, lang=self.lang),
+                # Keep slash commands discoverable without requiring Tab.
+                complete_while_typing=True,
                 multiline=True,
                 key_bindings=self._kb,
                 bottom_toolbar=self._bottom_toolbar,

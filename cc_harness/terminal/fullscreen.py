@@ -174,8 +174,9 @@ class FullscreenTerminalApp(InlineTerminalApp):
         self.input_buffer = Buffer(
             history=FileHistory(str(state_dir / "input-history")),
             auto_suggest=AutoSuggestFromHistory(),
-            completer=TerminalCompleter(self.runtime.cwd),
-            complete_while_typing=False,
+            completer=TerminalCompleter(self.runtime.cwd, lang=self.lang),
+            # Show slash-command choices as soon as the user types "/".
+            complete_while_typing=True,
             multiline=True,
             accept_handler=self._accept_input,
             read_only=Condition(lambda: self._overlay_active()),

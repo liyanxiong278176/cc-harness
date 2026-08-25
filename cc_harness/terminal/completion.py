@@ -12,8 +12,9 @@ _IGNORED_DIRS = {".git", ".venv", "node_modules", "__pycache__", ".idea"}
 
 
 class TerminalCompleter(Completer):
-    def __init__(self, cwd: Path) -> None:
+    def __init__(self, cwd: Path, *, lang: str = "en") -> None:
         self.cwd = Path(cwd)
+        self.lang = lang
 
     def get_completions(self, document, complete_event):
         del complete_event
@@ -23,7 +24,17 @@ class TerminalCompleter(Completer):
             prefix = before.lstrip().lower()
             for command in COMMANDS:
                 if command.name.startswith(prefix):
-                    yield Completion(command.name, start_position=-len(prefix))
+                    description = (
+                        command.description_zh
+                        if self.lang.lower().startswith("zh")
+                        else command.description_en
+                    )
+                    yield Completion(
+                        command.name,
+                        start_position=-len(prefix),
+                        display=command.name,
+                        display_meta=description,
+                    )
             return
         at = word.rfind("@")
         if at < 0:

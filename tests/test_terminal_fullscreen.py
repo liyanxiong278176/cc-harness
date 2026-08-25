@@ -66,6 +66,7 @@ def test_fullscreen_owns_alternate_screen_and_real_input_buffer(fullscreen_app):
     assert fullscreen_app._application.full_screen is True
     assert fullscreen_app._application.mouse_support() is False
     assert fullscreen_app.input_buffer.multiline()
+    assert fullscreen_app.input_buffer.complete_while_typing() is True
     assert fullscreen_app._application.layout.current_control.buffer is fullscreen_app.input_buffer
 
 
