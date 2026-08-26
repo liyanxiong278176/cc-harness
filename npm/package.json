@@ -1,0 +1,28 @@
+{
+  "name": "@lyx/cc-harness",
+  "version": "0.1.0",
+  "description": "npm launcher for the cc-harness terminal coding agent",
+  "license": "MIT",
+  "type": "commonjs",
+  "bin": {
+    "cc-harness": "bin/cc-harness.js"
+  },
+  "files": [
+    "bin/cc-harness.js",
+    "README.md"
+  ],
+  "engines": {
+    "node": ">=18"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/liyanxiong278176/cc-harness.git"
+  },
+  "homepage": "https://github.com/liyanxiong278176/cc-harness",
+  "bugs": {
+    "url": "https://github.com/liyanxiong278176/cc-harness/issues"
+  }
+}
