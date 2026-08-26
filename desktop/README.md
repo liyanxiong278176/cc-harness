@@ -13,6 +13,11 @@ Durable Runtime。桌面端不会复制 Agent、提示词、工具、权限、�
 - 底部显示模型、运行、连接、权限和活动数量
 - Python sidecar 通过版本化 JSONL/stdin-stdout bridge 工作
 
+首次打开桌面端时，请把左侧“工作区”改成实际项目目录（该目录应包含 `.env`，并
+按 CLI 的方式配置 `OPENAI_API_KEY`、`OPENAI_BASE_URL`、`OPENAI_MODEL`），然后点
+“连接”。如果连接失败，右侧会显示 sidecar 的真实启动错误，可直接点“重试连接”；
+不再只显示笼统的 `desktop bridge is not running`。
+
 ## 本地开发
 
 ### 仅预览前端
@@ -109,8 +114,7 @@ Windows Secrets：`WINDOWS_CERTIFICATE`（Base64 PFX）、
    将该文件内容填入 `APPLE_CERTIFICATE`，分别填入 `.p12` 密码、钥匙串密码、API
    Issuer ID、Key ID 和 `.p8` 私钥内容。API 私钥只能从 Apple 页面下载一次，下载后
    应立即安全保存。
-4. 先在没有 Secrets 的情况下用 `desktop-v0.1.1` 验证过构建链；配置完成后创建
-   一个新的版本标签（例如 `desktop-v0.1.2`）：
+4. 创建新的版本标签（例如 `desktop-v0.1.2`）：
 
    ```powershell
    git tag desktop-v0.1.2

@@ -29,6 +29,7 @@ function App() {
   const [composer, setComposer] = useState("");
   const [events, setEvents] = useState<BridgeMessage[]>([]);
   const [runtimeStarted, setRuntimeStarted] = useState(false);
+  const [bridgeConnected, setBridgeConnected] = useState(false);
   const [model, setModel] = useState("未启动");
   const [connection, setConnection] = useState("未连接");
   const [error, setError] = useState<string | null>(null);
@@ -86,18 +87,33 @@ function App() {
     }
   }
 
+  async function connectBridge(workspace = cwd): Promise<boolean> {
+    setError(null);
+    setConnection("正在连接本地 sidecar");
+    try {
+      const hello = await bridge.restart(workspace.trim() || ".");
+      setConnection(`本地 sidecar 已连接 · ${String(hello.data?.connection ?? "ready")}`);
+      setBridgeConnected(true);
+      setModel(String(hello.data?.model ?? "未启动"));
+      setRuntimeStarted(Boolean(hello.data?.runtime_started));
+      await refreshRuns();
+      return true;
+    } catch (reason) {
+      setConnection("sidecar 未连接");
+      setBridgeConnected(false);
+      setError(reason instanceof Error ? reason.message : String(reason));
+      return false;
+    }
+  }
+
   useEffect(() => {
     let unlistenQuit: UnlistenFn | undefined;
     let unlistenOpen: UnlistenFn | undefined;
     void (async () => {
       try {
-        const hello = await bridge.start(cwd);
-        setConnection(String(hello.data?.connection ?? "本地 sidecar 已连接"));
-        setModel(String(hello.data?.model ?? "未启动"));
-        setRuntimeStarted(Boolean(hello.data?.runtime_started));
-        await refreshRuns();
+        await connectBridge(cwd);
       } catch (reason) {
-        setConnection("等待本地 sidecar");
+        setConnection("sidecar 未连接");
         setError(reason instanceof Error ? reason.message : String(reason));
       }
     })();
@@ -145,6 +161,7 @@ function App() {
     setComposer("");
     setError(null);
     try {
+      if (!bridgeConnected && !(await connectBridge(cwd))) return;
       const result = await bridge.request("submit", {
         objective,
         auto_start: true,
@@ -193,8 +210,9 @@ function App() {
       </header>
       <section className="workspace">
         <aside className="sidebar panel">
-          <div className="panel-heading"><span>工作区</span><button>＋</button></div>
+          <div className="panel-heading"><span>工作区</span><button onClick={() => void connectBridge(cwd)}>连接</button></div>
           <input className="workspace-input" value={cwd} onChange={(event) => setCwd(event.target.value)} />
+          <div className="workspace-help">填写包含项目配置（.env / policy.yaml）的目录，然后点击“连接”。</div>
           <div className="panel-heading runs-heading"><span>会话 / 运行</span><span className="count">{runs.length}</span></div>
           <div className="run-list">
             {runs.length === 0 && <div className="empty">还没有运行。发送第一条任务开始。</div>}
@@ -237,7 +255,7 @@ function App() {
           <div className="context-section"><h3>审批</h3><p>待审批动作会显示在这里，并沿用现有策略。</p></div>
           <div className="context-section"><h3>任务状态</h3><p>{current ? `${current.status}${current.storage_error ? "（持久化投影不一致，未自动修改）" : ""}` : "暂无活动任务"}</p></div>
           <div className="context-section"><h3>实时用量</h3><p>{usage ? `${usage.input_tokens} 输入 · ${usage.output_tokens} 输出 · 缓存命中 ${(usage.cache_hit_ratio * 100).toFixed(1)}%` : "等待运行事件"}</p><p>{usage?.cost_status === "reported" ? `API 直接费用：${usage.reported_cost} ${usage.reported_cost_currency ?? ""}` : "API 直接费用：unavailable"}</p></div>
-          {error && <div className="error-box">{error}</div>}
+          {error && <div className="error-box">{error}<button onClick={() => void connectBridge(cwd)}>重试连接</button></div>}
         </aside>
       </section>
       <footer className="statusbar">

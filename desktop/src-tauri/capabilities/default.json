@@ -5,7 +5,21 @@
   "windows": ["main"],
   "permissions": [
     "core:default",
-    "shell:allow-spawn",
+    {
+      "identifier": "shell:allow-spawn",
+      "allow": [
+        {
+          "args": [
+            "--cwd",
+            {
+              "validator": ".+"
+            }
+          ],
+          "name": "binaries/cc-harness-desktop-bridge",
+          "sidecar": true
+        }
+      ]
+    },
     "shell:allow-stdin-write"
   ]
 }

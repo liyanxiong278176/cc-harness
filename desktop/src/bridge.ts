@@ -21,6 +21,7 @@ type Pending = {
 
 export class DesktopBridge {
   private child: Child | null = null;
+  private stderr = "";
   private readonly pending = new Map<string, Pending>();
   private readonly listeners = new Set<(message: BridgeMessage) => void>();
   private nextId = 1;
@@ -29,15 +30,32 @@ export class DesktopBridge {
     if (this.child) return this.request("hello");
     const command = Command.sidecar("binaries/cc-harness-desktop-bridge", ["--cwd", cwd]);
     command.stdout.on("data", (line) => this.receive(String(line)));
-    command.stderr.on("data", (line) => console.warn("cc-harness bridge:", line));
+    command.stderr.on("data", (line) => {
+      const text = String(line).trim();
+      if (text) this.stderr = `${this.stderr}${this.stderr ? "\n" : ""}${text}`.slice(-2000);
+      console.warn("cc-harness bridge:", line);
+    });
     command.on("close", (event) => {
-      const error = new Error(`desktop bridge exited (${event.code ?? "unknown"})`);
+      const detail = this.stderr ? `: ${this.stderr}` : "";
+      const error = new Error(`desktop bridge exited (${event.code ?? "unknown"})${detail}`);
       for (const pending of this.pending.values()) pending.reject(error);
       this.pending.clear();
       this.child = null;
     });
-    this.child = await command.spawn();
+    this.stderr = "";
+    try {
+      this.child = await command.spawn();
+    } catch (reason) {
+      this.child = null;
+      const detail = reason instanceof Error ? reason.message : String(reason);
+      throw new Error(`无法启动本地 sidecar：${detail}`);
+    }
     return this.request("hello");
+  }
+
+  async restart(cwd: string): Promise<BridgeMessage> {
+    await this.stop();
+    return this.start(cwd);
   }
 
   onMessage(listener: (message: BridgeMessage) => void): () => void {
@@ -63,6 +81,17 @@ export class DesktopBridge {
       await this.request("shutdown", { confirm });
     } finally {
       this.child = null;
+    }
+  }
+
+  async stop(): Promise<void> {
+    const child = this.child;
+    this.child = null;
+    if (!child) return;
+    try {
+      await child.kill();
+    } catch {
+      // The process may have already exited; the close handler is authoritative.
     }
   }
 
