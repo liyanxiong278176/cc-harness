@@ -33,11 +33,20 @@ def main() -> int:
     parser.add_argument("--version", required=True)
     parser.add_argument("--tag", required=True)
     parser.add_argument("--output", type=Path, required=True)
+    parser.add_argument(
+        "--platform",
+        action="append",
+        choices=sorted(PLATFORMS),
+        dest="platforms",
+        help="Include only the selected updater platforms (default: all).",
+    )
     args = parser.parse_args()
 
     base = f"https://github.com/liyanxiong278176/cc-harness/releases/download/{args.tag}"
     platforms = {}
-    for platform, archive in PLATFORMS.items():
+    selected_platforms = args.platforms or list(PLATFORMS)
+    for platform in selected_platforms:
+        archive = PLATFORMS[platform]
         platforms[platform] = {
             "url": f"{base}/{archive}",
             "signature": signature_for(args.assets, archive),

@@ -204,6 +204,7 @@ jobs:
             --assets release-assets \
             --version "$(python -c 'import json; print(json.load(open("desktop/src-tauri/tauri.conf.json"))["version"])')" \
             --tag "${GITHUB_REF_NAME}" \
+            --platform windows-x86_64 \
             --output release-assets/latest.json
       - name: Publish GitHub Release assets
         uses: softprops/action-gh-release@v2
