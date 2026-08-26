@@ -18,6 +18,33 @@ Durable Runtime。桌面端不会复制 Agent、提示词、工具、权限、�
 “连接”。如果连接失败，右侧会显示 sidecar 的真实启动错误，可直接点“重试连接”；
 不再只显示笼统的 `desktop bridge is not running`。
 
+## 下载并第一次运行
+
+已验证可用的安装包在 [desktop-v0.1.3 Release](https://github.com/liyanxiong278176/cc-harness/releases/tag/desktop-v0.1.3)：
+
+- Windows x64：[cc-harness_0.1.2_x64_en-US.msi](https://github.com/liyanxiong278176/cc-harness/releases/download/desktop-v0.1.3/cc-harness_0.1.2_x64_en-US.msi)
+- macOS Intel：[cc-harness_0.1.2_x64.dmg](https://github.com/liyanxiong278176/cc-harness/releases/download/desktop-v0.1.3/cc-harness_0.1.2_x64.dmg)
+- macOS Apple Silicon：[cc-harness_0.1.2_aarch64.dmg](https://github.com/liyanxiong278176/cc-harness/releases/download/desktop-v0.1.3/cc-harness_0.1.2_aarch64.dmg)
+
+安装后按下面顺序使用：
+
+1. 不要继续使用 `desktop-v0.1.1` 或没有安装包附件的旧 `desktop-v0.1.2`。
+   Windows 先在“应用和功能”卸载旧版，再安装上面的 MSI；macOS 将旧应用移到废纸篓。
+2. 准备一个实际项目目录，在其中创建 `.env`，例如：
+
+   ```dotenv
+   OPENAI_API_KEY=你的密钥
+   OPENAI_BASE_URL=https://你的兼容接口/v1
+   OPENAI_MODEL=你的模型名
+   ```
+
+3. 启动应用，把左侧“工作区”改成这个目录的绝对路径，点击“连接”。底部连接状态
+   变为已连接后再发送任务。桌面安装包已经内置 sidecar，不需要另外安装 Python、
+   `cc-harness` 或 npm 包。
+
+如果 Windows SmartScreen 提示“未知发布者”，这是当前未购买商业代码签名证书的
+未签名包：点击“更多信息 → 仍要运行”即可。签名发布流程仍可按下面的 Secrets 配置。
+
 ## 本地开发
 
 ### 仅预览前端
@@ -114,11 +141,11 @@ Windows Secrets：`WINDOWS_CERTIFICATE`（Base64 PFX）、
    将该文件内容填入 `APPLE_CERTIFICATE`，分别填入 `.p12` 密码、钥匙串密码、API
    Issuer ID、Key ID 和 `.p8` 私钥内容。API 私钥只能从 Apple 页面下载一次，下载后
    应立即安全保存。
-4. 创建新的版本标签（例如 `desktop-v0.1.2`）：
+4. 创建新的版本标签（例如 `desktop-v0.1.3`）：
 
    ```powershell
-   git tag desktop-v0.1.2
-   git push origin desktop-v0.1.2
+   git tag desktop-v0.1.3
+   git push origin desktop-v0.1.3
    ```
 
    Actions 会分别构建 Windows、macOS Intel 和 macOS Apple Silicon，并在签名验证
