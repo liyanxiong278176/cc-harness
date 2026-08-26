@@ -1,7 +1,10 @@
 import { useEffect, useMemo, useRef, useState } from "react";
+import { getVersion } from "@tauri-apps/api/app";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import { invoke } from "@tauri-apps/api/core";
 import { listen, UnlistenFn } from "@tauri-apps/api/event";
+import { relaunch } from "@tauri-apps/plugin-process";
+import { check, DownloadEvent } from "@tauri-apps/plugin-updater";
 import { DesktopBridge, BridgeMessage } from "../bridge";
 
 type RunSummary = {
@@ -20,6 +23,8 @@ type Usage = {
   cost_status: string;
 };
 
+type UpdateState = "idle" | "checking" | "installing" | "latest" | "error";
+
 const bridge = new DesktopBridge();
 
 function App() {
@@ -34,6 +39,9 @@ function App() {
   const [connection, setConnection] = useState("未连接");
   const [error, setError] = useState<string | null>(null);
   const [usage, setUsage] = useState<Usage | null>(null);
+  const [appVersion, setAppVersion] = useState("未知");
+  const [updateState, setUpdateState] = useState<UpdateState>("idle");
+  const [updateMessage, setUpdateMessage] = useState<string | null>(null);
   const inputRef = useRef<HTMLTextAreaElement>(null);
 
   const current = useMemo(
@@ -106,9 +114,49 @@ function App() {
     }
   }
 
+  async function checkForUpdates() {
+    if (updateState === "checking" || updateState === "installing") return;
+    setError(null);
+    setUpdateState("checking");
+    setUpdateMessage("正在检查更新…");
+    try {
+      const update = await check({ timeout: 30_000 });
+      if (!update) {
+        setUpdateState("latest");
+        setUpdateMessage(`当前已是最新版本（v${appVersion}）`);
+        return;
+      }
+
+      setUpdateState("installing");
+      setUpdateMessage(`发现 v${update.version}，正在下载并安装…`);
+      let downloaded = 0;
+      let contentLength: number | undefined;
+      await update.downloadAndInstall((event: DownloadEvent) => {
+        if (event.event === "Started") {
+          contentLength = event.data.contentLength;
+          downloaded = 0;
+        } else if (event.event === "Progress") {
+          downloaded += event.data.chunkLength;
+        }
+        if (contentLength) {
+          setUpdateMessage(`正在更新… ${Math.min(100, Math.round((downloaded / contentLength) * 100))}%`);
+        }
+      });
+      setUpdateMessage("更新已安装，正在重启应用…");
+      await relaunch();
+    } catch (reason) {
+      const message = reason instanceof Error ? reason.message : String(reason);
+      setUpdateState("error");
+      setUpdateMessage("更新失败");
+      setError(`更新失败：${message}`);
+    }
+  }
+
   useEffect(() => {
     let unlistenQuit: UnlistenFn | undefined;
     let unlistenOpen: UnlistenFn | undefined;
+    let unlistenUpdate: UnlistenFn | undefined;
+    void getVersion().then(setAppVersion).catch(() => setAppVersion("未知"));
     void (async () => {
       try {
         await connectBridge(cwd);
@@ -119,6 +167,7 @@ function App() {
     })();
     void (async () => {
       unlistenOpen = await listen("tray://open", () => void getCurrentWindow().show());
+      unlistenUpdate = await listen("tray://update", () => void checkForUpdates());
       unlistenQuit = await listen("tray://quit", async () => {
         try {
           const result = await bridge.request("shutdown", { confirm: false });
@@ -144,6 +193,7 @@ function App() {
     return () => {
       dispose();
       void unlistenOpen?.();
+      void unlistenUpdate?.();
       void unlistenQuit?.();
     };
   }, []);
@@ -206,7 +256,13 @@ function App() {
     <main className="shell">
       <header className="titlebar">
         <div className="brand"><span className="brand-dot" />cc-harness</div>
-        <div className="title-actions"><button onClick={hideWindow}>隐藏到托盘</button></div>
+        <div className="title-actions">
+          {updateMessage && <span className={`update-message update-${updateState}`}>{updateMessage}</span>}
+          <button disabled={updateState === "checking" || updateState === "installing"} onClick={() => void checkForUpdates()}>
+            {updateState === "checking" ? "检查中…" : updateState === "installing" ? "更新中…" : "检查更新"}
+          </button>
+          <button onClick={hideWindow}>隐藏到托盘</button>
+        </div>
       </header>
       <section className="workspace">
         <aside className="sidebar panel">
@@ -264,6 +320,7 @@ function App() {
         <span>连接：{connection}</span>
         <span>权限：沿用 policy.yaml</span>
         <span>活动：{runs.filter((run) => ["queued", "running", "awaiting_approval"].includes(run.status)).length}</span>
+        <span>版本：v{appVersion}</span>
         <span>Token：{usage ? `${usage.input_tokens}/${usage.output_tokens}` : "—"}</span>
         <span>费用：{usage?.cost_status === "reported" ? `${usage.reported_cost} ${usage.reported_cost_currency ?? ""}` : "unavailable"}</span>
         <span className="status-spacer" />

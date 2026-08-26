@@ -19,15 +19,15 @@ jobs:
           - name: Windows x64
             os: windows-latest
             target: x86_64-pc-windows-msvc
-            bundle: "**/*.msi"
+            platform_key: windows-x86_64
           - name: macOS Intel
             os: macos-15-intel
             target: x86_64-apple-darwin
-            bundle: "**/*.dmg"
+            platform_key: darwin-x86_64
           - name: macOS Apple Silicon
             os: macos-15
             target: aarch64-apple-darwin
-            bundle: "**/*.dmg"
+            platform_key: darwin-aarch64
     runs-on: ${{ matrix.os }}
     env:
       # Use neutral names so an empty secret is never auto-discovered by
@@ -152,9 +152,23 @@ jobs:
           mkdir -p "$api_key_dir"
           printf '%s' "$CC_APPLE_API_PRIVATE_KEY" > "$api_key_dir/AuthKey_${CC_APPLE_API_KEY}.p8"
           echo "APPLE_API_KEY_PATH=$api_key_dir/AuthKey_${CC_APPLE_API_KEY}.p8" >> "$GITHUB_ENV"
+      - name: Require updater signing key
+        env:
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+        run: >-
+          python -c "import os, sys; ok=bool(os.environ.get('TAURI_SIGNING_PRIVATE_KEY')); print('TAURI_SIGNING_PRIVATE_KEY is configured' if ok else 'TAURI_SIGNING_PRIVATE_KEY must be configured in repository Actions Secrets'); sys.exit(0 if ok else 1)"
       - name: Build installer
         working-directory: desktop
+        env:
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
         run: npm run tauri build -- --target ${{ matrix.target }}
+      - name: Stage installer and updater artifacts
+        run: >-
+          python scripts/stage_desktop_release_assets.py
+          --bundle-root desktop/src-tauri/target/${{ matrix.target }}/release/bundle
+          --output desktop/release-assets
+          --platform-key ${{ matrix.platform_key }}
       - name: Verify Windows signature
         if: matrix.target == 'x86_64-pc-windows-msvc' && env.CC_WINDOWS_CERTIFICATE != ''
         shell: pwsh
@@ -178,7 +192,7 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: cc-harness-${{ matrix.target }}
-          path: desktop/src-tauri/target/${{ matrix.target }}/release/bundle/${{ matrix.bundle }}
+          path: desktop/release-assets/*
           if-no-files-found: error
 
   release:
@@ -186,9 +200,17 @@ jobs:
     needs: build
     runs-on: ubuntu-latest
     steps:
+      - uses: actions/checkout@v4
       - uses: actions/download-artifact@v4
         with:
           path: release-assets
+      - name: Build updater manifest
+        run: |
+          python scripts/build_tauri_update_manifest.py \
+            --assets release-assets \
+            --version "$(python -c 'import json; print(json.load(open("desktop/src-tauri/tauri.conf.json"))["version"])')" \
+            --tag "${GITHUB_REF_NAME}" \
+            --output release-assets/latest.json
       - name: Publish GitHub Release assets
         uses: softprops/action-gh-release@v2
         with:

@@ -57,7 +57,9 @@ fn update_tray_status(
 
 pub fn run() {
     tauri::Builder::default()
+        .plugin(tauri_plugin_process::init())
         .plugin(tauri_plugin_shell::init())
+        .plugin(tauri_plugin_updater::Builder::new().build())
         .invoke_handler(tauri::generate_handler![exit_desktop, update_tray_status])
         .setup(|app| {
             let open = MenuItem::with_id(app, "open", "打开主界面", true, None::<&str>)?;

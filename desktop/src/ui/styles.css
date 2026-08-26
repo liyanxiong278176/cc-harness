@@ -16,6 +16,12 @@ button { border: 0; color: inherit; background: transparent; cursor: pointer; }
 .brand-dot { width: 9px; height: 9px; border-radius: 999px; background: #45a3ff; box-shadow: 0 0 14px #45a3ff; }
 .title-actions button, .panel-heading button { color: #9da7b8; padding: 5px 8px; border-radius: 6px; }
 .title-actions button:hover, .panel-heading button:hover { background: #252e3d; color: #fff; }
+.title-actions button:disabled { color: #5f6d80; cursor: wait; }
+.title-actions { display: flex; align-items: center; gap: 8px; }
+.update-message { color: #9da7b8; font-size: 11px; }
+.update-latest { color: #6fd69e; }
+.update-installing, .update-checking { color: #f0c46a; }
+.update-error { color: #ff9da5; }
 .workspace { flex: 1; display: grid; grid-template-columns: 238px minmax(480px, 1fr) 290px; gap: 1px; background: #252c38; }
 .panel { min-height: 0; background: #151b24; }
 .sidebar, .context { padding: 12px; }

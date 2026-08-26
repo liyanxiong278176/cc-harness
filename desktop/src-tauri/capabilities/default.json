@@ -20,6 +20,8 @@
         }
       ]
     },
-    "shell:allow-stdin-write"
+    "shell:allow-stdin-write",
+    "updater:default",
+    "process:allow-restart"
   ]
 }

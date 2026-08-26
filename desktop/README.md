@@ -12,6 +12,7 @@ Durable Runtime。桌面端不会复制 Agent、提示词、工具、权限、�
 - 左侧工作区与多 run 列表；中间流式事件；右侧审批/任务/用量投影
 - 底部显示模型、运行、连接、权限和活动数量
 - Python sidecar 通过版本化 JSONL/stdin-stdout bridge 工作
+- 标题栏和托盘菜单提供“检查更新”；发现新版本后自动下载、校验签名、安装并重启
 
 首次打开桌面端时，请把左侧“工作区”改成实际项目目录（该目录应包含 `.env`，并
 按 CLI 的方式配置 `OPENAI_API_KEY`、`OPENAI_BASE_URL`、`OPENAI_MODEL`），然后点
@@ -44,6 +45,28 @@ Durable Runtime。桌面端不会复制 Agent、提示词、工具、权限、�
 
 如果 Windows SmartScreen 提示“未知发布者”，这是当前未购买商业代码签名证书的
 未签名包：点击“更多信息 → 仍要运行”即可。签名发布流程仍可按下面的 Secrets 配置。
+
+## 应用内更新
+
+应用内更新使用 Tauri 官方签名更新包。安装了带 updater 的版本后，点击标题栏或托盘菜单
+中的“检查更新”即可：没有新版本时显示当前版本；有新版本时自动下载、验证并安装，Windows
+会退出当前进程完成安装，macOS 会自动重启到新版本。
+
+旧的 `desktop-v0.1.3` 安装包还没有 updater 组件，因此需要手动安装一次后续的 updater 版本；
+这是一项一次性迁移，之后每次更新都不需要再卸载或手动下载。
+
+更新签名私钥只配置一次：
+
+1. 本项目生成的私钥位于本机 `~/.tauri/cc-harness-updater.key`（Windows 对应
+   `%USERPROFILE%\\.tauri\\cc-harness-updater.key`）。不要提交或公开它。
+2. 打开 GitHub 仓库 **Settings → Secrets and variables → Actions → New repository secret**，
+   名称填写 `TAURI_SIGNING_PRIVATE_KEY`，值填写该文件的完整内容。
+3. 由于当前密钥没有密码，`TAURI_SIGNING_PRIVATE_KEY_PASSWORD` 可以留空；如果以后重新生成
+   加密密钥，必须同时配置该 Secret。
+4. 推送新的 `desktop-v*` 标签。工作流会生成 Windows/macOS 安装包、`.sig` 签名和
+   `latest.json`，并把它们发布到 GitHub Release。以后应用内检查更新会读取该清单。
+
+不要更换已经发布版本使用的更新公钥；如果丢失私钥，旧客户端将无法验证后续更新。
 
 ## 本地开发
 
@@ -107,6 +130,10 @@ Python 原生扩展错误地交叉打包到另一个平台。
 签名是可选的：没有这些 Secrets 时仍可构建测试用的未签名包；配置后，
 同一条 Release workflow 会签名并验证安装包。不要把 `.pfx`、`.p12`、`.p8`
 或密码提交到仓库。
+
+另外，应用内 updater 必须配置 `TAURI_SIGNING_PRIVATE_KEY`（以及可选的
+`TAURI_SIGNING_PRIVATE_KEY_PASSWORD`）；没有它，Release workflow 会主动失败，避免发布
+无法自动更新的包。更新签名密钥与 Windows/macOS 代码签名证书是两套独立凭据。
 
 Windows Secrets：`WINDOWS_CERTIFICATE`（Base64 PFX）、
 `WINDOWS_CERTIFICATE_PASSWORD`、`WINDOWS_CERTIFICATE_THUMBPRINT`，可选
