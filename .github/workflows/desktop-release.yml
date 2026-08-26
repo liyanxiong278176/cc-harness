@@ -21,11 +21,11 @@ jobs:
             target: x86_64-pc-windows-msvc
             bundle: "**/*.msi"
           - name: macOS Intel
-            os: macos-13
+            os: macos-15-intel
             target: x86_64-apple-darwin
             bundle: "**/*.dmg"
           - name: macOS Apple Silicon
-            os: macos-14
+            os: macos-15
             target: aarch64-apple-darwin
             bundle: "**/*.dmg"
     runs-on: ${{ matrix.os }}

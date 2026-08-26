@@ -60,7 +60,8 @@ npm run tauri:build
 
 本仓库的 `.github/workflows/desktop-release.yml` 会在 `desktop-v*` 标签或手动
 触发时，为 Windows x64、macOS Intel 和 macOS Apple Silicon 构建安装包，并把
-它们作为 GitHub Release 附件发布。工作流先在目标系统本机运行
+它们作为 GitHub Release 附件发布。当前工作流使用 GitHub Actions 的
+`macos-15-intel` 与 `macos-15` runner，避免使用已退役的旧 macOS 镜像。工作流先在目标系统本机运行
 `scripts/build_desktop_sidecar.py`，再运行 Tauri 构建；这样不会把某个平台的
 Python 原生扩展错误地交叉打包到另一个平台。
 
