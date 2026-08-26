@@ -14,15 +14,34 @@ uv tool install --editable .
 cc-harness
 ```
 
-也可以通过 npm 安装用户入口（第一阶段 npm 包发布后可用）：
+也可以通过 npm 安装用户入口（当前 latest 为 `0.1.1`）：
 
 ```bash
-npm install -g @liyanxiong278176/cc-harness
+npm install -g @liyanxiong278176/cc-harness@latest --registry https://registry.npmjs.org
 cc-harness
 ```
 
 npm 包只负责准备 Python 运行环境并转发参数，核心代码仍来自本项目；首次运行
 会下载依赖，可能需要一些时间。当前 npm 包源码位于 [`npm/`](npm/)。
+
+更新或卸载 npm 安装的入口：
+
+```powershell
+# 更新到最新版
+npm install -g @liyanxiong278176/cc-harness@latest --registry https://registry.npmjs.org
+
+# 检查已安装版本
+npm list -g @liyanxiong278176/cc-harness --depth=0
+
+# 卸载
+npm uninstall -g @liyanxiong278176/cc-harness
+```
+
+如果曾经误装过旧的 `@lyx/cc-harness` 包，可单独卸载它：
+
+```powershell
+npm uninstall -g @lyx/cc-harness
+```
 
 开发时也可直接运行：
 

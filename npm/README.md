@@ -10,6 +10,30 @@ npm install -g @liyanxiong278176/cc-harness
 cc-harness
 ```
 
+更新到最新版：
+
+```powershell
+npm install -g @liyanxiong278176/cc-harness@latest --registry https://registry.npmjs.org
+```
+
+检查版本：
+
+```powershell
+npm list -g @liyanxiong278176/cc-harness --depth=0
+```
+
+卸载：
+
+```powershell
+npm uninstall -g @liyanxiong278176/cc-harness
+```
+
+如果曾经误装过旧的 `@lyx/cc-harness` 包，可单独卸载：
+
+```powershell
+npm uninstall -g @lyx/cc-harness
+```
+
 要求 Node.js 18+。如果系统安装了 `uv`，优先使用 uv 运行 Python 核心；否则
 使用 Python 3.11+ 在用户缓存目录创建隔离虚拟环境。首次运行会下载依赖，可能
 需要一些时间。
