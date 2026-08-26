@@ -22,7 +22,8 @@ Durable Runtime。桌面端不会复制 Agent、提示词、工具、权限、�
 
 ## 下载并第一次运行
 
-已验证可用的安装包在 [desktop-v0.1.3 Release](https://github.com/liyanxiong278176/cc-harness/releases/tag/desktop-v0.1.3)：
+上一版安装包在 [desktop-v0.1.3 Release](https://github.com/liyanxiong278176/cc-harness/releases/tag/desktop-v0.1.3)，但它不包含本次“设置/工作区选择”和 sidecar 启动修复。
+本次修复对应 `desktop-v0.1.4`，需由 GitHub Actions 构建后再下载；不要继续使用旧包：
 
 - Windows x64：[cc-harness_0.1.2_x64_en-US.msi](https://github.com/liyanxiong278176/cc-harness/releases/download/desktop-v0.1.3/cc-harness_0.1.2_x64_en-US.msi)
 - macOS Intel：[cc-harness_0.1.2_x64.dmg](https://github.com/liyanxiong278176/cc-harness/releases/download/desktop-v0.1.3/cc-harness_0.1.2_x64.dmg)
