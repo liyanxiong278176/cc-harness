@@ -9,7 +9,7 @@ const { spawnSync } = require("node:child_process");
 
 // Keep each npm release reproducible. Bump this ref together with the npm
 // version when publishing a new release; users can override it explicitly.
-const DEFAULT_CORE_REF = "2f9f176";
+const DEFAULT_CORE_REF = "5bdd0e83192b67f4d942ed82f39ea3378bf45ac7";
 const DEFAULT_GIT_SOURCE =
   `git+https://github.com/liyanxiong278176/cc-harness.git@${DEFAULT_CORE_REF}`;
 const DEFAULT_ARCHIVE_SOURCE =

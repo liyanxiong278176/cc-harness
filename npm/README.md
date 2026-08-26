@@ -30,7 +30,7 @@ cc-harness --cwd /path/to/project
 同步更新 npm 版本和入口脚本中的提交号。也可以通过环境变量覆盖来源：
 
 ```bash
-CC_HARNESS_CORE_SOURCE="git+https://github.com/liyanxiong278176/cc-harness.git@2f9f176"
+CC_HARNESS_CORE_SOURCE="git+https://github.com/liyanxiong278176/cc-harness.git@5bdd0e83192b67f4d942ed82f39ea3378bf45ac7"
 CC_HARNESS_NPM_REINSTALL=1
 cc-harness
 ```
