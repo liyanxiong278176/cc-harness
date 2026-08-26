@@ -44,7 +44,7 @@ treatment 与必要的隔离 judge 均使用经服务端身份验证的 `deepsee
 不同 benchmark、样本及 treatment 分组使用互不共享的 workspace、运行目录、会话、记忆库、摘要、ref 与节点清单；每组完成后将其状态封存为只读审计证据并从后续活动运行中卸载，下一组启动前必须验证活动状态为空且不存在跨任务命中。隔离或清理失败使运行无效，评测不得读取或改写用户日常全局记忆。_Avoid_: 复用上一题的 CC_HARNESS_HOME、让 treatment 继承其他任务状态、为防污染删除审计证据、清理失败后继续运行
 
 **产品对标边界（Product Parity Boundary）**:
-cc-harness 对标 Claude Code 的终端 coding-agent 内核及 headless/SDK 能力；Web、Desktop、Mobile、Slack、Chrome 与完整企业平台不属于当前对标范围。桌面客户端可以作为可选的本地分发入口，但不改变终端内核的对标边界，也不构成独立的 Agent 产品线。_Avoid_: 完整复制 Claude 平台、只对齐终端外观、让桌面入口分叉出第二套代理语义
+cc-harness 对标 Claude Code 的终端 coding-agent 内核及 headless/SDK 能力；Web、Desktop、Mobile、Slack、Chrome 与完整企业平台不属于当前对标范围。_Avoid_: 完整复制 Claude 平台、只对齐终端外观
 
 **可信内核阶段（Trusted Core Phase）**:
 第一阶段优先完成原生文件与搜索工具、不可绕过的 hard-deny 与 sandbox、模型和成本追踪、headless JSON 协议及持续 coding benchmark，再建设 Skills、Hooks 与增强型 Subagents；UI 仅修复阻塞真实使用或验证的问题。_Avoid_: 用像素级界面对齐代替底层能力、在核心契约未成立前继续扩大 UI 表面积
@@ -69,11 +69,7 @@ cc-harness 对标 Claude Code 的终端 coding-agent 内核及 headless/SDK 能�
 
 **终端内会话（In-Terminal Session）**:
 在调用命令的当前终端内持续呈现对话、工具活动和输入区。默认 fullscreen renderer 使用 alternate screen 接管当前终端表面；classic renderer 作为兼容路径把历史写入原生 scrollback；两者退出后都恢复调用者的 shell。
-_Avoid_: 终端入口另开窗口、把终端会话改成桌面或 Web 会话、退出后破坏原终端状态
-
-**可选本地桌面客户端（Optional Local Desktop Client）**:
-在本机提供图形交互入口的可选客户端；它与 CLI/TUI 共享同一 Agent 语义、会话事实、权限边界、运行事件和费用/token 观测，不能成为第二套代理内核。CLI/TUI 仍是默认、可审计和可脚本化的正式入口；桌面客户端只改变交互表面与分发方式。
-_Avoid_: 在桌面端复制压缩、记忆、工具或权限逻辑、让桌面端改变 CLI 行为、把 GitHub Release 的安装包误当作远程云服务
+_Avoid_: 另开终端窗口、桌面 GUI、Web UI、退出后破坏原终端状态
 
 **一等本地平台（First-Class Local Platform）**:
 Windows、Linux 与 macOS 都必须通过核心工具、路径安全、会话恢复和 CLI 发布门；Windows 支持原生 PowerShell、PTY 与文件语义，不以 WSL 作为运行前提。_Avoid_: 把 Windows 当作尽力兼容、仅在单一开发机验证、用 WSL 结果代表原生 Windows
