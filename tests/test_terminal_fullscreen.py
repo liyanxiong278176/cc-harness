@@ -11,7 +11,7 @@ from prompt_toolkit.mouse_events import MouseButton, MouseEvent, MouseEventType
 from prompt_toolkit.output import DummyOutput
 
 from cc_harness.terminal.fullscreen import FullscreenTerminalApp
-from cc_harness.tokens import TokenCounter
+from cc_harness.tokens import SessionTokenStats, TokenCounter
 
 
 class FakeSessionStore:
@@ -246,3 +246,24 @@ async def test_shell_mode_streams_into_transcript_without_stdout(fullscreen_app)
     assert len(tools) == 1
     assert "shell-ok" in tools[0].output
     assert fullscreen_app.runtime.state.messages[-2]["content"].startswith("[Shell command]")
+
+
+@pytest.mark.asyncio
+async def test_fullscreen_clear_resets_api_usage_and_keeps_system_prompt(fullscreen_app):
+    fullscreen_app.runtime.state.messages = [
+        {"role": "system", "content": "system"},
+        {"role": "user", "content": "old"},
+    ]
+    fullscreen_app.runtime.state.session_stats = SessionTokenStats(
+        turns=1, turns_with_usage=1, api_prompt_tokens=5113,
+    )
+    await fullscreen_app._dispatch_command("/clear")
+
+    assert fullscreen_app.runtime.state.messages == [
+        {"role": "system", "content": "system"},
+    ]
+    assert fullscreen_app.runtime.state.session_stats.turns == 0
+    assert fullscreen_app.runtime.state.session_stats.api_prompt_tokens == 0
+    assert fullscreen_app.transcript.pending_notices[-1][1].startswith(
+        "Conversation context cleared"
+    )

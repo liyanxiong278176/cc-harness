@@ -46,6 +46,7 @@ from cc_harness.terminal.renderer import TerminalRenderer, _context_label
 from cc_harness.terminal.settings import save_project_terminal_setting
 from cc_harness.terminal.transcript import TranscriptState
 from cc_harness.terminal.transcript_render import TranscriptRichRenderer
+from cc_harness.tokens import SessionTokenStats
 
 
 @dataclass
@@ -433,17 +434,24 @@ class FullscreenTerminalApp(InlineTerminalApp):
     async def _dispatch_command(self, raw: str) -> None:
         if raw.strip().lower() == "/focus":
             self._focus = not self._focus
-            self.transcript.add_notice(f"focus: {'on' if self._focus else 'off'}")
+            self.transcript.add_notice(self._t(
+                f"聚焦模式：{'开' if self._focus else '关'}",
+                f"focus: {'on' if self._focus else 'off'}",
+            ))
         elif raw.strip().lower() == "/tui":
-            self.transcript.add_notice("tui: fullscreen")
+            self.transcript.add_notice(self._t("终端界面：全屏", "tui: fullscreen"))
         elif raw.strip().lower() == "/tui default":
             save_project_terminal_setting(self.runtime.cwd, "tui", "default")
-            self.transcript.add_notice(
-                "Classic renderer selected for the next launch.", "info",
-            )
+            self.transcript.add_notice(self._t(
+                "已选择经典界面，下次启动生效。",
+                "Classic renderer selected for the next launch.",
+            ), "info")
         elif raw.strip().lower() == "/tui fullscreen":
             save_project_terminal_setting(self.runtime.cwd, "tui", "fullscreen")
-            self.transcript.add_notice("Fullscreen renderer selected.", "info")
+            self.transcript.add_notice(self._t(
+                "已选择全屏界面，下次启动生效。",
+                "Fullscreen renderer selected.",
+            ), "info")
         elif raw.strip().lower() == "/rewind":
             await self._rewind_card()
         elif raw.strip().lower() == "/resume":
@@ -453,14 +461,14 @@ class FullscreenTerminalApp(InlineTerminalApp):
         elif raw.strip().lower().startswith("/rename"):
             await self._rename_session(raw)
         elif raw.strip().lower() == "/clear":
-            self.runtime.state.messages = [
-                message for message in self.runtime.state.messages
-                if message.get("role") == "system"
-            ]
+            await self._clear_conversation(announce=False)
             self.transcript = TranscriptState(self.runtime.state.session_id)
-            await self.runtime.save()
+            system_tokens = self._context_tokens(include_system=True)
+            self.transcript.add_notice(self._t(
+                f"对话上下文已清空；已重置本轮 API 统计。系统指令仍占用 {system_tokens:,} tokens。",
+                f"Conversation context cleared; API usage reset. System instructions use {system_tokens:,} tokens.",
+            ), "info")
             await self._persist_transcript()
-            self.transcript.add_notice("Conversation context cleared.", "info")
         elif raw.strip().lower() == "/tasks":
             await self._show_tasks(agents_only=False)
         elif raw.strip().lower() == "/agents":
@@ -501,9 +509,11 @@ class FullscreenTerminalApp(InlineTerminalApp):
     async def _show_tasks(self, *, agents_only: bool) -> None:
         await self._refresh_task_cache()
         tasks = self._agent_tasks() if agents_only else self._task_cache
-        title = "Agents" if agents_only else "Tasks"
+        title = self._t("代理任务", "Agents") if agents_only else self._t("任务列表", "Tasks")
         if not tasks:
-            self.transcript.add_notice(f"{title}: none", "info")
+            self.transcript.add_notice(
+                f"{title}{'：无' if self.lang.startswith('zh') else ': none'}", "info",
+            )
             return
         icons = {
             "done": "✓", "in_progress": "●", "pending": "○",
@@ -535,14 +545,15 @@ class FullscreenTerminalApp(InlineTerminalApp):
             )
             stdout, stderr = await process.communicate()
         except OSError as exc:
-            return f"Diff unavailable: {exc}"
+            return self._t(f"无法读取差异：{exc}", f"Diff unavailable: {exc}")
         if process.returncode != 0:
-            return "Diff unavailable: " + stderr.decode(errors="replace").strip()
+            detail = stderr.decode(errors="replace").strip()
+            return self._t(f"无法读取差异：{detail}", f"Diff unavailable: {detail}")
         value = stdout.decode("utf-8", errors="replace").strip()
         if not value:
-            return "No tracked file changes."
+            return self._t("没有已跟踪文件差异。", "No tracked file changes.")
         limit = 16_000
-        return value if len(value) <= limit else value[:limit] + "\n… diff truncated"
+        return value if len(value) <= limit else value[:limit] + self._t("\n… 差异已截断", "\n… diff truncated")
 
     async def _execute_fullscreen(self, queued: QueuedInput | str) -> None:
         item = queued if isinstance(queued, QueuedInput) else QueuedInput(queued)
@@ -874,7 +885,7 @@ class FullscreenTerminalApp(InlineTerminalApp):
             if list_checkpoints is not None else []
         )
         if not checkpoints:
-            self.transcript.add_notice("No checkpoints yet.", "warning")
+            self.transcript.add_notice(self._t("还没有检查点。", "No checkpoints yet."), "warning")
             self._invalidate()
             return
         loop = asyncio.get_running_loop()
@@ -911,7 +922,7 @@ class FullscreenTerminalApp(InlineTerminalApp):
     async def _resume_card(self) -> None:
         records = await self.runtime.session_store.list_recent(8)
         if not records:
-            self.transcript.add_notice("No saved sessions.", "warning")
+            self.transcript.add_notice(self._t("没有已保存的会话。", "No saved sessions."), "warning")
             return
         loop = asyncio.get_running_loop()
         future: asyncio.Future[str | None] = loop.create_future()
@@ -929,6 +940,7 @@ class FullscreenTerminalApp(InlineTerminalApp):
         await self.runtime.save()
         record = next(item for item in records if item.session_id == session_id)
         self.runtime.state.session_id = session_id
+        self.runtime.state.session_stats = SessionTokenStats()
         self.runtime.state.mode = record.mode
         self.runtime.state.messages = await self.runtime.session_store.load(session_id)
         events = await self.runtime.session_store.load_events(session_id)
@@ -942,7 +954,10 @@ class FullscreenTerminalApp(InlineTerminalApp):
         self.attachments.session_dir = (
             self.runtime.session_store.attachments_root / session_id
         )
-        self.transcript.add_notice(f"Resumed: {record.title}", "info")
+        self.transcript.add_notice(self._t(
+            f"已恢复：{record.title}",
+            f"Resumed: {record.title}",
+        ), "info")
         self._jump_bottom()
 
     async def _branch_session(self, raw: str) -> None:
@@ -950,7 +965,9 @@ class FullscreenTerminalApp(InlineTerminalApp):
         source = self.runtime.state.session_id
         session_id = uuid.uuid4().hex
         events = self.transcript.to_jsonable()
+        await self.runtime.save()
         self.runtime.state.session_id = session_id
+        self.runtime.state.session_stats = SessionTokenStats()
         await self.runtime.session_store.save(
             session_id,
             self.runtime.state.messages,
@@ -965,19 +982,23 @@ class FullscreenTerminalApp(InlineTerminalApp):
         self.attachments.session_dir = (
             self.runtime.session_store.attachments_root / session_id
         )
-        self.transcript.add_notice(
-            f"Branched {source[:8]} → {session_id[:8]}", "info",
-        )
+        self.transcript.add_notice(self._t(
+            f"已创建会话分支：{source[:8]} → {session_id[:8]}",
+            f"Branched {source[:8]} → {session_id[:8]}",
+        ), "info")
         self._jump_bottom()
 
     async def _rename_session(self, raw: str) -> None:
         name = raw.strip()[len("/rename"):].strip()
         if not name:
-            self.transcript.add_notice("Usage: /rename <name>", "warning")
+            self.transcript.add_notice(self._t("用法：/rename <名称>", "Usage: /rename <name>"), "warning")
             return
         await self.runtime.session_store.rename(self.runtime.state.session_id, name)
         self._session_name = " ".join(name.split())[:80]
-        self.transcript.add_notice(f"Session renamed: {self._session_name}", "info")
+        self.transcript.add_notice(self._t(
+            f"会话已重命名：{self._session_name}",
+            f"Session renamed: {self._session_name}",
+        ), "info")
 
     async def _restore_checkpoint(self, checkpoint_index: int) -> None:
         store = self.runtime.session_store

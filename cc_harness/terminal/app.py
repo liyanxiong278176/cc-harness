@@ -6,6 +6,7 @@ import contextlib
 import copy
 import shutil
 import time
+import uuid
 from collections import deque
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
@@ -30,7 +31,8 @@ from cc_harness.terminal.attachments import AttachmentManager
 from cc_harness.terminal.commands import COMMAND_MAP, COMMANDS
 from cc_harness.terminal.completion import TerminalCompleter
 from cc_harness.terminal.renderer import TerminalRenderer
-from cc_harness.terminal.settings import load_terminal_settings
+from cc_harness.terminal.settings import load_terminal_settings, save_project_terminal_setting
+from cc_harness.tokens import SessionTokenStats
 
 _PERMISSION_MODES = ("default", "auto-edit", "bypass-prompts")
 _WORK_MODES = ("coding", "plan", "design", "chat")
@@ -291,9 +293,7 @@ class InlineTerminalApp:
         elif name == "/status":
             self.renderer.info(self._status_text())
         elif name == "/clear":
-            self.runtime.state.messages = [m for m in self.runtime.state.messages if m.get("role") == "system"]
-            await self.runtime.save()
-            self.renderer.info(self._t("对话上下文已清空。", "Conversation context cleared."))
+            await self._clear_conversation()
         elif name in ("/coding", "/plan", "/design", "/chat"):
             self.runtime.state.mode = name[1:]
             self.renderer.info(self._t(f"模式：{name[1:]}", f"Mode: {name[1:]}"))
@@ -329,8 +329,13 @@ class InlineTerminalApp:
             self.renderer.info(f"verbose: {'on' if self.verbose else 'off'}")
         elif name == "/context":
             used = self._context_tokens()
+            conversation = self._context_tokens(include_system=False)
+            system = max(0, used - conversation)
             total = self.runtime.state.context_config.context_window
-            self.renderer.info(f"context: {used:,} / {total:,} ({used / total:.1%})")
+            self.renderer.info(
+                f"context: {used:,} / {total:,} ({used / total:.1%}); "
+                f"conversation={conversation:,}, system={system:,}"
+            )
         elif name == "/usage":
             self.renderer.info(self._usage_text())
         elif name == "/inspector":
@@ -351,13 +356,185 @@ class InlineTerminalApp:
             tools = await self.runtime.mcp.list_tools()
             names = [tool.get("function", {}).get("name", "") for tool in tools]
             names.append("run_command")
-            self.console.print("\n".join(f"• {item}" for item in names))
+            self.console.print("\n".join(f"• {item}" for item in names), markup=False)
         elif name == "/mcp":
             tools = await self.runtime.mcp.list_tools()
             self.renderer.info(f"MCP tools: {len(tools)}")
+        elif name == "/branch":
+            await self._branch_session(args)
+        elif name == "/rename":
+            await self._rename_session(args)
+        elif name == "/rewind":
+            await self._rewind_picker()
+        elif name == "/focus":
+            self._show_focus()
+        elif name == "/diff":
+            self.renderer.info(await self._session_diff())
+        elif name in ("/tasks", "/agents"):
+            await self._show_tasks(agents_only=name == "/agents")
+        elif name == "/tui":
+            self._select_renderer(args)
         elif name == "/resume":
             await self._resume_picker()
         return False
+
+    async def _clear_conversation(self, *, announce: bool = True) -> None:
+        """Start a clean conversation without carrying stale usage forward.
+
+        The system message is intentionally retained: it is part of the
+        runtime contract and is sent on every provider request.  Session API
+        counters, checkpoints, queued input, and the visible title are
+        conversation-scoped and must be reset together, otherwise ``/clear``
+        appears to work while the toolbar still reports the previous turn.
+        """
+        self.runtime.state.messages = [
+            message for message in self.runtime.state.messages
+            if message.get("role") == "system"
+        ]
+        self.runtime.state.session_stats = SessionTokenStats()
+        reset_fields = (
+            ("last_turn_text", ""),
+            ("todo_hints", []),
+            ("turn_counter", 0),
+            ("decomposition_rejected", False),
+            ("last_decomp_todo_ids", []),
+            ("last_decomp_summary", None),
+            ("subagent_cancelled", []),
+        )
+        for attr_name, value in reset_fields:
+            if hasattr(self.runtime.state, attr_name):
+                setattr(self.runtime.state, attr_name, value)
+        self._checkpoints.clear()
+        self.queue.clear()
+        self._pending_clipboard.clear()
+        self._stashed_draft = ""
+        self._session_name = ""
+        await self.runtime.save()
+        # Fullscreen mode keeps a separate renderer event projection.  Clear
+        # it when the store exposes the optional event API, while retaining
+        # the immutable message history used for audit/recovery.
+        save_events = getattr(self.runtime.session_store, "save_events", None)
+        if save_events is not None:
+            await save_events(self.runtime.state.session_id, [])
+        if announce:
+            system_tokens = self._context_tokens(include_system=True)
+            self.renderer.info(self._t(
+                f"对话上下文已清空；已重置本轮 API 统计。系统指令仍占用 {system_tokens:,} tokens。",
+                f"Conversation context cleared; API usage reset. System instructions use {system_tokens:,} tokens.",
+            ))
+
+    async def _branch_session(self, args: list[str]) -> None:
+        """Fork the current message projection into a new saved session."""
+        store = self.runtime.session_store
+        if store is None:
+            self.renderer.warning(self._t("当前运行不支持会话分支。", "Session branching is unavailable."))
+            return
+        title = " ".join(args).strip()
+        source_id = self.runtime.state.session_id
+        await self.runtime.save()
+        session_id = uuid.uuid4().hex
+        messages = copy.deepcopy(self.runtime.state.messages)
+        await store.save(session_id, messages, mode=self.runtime.state.mode)
+        load_events = getattr(store, "load_events", None)
+        save_events = getattr(store, "save_events", None)
+        if load_events is not None and save_events is not None:
+            await save_events(session_id, await load_events(source_id))
+        if title:
+            await store.rename(session_id, title)
+        self.runtime.state.session_id = session_id
+        self.runtime.state.session_stats = SessionTokenStats()
+        self._session_name = " ".join(title.split())[:80] if title else f"branch-{session_id[:8]}"
+        self.attachments.session_dir = store.attachments_root / session_id
+        self.renderer.info(self._t(
+            f"已创建会话分支：{source_id[:8]} → {session_id[:8]}",
+            f"Branched session: {source_id[:8]} → {session_id[:8]}",
+        ))
+
+    async def _rename_session(self, args: list[str]) -> None:
+        title = " ".join(args).strip()
+        if not title:
+            self.renderer.warning(self._t("用法：/rename <名称>", "Usage: /rename <name>"))
+            return
+        store = self.runtime.session_store
+        if store is None:
+            self.renderer.warning(self._t("当前运行不支持会话重命名。", "Session renaming is unavailable."))
+            return
+        await store.rename(self.runtime.state.session_id, title)
+        self._session_name = " ".join(title.split())[:80]
+        self.renderer.info(self._t(f"会话已重命名：{self._session_name}", f"Session renamed: {self._session_name}"))
+
+    def _show_focus(self) -> None:
+        messages = [
+            message for message in self.runtime.state.messages
+            if message.get("role") != "system"
+        ]
+        if len(messages) > 2:
+            messages = messages[-2:]
+        if not messages:
+            self.renderer.info(self._t("当前回合暂无内容。", "No current-turn content."))
+            return
+        self.renderer.show_transcript(messages)
+
+    async def _session_diff(self) -> str:
+        try:
+            process = await asyncio.create_subprocess_exec(
+                "git", "-C", str(self.runtime.cwd), "diff", "--no-ext-diff", "--",
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+            stdout, stderr = await process.communicate()
+        except OSError as exc:
+            return self._t(f"无法读取差异：{exc}", f"Diff unavailable: {exc}")
+        if process.returncode != 0:
+            detail = stderr.decode(errors="replace").strip()
+            return self._t(f"无法读取差异：{detail}", f"Diff unavailable: {detail}")
+        value = stdout.decode("utf-8", errors="replace").strip()
+        if not value:
+            return self._t("本次会话没有已跟踪文件差异。", "No tracked file changes this session.")
+        limit = 16_000
+        return value if len(value) <= limit else value[:limit] + "\n… 差异已截断"
+
+    async def _show_tasks(self, *, agents_only: bool) -> None:
+        service = getattr(self.runtime.state, "todo_service", None)
+        tasks = []
+        if service is not None and hasattr(service, "list"):
+            try:
+                tasks = list(await service.list(include_done=True))
+            except Exception as exc:  # noqa: BLE001 - status command must not abort the UI
+                self.renderer.warning(self._t(f"任务读取失败：{exc}", f"Task read failed: {exc}"))
+                return
+        if agents_only:
+            tasks = [
+                task for task in tasks
+                if getattr(task, "parent_task", None) is not None
+                or getattr(task, "assigned_to", None)
+            ]
+        title = "代理任务" if agents_only else "任务列表"
+        if not tasks:
+            self.renderer.info(f"{title}：无")
+            return
+        icons = {"done": "✓", "in_progress": "●", "pending": "○", "blocked": "!", "cancelled": "×"}
+        lines = [title]
+        for task in tasks[:30]:
+            status = str(getattr(task, "status", "unknown"))
+            task_id = str(getattr(task, "id", "?"))
+            task_title = str(getattr(task, "title", "Untitled"))
+            assignee = getattr(task, "assigned_to", None)
+            suffix = f" · {assignee}" if assignee else ""
+            lines.append(f"{icons.get(status, '·')} {task_title} [{task_id}] · {status}{suffix}")
+        self.console.print("\n".join(lines), markup=False)
+
+    def _select_renderer(self, args: list[str]) -> None:
+        value = args[0].lower() if args else self.terminal_settings.tui
+        if value not in {"default", "fullscreen"}:
+            self.renderer.warning(self._t("用法：/tui default|fullscreen", "Usage: /tui default|fullscreen"))
+            return
+        save_project_terminal_setting(self.runtime.cwd, "tui", value)
+        self.terminal_settings = load_terminal_settings(self.runtime.cwd)
+        self.renderer.info(self._t(
+            f"终端界面：{value}（下次启动生效）",
+            f"Terminal renderer: {value} (effective next launch)",
+        ))
 
     async def _resume_picker(self) -> None:
         records = await self.runtime.session_store.list_recent(20)
@@ -374,9 +551,13 @@ class InlineTerminalApp:
         except (ValueError, IndexError):
             self.renderer.warning(self._t("无效选择。", "Invalid selection."))
             return
+        await self.runtime.save()
         self.runtime.state.session_id = record.session_id
         self.runtime.state.mode = record.mode
         self.runtime.state.messages = await self.runtime.session_store.load(record.session_id)
+        self.runtime.state.session_stats = SessionTokenStats()
+        self._checkpoints.clear()
+        self.queue.clear()
         self._session_name = record.title if record.title != "Untitled session" else ""
         self.attachments.session_dir = self.runtime.session_store.attachments_root / record.session_id
         self.renderer.info(self._t(f"已恢复：{record.title}", f"Resumed: {record.title}"))
@@ -583,6 +764,8 @@ class InlineTerminalApp:
 
     def _context_status(self, width: int) -> list[tuple[str, str]]:
         used = self._context_tokens()
+        conversation = self._context_tokens(include_system=False)
+        system = max(0, used - conversation)
         total = max(1, self.runtime.state.context_config.context_window)
         ratio = min(1.0, used / total)
         filled = min(18, round(ratio * 18))
@@ -597,6 +780,8 @@ class InlineTerminalApp:
             ("class:status.context.empty", "░" * (18 - filled)),
             (context_style, f"  {ratio:.0%}"),
         ]
+        if system and conversation == 0:
+            left.append(("class:status.dim", " · conversation 0% · system baseline"))
         return self._aligned_line(left, [], width)
 
     def _usage_status(self, width: int) -> list[tuple[str, str]]:
@@ -870,9 +1055,11 @@ class InlineTerminalApp:
             "prompt_text=hidden"
         )
 
-    def _context_tokens(self) -> int:
+    def _context_tokens(self, *, include_system: bool = True) -> int:
         total = 0
         for message in self.runtime.state.messages:
+            if not include_system and message.get("role") == "system":
+                continue
             content = message.get("content", "")
             if isinstance(content, str):
                 total += self.runtime.state.token_counter.count_text(content)

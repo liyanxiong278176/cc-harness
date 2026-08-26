@@ -16,7 +16,11 @@ COMMANDS = (
     CommandSpec("/init", "Create CC-HARNESS.md project instructions", "创建项目指令文件 CC-HARNESS.md"),
     CommandSpec("/release-notes", "Show cc-harness release notes", "查看 cc-harness 版本更新记录"),
     CommandSpec("/status", "Show session status", "查看当前会话、模型和运行状态"),
-    CommandSpec("/clear", "Clear conversation context", "清除当前对话上下文，保留系统指令"),
+    CommandSpec(
+        "/clear",
+        "Clear conversation context and reset session usage",
+        "清除对话上下文并重置本轮 API 统计（保留系统指令）",
+    ),
     CommandSpec("/resume", "Select a saved session", "选择并恢复历史会话"),
     CommandSpec("/branch", "Fork this conversation into a new session", "从当前会话创建独立分支"),
     CommandSpec("/rename", "Rename the current session", "重命名当前会话"),

@@ -266,13 +266,16 @@ class TerminalRenderer:
                 self.console.print(f"[color(209)]•[/color(209)] {item}")
 
     def info(self, text: str) -> None:
-        self.console.print(f"[cyan]●[/cyan] {text}")
+        # Command output can contain arbitrary text (for example ``git diff``
+        # hunks with ``[... ]``).  Render the payload as literal Text so Rich
+        # markup cannot interpret or reject user/tool output.
+        self.console.print(Text("● ", style="cyan") + Text(str(text)))
 
     def warning(self, text: str) -> None:
-        self.console.print(f"[yellow]▲[/yellow] {text}")
+        self.console.print(Text("▲ ", style="yellow") + Text(str(text)))
 
     def error(self, text: str) -> None:
-        self.console.print(f"[red]Error:[/red] {text}")
+        self.console.print(Text("Error: ", style="red") + Text(str(text)))
 
     @staticmethod
     def git_branch(cwd: Path) -> str:
