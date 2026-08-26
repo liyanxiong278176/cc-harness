@@ -30,21 +30,18 @@ jobs:
             bundle: "**/*.dmg"
     runs-on: ${{ matrix.os }}
     env:
-      # Signing is opt-in. Empty secrets keep the existing unsigned build path
-      # usable for local/testing releases without putting private keys in git.
-      WINDOWS_CERTIFICATE: ${{ secrets.WINDOWS_CERTIFICATE }}
-      WINDOWS_CERTIFICATE_PASSWORD: ${{ secrets.WINDOWS_CERTIFICATE_PASSWORD }}
-      WINDOWS_CERTIFICATE_THUMBPRINT: ${{ secrets.WINDOWS_CERTIFICATE_THUMBPRINT }}
-      WINDOWS_TIMESTAMP_URL: ${{ secrets.WINDOWS_TIMESTAMP_URL }}
-      APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
-      APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
-      KEYCHAIN_PASSWORD: ${{ secrets.KEYCHAIN_PASSWORD }}
-      APPLE_API_ISSUER: ${{ secrets.APPLE_API_ISSUER }}
-      APPLE_API_KEY: ${{ secrets.APPLE_API_KEY }}
-      APPLE_API_PRIVATE_KEY: ${{ secrets.APPLE_API_PRIVATE_KEY }}
-      APPLE_ID: ${{ secrets.APPLE_ID }}
-      APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
-      APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+      # Use neutral names so an empty secret is never auto-discovered by
+      # Tauri as APPLE_CERTIFICATE/WINDOWS_CERTIFICATE.
+      CC_WINDOWS_CERTIFICATE: ${{ secrets.WINDOWS_CERTIFICATE }}
+      CC_WINDOWS_CERTIFICATE_PASSWORD: ${{ secrets.WINDOWS_CERTIFICATE_PASSWORD }}
+      CC_WINDOWS_CERTIFICATE_THUMBPRINT: ${{ secrets.WINDOWS_CERTIFICATE_THUMBPRINT }}
+      CC_WINDOWS_TIMESTAMP_URL: ${{ secrets.WINDOWS_TIMESTAMP_URL }}
+      CC_APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
+      CC_APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+      CC_KEYCHAIN_PASSWORD: ${{ secrets.KEYCHAIN_PASSWORD }}
+      CC_APPLE_API_ISSUER: ${{ secrets.APPLE_API_ISSUER }}
+      CC_APPLE_API_KEY: ${{ secrets.APPLE_API_KEY }}
+      CC_APPLE_API_PRIVATE_KEY: ${{ secrets.APPLE_API_PRIVATE_KEY }}
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -69,12 +66,17 @@ jobs:
         working-directory: desktop
         run: npx tauri icon src-tauri/icons/app-icon.svg
       - name: Import Windows signing certificate
-        if: matrix.target == 'x86_64-pc-windows-msvc' && env.WINDOWS_CERTIFICATE != ''
+        if: matrix.target == 'x86_64-pc-windows-msvc' && env.CC_WINDOWS_CERTIFICATE != ''
         shell: pwsh
+        env:
+          CC_WINDOWS_CERTIFICATE: ${{ secrets.WINDOWS_CERTIFICATE }}
+          CC_WINDOWS_CERTIFICATE_PASSWORD: ${{ secrets.WINDOWS_CERTIFICATE_PASSWORD }}
+          CC_WINDOWS_CERTIFICATE_THUMBPRINT: ${{ secrets.WINDOWS_CERTIFICATE_THUMBPRINT }}
+          CC_WINDOWS_TIMESTAMP_URL: ${{ secrets.WINDOWS_TIMESTAMP_URL }}
         run: |
           $required = @(
-            'WINDOWS_CERTIFICATE_PASSWORD',
-            'WINDOWS_CERTIFICATE_THUMBPRINT'
+            'CC_WINDOWS_CERTIFICATE_PASSWORD',
+            'CC_WINDOWS_CERTIFICATE_THUMBPRINT'
           )
           foreach ($name in $required) {
             if ([string]::IsNullOrWhiteSpace((Get-Item "Env:$name").Value)) {
@@ -85,11 +87,11 @@ jobs:
           New-Item -ItemType Directory -Force -Path $signingDir | Out-Null
           $encoded = Join-Path $signingDir 'certificate.txt'
           $pfx = Join-Path $signingDir 'certificate.pfx'
-          Set-Content -Path $encoded -Value $env:WINDOWS_CERTIFICATE -NoNewline
+          Set-Content -Path $encoded -Value $env:CC_WINDOWS_CERTIFICATE -NoNewline
           certutil -f -decode $encoded $pfx
           if ($LASTEXITCODE -ne 0) { throw 'Unable to decode WINDOWS_CERTIFICATE' }
           Remove-Item -Force $encoded
-          $password = ConvertTo-SecureString $env:WINDOWS_CERTIFICATE_PASSWORD -AsPlainText -Force
+          $password = ConvertTo-SecureString $env:CC_WINDOWS_CERTIFICATE_PASSWORD -AsPlainText -Force
           Import-PfxCertificate -FilePath $pfx -CertStoreLocation Cert:\CurrentUser\My -Password $password | Out-Null
 
           # The thumbprint is public certificate metadata, but keeping it as a
@@ -99,20 +101,27 @@ jobs:
           if (-not $config.bundle.windows) {
             $config.bundle | Add-Member -NotePropertyName windows -NotePropertyValue ([PSCustomObject]@{})
           }
-          $thumbprint = ($env:WINDOWS_CERTIFICATE_THUMBPRINT -replace '\s', '').ToUpperInvariant()
-          $timestampUrl = if ([string]::IsNullOrWhiteSpace($env:WINDOWS_TIMESTAMP_URL)) {
+          $thumbprint = ($env:CC_WINDOWS_CERTIFICATE_THUMBPRINT -replace '\s', '').ToUpperInvariant()
+          $timestampUrl = if ([string]::IsNullOrWhiteSpace($env:CC_WINDOWS_TIMESTAMP_URL)) {
             'http://timestamp.digicert.com'
-          } else { $env:WINDOWS_TIMESTAMP_URL }
+          } else { $env:CC_WINDOWS_TIMESTAMP_URL }
           $config.bundle.windows | Add-Member -Force -NotePropertyName certificateThumbprint -NotePropertyValue $thumbprint
           $config.bundle.windows | Add-Member -Force -NotePropertyName digestAlgorithm -NotePropertyValue 'sha256'
           $config.bundle.windows | Add-Member -Force -NotePropertyName timestampUrl -NotePropertyValue $timestampUrl
           $config | ConvertTo-Json -Depth 50 | Set-Content -Encoding UTF8 $configPath
       - name: Import macOS signing certificate and notarization key
-        if: contains(matrix.target, '-apple-darwin') && env.APPLE_CERTIFICATE != ''
+        if: contains(matrix.target, '-apple-darwin') && env.CC_APPLE_CERTIFICATE != ''
         shell: bash
+        env:
+          CC_APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
+          CC_APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+          CC_KEYCHAIN_PASSWORD: ${{ secrets.KEYCHAIN_PASSWORD }}
+          CC_APPLE_API_ISSUER: ${{ secrets.APPLE_API_ISSUER }}
+          CC_APPLE_API_KEY: ${{ secrets.APPLE_API_KEY }}
+          CC_APPLE_API_PRIVATE_KEY: ${{ secrets.APPLE_API_PRIVATE_KEY }}
         run: |
           set -euo pipefail
-          for name in APPLE_CERTIFICATE_PASSWORD KEYCHAIN_PASSWORD APPLE_API_ISSUER APPLE_API_KEY APPLE_API_PRIVATE_KEY; do
+          for name in CC_APPLE_CERTIFICATE_PASSWORD CC_KEYCHAIN_PASSWORD CC_APPLE_API_ISSUER CC_APPLE_API_KEY CC_APPLE_API_PRIVATE_KEY; do
             if [[ -z "${!name:-}" ]]; then
               echo "$name must be configured when APPLE_CERTIFICATE is set" >&2
               exit 1
@@ -121,17 +130,17 @@ jobs:
           signing_dir="$RUNNER_TEMP/cc-harness-signing"
           keychain="$signing_dir/build.keychain-db"
           mkdir -p "$signing_dir"
-          printf '%s' "$APPLE_CERTIFICATE" | base64 -D > "$signing_dir/certificate.p12"
-          security create-keychain -p "$KEYCHAIN_PASSWORD" "$keychain"
+          printf '%s' "$CC_APPLE_CERTIFICATE" | base64 -D > "$signing_dir/certificate.p12"
+          security create-keychain -p "$CC_KEYCHAIN_PASSWORD" "$keychain"
           security set-keychain-settings -lut 21600 "$keychain"
-          security unlock-keychain -p "$KEYCHAIN_PASSWORD" "$keychain"
+          security unlock-keychain -p "$CC_KEYCHAIN_PASSWORD" "$keychain"
           security import "$signing_dir/certificate.p12" \
-            -k "$keychain" -P "$APPLE_CERTIFICATE_PASSWORD" \
+            -k "$keychain" -P "$CC_APPLE_CERTIFICATE_PASSWORD" \
             -T /usr/bin/codesign -T /usr/bin/security
           security list-keychains -d user -s "$keychain" "$HOME/Library/Keychains/login.keychain-db"
           security default-keychain -s "$keychain"
           security set-key-partition-list -S apple-tool:,apple:,codesign: \
-            -s -k "$KEYCHAIN_PASSWORD" "$keychain"
+            -s -k "$CC_KEYCHAIN_PASSWORD" "$keychain"
           identity="$(security find-identity -v -p codesigning "$keychain" | \
             awk -F '"' '/Developer ID Application/{print $2; exit}')"
           if [[ -z "$identity" ]]; then
@@ -141,13 +150,13 @@ jobs:
           echo "APPLE_SIGNING_IDENTITY=$identity" >> "$GITHUB_ENV"
           api_key_dir="$RUNNER_TEMP/private_keys"
           mkdir -p "$api_key_dir"
-          printf '%s' "$APPLE_API_PRIVATE_KEY" > "$api_key_dir/AuthKey_${APPLE_API_KEY}.p8"
-          echo "APPLE_API_KEY_PATH=$api_key_dir/AuthKey_${APPLE_API_KEY}.p8" >> "$GITHUB_ENV"
+          printf '%s' "$CC_APPLE_API_PRIVATE_KEY" > "$api_key_dir/AuthKey_${CC_APPLE_API_KEY}.p8"
+          echo "APPLE_API_KEY_PATH=$api_key_dir/AuthKey_${CC_APPLE_API_KEY}.p8" >> "$GITHUB_ENV"
       - name: Build installer
         working-directory: desktop
         run: npm run tauri build -- --target ${{ matrix.target }}
       - name: Verify Windows signature
-        if: matrix.target == 'x86_64-pc-windows-msvc' && env.WINDOWS_CERTIFICATE != ''
+        if: matrix.target == 'x86_64-pc-windows-msvc' && env.CC_WINDOWS_CERTIFICATE != ''
         shell: pwsh
         run: |
           $installer = Get-ChildItem 'desktop/src-tauri/target/x86_64-pc-windows-msvc/release/bundle' -Recurse -Filter '*.msi' | Select-Object -First 1
@@ -155,7 +164,7 @@ jobs:
           $signature = Get-AuthenticodeSignature $installer.FullName
           if ($signature.Status -ne 'Valid') { throw "Invalid Windows signature: $($signature.Status)" }
       - name: Verify macOS signature
-        if: contains(matrix.target, '-apple-darwin') && env.APPLE_CERTIFICATE != ''
+        if: contains(matrix.target, '-apple-darwin') && env.CC_APPLE_CERTIFICATE != ''
         shell: bash
         run: |
           set -euo pipefail
