@@ -20,14 +20,8 @@ jobs:
             os: windows-latest
             target: x86_64-pc-windows-msvc
             platform_key: windows-x86_64
-          - name: macOS Intel
-            os: macos-15-intel
-            target: x86_64-apple-darwin
-            platform_key: darwin-x86_64
-          - name: macOS Apple Silicon
-            os: macos-15
-            target: aarch64-apple-darwin
-            platform_key: darwin-aarch64
+          # macOS packaging is intentionally deferred. Keep the release
+          # pipeline Windows-only until macOS signing/notarization is set up.
     runs-on: ${{ matrix.os }}
     env:
       # Use neutral names so an empty secret is never auto-discovered by

@@ -1,6 +1,6 @@
 [package]
 name = "cc-harness-desktop"
-version = "0.1.4"
+version = "0.1.5"
 description = "Optional local desktop client for cc-harness"
 authors = ["lyx"]
 edition = "2021"
