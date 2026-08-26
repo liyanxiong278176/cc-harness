@@ -9,6 +9,7 @@ htmlcov/
 dist/
 build/
 *.egg-info/
+*.spec
 .idea/
 .DS_Store
 .worktrees/
@@ -82,6 +83,11 @@ cc_harness/memory/*.db
 # Local frontend build/install output (this workspace has no tracked frontend source).
 /web/
 *.tsbuildinfo
+/desktop/node_modules/
+/desktop/src-tauri/target/
+/desktop/src-tauri/binaries/
+/desktop/src-tauri/icons/*
+!/desktop/src-tauri/icons/app-icon.svg
 
 # Temporary local worker/debug output.
 /.tmp-wsl-worker.log

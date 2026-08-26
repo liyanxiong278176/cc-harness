@@ -24,6 +24,12 @@ cc-harness
 npm 包只负责准备 Python 运行环境并转发参数，核心代码仍来自本项目；首次运行
 会下载依赖，可能需要一些时间。当前 npm 包源码位于 [`npm/`](npm/)。
 
+可选的 Windows/macOS 桌面客户端正在以 Tauri 2 + React/TypeScript 开发，和 CLI/TUI
+共享同一 Python Durable Runtime；它不是第二套 Agent。开发、sidecar 协议和 GitHub
+Release 打包说明见 [`desktop/README.md`](desktop/README.md)。发布者创建
+`desktop-v*` 标签后，GitHub Actions 会生成 Windows/macOS 安装包并附加到 Release；
+未发布桌面包时仍可只使用下面的 CLI/TUI 安装方式。
+
 更新或卸载 npm 安装的入口：
 
 ```powershell

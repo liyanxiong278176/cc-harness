@@ -38,6 +38,7 @@ packages = ["cc_harness"]
 
 [project.scripts]
 cc-harness = "cc_harness.entrypoint:main"
+cc-harness-desktop-bridge = "cc_harness.desktop_bridge:main"
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"

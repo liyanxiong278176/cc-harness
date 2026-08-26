@@ -1,0 +1,42 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "cc-harness",
+  "version": "0.1.0",
+  "identifier": "com.lyx.cc-harness",
+  "build": {
+    "beforeDevCommand": "npm run dev",
+    "beforeBuildCommand": "npm run build",
+    "devUrl": "http://127.0.0.1:1420",
+    "frontendDist": "../dist"
+  },
+  "app": {
+    "windows": [
+      {
+        "label": "main",
+        "title": "cc-harness",
+        "width": 1440,
+        "height": 900,
+        "minWidth": 980,
+        "minHeight": 620,
+        "resizable": true,
+        "visible": true,
+        "center": true
+      }
+    ],
+    "security": {
+      "csp": null
+    }
+  },
+  "bundle": {
+    "active": true,
+    "icon": [
+      "icons/32x32.png",
+      "icons/128x128.png",
+      "icons/128x128@2x.png",
+      "icons/icon.icns",
+      "icons/icon.ico"
+    ],
+    "targets": ["msi", "dmg", "app", "appimage"],
+    "externalBin": ["binaries/cc-harness-desktop-bridge"]
+  }
+}
