@@ -70,6 +70,58 @@ Python 原生扩展错误地交叉打包到另一个平台。
 `desktop-v*` 标签。当前开发机若没有 Rust/MSVC，不能执行本地安装包构建，
 但不影响 CLI/TUI 或 sidecar 协议测试。
 
+### GitHub Actions 签名配置
+
+签名是可选的：没有这些 Secrets 时仍可构建测试用的未签名包；配置后，
+同一条 Release workflow 会签名并验证安装包。不要把 `.pfx`、`.p12`、`.p8`
+或密码提交到仓库。
+
+Windows Secrets：`WINDOWS_CERTIFICATE`（Base64 PFX）、
+`WINDOWS_CERTIFICATE_PASSWORD`、`WINDOWS_CERTIFICATE_THUMBPRINT`，可选
+`WINDOWS_TIMESTAMP_URL`。macOS Secrets：`APPLE_CERTIFICATE`（Base64 P12）、
+`APPLE_CERTIFICATE_PASSWORD`、`KEYCHAIN_PASSWORD`、`APPLE_API_ISSUER`、
+`APPLE_API_KEY`、`APPLE_API_PRIVATE_KEY`。macOS 使用 Developer ID Application
+证书和 App Store Connect API Key 做公证；填写 Secrets 后重新推送
+`desktop-v*` 标签即可触发签名发布。
+
+#### 一次性配置步骤
+
+1. 在 GitHub 仓库的 **Settings → Secrets and variables → Actions** 中添加上面的
+   Secrets。建议使用仓库 Secrets，并限制能够创建 `desktop-v*` 标签的人员；不要把
+   证书文件、密码或私钥放进 Issue、PR、日志或代码。
+2. Windows 证书需要是代码签名证书（不是 SSL 证书），导出带私钥的 `.pfx`：
+
+   ```powershell
+   certutil -encode certificate.pfx certificate-base64.txt
+   (Get-PfxCertificate .\certificate.pfx).Thumbprint
+   ```
+
+   将 `certificate-base64.txt` 的内容填入 `WINDOWS_CERTIFICATE`，导出密码填入
+   `WINDOWS_CERTIFICATE_PASSWORD`，去掉空格后的指纹填入
+   `WINDOWS_CERTIFICATE_THUMBPRINT`。
+3. macOS 需要付费 Apple Developer 账号、Developer ID Application 证书和
+   App Store Connect API Key。将证书导出的 `.p12` 转成单行 Base64：
+
+   ```bash
+   openssl base64 -A -in certificate.p12 -out certificate-base64.txt
+   ```
+
+   将该文件内容填入 `APPLE_CERTIFICATE`，分别填入 `.p12` 密码、钥匙串密码、API
+   Issuer ID、Key ID 和 `.p8` 私钥内容。API 私钥只能从 Apple 页面下载一次，下载后
+   应立即安全保存。
+4. 先在没有 Secrets 的情况下用 `desktop-v0.1.1` 验证过构建链；配置完成后创建
+   一个新的版本标签（例如 `desktop-v0.1.2`）：
+
+   ```powershell
+   git tag desktop-v0.1.2
+   git push origin desktop-v0.1.2
+   ```
+
+   Actions 会分别构建 Windows、macOS Intel 和 macOS Apple Silicon，并在签名验证
+   通过后更新 GitHub Release。Windows 可用 `Get-AuthenticodeSignature` 验证，macOS
+   可用 `codesign --verify --deep --strict` 验证。任何一个平台的证书配置不完整时，
+   该平台会明确失败，不会静默地把“看似正式”的包当成已签名包发布。
+
 ## 设计边界
 
 - 首次启动或恢复会话只读取状态，不自动调用模型或执行工具。
