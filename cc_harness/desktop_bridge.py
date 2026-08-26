@@ -23,6 +23,8 @@ from .desktop_protocol import (
     response,
     validate_request,
 )
+from .config import ConfigError
+from .desktop_config import read_workspace_config, save_workspace_config
 from .durable_runtime import DurableRuntimeClient
 from .run_model import RunStatus
 from .run_store import RunNotFound, RunStoreError
@@ -118,6 +120,12 @@ class DesktopBridge:
                     "message": "durable run state is inconsistent; repair is required",
                 },
             )
+        except ConfigError as exc:
+            return response(
+                request_id,
+                ok=False,
+                error={"code": "configuration_error", "message": str(exc)},
+            )
         except Exception as exc:  # noqa: BLE001 - bridge must not die on one request
             LOGGER.exception("desktop bridge request failed")
             return response(
@@ -143,6 +151,7 @@ class DesktopBridge:
                     "inspect",
                     "events",
                     "usage",
+                    "config",
                     "watch",
                     "submit",
                     "follow_up",
@@ -156,6 +165,29 @@ class DesktopBridge:
             }
         if message_type == "ping":
             return {"pong": True, **self._runtime_info()}
+        if message_type == "config":
+            action = str(payload.get("action", "get")).strip().lower()
+            if action == "get":
+                return {
+                    **read_workspace_config(self.client.cwd),
+                    "runtime_started": self._runtime_started,
+                }
+            if action == "save":
+                if self._runtime_started:
+                    raise ConfigError(
+                        "runtime already started; finish or stop the current run before changing model settings"
+                    )
+                return save_workspace_config(
+                    self.client.cwd,
+                    base_url=self._required_text(payload.get("base_url"), "base_url"),
+                    model=self._required_text(payload.get("model"), "model"),
+                    api_key=(
+                        str(payload.get("api_key"))
+                        if payload.get("api_key") is not None
+                        else None
+                    ),
+                )
+            raise DesktopProtocolError("config action must be get or save")
         if message_type in {"start", "start_runtime"}:
             await self.client.start_supervisor(
                 worker_id=str(payload.get("worker_id"))

@@ -10,14 +10,15 @@ Durable Runtime。桌面端不会复制 Agent、提示词、工具、权限、�
 - 关闭窗口只隐藏，不停止 sidecar 或已提交的任务
 - 从托盘退出时先检查活动任务，确认后才结束 Runtime
 - 左侧工作区与多 run 列表；中间流式事件；右侧审批/任务/用量投影
+- 左上角“设置”可选择实际项目目录并填写 `base_url`、`api_key`、模型名称；密钥只写入该目录 `.env`，不会回显
 - 底部显示模型、运行、连接、权限和活动数量
 - Python sidecar 通过版本化 JSONL/stdin-stdout bridge 工作
 - 标题栏和托盘菜单提供“检查更新”；发现新版本后自动下载、校验签名、安装并重启
 
-首次打开桌面端时，请把左侧“工作区”改成实际项目目录（该目录应包含 `.env`，并
-按 CLI 的方式配置 `OPENAI_API_KEY`、`OPENAI_BASE_URL`、`OPENAI_MODEL`），然后点
-“连接”。如果连接失败，右侧会显示 sidecar 的真实启动错误，可直接点“重试连接”；
-不再只显示笼统的 `desktop bridge is not running`。
+首次打开桌面端时，点击左上角齿轮进入“工作区设置”，填写实际项目目录、`base_url`、
+`api_key` 和模型名称，然后保存。应用会在项目目录写入 CLI 兼容的 `.env`，底部显示“配置已保存，
+等待启动”；此时即可发送任务。桌面安装包内置 sidecar，不需要另外安装 Python、`cc-harness`
+或 npm 包。运行已经启动后不能切换模型配置，以避免重载 sidecar 时中断任务。
 
 ## 下载并第一次运行
 
@@ -100,7 +101,7 @@ sidecar 源码也可以直接验证：
 python -m cc_harness.desktop_bridge --cwd D:\path\to\project
 ```
 
-输入一行 JSON 即可执行 `hello`、`list`、`inspect`、`events`、`watch`、
+输入一行 JSON 即可执行 `hello`、`config`、`list`、`inspect`、`events`、`watch`、
 `submit`、`follow_up`、`interrupt`、`cancel`、`resume`、`approve`、`reject`
 和 `shutdown`。`watch` 事件使用持久化 `sequence`，客户端断线后可用
 `events` 从最后一个序号补读。
