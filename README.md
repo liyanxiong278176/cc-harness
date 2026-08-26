@@ -17,7 +17,7 @@ cc-harness
 也可以通过 npm 安装用户入口（第一阶段 npm 包发布后可用）：
 
 ```bash
-npm install -g @lyx/cc-harness
+npm install -g @liyanxiong278176/cc-harness
 cc-harness
 ```
 

@@ -1,4 +1,4 @@
-# @lyx/cc-harness
+# @liyanxiong278176/cc-harness
 
 `cc-harness` 的 npm 安装入口。核心运行时仍然来自 Python 项目；此包只负责
 准备运行环境并转发命令行参数。
@@ -6,7 +6,7 @@
 ## 安装
 
 ```bash
-npm install -g @lyx/cc-harness
+npm install -g @liyanxiong278176/cc-harness
 cc-harness
 ```
 
@@ -40,7 +40,7 @@ Python 模型配置仍使用 `OPENAI_API_KEY`、`OPENAI_BASE_URL` 和 `OPENAI_MO
 
 ## 维护者发布
 
-`lyx` 必须是你有权限发布的 npm 用户名或组织 scope。登录官方 registry 后，
+`liyanxiong278176` 是当前维护者账号的 npm 用户 scope。登录官方 registry 后，
 在本目录执行：
 
 ```bash
