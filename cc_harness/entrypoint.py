@@ -4,8 +4,10 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import contextlib
 import json
 import locale
+import math
 import os
 import sys
 from importlib.metadata import PackageNotFoundError, version
@@ -14,8 +16,9 @@ from pathlib import Path
 from prompt_toolkit import PromptSession
 from rich.console import Console
 
-from cc_harness.config import ConfigError, load_layered_config
+from cc_harness.config import ConfigError
 from cc_harness.runtime import SessionRuntime
+from cc_harness.run_telemetry import aggregate_model_usage
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -60,7 +63,18 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--model", default=None)
     parser.add_argument("--effort", choices=("low", "medium", "high"), default=None)
     parser.add_argument(
+        "--max-workers",
+        type=int,
+        default=3,
+        help="Maximum concurrent Durable workers for supervisor mode",
+    )
+    parser.add_argument(
         "--permission-mode", choices=("default", "auto-edit", "bypass-prompts"), default="default"
+    )
+    parser.add_argument(
+        "--confirm-high-risk",
+        action="store_true",
+        help="Explicitly confirm a high-risk goal for this invocation; the decision is recorded durably",
     )
     parser.add_argument(
         "--host-execution",
@@ -117,9 +131,9 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--repl", action="store_true", help=argparse.SUPPRESS)
     parser.add_argument(
         "--runtime",
-        choices=("legacy", "durable"),
-        default=(os.getenv("CC_HARNESS_RUNTIME") if os.getenv("CC_HARNESS_RUNTIME") in {"legacy", "durable"} else "legacy"),
-        help="execution runtime facade (legacy fullscreen TUI by default; durable is explicit)",
+        choices=("durable",),
+        default="durable",
+        help="execution runtime (Durable Runtime)",
     )
     parser.add_argument(
         "--command",
@@ -149,91 +163,10 @@ async def async_main(argv: list[str] | None = None) -> int:
     if not cwd.is_dir():
         Console(stderr=True).print(f"[red]working directory not found:[/red] {cwd}")
         return 2
-    if args.runtime == "durable":
-        return await _run_durable(args, cwd)
-    additional_dirs = [Path(p).resolve() for p in args.add_dir]
-    missing_dirs = [p for p in additional_dirs if not p.is_dir()]
-    if missing_dirs:
-        Console(stderr=True).print(f"[red]additional directory not found:[/red] {missing_dirs[0]}")
-        return 2
-
-    interactive = not args.print_mode and sys.stdin.isatty() and sys.stdout.isatty()
-    try:
-        load_layered_config(cwd)
-    except ConfigError as exc:
-        if not interactive:
-            Console(stderr=True, no_color=True).print(f"configuration error: {exc}")
-            return 2
-        try:
-            await _setup_wizard(_language(args.lang))
-        except ConfigError as setup_error:
-            Console(stderr=True, no_color=True).print(f"configuration error: {setup_error}")
-            return 2
-
-    resume = "latest" if args.continue_session else args.resume
-    if resume == "picker":
-        resume = None
-    runtime = await SessionRuntime.create(
-        cwd,
-        mode=args.mode,
-        additional_dirs=additional_dirs,
-        effort=args.effort,
-        resume=resume,
-        host_execution=args.host_execution,
-        max_iterations=args.max_iterations,
-        bare=args.bare,
-        capability_profile=args.capability_profile,
-    )
-    if args.model:
-        runtime.llm.model = args.model
-
-    if args.repl:
-        # The compatibility flag selects the inline renderer. It no longer
-        # constructs a second agent stack through the legacy REPL function.
-        from cc_harness.terminal.app import InlineTerminalApp
-
-        return await InlineTerminalApp(
-            runtime,
-            lang=_language(args.lang),
-            verbose=args.verbose,
-            permission_mode=args.permission_mode,
-        ).run(version=_version())
-
-    piped = ""
-    if not sys.stdin.isatty():
-        piped = sys.stdin.read()
-    initial = "\n".join(part for part in (piped.strip(), args.prompt or "") if part)
-    if args.print_mode or not interactive:
-        if not initial:
-            Console(stderr=True, no_color=True).print("print mode requires a prompt or piped stdin")
-            await runtime.close()
-            return 2
-        return await _run_print(runtime, initial, args.permission_mode, args.output_format)
-
-    from cc_harness.terminal.settings import load_terminal_settings
-
-    renderer_mode = args.tui or load_terminal_settings(cwd).tui
-    if renderer_mode == "default":
-        from cc_harness.terminal.app import InlineTerminalApp as TerminalApp
-    else:
-        from cc_harness.terminal.fullscreen import FullscreenTerminalApp as TerminalApp
-    app = TerminalApp(
-        runtime,
-        lang=_language(args.lang),
-        verbose=args.verbose,
-        permission_mode=args.permission_mode,
-        **({"version": _version()} if renderer_mode != "default" else {}),
-    )
-    if args.resume == "picker":
-        if renderer_mode == "default":
-            await app._resume_picker()
-        else:
-            app.open_resume_on_start = True
-    if args.prompt:
-        from cc_harness.terminal.app import QueuedInput
-
-        app.queue.append(QueuedInput(args.prompt))
-    return await app.run(version=_version())
+    # The installed command has one execution path.  Legacy SessionRuntime
+    # helpers remain importable only for data migration/tests; they are not a
+    # selectable runtime or a fallback for a Durable Run.
+    return await _run_durable(args, cwd)
 
 
 async def _run_durable(args, cwd: Path) -> int:
@@ -258,14 +191,25 @@ async def _run_durable(args, cwd: Path) -> int:
             await client.run_supervisor_forever(
                 reasoning_effort=args.effort,
                 host_execution=args.host_execution,
+                auto_approve=args.permission_mode == "bypass-prompts",
+                max_workers=max(1, args.max_workers),
             )
             return 0
         if command is None and sys.stdin.isatty():
-            await client.start_supervisor(
+            client.start_detached_supervisor(
                 reasoning_effort=args.effort,
                 host_execution=args.host_execution,
             )
-            await run_durable_repl(client, initial_prompt=args.prompt)
+            await run_durable_repl(
+                client,
+                initial_prompt=(
+                    None
+                    if args.continue_session or args.resume is not None
+                    else args.prompt
+                ),
+                continue_latest=args.continue_session,
+                resume_run_id=args.resume,
+            )
             return 0
         if command is None and args.prompt:
             command = "run"
@@ -274,7 +218,7 @@ async def _run_durable(args, cwd: Path) -> int:
             if not objective:
                 Console(stderr=True, no_color=True).print("durable run requires a prompt")
                 return 2
-            run_id = await client.submit(objective)
+            run_id = await client.submit(objective, confirm_high_risk=args.confirm_high_risk)
             print(json.dumps({"run_id": run_id}, ensure_ascii=False))
             return 0
         if command in {"status", "attach"}:
@@ -331,63 +275,72 @@ async def _run_durable_print(client, args, objective: str) -> int:
 
     from cc_harness.run_model import ApprovalStatus, RunStatus
 
-    run_id = await client.submit(objective)
-    await client.start_supervisor(
-        max_workers=1,
-        reasoning_effort=args.effort,
-        capability_profile=args.capability_profile or "standard",
-        host_execution=args.host_execution,
+    run_id = await client.submit(objective, confirm_high_risk=args.confirm_high_risk)
+    # Start the supervisor concurrently with the print-mode control loop.  A
+    # worker can reach a durable approval boundary before ``start_supervisor``
+    # returns; waiting for startup first would leave a non-interactive
+    # ``--permission-mode bypass-prompts`` invocation deadlocked forever.
+    supervisor_task = asyncio.create_task(
+        client.start_supervisor(
+            max_workers=1,
+            reasoning_effort=args.effort,
+            capability_profile=args.capability_profile or "standard",
+            host_execution=args.host_execution,
+        ),
+        name="cc-harness-print-supervisor-start",
     )
-    if args.model and client._llm is not None:
-        client._llm.model = args.model
-    terminal = {
-        RunStatus.COMPLETED,
-        RunStatus.CANCELLED,
-        RunStatus.FAILED_TERMINAL,
-        RunStatus.BLOCKED,
-        RunStatus.STALLED,
-        RunStatus.FAILED_RECOVERABLE,
-    }
-    while True:
-        view = await client.coordinator.inspect(run_id)
-        if view.status is RunStatus.AWAITING_APPROVAL:
-            pending = [
-                item
-                for item in view.projection.approvals
-                if item.status is ApprovalStatus.REQUESTED
-            ]
-            if args.permission_mode != "bypass-prompts":
-                return await _write_durable_print_result(
-                    client,
-                    run_id,
-                    error="durable run is awaiting approval",
+    try:
+        if args.model and client._llm is not None:
+            client._llm.model = args.model
+        terminal = {
+            RunStatus.COMPLETED,
+            RunStatus.CANCELLED,
+            RunStatus.FAILED_TERMINAL,
+            RunStatus.BLOCKED,
+            RunStatus.STALLED,
+            RunStatus.FAILED_RECOVERABLE,
+        }
+        while True:
+            if supervisor_task.done():
+                # Propagate startup/preflight failures at the same point as
+                # the previous synchronous implementation, while consuming
+                # the task exception so it is never left unobserved.
+                await supervisor_task
+            view = await client.coordinator.inspect(run_id)
+            if view.status is RunStatus.AWAITING_APPROVAL:
+                pending = [
+                    item
+                    for item in view.projection.approvals
+                    if item.status is ApprovalStatus.REQUESTED
+                ]
+                if args.permission_mode != "bypass-prompts":
+                    return await _write_durable_print_result(
+                        client,
+                        run_id,
+                        error="durable run is awaiting approval",
+                    )
+                for approval in pending:
+                    await client.coordinator.approve(
+                        run_id=run_id,
+                        approval_id=approval.approval_id,
+                        action_args_digest=approval.action_args_digest,
+                    )
+            elif view.status in terminal:
+                # Only CompletionAccepted is a successful terminal state.  A
+                # final assistant message is evidence for a future continuation,
+                # not a substitute for the goal/evidence gate; otherwise a
+                # bookkeeping failure or stalled worker could be reported as a
+                # benchmark pass.
+                error = None if view.status is RunStatus.COMPLETED else (
+                    f"durable run ended with status {view.status.value}"
                 )
-            for approval in pending:
-                await client.coordinator.approve(
-                    run_id=run_id,
-                    approval_id=approval.approval_id,
-                    action_args_digest=approval.action_args_digest,
-                )
-        elif view.status in terminal:
-            # A one-shot CLI run may legitimately end after a final assistant
-            # answer without a model-authored durable completion object.  The
-            # durable stream records that as stalled for later continuation,
-            # while the benchmark-facing print contract treats the committed
-            # final answer as the terminal response. Official task verifiers,
-            # not this compatibility seam, decide whether it is correct.
-            usable_benchmark_final = (
-                view.status is RunStatus.FAILED_RECOVERABLE
-                and os.getenv("CC_HARNESS_TERMINAL_BENCH") == "1"
-                and await _has_usable_committed_final(client, run_id)
-            )
-            error = (
-                None
-                if view.status in {RunStatus.COMPLETED, RunStatus.STALLED}
-                or usable_benchmark_final
-                else f"durable run ended with status {view.status.value}"
-            )
-            return await _write_durable_print_result(client, run_id, error=error)
-        await asyncio.sleep(0.1)
+                return await _write_durable_print_result(client, run_id, error=error)
+            await asyncio.sleep(0.1)
+    finally:
+        if not supervisor_task.done():
+            supervisor_task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await supervisor_task
 
 
 async def _has_usable_committed_final(client, run_id: str) -> bool:
@@ -441,29 +394,49 @@ async def _write_durable_print_result(client, run_id: str, *, error: str | None)
 
     async def collect() -> dict:
         page = await client.store.read(run_id, limit=100_000)
+        telemetry = aggregate_model_usage(page.events)
         usage = {
-            "input_tokens": 0,
-            "uncached_input_tokens": 0,
-            "cache_creation_input_tokens": 0,
-            "cache_read_input_tokens": 0,
-            "output_tokens": 0,
-            "model_calls": 0,
+            "input_tokens": telemetry["input_tokens"],
+            "uncached_input_tokens": telemetry["uncached_input_tokens"],
+            "cache_creation_input_tokens": telemetry["cache_creation_input_tokens"],
+            "cache_read_input_tokens": telemetry["cache_read_input_tokens"],
+            "output_tokens": telemetry["output_tokens"],
+            "model_calls": telemetry["model_calls"],
             "tool_calls": 0,
             "cost_microusd": None,
+            "api_reported_cost": telemetry["reported_cost"],
+            "api_reported_cost_currency": telemetry["reported_cost_currency"],
+            "api_cost_source": telemetry["cost_source"],
+            "api_cost_status": telemetry["cost_status"],
+            "api_cost_observed": telemetry["cost_observed"],
+            "api_cost_complete": telemetry["cost_complete"],
+            "providers": telemetry["providers"],
+            "models": telemetry["models"],
+            "invocation_count": telemetry["invocation_count"],
+            "invocation_statuses": telemetry["statuses"],
         }
         trajectory: list[dict] = []
         final = ""
+        outcome = None
         for event in page.events:
-            if event.event_type == "AssistantMessageCommitted":
-                for key in (
-                    "input_tokens",
-                    "uncached_input_tokens",
-                    "cache_creation_input_tokens",
-                    "cache_read_input_tokens",
-                    "output_tokens",
-                    "model_calls",
-                ):
-                    usage[key] += int((event.payload.get("usage") or {}).get(key) or 0)
+            if event.event_type == "RunOutcomeRecorded":
+                # Keep terminal classification in the machine-readable
+                # result; unlike model prose this is runtime-owned telemetry.
+                outcome = {
+                    key: event.payload[key]
+                    for key in (
+                        "outcome",
+                        "primary_class",
+                        "retryable",
+                        "secondary_causes",
+                        "evidence_refs",
+                        "attempt",
+                        "recovery_attempt",
+                        "details",
+                    )
+                    if key in event.payload
+                }
+            elif event.event_type == "AssistantMessageCommitted":
                 artifact = event.payload.get("message_artifact")
                 try:
                     message = json.loads(client.store.artifacts.read_text(str(artifact)))
@@ -515,6 +488,7 @@ async def _write_durable_print_result(client, run_id: str, *, error: str | None)
             "error": error,
             "run_id": run_id,
             "runtime": "durable",
+            "outcome": outcome,
             "trajectory": trajectory,
             "usage": usage,
         }
@@ -591,6 +565,32 @@ async def _run_print(
         await runtime.close()
 
 
+def _api_cost_status(stats) -> str:
+    """Return billing status without inferring a tariff from token counts."""
+
+    missing = object()
+    cost = getattr(stats, "api_reported_cost", missing)
+    complete_attr = getattr(stats, "api_cost_complete", missing)
+    observed_attr = getattr(stats, "api_cost_observed", missing)
+    # Stats objects created before the explicit completeness flags were added
+    # may still carry a provider-reported cost.  Preserve that fact without
+    # guessing a price from tokens; new objects always take the stricter path.
+    if cost is not missing and complete_attr is missing and observed_attr is missing:
+        try:
+            return "reported" if cost is not None and math.isfinite(float(cost)) else "unavailable"
+        except (TypeError, ValueError):
+            return "unavailable"
+    complete = bool(complete_attr) if complete_attr is not missing else False
+    observed = bool(observed_attr) if observed_attr is not missing else False
+    if complete and cost is not missing and cost is not None:
+        try:
+            if math.isfinite(float(cost)):
+                return "reported"
+        except (TypeError, ValueError):
+            pass
+    return "incomplete" if observed else "unavailable"
+
+
 def _write_print_json(
     runtime: SessionRuntime,
     final: str,
@@ -626,6 +626,12 @@ def _write_print_json(
             + int(getattr(stats, "auxiliary_model_calls", 0) or 0),
             "tool_calls": len(getattr(stats, "tool_call_log", []) or []),
             "cost_microusd": None,
+            "api_reported_cost": getattr(stats, "api_reported_cost", None),
+            "api_reported_cost_currency": getattr(stats, "api_reported_cost_currency", None),
+            "api_cost_source": "provider",
+            "api_cost_status": _api_cost_status(stats),
+            "api_cost_observed": bool(getattr(stats, "api_cost_observed", False)),
+            "api_cost_complete": bool(getattr(stats, "api_cost_complete", False)),
         },
     }
     encoded = (json.dumps(payload, ensure_ascii=False, allow_nan=False) + "\n").encode("utf-8")

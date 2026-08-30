@@ -8,6 +8,7 @@ the concrete runtimes still own their run/session-scoped resources.
 from __future__ import annotations
 
 import os
+import importlib.util
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Mapping, Protocol, Sequence
@@ -30,6 +31,21 @@ from .config import (
 from .l5 import build_l5_engine
 from .memory.config import load_memory_config
 from .policy import PolicyEngine
+
+
+def _module_available(name: str) -> bool:
+    """Return whether an optional runtime module can be imported.
+
+    ``find_spec`` can itself raise for partially-installed distributions (or
+    modules whose ``__spec__`` has been cleared by a test/plugin).  Capability
+    discovery must never make startup fail, so those cases are reported as
+    unavailable and surfaced in the activation manifest instead.
+    """
+
+    try:
+        return importlib.util.find_spec(name) is not None
+    except (ImportError, ModuleNotFoundError, ValueError, AttributeError):
+        return False
 
 
 class ContextEngine(Protocol):
@@ -107,6 +123,7 @@ class SharedCapabilityServices:
     e1_decompose_enabled: bool
     provenance_mode: bool
     output_egress_guard_enabled: bool
+    l5_config: Any | None = None
 
     @classmethod
     def load(
@@ -139,6 +156,7 @@ class SharedCapabilityServices:
             else None
         )
         executor_config = load_executor_config(policy_path)
+        l5_config = load_l5_config(policy_path)
         if host_execution:
             executor_config.backend = ExecutorBackend.NATIVE
         return cls(
@@ -157,18 +175,44 @@ class SharedCapabilityServices:
             l2_config=l2_config,
             l2_client=l2_client,
             l2_model=os.getenv("JUDGE_MODEL") or config.openai_model,
-            l5=build_l5_engine(load_l5_config(policy_path)),
+            l5=build_l5_engine(l5_config),
             executor_config=executor_config,
             e1_decompose_enabled=policy_config.e1_decompose_enabled,
             provenance_mode=provenance_mode,
             output_egress_guard_enabled=(
                 profile_name == "hardened-safety" or _env_flag("CC_HARNESS_OUTPUT_EGRESS_GUARD")
             ),
+            l5_config=l5_config,
         )
 
     def activation_details(self) -> dict[str, Any]:
         """Return redaction-safe activation metadata for this shared stack."""
 
+        sandbox_sdk = _module_available("opensandbox")
+        sandbox_server = _module_available("opensandbox_server")
+        sandbox_requested = self.executor_config.backend is ExecutorBackend.SANDBOX
+        l5_config = self.l5_config
+        pii_requested = bool(getattr(l5_config, "enabled", False) and getattr(l5_config, "pii_on", False))
+        pii_dependency = _module_available("presidio_analyzer")
+        memory_enabled = bool(getattr(self.memory_config, "enabled", False))
+        memory_dependency = _module_available("sqlite_vec")
+        degraded: list[str] = []
+        if sandbox_requested and not sandbox_sdk:
+            degraded.append("sandbox_sdk_missing")
+        if sandbox_requested and not sandbox_server:
+            degraded.append("sandbox_server_package_missing")
+        if pii_requested and not pii_dependency:
+            # Key redaction remains active; this is a degraded optional PII
+            # layer, not a reason to silently disable output protection.
+            degraded.append("presidio_missing_keys_only")
+        if memory_enabled and not memory_dependency:
+            degraded.append("sqlite_vec_missing_memory_disabled")
+        model_ready = bool(
+            str(self.config.openai_api_key).strip()
+            and str(self.config.openai_base_url).strip()
+            and str(self.config.openai_model).strip()
+        )
+        required_ready = model_ready and (not sandbox_requested or sandbox_sdk)
         return {
             "policy_enabled": self.policy.enabled,
             "l2_enabled": self.l2_config.enabled,
@@ -177,6 +221,18 @@ class SharedCapabilityServices:
             "executor_backend": self.executor_config.backend.value,
             "provenance_enforced": self.provenance_mode,
             "output_egress_guard": self.output_egress_guard_enabled,
+            "environment_ready": required_ready,
+            "degraded_reasons": degraded,
+            "security_dependencies": {
+                "sandbox_sdk": sandbox_sdk,
+                "sandbox_server_package": sandbox_server,
+                "presidio_analyzer": pii_dependency,
+                "sqlite_vec": memory_dependency,
+                "model_configuration": model_ready,
+            },
+            "sandbox_requested": sandbox_requested,
+            "memory_configured": memory_enabled,
+            "pii_requested": pii_requested,
         }
 
 

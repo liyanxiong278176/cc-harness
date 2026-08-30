@@ -53,6 +53,7 @@ async def test_ensure_server_starts_when_absent(monkeypatch):
     """server 没跑 + Docker 可用 → fork,标 owned。"""
     from cc_harness import sandbox_server as ss
     monkeypatch.setattr(ss, "ping", AsyncMock(side_effect=[False, True]))
+    monkeypatch.setattr(ss, "health", AsyncMock(return_value=True))
     monkeypatch.setattr(ss, "_docker_available", MagicMock(return_value=True))
     # _fork_server 在 impl 里被 await,故用 AsyncMock(plan 原文 MagicMock 不可 await)
     monkeypatch.setattr(ss, "_fork_server", AsyncMock())

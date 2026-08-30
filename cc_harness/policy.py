@@ -59,6 +59,7 @@ _SENSITIVE_FILE_NAMES = {
     "id_dsa", "id_ecdsa", "id_ed25519", "id_rsa",
 }
 _NON_SECRET_ENV_SUFFIXES = (".example", ".sample", ".template")
+_SANDBOX_WORKSPACE_ALIAS = "/workspace"
 
 
 def _classify(name: str) -> str:
@@ -130,6 +131,17 @@ def _extract_paths(args: dict) -> Iterator[str]:
 def _resolve(target: str, project_root: Path) -> Path:
     """展开 ~ / 环境变量 / 相对路径,返回绝对路径(不要求存在)。"""
     expanded = os.path.expandvars(os.path.expanduser(target))
+    # File tools execute in the supervisor process while shell tools execute
+    # inside the OpenSandbox mount.  Models quite reasonably use the
+    # container's canonical ``/workspace`` path for both.  Treat that exact
+    # mount alias as the configured project root, but still resolve ``..``
+    # afterwards so traversal and sensitive-path checks remain hard denies.
+    if (
+        expanded == _SANDBOX_WORKSPACE_ALIAS
+        or expanded.startswith(_SANDBOX_WORKSPACE_ALIAS + "/")
+    ) and project_root.as_posix().rstrip("/") != _SANDBOX_WORKSPACE_ALIAS:
+        suffix = expanded[len(_SANDBOX_WORKSPACE_ALIAS) :].lstrip("/")
+        expanded = str(project_root / suffix) if suffix else str(project_root)
     p = Path(expanded)
     if not p.is_absolute():
         p = (project_root / p)

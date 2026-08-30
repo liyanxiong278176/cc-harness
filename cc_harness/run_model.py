@@ -231,12 +231,26 @@ class PlanNode:
     owned_paths: tuple[str, ...] = ()
     child_run_id: str | None = None
     worktree_id: str | None = None
+    # Child-task contract metadata is persisted with the DAG so recovery and
+    # completion gates do not depend on the latest model message.
+    required: bool = True
+    effect_class: str = EffectClass.READ_ONLY.value
+    acceptance_criteria: tuple[str, ...] = ()
+    worktree_base_commit: str | None = None
+    budget: Mapping[str, Any] = field(default_factory=dict)
+    timeout_seconds: int = 240
+    max_retries: int = 1
+    output_schema: Mapping[str, Any] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
         if not self.node_id or not self.kind:
             raise DomainValidationError("plan node id and kind are required")
         if self.depth < 0:
             raise DomainValidationError("plan node depth cannot be negative")
+        if self.timeout_seconds < 1 or self.timeout_seconds > 3600:
+            raise DomainValidationError("plan node timeout_seconds must be in [1, 3600]")
+        if self.max_retries < 0 or self.max_retries > 2:
+            raise DomainValidationError("plan node max_retries must be in [0, 2]")
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -247,6 +261,14 @@ class PlanNode:
             "owned_paths": list(self.owned_paths),
             "child_run_id": self.child_run_id,
             "worktree_id": self.worktree_id,
+            "required": self.required,
+            "effect_class": self.effect_class,
+            "acceptance_criteria": list(self.acceptance_criteria),
+            "worktree_base_commit": self.worktree_base_commit,
+            "budget": dict(self.budget),
+            "timeout_seconds": self.timeout_seconds,
+            "max_retries": self.max_retries,
+            "output_schema": dict(self.output_schema),
         }
 
     @classmethod
@@ -259,6 +281,18 @@ class PlanNode:
             owned_paths=tuple(str(item) for item in data.get("owned_paths") or ()),
             child_run_id=data.get("child_run_id"),
             worktree_id=(str(data["worktree_id"]) if data.get("worktree_id") else None),
+            required=bool(data.get("required", True)),
+            effect_class=str(data.get("effect_class", EffectClass.READ_ONLY.value)),
+            acceptance_criteria=tuple(str(item) for item in data.get("acceptance_criteria") or ()),
+            worktree_base_commit=(
+                str(data["worktree_base_commit"])
+                if data.get("worktree_base_commit")
+                else None
+            ),
+            budget=dict(data.get("budget") or {}),
+            timeout_seconds=int(data.get("timeout_seconds", 240)),
+            max_retries=int(data.get("max_retries", 1)),
+            output_schema=dict(data.get("output_schema") or {}),
         )
 
 
@@ -333,16 +367,25 @@ class PlanGraph:
         return replace(self, nodes=(*self.nodes, node), revision=self.revision + 1)
 
     def can_run_parallel(self, node_ids: list[str] | tuple[str, ...]) -> bool:
+        # A plan batch is a set of distinct nodes.  Treating a repeated id as
+        # parallel work would bypass dependency/ownership checks and can lead
+        # to duplicate child scheduling.
+        if len(set(node_ids)) != len(node_ids):
+            return False
         selected = [self.by_id[node_id] for node_id in node_ids]
         children = [node for node in selected if node.kind == "child"]
         if len(children) > self.max_concurrent_children:
             return False
         if len(children) > 1:
-            worktrees = [node.worktree_id for node in children]
-            if any(not worktree for worktree in worktrees):
-                return False
-            if len(set(worktrees)) != len(worktrees):
-                return False
+            # Read-only children can safely share the project snapshot. Any
+            # mutating child must have a distinct isolated worktree.
+            mutating = [node for node in children if node.effect_class != EffectClass.READ_ONLY.value]
+            if mutating:
+                worktrees = [node.worktree_id for node in mutating]
+                if any(not worktree for worktree in worktrees):
+                    return False
+                if len(set(worktrees)) != len(worktrees):
+                    return False
         for index, left in enumerate(selected):
             for right in selected[index + 1 :]:
                 if any(
@@ -688,6 +731,7 @@ class RunStateMachine:
             RunStatus.BLOCKED: {RunStatus.QUEUED},
             RunStatus.FAILED_RECOVERABLE: {RunStatus.QUEUED},
             RunStatus.WAITING_ON_PREDECESSOR: {RunStatus.QUEUED},
+            RunStatus.CANCELLED: {RunStatus.QUEUED},
         },
         "RunSegmentStarted": {RunStatus.RUNNING: {RunStatus.RUNNING}},
         "RunSegmentFinished": {RunStatus.RUNNING: {RunStatus.RUNNING}},
@@ -751,6 +795,7 @@ class RunStateMachine:
         "PlanNodeCompleted",
         "PlanNodeBlocked",
         "ModelInvocationStarted",
+        "ModelInvocationFinished",
         "AssistantMessageCommitted",
         "AssistantMessageInterrupted",
         "ToolObservationChunkCommitted",
@@ -778,10 +823,14 @@ class RunStateMachine:
         "LegacyRunImported",
         "ChildRunCreated",
         "ChildRunClaimed",
+        "ChildRunCompleted",
+        "ChildRunCancelled",
+        "ChildRunFailed",
         "ChildCandidateSubmitted",
         "ChildCandidateAccepted",
         "ChildCandidateRejected",
         "IntegrationConflictRaised",
+        "RunOutcomeRecorded",
     }
 
     _SAME_STATE_ALLOWED: ClassVar[dict[str, set[RunStatus]]] = {
@@ -796,17 +845,48 @@ class RunStateMachine:
         "ActionSucceeded": {RunStatus.RUNNING},
         "ActionFailed": {RunStatus.RUNNING, RunStatus.BLOCKED, RunStatus.FAILED_RECOVERABLE},
         "ActionCancelled": {RunStatus.RUNNING, RunStatus.CANCEL_REQUESTED},
-        "ActionOutcomeUnknown": {RunStatus.RUNNING, RunStatus.BLOCKED},
+        # A cancellation request can arrive while a tool is in flight.  The
+        # owning worker must still be able to persist its observation and mark
+        # the effect unknown before acknowledging RunCancelled.
+        "ActionOutcomeUnknown": {
+            RunStatus.RUNNING,
+            RunStatus.BLOCKED,
+            RunStatus.CANCEL_REQUESTED,
+            RunStatus.CANCELLED,
+        },
         "PlanDiscoveryStarted": {RunStatus.DRAFT, RunStatus.QUEUED, RunStatus.RUNNING},
         "PlanDiscoveryCompleted": {RunStatus.DRAFT, RunStatus.QUEUED, RunStatus.RUNNING},
         "PlanNodeStarted": {RunStatus.QUEUED, RunStatus.RUNNING},
         "PlanNodeCompleted": {RunStatus.QUEUED, RunStatus.RUNNING},
         "PlanNodeBlocked": {RunStatus.QUEUED, RunStatus.RUNNING, RunStatus.BLOCKED},
         "ModelInvocationStarted": {RunStatus.RUNNING},
+        "ModelInvocationFinished": {
+            RunStatus.RUNNING,
+            RunStatus.CANCEL_REQUESTED,
+            RunStatus.CANCELLED,
+            RunStatus.BLOCKED,
+            RunStatus.STALLED,
+            RunStatus.FAILED_RECOVERABLE,
+            RunStatus.FAILED_TERMINAL,
+            RunStatus.COMPLETED,
+        },
         "AssistantMessageCommitted": {RunStatus.RUNNING},
-        "AssistantMessageInterrupted": {RunStatus.RUNNING, RunStatus.CANCEL_REQUESTED},
-        "ToolObservationChunkCommitted": {RunStatus.RUNNING},
-        "ToolObservationCommitted": {RunStatus.RUNNING, RunStatus.BLOCKED},
+        "AssistantMessageInterrupted": {
+            RunStatus.RUNNING,
+            RunStatus.CANCEL_REQUESTED,
+            RunStatus.CANCELLED,
+        },
+        "ToolObservationChunkCommitted": {
+            RunStatus.RUNNING,
+            RunStatus.CANCEL_REQUESTED,
+            RunStatus.CANCELLED,
+        },
+        "ToolObservationCommitted": {
+            RunStatus.RUNNING,
+            RunStatus.BLOCKED,
+            RunStatus.CANCEL_REQUESTED,
+            RunStatus.CANCELLED,
+        },
         "ContextProjectionBuilt": {RunStatus.RUNNING},
         "ContextCompacted": {RunStatus.RUNNING},
         "MemoryCandidateRecorded": set(RunStatus),
@@ -824,14 +904,25 @@ class RunStateMachine:
         "StallDiagnosisRecorded": {RunStatus.RUNNING, RunStatus.STALLED},
         "ChildRunCreated": {RunStatus.RUNNING, RunStatus.QUEUED},
         "ChildRunClaimed": {RunStatus.RUNNING, RunStatus.QUEUED},
+        "ChildRunCompleted": set(RunStatus),
+        "ChildRunCancelled": set(RunStatus),
+        "ChildRunFailed": set(RunStatus),
         "ChildCandidateSubmitted": {RunStatus.RUNNING, RunStatus.QUEUED},
         "ChildCandidateAccepted": {RunStatus.RUNNING, RunStatus.BLOCKED},
         "ChildCandidateRejected": {RunStatus.RUNNING, RunStatus.BLOCKED},
         "IntegrationConflictRaised": {RunStatus.RUNNING, RunStatus.BLOCKED},
+        "RunOutcomeRecorded": set(RunStatus),
         "FollowUpQueued": set(RunStatus),
         "FollowUpStarted": set(RunStatus),
         "LegacyRunImported": set(RunStatus),
-        "PredecessorBypassed": {RunStatus.QUEUED, RunStatus.WAITING_ON_PREDECESSOR},
+        # A stalled predecessor is still a valid recovery boundary.  The
+        # follow-up must be able to start from its durable handoff instead of
+        # requiring a mutable/implicit reset of the predecessor first.
+        "PredecessorBypassed": {
+            RunStatus.QUEUED,
+            RunStatus.WAITING_ON_PREDECESSOR,
+            RunStatus.STALLED,
+        },
         "RunRuntimeMigrated": set(RunStatus),
         "RunSnapshotCreated": set(RunStatus),
     }

@@ -118,15 +118,19 @@ class GoalContractService:
         command sandboxing, and output guards remain active.
         """
 
-        trusted_benchmark = goal_provenance == "official_benchmark"
+        # ``user_confirmed`` is only set by the explicit CLI confirmation
+        # path.  Keep it distinct from the benchmark provenance so the event
+        # log records whether a live user or an isolated benchmark authorized
+        # the high-risk goal.
+        trusted_provenance = goal_provenance in {"official_benchmark", "user_confirmed"}
         text = " ".join((goal.objective, *goal.acceptance_criteria, *goal.constraints))
         # A frozen benchmark statement is an externally-owned task contract,
         # not an underspecified live user request. Do not stop the benchmark
         # before its model call because a fixture path (for example ``/etc``)
         # or a task phrase happens to match a generic goal marker. All
         # action-level controls remain enforced after this goal gate.
-        ambiguous = () if trusted_benchmark else _contains_marker(text, _AMBIGUOUS_MARKERS)
-        high_risk = () if trusted_benchmark else _contains_marker(text, _HIGH_RISK_MARKERS)
+        ambiguous = () if trusted_provenance else _contains_marker(text, _AMBIGUOUS_MARKERS)
+        high_risk = () if trusted_provenance else _contains_marker(text, _HIGH_RISK_MARKERS)
         reasons: list[str] = []
         questions: list[str] = []
         if ambiguous:

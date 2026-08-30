@@ -54,6 +54,18 @@ def test_agent_exception_without_verifier_bootstrap_failure_is_runtime_failure()
     assert _terminal_failure_class(trial, verifier_diagnostic="") == "agent_runtime"
 
 
+def test_provider_transport_error_is_not_published_as_task_failure() -> None:
+    trial = {
+        "exception_info": {
+            "exception_type": "APIConnectionError",
+            "exception_message": "connection reset by peer",
+        }
+    }
+
+    assert _terminal_failure_class(trial, verifier_diagnostic="") == "provider_transport"
+    assert _terminal_official_zero_reward_status("provider_transport") is TrialStatus.INVALID
+
+
 def test_verifier_infrastructure_zero_reward_is_not_published_as_task_fail() -> None:
     assert (
         _terminal_official_zero_reward_status("verifier_infrastructure")

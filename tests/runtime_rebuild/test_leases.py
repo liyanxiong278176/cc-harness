@@ -75,3 +75,21 @@ async def test_expired_lease_recovery_returns_run_to_queue(tmp_path) -> None:
         assert await store.current_lease(RUN_ID) is None
     finally:
         await store.close()
+
+
+@pytest.mark.asyncio
+async def test_running_projection_without_lease_is_recovered(tmp_path) -> None:
+    store = await queued_store(tmp_path)
+    try:
+        manager = LeaseManager(store, ttl_seconds=1)
+        lease = await manager.claim(RUN_ID, "worker-crash")
+        assert await store.release_lease(RUN_ID, lease.epoch)
+        assert await manager.reclaim_expired(RUN_ID) is None
+        projection = await store.load_projection(RUN_ID)
+        assert projection.status.value == "queued"
+        assert projection.active_worker_id is None
+        events = (await store.read(RUN_ID, limit=100)).events
+        assert events[-1].event_type == "WorkerLeaseExpired"
+        assert "no active worker lease" in str(events[-1].payload["reason"])
+    finally:
+        await store.close()

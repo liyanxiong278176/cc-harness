@@ -20,6 +20,7 @@ from cc_harness.run_model import (
     ProgressKind,
     Run,
     RunProgress,
+    RunStateMachine,
     RunStatus,
     RuntimeContract,
     predecessor_gate,
@@ -139,3 +140,11 @@ def test_predecessor_gate_matches_decided_matrix() -> None:
     assert predecessor_gate(RunStatus.CANCELLED) is PredecessorGateStatus.INCOMPLETE
     assert predecessor_gate(RunStatus.BLOCKED) is PredecessorGateStatus.WAITING
     assert predecessor_gate(RunStatus.BLOCKED, bypassed=True) is PredecessorGateStatus.BYPASSED
+
+
+def test_stalled_predecessor_can_be_bypassed_for_durable_follow_up() -> None:
+    machine = RunStateMachine()
+    assert machine.transition(
+        RunStatus.STALLED,
+        "PredecessorBypassed",
+    ) is RunStatus.STALLED

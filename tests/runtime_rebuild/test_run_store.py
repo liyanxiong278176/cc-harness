@@ -1,12 +1,13 @@
 from __future__ import annotations
 
 import asyncio
+import uuid
 
 import aiosqlite
 import pytest
 
 from cc_harness.run_events import EventActor, RunEvent
-from cc_harness.run_model import GoalContract, Run, RuntimeContract
+from cc_harness.run_model import GoalContract, Run, RunStatus, RuntimeContract
 from cc_harness.run_store import LeaseFenceError, RunStore, SequenceConflict
 
 
@@ -16,10 +17,18 @@ CONTRACT = RuntimeContract("store-test", 1, "sha256:tools", "sha256:model", "sha
 GOAL = GoalContract("store a run", ("events persist",))
 
 
-def event(sequence: int, event_type: str, payload: dict, *, lease_epoch: int = 0, digest: str | None = None):
+def event(
+    sequence: int,
+    event_type: str,
+    payload: dict,
+    *,
+    lease_epoch: int = 0,
+    digest: str | None = None,
+    run_id: str = RUN_ID,
+):
     return RunEvent.create(
-        event_id=f"00000000-0000-0000-0000-{sequence:012d}",
-        run_id=RUN_ID,
+        event_id=str(uuid.uuid5(uuid.NAMESPACE_URL, f"{run_id}:{sequence}:{event_type}")),
+        run_id=run_id,
         sequence=sequence,
         event_type=event_type,
         actor=ACTOR,
@@ -254,3 +263,75 @@ async def test_derived_tables_and_snapshot_metadata_commit_with_event(tmp_path) 
             assert action[0] == "planned"
     finally:
         await store.close()
+
+
+@pytest.mark.asyncio
+async def test_distinct_store_connections_serialize_concurrent_writers(tmp_path) -> None:
+    """WAL plus bounded BEGIN IMMEDIATE backoff protects separate workers."""
+
+    project = tmp_path / "project"
+    project.mkdir()
+    data_root = tmp_path / "shared-user-data"
+    first = RunStore(project, data_root=data_root)
+    second = RunStore(project, data_root=data_root)
+    await first.open()
+    await second.open()
+    run_ids = (
+        "00000000-0000-0000-0000-000000000211",
+        "00000000-0000-0000-0000-000000000212",
+    )
+    try:
+        for store, run_id in zip((first, second), run_ids):
+            await store.create_run(Run(run_id, GOAL, CONTRACT))
+            await store.append(
+                event(
+                    1,
+                    "RunCreated",
+                    {"goal": GOAL.to_dict(), "runtime_contract": CONTRACT.to_dict()},
+                    run_id=run_id,
+                ),
+                expected_sequence=0,
+            )
+
+        async def append_heartbeat_stream(store: RunStore, run_id: str) -> None:
+            await store.append(
+                event(2, "RunQueued", {}, run_id=run_id), expected_sequence=1
+            )
+            await store.append(
+                event(
+                    3,
+                    "RunClaimed",
+                    {"worker_id": "worker-1"},
+                    lease_epoch=1,
+                    run_id=run_id,
+                ),
+                expected_sequence=2,
+                expected_lease_epoch=0,
+            )
+            for sequence in range(4, 24):
+                await store.append(
+                    event(
+                        sequence,
+                        "WorkerHeartbeat",
+                        {
+                            "heartbeat_at": f"2026-08-18T00:00:{sequence:02d}Z",
+                            "expires_at": 4102444800.0,
+                        },
+                        lease_epoch=1,
+                        run_id=run_id,
+                    ),
+                    expected_sequence=sequence - 1,
+                    expected_lease_epoch=1,
+                )
+
+        await asyncio.gather(
+            append_heartbeat_stream(first, run_ids[0]),
+            append_heartbeat_stream(second, run_ids[1]),
+        )
+        for store, run_id in zip((first, second), run_ids):
+            projection = await store.load_projection(run_id)
+            assert projection.sequence == 23
+            assert projection.status is RunStatus.RUNNING
+    finally:
+        await first.close()
+        await second.close()

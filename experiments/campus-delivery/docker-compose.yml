@@ -1,0 +1,102 @@
+services:
+  mysql:
+    image: mysql:8.0
+    container_name: campus-mysql
+    environment:
+      MYSQL_ROOT_PASSWORD: ${MYSQL_ROOT_PASSWORD:-root123456}
+      MYSQL_DATABASE: campus
+      MYSQL_USER: campus
+      MYSQL_PASSWORD: ${MYSQL_PASSWORD:-campus123456}
+      TZ: Asia/Shanghai
+    command:
+      - --character-set-server=utf8mb4
+      - --collation-server=utf8mb4_unicode_ci
+      - --default-authentication-plugin=mysql_native_password
+    ports:
+      - "3306:3306"
+    volumes:
+      - mysql-data:/var/lib/mysql
+      - ./db/init:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "127.0.0.1", "-uroot", "-p${MYSQL_ROOT_PASSWORD:-root123456}"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+      start_period: 20s
+
+  redis:
+    image: redis:7-alpine
+    container_name: campus-redis
+    command: ["redis-server", "--appendonly", "yes"]
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis-data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  rabbitmq:
+    image: rabbitmq:3.13-management
+    container_name: campus-rabbitmq
+    environment:
+      RABBITMQ_DEFAULT_USER: ${RABBITMQ_USER:-campus}
+      RABBITMQ_DEFAULT_PASS: ${RABBITMQ_PASSWORD:-campus123456}
+    ports:
+      - "5672:5672"
+      - "15672:15672"
+    volumes:
+      - rabbitmq-data:/var/lib/rabbitmq
+    healthcheck:
+      test: ["CMD", "rabbitmq-diagnostics", "-q", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+      start_period: 20s
+
+  app:
+    build: .
+    container_name: campus-app
+    depends_on:
+      mysql:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      rabbitmq:
+        condition: service_healthy
+    environment:
+      SPRING_PROFILES_ACTIVE: prod
+      # ---- 数据库 ----
+      CAMPUS_DB_URL: jdbc:mysql://mysql:3306/campus?useUnicode=true&characterEncoding=utf8&serverTimezone=Asia/Shanghai&useSSL=false&allowPublicKeyRetrieval=true
+      CAMPUS_DB_USERNAME: campus
+      CAMPUS_DB_PASSWORD: ${MYSQL_PASSWORD:-campus123456}
+      # ---- Redis ----
+      CAMPUS_REDIS_HOST: redis
+      CAMPUS_REDIS_PORT: "6379"
+      # ---- RabbitMQ ----
+      CAMPUS_RABBIT_HOST: rabbitmq
+      CAMPUS_RABBIT_PORT: "5672"
+      CAMPUS_RABBIT_USERNAME: ${RABBITMQ_USER:-campus}
+      CAMPUS_RABBIT_PASSWORD: ${RABBITMQ_PASSWORD:-campus123456}
+      # ---- 安全密钥(生产必须外部注入;空值回退 dev 默认,见 JwtUtils/AesUtils) ----
+      APP_JWT_SECRET: ${APP_JWT_SECRET:-}
+      APP_CRYPTO_KEY: ${APP_CRYPTO_KEY:-}
+      # ---- 特性开关 ----
+      APP_MQ_ENABLED: "true"
+      APP_SEED_DEMO_PASSWORD_RESET: "true"
+      TZ: Asia/Shanghai
+    ports:
+      - "8080:8080"
+    healthcheck:
+      test: ["CMD", "curl", "-sf", "http://localhost:8080/api/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 30
+      start_period: 40s
+
+volumes:
+  mysql-data:
+  redis-data:
+  rabbitmq-data:

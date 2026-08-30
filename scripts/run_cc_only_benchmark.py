@@ -585,7 +585,10 @@ def _parser() -> argparse.ArgumentParser:
         "--cost-limit-cny",
         type=float,
         default=200.0,
-        help="pause Terminal-Bench before the next task after this estimated CNY cost",
+        help=(
+            "pause Terminal-Bench before the next task only after this "
+            "provider-reported CNY cost (no tariff estimate is used)"
+        ),
     )
     parser.add_argument(
         "--task-limit",

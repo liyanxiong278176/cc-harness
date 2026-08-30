@@ -9,6 +9,7 @@ Provides:
 from __future__ import annotations
 
 import json
+import math
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -73,12 +74,13 @@ class UsageRecord:
         if reported_cost is None:
             reported_cost = value(usage, "total_cost", None)
         try:
-            normalized_cost = float(reported_cost) if reported_cost is not None else None
+            parsed_cost = float(reported_cost) if reported_cost is not None else None
+            normalized_cost = parsed_cost if parsed_cost is not None and math.isfinite(parsed_cost) else None
         except (TypeError, ValueError):
             normalized_cost = None
         currency = value(usage, "cost_currency", None) or value(usage, "currency", None)
         if currency is not None:
-            currency = str(currency)
+            currency = str(currency).strip().upper() or None
         cache_read = min(prompt_tokens, nonnegative_int(cache_read))
         cache_creation = min(prompt_tokens - cache_read, nonnegative_int(cache_creation))
         return cls(
@@ -94,7 +96,7 @@ class UsageRecord:
     def __add__(self, other: UsageRecord) -> UsageRecord:
         if self.reported_cost is None or other.reported_cost is None:
             cost = None
-        elif self.reported_cost_currency not in (None, other.reported_cost_currency):
+        elif self.reported_cost_currency != other.reported_cost_currency:
             cost = None
         else:
             cost = self.reported_cost + other.reported_cost
@@ -214,6 +216,10 @@ class TurnTokenStats:
     api_total_tokens: int = 0
     api_reported_cost: float | None = None
     api_reported_cost_currency: str | None = None
+    # Provider billing is optional.  These flags distinguish “the provider
+    # gave no price” from a zero-priced call and from a mixed/incomplete turn.
+    api_cost_complete: bool = True
+    api_cost_observed: bool = False
     # Metadata
     iter_count: int = 0
     auxiliary_model_calls: int = 0
@@ -330,11 +336,18 @@ class SessionTokenStats:
         self.api_total_tokens += turn.api_total_tokens
         if turn.api_reported:
             self.api_cost_observed = True
-            if turn.api_reported_cost is None or not self.api_cost_complete:
+            if (
+                turn.api_reported_cost is None
+                or not turn.api_cost_complete
+                or not math.isfinite(turn.api_reported_cost)
+            ):
                 self.api_cost_complete = False
                 self.api_reported_cost = None
                 self.api_reported_cost_currency = None
-            elif self.api_reported_cost_currency not in (None, turn.api_reported_cost_currency):
+            elif (
+                self.api_reported_cost is not None
+                and self.api_reported_cost_currency != turn.api_reported_cost_currency
+            ):
                 self.api_cost_complete = False
                 self.api_reported_cost = None
                 self.api_reported_cost_currency = None

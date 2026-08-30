@@ -13,6 +13,8 @@ from pathlib import Path
 
 import aiosqlite
 
+from .sqlite_utils import begin_immediate
+
 
 @dataclass(frozen=True)
 class SessionRecord:
@@ -167,7 +169,7 @@ class SessionStore:
     async def claim_next_input(self, session_id: str) -> QueuedInput | None:
         """Atomically claim the oldest queued input for one session."""
         assert self._db is not None
-        await self._db.execute("BEGIN IMMEDIATE")
+        await begin_immediate(self._db)
         try:
             cursor = await self._db.execute(
                 "SELECT queue_id, session_id, payload_json, status, created_at, attempts, last_error "

@@ -9,6 +9,7 @@ while schema and lifecycle checks remain mandatory.
 from __future__ import annotations
 
 import json
+import math
 import uuid
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -48,6 +49,7 @@ EVENT_TYPES = frozenset(
         "PlanNodeCompleted",
         "PlanNodeBlocked",
         "ModelInvocationStarted",
+        "ModelInvocationFinished",
         "AssistantMessageCommitted",
         "AssistantMessageInterrupted",
         "ToolObservationChunkCommitted",
@@ -62,10 +64,14 @@ EVENT_TYPES = frozenset(
         "PlanRevised",
         "ChildRunCreated",
         "ChildRunClaimed",
+        "ChildRunCompleted",
+        "ChildRunCancelled",
+        "ChildRunFailed",
         "ChildCandidateSubmitted",
         "ChildCandidateAccepted",
         "ChildCandidateRejected",
         "IntegrationConflictRaised",
+        "RunOutcomeRecorded",
         "ActionPlanned",
         "ActionPrepared",
         "ActionStarted",
@@ -118,6 +124,7 @@ _REQUIRED_PAYLOAD_FIELDS: dict[str, tuple[str, ...]] = {
     "PlanNodeCompleted": ("node_id",),
     "PlanNodeBlocked": ("node_id", "reason"),
     "ModelInvocationStarted": ("invocation_id", "segment", "round"),
+    "ModelInvocationFinished": ("invocation_id", "status"),
     "AssistantMessageCommitted": ("message_id", "message_artifact", "segment", "round"),
     "AssistantMessageInterrupted": ("message_id", "reason"),
     "ToolObservationChunkCommitted": (
@@ -150,6 +157,9 @@ _REQUIRED_PAYLOAD_FIELDS: dict[str, tuple[str, ...]] = {
     "PlanRevised": ("plan",),
     "ChildRunCreated": ("child_run_id",),
     "ChildRunClaimed": ("child_run_id", "worker_id"),
+    "ChildRunCompleted": ("child_run_id",),
+    "ChildRunCancelled": ("child_run_id", "reason"),
+    "ChildRunFailed": ("child_run_id", "reason"),
     "ChildCandidateSubmitted": ("child_run_id", "candidate_commit", "diff_digest"),
     "ChildCandidateAccepted": ("child_run_id",),
     "ChildCandidateRejected": ("child_run_id", "reason"),
@@ -187,6 +197,7 @@ _REQUIRED_PAYLOAD_FIELDS: dict[str, tuple[str, ...]] = {
     "RunRuntimeMigrated": ("previous_runtime_contract_digest", "new_runtime_contract_digest"),
     "LegacyRunImported": ("source_digest",),
     "RunSnapshotCreated": ("snapshot_digest",),
+    "RunOutcomeRecorded": ("outcome", "primary_class", "retryable"),
 }
 
 _ACTION_EVENTS = {
@@ -475,6 +486,7 @@ class EventValidator:
                 "source_message_count",
                 "projected_message_count",
                 "captured_count",
+                "retryable",
             }
         }
         for field_name in string_fields:
@@ -490,6 +502,51 @@ class EventValidator:
                 raise EventValidationError("model invocation segment must be non-negative")
             if not isinstance(payload["round"], int) or payload["round"] < 0:
                 raise EventValidationError("model invocation round must be non-negative")
+        if event.event_type == "ModelInvocationFinished":
+            if payload["status"] not in {"succeeded", "failed", "cancelled"}:
+                raise EventValidationError("model invocation status is invalid")
+            if not isinstance(payload.get("usage", {}), Mapping):
+                raise EventValidationError("model invocation usage must be an object")
+            usage = payload.get("usage", {})
+            for name in (
+                "input_tokens",
+                "uncached_input_tokens",
+                "cache_creation_input_tokens",
+                "cache_read_input_tokens",
+                "output_tokens",
+                "model_calls",
+            ):
+                if name not in usage or usage[name] is None:
+                    continue
+                try:
+                    value = int(usage[name])
+                except (TypeError, ValueError) as exc:
+                    raise EventValidationError(f"model invocation usage.{name} must be an integer") from exc
+                if value < 0:
+                    raise EventValidationError(f"model invocation usage.{name} cannot be negative")
+            if usage.get("reported_cost") is not None:
+                try:
+                    cost = float(usage["reported_cost"])
+                except (TypeError, ValueError) as exc:
+                    raise EventValidationError("model invocation reported_cost must be numeric") from exc
+                if not math.isfinite(cost) or cost < 0:
+                    raise EventValidationError("model invocation reported_cost must be finite and non-negative")
+            if "duration_ms" in payload:
+                try:
+                    if float(payload["duration_ms"]) < 0:
+                        raise EventValidationError("model invocation duration cannot be negative")
+                except (TypeError, ValueError) as exc:
+                    raise EventValidationError("model invocation duration must be numeric") from exc
+        if event.event_type == "RunOutcomeRecorded":
+            if not isinstance(payload["retryable"], bool):
+                raise EventValidationError("outcome retryable must be boolean")
+            for name in ("secondary_causes", "evidence_refs"):
+                if name in payload and not isinstance(payload[name], (list, tuple)):
+                    raise EventValidationError(f"outcome {name} must be a list")
+            for name in ("attempt", "recovery_attempt"):
+                if name in payload:
+                    if not isinstance(payload[name], int) or payload[name] < 0:
+                        raise EventValidationError(f"outcome {name} must be a non-negative integer")
         if event.event_type == "ToolObservationChunkCommitted":
             if not isinstance(payload["chunk_index"], int) or payload["chunk_index"] < 0:
                 raise EventValidationError("observation chunk_index must be non-negative")

@@ -23,6 +23,7 @@ MAX_READ_CHARS = 256_000
 MAX_SEARCH_FILE_BYTES = 2 * 1024 * 1024
 MAX_RESULTS = 500
 _IGNORED_DIRS = {".git", ".cc-harness", "__pycache__"}
+_SANDBOX_WORKSPACE_ALIAS = "/workspace"
 
 
 class NativeToolError(ValueError):
@@ -56,7 +57,14 @@ def _resolve_workspace_path(raw_path: str, cwd: str | Path) -> Path:
     if not isinstance(raw_path, str) or not raw_path.strip():
         raise NativeToolError("'path' must be a non-empty string")
     root = Path(cwd).resolve(strict=False)
-    candidate = Path(os.path.expandvars(os.path.expanduser(raw_path)))
+    expanded = os.path.expandvars(os.path.expanduser(raw_path))
+    if (
+        expanded == _SANDBOX_WORKSPACE_ALIAS
+        or expanded.startswith(_SANDBOX_WORKSPACE_ALIAS + "/")
+    ) and root.as_posix().rstrip("/") != _SANDBOX_WORKSPACE_ALIAS:
+        suffix = expanded[len(_SANDBOX_WORKSPACE_ALIAS) :].lstrip("/")
+        expanded = str(root / suffix) if suffix else str(root)
+    candidate = Path(expanded)
     if not candidate.is_absolute():
         candidate = root / candidate
     resolved = candidate.resolve(strict=False)
@@ -77,7 +85,14 @@ def _resolve_mutation_path(raw_path: str, cwd: str | Path) -> Path:
     if not isinstance(raw_path, str) or not raw_path.strip():
         raise NativeToolError("'path' must be a non-empty string")
     root = Path(cwd).resolve(strict=False)
-    candidate = Path(os.path.expandvars(os.path.expanduser(raw_path)))
+    expanded = os.path.expandvars(os.path.expanduser(raw_path))
+    if (
+        expanded == _SANDBOX_WORKSPACE_ALIAS
+        or expanded.startswith(_SANDBOX_WORKSPACE_ALIAS + "/")
+    ) and root.as_posix().rstrip("/") != _SANDBOX_WORKSPACE_ALIAS:
+        suffix = expanded[len(_SANDBOX_WORKSPACE_ALIAS) :].lstrip("/")
+        expanded = str(root / suffix) if suffix else str(root)
+    candidate = Path(expanded)
     if not candidate.is_absolute():
         candidate = root / candidate
     lexical = Path(os.path.abspath(candidate))

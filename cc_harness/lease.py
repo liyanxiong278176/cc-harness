@@ -67,7 +67,30 @@ class LeaseManager:
 
     async def reclaim_expired(self, run_id: str, *, reason: str = "worker lease expired") -> Lease | None:
         current = await self.store.current_lease(run_id)
-        if current is None or not current.is_expired():
+        if current is None:
+            # A supervisor can be interrupted after the worker lease row has
+            # been removed but before the terminal/recovery event is written.
+            # Treat a still-running projection with no lease as a recoverable
+            # crash instead of leaving it permanently invisible to the queue.
+            projection = await self.store.load_projection(run_id)
+            if projection.status not in {RunStatus.RUNNING, RunStatus.CANCEL_REQUESTED}:
+                return None
+            event_type = "RunCancelled" if projection.status is RunStatus.CANCEL_REQUESTED else "WorkerLeaseExpired"
+            event = RunEvent.create(
+                run_id=run_id,
+                sequence=projection.sequence + 1,
+                event_type=event_type,
+                actor=EventActor("supervisor", "local-supervisor"),
+                runtime_contract_digest=str(projection.runtime_contract_digest),
+                lease_epoch=0,
+                payload={
+                    "reason": f"{reason}; no active worker lease",
+                    "worker_id": projection.active_worker_id or "unknown",
+                },
+            )
+            await self.store.append(event, expected_sequence=projection.sequence)
+            return None
+        if not current.is_expired():
             return None
         projection = await self.store.load_projection(run_id)
         event_type = "RunCancelled" if projection.status is RunStatus.CANCEL_REQUESTED else "WorkerLeaseExpired"

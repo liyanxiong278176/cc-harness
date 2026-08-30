@@ -263,6 +263,31 @@ async def test_run_command_uses_session_executor(monkeypatch, tmp_path):
     fake.run.assert_awaited_once()
 
 
+@pytest.mark.asyncio
+async def test_prewarm_session_executor_delegates_to_executor(monkeypatch):
+    """Durable startup has one executor-level seam for sandbox prewarming."""
+    from cc_harness import tools
+
+    state = object()
+    fake = MagicMock()
+    fake.prewarm_server = AsyncMock(return_value=state)
+    monkeypatch.setattr(tools, "get_session_executor", lambda: fake)
+
+    assert await tools.prewarm_session_executor() is state
+    fake.prewarm_server.assert_awaited_once_with()
+
+
+@pytest.mark.asyncio
+async def test_prewarm_session_executor_is_noop_for_native(monkeypatch):
+    """Explicit host execution must not try to start OpenSandbox."""
+    from cc_harness import tools
+
+    fake = MagicMock(spec=[])
+    monkeypatch.setattr(tools, "get_session_executor", lambda: fake)
+
+    assert await tools.prewarm_session_executor() is None
+
+
 def test_init_then_get_returns_same(monkeypatch, tmp_path):
     """init_session_executor 后 get 返回同一实例(会话级复用)。"""
     from cc_harness import tools

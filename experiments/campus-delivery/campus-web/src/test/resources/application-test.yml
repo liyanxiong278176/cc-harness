@@ -1,0 +1,38 @@
+spring:
+  datasource:
+    # H2 MySQL 兼容模式;内存库,无需外部中间件
+    url: jdbc:h2:mem:campus;MODE=MySQL;DATABASE_TO_LOWER=TRUE;CASE_INSENSITIVE_IDENTIFIERS=TRUE;DB_CLOSE_DELAY=-1
+    driver-class-name: org.h2.Driver
+    username: sa
+    password: ""
+  sql:
+    init:
+      mode: always
+      schema-locations: classpath:h2-schema.sql
+  rabbitmq:
+    listener:
+      simple:
+        auto-startup: false   # 测试不消费真实消息
+  flyway:
+    enabled: false
+
+app:
+  cache:
+    type: local              # 测试使用内存缓存,不依赖 Redis
+  mq:
+    enabled: false           # 不创建 MQ 消费者
+  seed:
+    demo-password-reset: true
+
+mybatis-plus:
+  global-config:
+    db-config:
+      logic-delete-field: deleted
+      logic-delete-value: 1
+      logic-not-delete-value: 0
+  configuration:
+    map-underscore-to-camel-case: true
+
+logging:
+  level:
+    com.campus: INFO

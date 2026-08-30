@@ -13,8 +13,10 @@ import inspect
 import ipaddress
 import json
 import logging
+import os
 import socket
 import time
+import uuid
 from datetime import timedelta
 from pathlib import Path
 
@@ -115,7 +117,50 @@ async def _validate_egress_targets(targets: list[str]) -> None:
         await asyncio.to_thread(_resolve_egress_target, target)
 
 
-async def _with_retry(coro_factory, attempts: int = 3):
+SANDBOX_RETRY_ATTEMPTS_ENV = "CC_HARNESS_SANDBOX_RETRY_ATTEMPTS"
+MAX_SANDBOX_RETRY_ATTEMPTS = 10
+# A durable coding run can outlive the SDK's 10-minute default sandbox
+# expiration by hours.  Keep the command timeout separate from the sandbox
+# lifetime: the former bounds one action, while this value keeps a healthy
+# session reusable across model turns.  OpenSandbox's server configuration
+# caps this at 24 hours, so the default matches that cap and remains finite.
+SANDBOX_LIFETIME_SECONDS_ENV = "CC_HARNESS_SANDBOX_LIFETIME_SECONDS"
+DEFAULT_SANDBOX_LIFETIME_SECONDS = 86_400
+MAX_SANDBOX_LIFETIME_SECONDS = 86_400
+
+
+def _resolve_retry_attempts(value: int | float | str | None = None, *, default: int = 3) -> int:
+    """Resolve bounded transport retries without changing side-effect semantics.
+
+    A failed HTTP connection is still reported as ``outcome_unknown`` by the
+    durable worker; retries only cover the transport setup before that fact is
+    committed.  The normal interactive default remains three attempts, while
+    long-running CI/agent sessions may opt into a larger (but finite) budget
+    through ``CC_HARNESS_SANDBOX_RETRY_ATTEMPTS``.
+    """
+
+    raw = value if value is not None else os.getenv(SANDBOX_RETRY_ATTEMPTS_ENV)
+    try:
+        parsed = int(float(raw)) if raw is not None else int(default)
+    except (TypeError, ValueError):
+        parsed = int(default)
+    return max(1, min(parsed, MAX_SANDBOX_RETRY_ATTEMPTS))
+
+
+def _resolve_sandbox_lifetime(value: int | float | str | None = None) -> float:
+    """Resolve a finite reusable-session lifetime for long durable runs."""
+
+    raw = value if value is not None else os.getenv(SANDBOX_LIFETIME_SECONDS_ENV)
+    try:
+        parsed = float(raw) if raw is not None else float(DEFAULT_SANDBOX_LIFETIME_SECONDS)
+    except (TypeError, ValueError):
+        parsed = float(DEFAULT_SANDBOX_LIFETIME_SECONDS)
+    if not parsed or not (parsed > 0) or not (parsed < float("inf")):
+        parsed = float(DEFAULT_SANDBOX_LIFETIME_SECONDS)
+    return min(parsed, float(MAX_SANDBOX_LIFETIME_SECONDS))
+
+
+async def _with_retry(coro_factory, attempts: int | None = None):
     """指数退避:第 1、2 次重试前睡 1s、2s(第 3 次是最后尝试不睡)。返回 coro 结果;全败抛 SandboxUnavailableError(包 last)。
 
     - coro_factory:零参返回新协程的 callable(每次重试重建协程,避免
@@ -123,13 +168,14 @@ async def _with_retry(coro_factory, attempts: int = 3):
     - 命令正常返回(exit≠0)不会进异常分支,因此不会被重试——只有通信错
       (create/run 抛异常)才重试。这是设计意图。
     """
+    retry_budget = _resolve_retry_attempts(attempts)
     last: Exception | None = None
-    for i in range(attempts):
+    for i in range(retry_budget):
         try:
             return await coro_factory()
         except Exception as e:
             last = e
-            if i < attempts - 1:
+            if i < retry_budget - 1:
                 await asyncio.sleep(2 ** i)
     # 全败:包成 SandboxUnavailableError,让调用方按统一类型降级。
     raise SandboxUnavailableError(str(last)) from last
@@ -164,6 +210,10 @@ class SandboxExecutor:
         self.project_root = Path(project_root).resolve()
         self._sandbox = None     # lazy create,会话级复用
         self._mask_plan: WorkspaceMaskPlan | None = None
+        # Keep mask mounts below the project root.  Besides making the
+        # allowlist stable for externally managed servers, this lets startup
+        # prewarm the service without walking the entire repository first.
+        self._mask_parent = self.project_root / ".cc-harness" / "workspace-masks"
         self._credential_broker = CredentialBroker(cfg, self.project_root)
 
     def _network_policy(self) -> NetworkPolicy:
@@ -199,6 +249,11 @@ class SandboxExecutor:
         if self._mask_plan is not None:
             reusable_root = self._mask_plan.root
             self._mask_plan.cleanup()
+        if reusable_root is None:
+            self._mask_parent.mkdir(parents=True, exist_ok=True)
+            reusable_root = self._mask_parent / (
+                f"session-{os.getpid()}-{uuid.uuid4().hex}"
+            )
         self._mask_plan = WorkspaceMaskPlan.create(targets, root=reusable_root)
 
     def _volumes(self) -> list[Volume]:
@@ -207,7 +262,11 @@ class SandboxExecutor:
                 name="workspace",
                 host=Host(path=str(self.project_root)),
                 mountPath="/workspace",
-                readOnly=True,
+                # The coding workspace is intentionally writable: command
+                # tools must be able to create and modify the checked-out
+                # project. Sensitive paths are mounted below as empty,
+                # read-only overlays and therefore remain masked.
+                readOnly=False,
             )
         ]
         if self._mask_plan is None:
@@ -220,26 +279,38 @@ class SandboxExecutor:
                     mountPath=f"/workspace/{target.relative_path.as_posix()}",
                     readOnly=True,
                 )
-            )
+                )
         return volumes
 
-    async def _ensure_sandbox(self):
-        if self._sandbox is not None:
-            return self._sandbox
+    async def _ensure_server(self):
+        """Validate egress and ensure OpenSandbox is healthy for this session.
+
+        This is deliberately separate from ``Sandbox.create`` so the Durable
+        supervisor can fail before it accepts work or calls a model.  The
+        stable mask parent is part of the host-mount attestation; individual
+        empty overlays are created lazily immediately before the first
+        container.
+        """
         if Sandbox is None:
-            raise RuntimeError("opensandbox SDK 未装(pip install -e '.[sandbox]')")
+            raise SandboxUnavailableError(
+                "opensandbox SDK 未装(pip install -e '.[sandbox]')"
+            )
         await _validate_egress_targets(self.cfg.egress_allow)
-        # Gap 1 修复:确保 opensandbox-server 在跑(复用 external / 自动起 owned / 无 Docker 返 None)。
-        # ensure_server 内部已轮询 ready_timeout 等 server 起,故放 _with_retry 外(不重试 server lifecycle);
-        # 仅 Sandbox.create 通信步进 _with_retry。state None → SandboxUnavailableError 触发既有降级链。
-        # 懒 import(patch 目标 = cc_harness.sandbox_server.ensure_server 属性,单测 monkeypatch 该模块属性即可生效)。
+        # Lazy import keeps the base package importable without the optional
+        # OpenSandbox dependency, while allowing tests to patch the module
+        # seam before this method is called.
         from cc_harness.sandbox_server import ensure_server
-        # allowed_host_paths=[project_root]:server 0.2.1 空 allowed_host_paths = DENY-ALL
-        # (与 config 注释矛盾)→ 下方 Volume(host=Host(path=project_root)) mount 报
-        # HOST_PATH_NOT_ALLOWED。_fork_server 生成 config 时写入项目根前缀解锁。
+
         allowed_host_paths = [str(self.project_root)]
         if self._mask_plan is not None:
             allowed_host_paths.append(str(self._mask_plan.root))
+        else:
+            # The actual mask directory is created just before the first
+            # container.  Allow its stable parent during startup so an
+            # external server can attest the same contract without requiring
+            # a dynamic /tmp path in its configuration.
+            self._mask_parent.mkdir(parents=True, exist_ok=True)
+            allowed_host_paths.append(str(self._mask_parent))
         state = await ensure_server(
             host=self.cfg.server_host,
             port=self.cfg.server_port,
@@ -249,9 +320,29 @@ class SandboxExecutor:
             require_external_attestation=self.cfg.require_external_attestation,
         )
         if state is None:
-            # Docker 没装/server 起不来 → 直接走降级(run() 的 except SandboxUnavailableError 接住)。
             raise SandboxUnavailableError(
-                "opensandbox-server 不可用(Docker 未装/未运行,或 server 起不来)")
+                "opensandbox-server 不可用(Docker 未装/未运行,或 server 起不来)"
+            )
+        return state
+
+    async def prewarm_server(self):
+        """Start or reuse the OpenSandbox server without creating a container.
+
+        The server is owned by the current Durable supervisor process when it
+        is auto-started.  The eventual sandbox container remains lazy and is
+        still created on the first command, preserving the existing session
+        reuse and workspace-mask behavior.
+        """
+        return await self._ensure_server()
+
+    async def _ensure_sandbox(self):
+        if self._sandbox is not None:
+            return self._sandbox
+        # Gap 1 修复:确保 opensandbox-server 在跑(复用 external / 自动起 owned / 无 Docker 返 None)。
+        # Server lifecycle is intentionally outside _with_retry; only the
+        # Sandbox.create communication step gets bounded retries.
+        await self._refresh_workspace_masks()
+        await self._ensure_server()
         # Gap 2:kwargs 已锁真 SDK(opensandbox 0.1.13,inspect.signature 核实):
         #   volumes=[Volume(name, host=Host(path), mountPath, readOnly)] 替代 mounts=/Mount
         #   (真 SDK 无 Mount 类、无 mounts= 参数);connection_config=ConnectionConfig(domain=...)
@@ -262,8 +353,14 @@ class SandboxExecutor:
         # 项目根 RO mount:fs 工具改动实时反映(读一致)。
         cc = (ConnectionConfig(domain=f"{self.cfg.server_host}:{self.cfg.server_port}")
               if ConnectionConfig is not None else None)
+        lifetime = timedelta(seconds=_resolve_sandbox_lifetime())
         candidate = await _with_retry(lambda: Sandbox.create(
             self.cfg.image,
+            # The SDK default is 600s. A durable coding run regularly spans
+            # longer than that; an expired reused handle otherwise makes the
+            # next harmless command hang until the per-action timeout. This is
+            # a finite sandbox lifetime, not a command or benchmark timeout.
+            timeout=lifetime,
             volumes=self._volumes(),
             # 不传 env=:host(Windows)env(PATH/SYSTEMROOT)注入 Linux 沙箱会破坏容器。
             # 沙箱用容器默认 env;凭证后续走 Credential Vault(Task 12 增强),非 host env。
@@ -294,6 +391,22 @@ class SandboxExecutor:
                 display="'command' must be a non-empty string",
                 llm="[Tool Error] 'command' must be a non-empty string",
             )
+        # A detached process cannot be owned or audited by the short-lived
+        # sandbox command call.  Fail closed instead of silently ignoring the
+        # flag (which would make the model believe a service was started).
+        if bool(args.get("background", False)):
+            return ToolResult.error(
+                display="background execution is only supported by the native executor",
+                llm=(
+                    "[Tool Error] background execution is unavailable in the sandbox backend; "
+                    "use a managed service/run instead"
+                ),
+                metadata={
+                    "background": True,
+                    "background_supported": False,
+                    "state": "unsupported",
+                },
+            )
         try:
             await self._refresh_workspace_masks()
             sb = await self._ensure_sandbox()    # 内含 retry,3 次后抛 SandboxUnavailableError
@@ -309,15 +422,27 @@ class SandboxExecutor:
                     f"[Tool Error] sandbox timeout after {self.cfg.timeout_s}s; "
                     "the sandbox was destroyed"
                 ),
+                metadata={"exit_code": None, "timed_out": True},
             )
         except SandboxUnavailableError as e:
+            # Drop the session handle before surfacing the unknown outcome.
+            # The server may have restarted or the container endpoint may be
+            # stale; retaining it would make every later continuation reuse a
+            # dead client.  We still fail closed (the durable worker records
+            # outcome_unknown) and never replay a potentially mutating command.
+            await self._destroy_sandbox()
             # 降级前落审计,再上抛让调用方按配置处理。
-            _audit_fallback(project_root=self.project_root, reason=str(e), retries=3)
+            _audit_fallback(
+                project_root=self.project_root,
+                reason=str(e),
+                retries=_resolve_retry_attempts(),
+            )
             raise
         except Exception as e:
             return ToolResult.error(
                 display=f"sandbox run failed: {e}",
                 llm=f"[Tool Error] sandbox: {type(e).__name__}: {e}",
+                metadata={"exit_code": None, "timed_out": False, "exception": type(e).__name__},
             )
         stdout = "".join(log.text for log in (execution.logs.stdout or []))
         stderr = "".join(log.text for log in (execution.logs.stderr or []))
@@ -326,8 +451,22 @@ class SandboxExecutor:
             return ToolResult.error(
                 display=f"exit {execution.exit_code}: {combined[:200]}",
                 llm=f"[Tool Error] exit {execution.exit_code}\nstdout: {stdout}\nstderr: {stderr}",
+                metadata={
+                    "exit_code": execution.exit_code,
+                    "timed_out": False,
+                    "stdout": stdout,
+                    "stderr": stderr,
+                },
             )
-        return ToolResult.success(stdout if stdout else "(no output)")
+        return ToolResult.success(
+            stdout if stdout else "(no output)",
+            metadata={
+                "exit_code": 0,
+                "timed_out": False,
+                "stdout": stdout,
+                "stderr": stderr,
+            },
+        )
 
     async def kill(self) -> bool:
         """会话结束清理。"""

@@ -11,6 +11,23 @@ from pathlib import Path
 from cc_harness.policy import is_sensitive_path
 
 
+# Dependency/build trees can contain hundreds of thousands of files but are
+# not credential locations.  Walking them during supervisor startup made the
+# new sandbox prewarm look hung on real repositories.  Sensitive directories
+# are still discovered below; these names are only a traversal optimization.
+_PRUNED_DIR_NAMES = {
+    ".venv",
+    "node_modules",
+    "__pycache__",
+    ".mypy_cache",
+    ".pytest_cache",
+    ".ruff_cache",
+    "dist",
+    "build",
+    "target",
+}
+
+
 @dataclass(frozen=True)
 class MaskTarget:
     relative_path: Path
@@ -27,8 +44,20 @@ def discover_mask_targets(project_root: Path) -> tuple[MaskTarget, ...]:
         for name in dirnames:
             path = current_path / name
             relative = path.relative_to(root)
+            if name == ".git" and path.is_dir() and not path.is_symlink():
+                # Git object/pack trees are large and contain no credentials
+                # that this overlay protects.  Preserve the two config files
+                # that may contain credentials, without traversing every
+                # object and reflog in the repository.
+                for config_name in ("config", "config.worktree"):
+                    config_path = path / config_name
+                    if config_path.is_file() or config_path.is_symlink():
+                        targets.append(MaskTarget(relative / config_name, is_dir=False))
+                continue
             if path.is_symlink() or is_sensitive_path(relative):
                 targets.append(MaskTarget(relative, is_dir=True))
+            elif name in _PRUNED_DIR_NAMES:
+                continue
             else:
                 retained_dirs.append(name)
         dirnames[:] = retained_dirs

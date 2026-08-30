@@ -1,0 +1,3 @@
+# Classify verification outcomes into four states
+
+Verification must persist one of four states: `passed`, `failed`, `environment_not_ready`, or `outcome_unknown`. A failed assertion rejects the completion candidate and returns actionable unresolved errors for repair; an unavailable verifier blocks the Run and may receive bounded infrastructure-only retries without another model call; an interrupted or side-effecting check with unknown outcome remains blocked until reconciliation. Only a complete set of required `passed` results can emit `CompletionAccepted`, and no partial result may advance the Run to completed.

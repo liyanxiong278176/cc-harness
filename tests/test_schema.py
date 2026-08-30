@@ -17,6 +17,16 @@ def test_native_run_command_wrong_type_rejected():
     assert not ok
 
 
+def test_native_run_command_accepts_explicit_background_flag():
+    ok, msg = validate_native("run_command", {"command": "sleep 60", "background": True})
+    assert ok and msg == ""
+
+
+def test_native_run_command_rejects_unknown_background_shape():
+    ok, _ = validate_native("run_command", {"command": "sleep 60", "background": "yes"})
+    assert not ok
+
+
 def test_native_unknown_tool_passes():
     ok, _ = validate_native("something_else", {})
     assert ok

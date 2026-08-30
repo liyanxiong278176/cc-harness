@@ -56,7 +56,10 @@ class CheckResult:
 class TrialOutcome:
     status: TrialStatus
     metrics: Mapping[str, Any] = field(default_factory=dict)
-    usage: Mapping[str, int | None] = field(default_factory=dict)
+    # Usage is intentionally extensible: token counters remain integers while
+    # provider billing telemetry also carries a currency, status, and source.
+    # Keeping this as ``Any`` avoids coercing or dropping those audit facts.
+    usage: Mapping[str, Any] = field(default_factory=dict)
     invalid_reason: str | None = None
     failure_reason: str | None = None
     critical_failure: bool = False

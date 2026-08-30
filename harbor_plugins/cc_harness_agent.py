@@ -7,7 +7,7 @@ import re
 import shlex
 import time
 from datetime import UTC, datetime
-from decimal import ROUND_HALF_UP, Decimal
+import math
 from pathlib import Path
 from typing import Any, override
 
@@ -52,9 +52,7 @@ Execution discipline for this Terminal-Bench task:
   final change. Once the artifacts and decisive checks pass, stop immediately
   and leave a concise final summary instead of doing optional extra work.
 """
-PRICING_CONTRACT_DIGEST = (
-    "sha256:662ed3f9340531cb7391c9dd983c0494c99f36f5862249d608f6a7e8ba0944f1"
-)
+COST_CONTRACT = "provider-reported-only-v1"
 _WHEEL_VERSION = re.compile(r"^cc_harness-([0-9]+\.[0-9]+\.[0-9]+)-")
 _TIKTOKEN_CACHE_DIR = "/opt/cc-harness/tiktoken-cache"
 _TIKTOKEN_CACHE_KEY = "9b5ad71b2ce5302211f9c61530b329a4922fc6a4"
@@ -511,7 +509,10 @@ class CCHarnessHarborAgent(BaseInstalledAgent):
         context.n_input_tokens = usage["input_tokens"]
         context.n_cache_tokens = usage["cache_read_input_tokens"]
         context.n_output_tokens = usage["output_tokens"]
-        context.cost_usd = usage["cost_microusd"] / 1_000_000
+        # Harbor's context field is USD.  Only populate it when the provider
+        # explicitly reports USD (or the provider's legacy direct-cost field
+        # omitted currency); never derive it from token counts.
+        context.cost_usd = usage["provider_cost_usd"]
         context.metadata = {
             "resolved_model": MODEL,
             "model_calls": usage["model_calls"],
@@ -527,7 +528,13 @@ class CCHarnessHarborAgent(BaseInstalledAgent):
             "uncached_input_tokens": usage["uncached_input_tokens"],
             "cache_creation_input_tokens": usage["cache_creation_input_tokens"],
             "cache_read_input_tokens": usage["cache_read_input_tokens"],
-            "pricing_contract_digest": PRICING_CONTRACT_DIGEST,
+            "api_reported_cost": usage["api_reported_cost"],
+            "api_reported_cost_currency": usage["api_reported_cost_currency"],
+            "api_cost_source": "provider",
+            "api_cost_status": usage["api_cost_status"],
+            "api_cost_observed": usage["api_cost_observed"],
+            "api_cost_complete": usage["api_cost_complete"],
+            "cost_contract": COST_CONTRACT,
         }
 
     @override
@@ -571,7 +578,7 @@ def _parse_document(stdout: str) -> dict[str, Any]:
     return result
 
 
-def _usage_from_document(result: dict[str, Any]) -> dict[str, int]:
+def _usage_from_document(result: dict[str, Any]) -> dict[str, Any]:
     usage = result.get("usage")
     if not isinstance(usage, dict):
         raise TypeError("cc-harness result lacks usage telemetry")
@@ -582,11 +589,56 @@ def _usage_from_document(result: dict[str, Any]) -> dict[str, int]:
     if uncached + cache_creation + cache_read != input_tokens:
         raise ValueError("cc-harness cache token breakdown does not sum to input_tokens")
     output_tokens = _count(usage, "output_tokens")
-    cost = (
-        Decimal(uncached) * Decimal(5)
-        + Decimal(cache_creation) * Decimal("6.25")
-        + Decimal(cache_read) * Decimal("0.5")
-        + Decimal(output_tokens) * Decimal(25)
+    model_calls = _count(usage, "model_calls")
+    tool_calls = _count(usage, "tool_calls")
+    raw_cost = usage.get("api_reported_cost")
+    if raw_cost is None:
+        raw_cost = usage.get("reported_cost")
+    try:
+        api_reported_cost = float(raw_cost) if raw_cost is not None else None
+    except (TypeError, ValueError):
+        api_reported_cost = None
+    if api_reported_cost is not None and (
+        not math.isfinite(api_reported_cost) or api_reported_cost < 0
+    ):
+        api_reported_cost = None
+    raw_currency = usage.get("api_reported_cost_currency")
+    if raw_currency is None:
+        raw_currency = usage.get("reported_cost_currency")
+    api_reported_cost_currency = (
+        str(raw_currency).strip().upper() if raw_currency is not None else None
+    )
+    raw_status = usage.get("api_cost_status")
+    api_cost_status = (
+        str(raw_status).strip().lower() if raw_status is not None else None
+    )
+    if api_cost_status is None and api_reported_cost is not None:
+        # Backward-compatible direct provider envelope: the amount itself is
+        # evidence, but no tariff inference is permitted.
+        api_cost_status = "reported"
+    # Providers may return token usage without a separate call counter. That
+    # is still observable model activity, so a missing direct price must be
+    # classified as incomplete rather than unavailable.
+    api_cost_observed = (
+        bool(usage.get("api_cost_observed"))
+        or model_calls > 0
+        or input_tokens > 0
+        or output_tokens > 0
+    )
+    api_cost_complete = (
+        api_cost_status == "reported" and api_reported_cost is not None
+    )
+    if not api_cost_complete:
+        api_cost_status = "incomplete" if api_cost_observed else "unavailable"
+    provider_cost_usd = (
+        api_reported_cost
+        if api_cost_complete and api_reported_cost_currency in (None, "USD")
+        else None
+    )
+    direct_cost_microusd = (
+        round(provider_cost_usd * 1_000_000)
+        if provider_cost_usd is not None
+        else None
     )
     return {
         "input_tokens": input_tokens,
@@ -594,9 +646,18 @@ def _usage_from_document(result: dict[str, Any]) -> dict[str, int]:
         "cache_creation_input_tokens": cache_creation,
         "cache_read_input_tokens": cache_read,
         "output_tokens": output_tokens,
-        "model_calls": _count(usage, "model_calls"),
-        "tool_calls": _count(usage, "tool_calls"),
-        "cost_microusd": int(cost.quantize(Decimal(1), rounding=ROUND_HALF_UP)),
+        "model_calls": model_calls,
+        "tool_calls": tool_calls,
+        # This legacy-shaped field is now a normalized provider USD fact, not
+        # a token-tariff estimate.  It stays null for unknown currencies.
+        "cost_microusd": direct_cost_microusd,
+        "api_reported_cost": api_reported_cost if api_cost_complete else None,
+        "api_reported_cost_currency": api_reported_cost_currency,
+        "api_cost_source": "provider",
+        "api_cost_status": api_cost_status,
+        "api_cost_observed": api_cost_observed,
+        "api_cost_complete": api_cost_complete,
+        "provider_cost_usd": provider_cost_usd,
     }
 
 
@@ -711,12 +772,16 @@ def _atif_trajectory(
             total_prompt_tokens=usage["input_tokens"],
             total_completion_tokens=usage["output_tokens"],
             total_cached_tokens=usage["cache_read_input_tokens"],
-            total_cost_usd=usage["cost_microusd"] / 1_000_000,
+            total_cost_usd=usage["provider_cost_usd"],
             total_steps=len(steps),
             extra={
                 "model_calls": usage["model_calls"],
                 "tool_calls": usage["tool_calls"],
-                "pricing_contract_digest": PRICING_CONTRACT_DIGEST,
+                "api_reported_cost": usage["api_reported_cost"],
+                "api_reported_cost_currency": usage["api_reported_cost_currency"],
+                "api_cost_source": "provider",
+                "api_cost_status": usage["api_cost_status"],
+                "cost_contract": COST_CONTRACT,
             },
         ),
         notes="Converted from cc-harness append-only JSONL events; raw JSONL is retained.",

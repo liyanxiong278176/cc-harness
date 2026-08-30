@@ -11,7 +11,9 @@ import contextlib
 import json
 import traceback
 import re
+import time
 from dataclasses import dataclass, replace
+from pathlib import Path
 from typing import Any, Awaitable, Callable, Mapping, Sequence
 
 from .action_contracts import ToolContractRegistry
@@ -19,11 +21,21 @@ from .activation import ActivationManifest
 from .capability_runtime import AgentCapabilityRuntime
 from .interaction_history import assistant_message, materialize_interaction_messages, objective_messages
 from .lease import LeaseManager
+from .llm import ProviderProtocolError
 from .run_events import EventActor, RunEvent
 from .run_kernel import ActionRequest, AgentKernel, SegmentContext
-from .run_model import ActionStatus, CompletionCandidate, EffectClass, Lease, RunStatus
+from .run_model import (
+    ActionStatus,
+    CompletionCandidate,
+    EffectClass,
+    EvidenceKind,
+    EvidenceRef,
+    Lease,
+    RunStatus,
+)
 from .run_projection import RunProjection
 from .run_store import RunStore
+from .run_outcomes import outcome_for_event
 from .tool_observation import ToolObservation, make_observation
 
 
@@ -43,6 +55,10 @@ class ActionExecutionResult:
 ActionExecutor = Callable[[ActionRequest], Awaitable[ActionExecutionResult]]
 CompletionVerifier = Callable[[CompletionCandidate], bool]
 MessageProvider = Callable[[RunProjection], Sequence[Mapping[str, Any]]]
+ChildCompletionCallback = Callable[[str, CompletionCandidate], Awaitable[None]]
+ChildCancellationCallback = Callable[[str, str], Awaitable[None]]
+ChildFailureCallback = Callable[[str, str], Awaitable[None]]
+WorkingDirectoryResolver = Callable[[str], Awaitable[Path]]
 
 _SENSITIVE_KEY = re.compile(
     r"(?:api.?key|access.?token|authorization|cookie|credential|password|passwd|private.?key|secret|token)",
@@ -83,10 +99,15 @@ class RunWorker:
         persist_interactions: bool = True,
         activation_manifest: ActivationManifest | None = None,
         project_instructions: str | None = None,
+        child_completion_callback: ChildCompletionCallback | None = None,
+        child_cancellation_callback: ChildCancellationCallback | None = None,
+        child_failure_callback: ChildFailureCallback | None = None,
+        working_directory_resolver: WorkingDirectoryResolver | None = None,
     ) -> None:
         self.store = store
         self.kernel = kernel
         self.worker_id = worker_id
+        self._uses_default_lease_manager = lease_manager is None
         self.lease_manager = lease_manager or LeaseManager(store)
         self.action_executor = action_executor
         self.contracts = contracts or ToolContractRegistry.first_party()
@@ -99,6 +120,11 @@ class RunWorker:
         self.persist_interactions = persist_interactions
         self.activation_manifest = activation_manifest
         self.project_instructions = project_instructions
+        self.child_completion_callback = child_completion_callback
+        self.child_cancellation_callback = child_cancellation_callback
+        self.child_failure_callback = child_failure_callback
+        self.working_directory_resolver = working_directory_resolver
+        self.working_directory: Path = self.store.project_root
         self._active_node_id: str | None = None
         self._event_lock = asyncio.Lock()
 
@@ -112,6 +138,8 @@ class RunWorker:
         current_lease = lease
         try:
             projection = await self.store.load_projection(lease.run_id)
+            if self.working_directory_resolver is not None:
+                self.working_directory = await self.working_directory_resolver(lease.run_id)
             segment = self._next_segment(projection)
             await self._append(current_lease, "RunSegmentStarted", {"segment": segment})
             self._active_node_id = await self._ensure_plan_node_started(current_lease, projection)
@@ -129,7 +157,7 @@ class RunWorker:
 
             projection = await self.store.load_projection(lease.run_id)
             if projection.status is RunStatus.CANCEL_REQUESTED:
-                await self._append(current_lease, "RunCancelled", {"reason": "cancel requested"})
+                await self._acknowledge_cancellation(current_lease, "cancel requested")
                 return
 
             # Approval is a durable pause. Once granted, resume the exact
@@ -144,6 +172,16 @@ class RunWorker:
             )
             had_action = had_action or recovered_action
             if recovery_blocked:
+                # A recovered child must not disappear behind a blocked
+                # projection.  Surface the durable failure to the parent so
+                # the parent can re-plan or replace that child instead of
+                # waiting forever on a child that can no longer progress.
+                if self.child_failure_callback is not None:
+                    with contextlib.suppress(Exception):
+                        await self.child_failure_callback(
+                            lease.run_id,
+                            "in-flight action recovery blocked; reconciliation required",
+                        )
                 return
 
             # A Segment is a recoverable interaction interval, not one model
@@ -152,12 +190,19 @@ class RunWorker:
             while True:
                 projection = await self.store.load_projection(lease.run_id)
                 if projection.status is RunStatus.CANCEL_REQUESTED:
-                    await self._append(current_lease, "RunCancelled", {"reason": "cancel requested"})
+                    await self._acknowledge_cancellation(current_lease, "cancel requested")
                     return
                 if self.capability_runtime is not None:
                     validate_goal = getattr(self.capability_runtime, "validate_goal", None)
                     if validate_goal is not None:
                         goal_allowed, goal_reason = await validate_goal(projection)
+                        self._trigger_activation(
+                            "safety",
+                            run_id=lease.run_id,
+                            stage="goal_validation",
+                            allowed=bool(goal_allowed),
+                            reason=str(goal_reason),
+                        )
                         if not goal_allowed:
                             await self._append(
                                 current_lease,
@@ -178,7 +223,9 @@ class RunWorker:
                         projection,
                         messages,
                         self.available_tools,
-                        query=projection.goal.objective if projection.goal else "",
+                        # Automatic memory injection is an L2/L3 snapshot;
+                        # concrete L1 recall remains an explicit model tool.
+                        query="",
                     )
                     messages = context_build.messages
                     context_manifest_artifact = context_build.manifest_artifact
@@ -247,11 +294,12 @@ class RunWorker:
                         )
                         return
                 round_index = len(projection.actions)
+                invocation_id = f"model-{lease.run_id}-{segment}-{round_index}"
                 await self._append(
                     current_lease,
                     "ModelInvocationStarted",
                     {
-                        "invocation_id": f"model-{lease.run_id}-{segment}-{round_index}",
+                        "invocation_id": invocation_id,
                         "segment": segment,
                         "round": round_index,
                         "context_manifest_artifact": context_manifest_artifact,
@@ -278,7 +326,54 @@ class RunWorker:
                     worker_id=self.worker_id,
                     cancellation_requested=projection.status is RunStatus.CANCEL_REQUESTED,
                 )
-                outcome = await self.kernel.execute_segment(context)
+                invocation_started = time.monotonic()
+                invocation_status = "failed"
+                invocation_error: str | None = None
+                outcome = None
+                try:
+                    outcome = await self.kernel.execute_segment(context)
+                    invocation_status = "succeeded"
+                except asyncio.CancelledError as exc:
+                    invocation_status = "cancelled"
+                    invocation_error = f"{type(exc).__name__}: {exc}"[:600]
+                    raise
+                except Exception as exc:
+                    invocation_error = f"{type(exc).__name__}: {exc}"[:600]
+                    raise
+                finally:
+                    # Persist a terminal invocation fact even when the
+                    # provider stream fails before an assistant message can
+                    # be committed.  Usage reports consume these facts.
+                    finished_payload: dict[str, Any] = {
+                        "invocation_id": invocation_id,
+                        "status": invocation_status,
+                        "duration_ms": round((time.monotonic() - invocation_started) * 1000, 3),
+                        "usage": dict(getattr(outcome, "usage", {}) or {}),
+                    }
+                    if invocation_error:
+                        finished_payload["error"] = invocation_error
+                    with contextlib.suppress(Exception):
+                        await self._append_runtime_event(
+                            lease.run_id,
+                            "ModelInvocationFinished",
+                            finished_payload,
+                        )
+                after_model = await self.store.load_projection(lease.run_id)
+                if after_model.status in {RunStatus.CANCEL_REQUESTED, RunStatus.CANCELLED}:
+                    await self._append(
+                        current_lease,
+                        "AssistantMessageInterrupted",
+                        {
+                            "segment": segment,
+                            "round": round_index,
+                            "reason": "cancel requested during model segment",
+                        },
+                    )
+                    await self._acknowledge_cancellation(
+                        current_lease,
+                        "cancel requested during model segment",
+                    )
+                    return
                 protect_output = getattr(self.capability_runtime, "protect_model_output", None)
                 if protect_output is not None:
                     safe_text, _security_details = protect_output(outcome.model_text, messages)
@@ -371,6 +466,12 @@ class RunWorker:
                         )
                         return
                 statuses = await self._execute_request_batch(current_lease, requests)
+                cancellation_state = await self.store.load_projection(lease.run_id)
+                if cancellation_state.status is RunStatus.CANCEL_REQUESTED:
+                    await self._acknowledge_cancellation(current_lease, "cancel requested after action boundary")
+                    return
+                if cancellation_state.status is RunStatus.CANCELLED:
+                    return
                 for request, result_status in zip(requests, statuses, strict=True):
                     if result_status is ActionStatus.OUTCOME_UNKNOWN:
                         await self._append(
@@ -414,6 +515,23 @@ class RunWorker:
                 had_action=had_action,
                 had_progress=had_progress,
             )
+        except ProviderProtocolError as exc:
+            # Protocol failures are deterministic and must be visible in the
+            # durable stream.  Never retry by fabricating provider fields or
+            # spending another model call on the same malformed replay.
+            with contextlib.suppress(Exception):
+                await self._append(
+                    current_lease,
+                    "RunFailed",
+                    {
+                        "reason": f"{exc.code}: {str(exc)[:600]}",
+                        "target_status": RunStatus.FAILED_RECOVERABLE.value,
+                    },
+                )
+            if self.child_failure_callback is not None:
+                with contextlib.suppress(Exception):
+                    await self.child_failure_callback(current_lease.run_id, f"{exc.code}: {exc}")
+            raise
         except Exception as exc:
             # A worker exception must become durable state before its lease is
             # released.  Otherwise the supervisor has neither an active task
@@ -432,6 +550,12 @@ class RunWorker:
                         "target_status": RunStatus.FAILED_RECOVERABLE.value,
                     },
                 )
+            if self.child_failure_callback is not None:
+                with contextlib.suppress(Exception):
+                    await self.child_failure_callback(
+                        lease.run_id,
+                        f"{type(exc).__name__}: {str(exc)[:300]}",
+                    )
             raise
         finally:
             if heartbeat_task is not None:
@@ -972,15 +1096,29 @@ class RunWorker:
         lease: Lease,
         candidate: CompletionCandidate | None,
     ) -> bool:
-        if candidate is None:
-            return False
-        await self._append(
-            lease,
-            "CompletionCandidateSubmitted",
-            candidate.to_dict(),
-        )
-        verifier = self.completion_verifier or self._valid_candidate
         projection = await self.store.load_projection(lease.run_id)
+        source = "model"
+        if candidate is None:
+            candidate = await self._synthesize_completion_candidate(lease, projection)
+            if candidate is None:
+                return False
+            source = "runtime"
+        required_pending = tuple(
+            item.child_run_id
+            for item in projection.children
+            if item.required and item.status not in {"completed", "accepted"}
+        )
+        if required_pending:
+            candidate = replace(
+                candidate,
+                unaccepted_children=tuple(
+                    sorted(set(candidate.unaccepted_children).union(required_pending))
+                ),
+            )
+        submitted_payload = candidate.to_dict()
+        submitted_payload.update({"source": source, "synthesized": source == "runtime"})
+        await self._append(lease, "CompletionCandidateSubmitted", submitted_payload)
+        verifier = self.completion_verifier or self._valid_candidate
         if verifier(candidate):
             try:
                 if projection.goal is not None:
@@ -1019,9 +1157,172 @@ class RunWorker:
                         },
                     )
                     return False
-            await self._append(lease, "CompletionAccepted", candidate.to_dict())
+            accepted_payload = candidate.to_dict()
+            accepted_payload.update(
+                {
+                    "source": source,
+                    "synthesized": source == "runtime",
+                    "evidence_refs": [item.digest for item in candidate.evidence],
+                }
+            )
+            await self._append(lease, "CompletionAccepted", accepted_payload)
+            if self.child_completion_callback is not None and await self._is_child_run(lease.run_id):
+                await self.child_completion_callback(lease.run_id, candidate)
             return True
         return False
+
+    async def _synthesize_completion_candidate(
+        self,
+        lease: Lease,
+        projection: RunProjection,
+    ) -> CompletionCandidate | None:
+        """Build a candidate only when durable evidence satisfies the goal.
+
+        A model's final sentence is never treated as completion evidence.  The
+        gate requires complete successful observations, no unresolved latest
+        action, and a post-mutation verification for code changes. Service
+        goals additionally require a successful health/readiness-shaped probe.
+        """
+
+        goal = projection.goal
+        if goal is None:
+            return None
+        if any(
+            item.required and item.status not in {"completed", "accepted"}
+            for item in projection.children
+        ):
+            return None
+        if any(item.status.value == "requested" for item in projection.approvals):
+            return None
+
+        latest_actions: dict[str, Any] = {}
+        for action in projection.actions:
+            previous = latest_actions.get(action.action_id)
+            if previous is None or action.attempt > previous.attempt:
+                latest_actions[action.action_id] = action
+        if any(
+            action.status in {
+                ActionStatus.PLANNED,
+                ActionStatus.PREPARED,
+                ActionStatus.STARTED,
+                ActionStatus.FAILED,
+                ActionStatus.OUTCOME_UNKNOWN,
+            }
+            for action in latest_actions.values()
+        ):
+            return None
+
+        events: list[RunEvent] = []
+        after = 0
+        while True:
+            page = await self.store.read(lease.run_id, after=after, limit=1000)
+            events.extend(page.events)
+            if page.next_cursor is None:
+                break
+            after = page.next_cursor
+
+        evidence: list[EvidenceRef] = []
+        verification_evidence: list[EvidenceRef] = []
+        service_probe = False
+        for event in events:
+            if (
+                event.event_type != "ToolObservationCommitted"
+                or event.payload.get("status") != "succeeded"
+                or not bool(event.payload.get("complete", True))
+            ):
+                continue
+            artifact = str(event.payload.get("observation_artifact") or "")
+            if not artifact:
+                continue
+            try:
+                raw = json.loads(self.store.artifacts.read_text(artifact))
+                observation = ToolObservation.from_dict(raw)
+            except (OSError, TypeError, ValueError, KeyError, json.JSONDecodeError):
+                continue
+            metadata = dict(observation.metadata)
+            arguments = metadata.get("request_arguments")
+            command = (
+                str(arguments.get("command") or "")
+                if isinstance(arguments, Mapping)
+                else ""
+            )
+            source = command or observation.tool_name
+            marker_text = f"{observation.tool_name} {command}".casefold()
+            is_verification = any(
+                marker in marker_text
+                for marker in (
+                    "pytest", "unittest", "test", "verify", "check", "lint", "typecheck",
+                    "mypy", "ruff", "eslint", "build", "compile", "cargo test", "go test",
+                    "npm test",
+                )
+            )
+            if any(
+                marker in marker_text
+                for marker in ("curl", "health", "readiness", "grpcurl", "nc ", "ss ")
+            ):
+                service_probe = True
+            ref = EvidenceRef(
+                evidence_id=f"runtime-{observation.observation_id}",
+                kind=EvidenceKind.TEST if is_verification else EvidenceKind.ACTION_RESULT,
+                digest=artifact,
+                source=source,
+                recorded_at=time.time(),
+                confidence=1.0,
+                metadata={"action_id": observation.action_id, "status": observation.status},
+            )
+            evidence.append(ref)
+            if is_verification:
+                verification_evidence.append(ref)
+        if not evidence:
+            return None
+
+        changed_paths = tuple(sorted(set(projection.working_state.modified_paths)))
+        # Runtime synthesis is deliberately stricter than a model-submitted
+        # candidate: at least one explicit verification-shaped action must
+        # have succeeded.  A read-only observation alone is not proof that the
+        # user's acceptance criteria were met.
+        if not verification_evidence:
+            return None
+        goal_text = f"{goal.objective} {' '.join(goal.acceptance_criteria)}".casefold()
+        service_goal = any(
+            marker in goal_text
+            for marker in ("service", "server", "endpoint", "listening", "daemon", "api", "health")
+        )
+        if service_goal and not service_probe:
+            return None
+        if goal.required_evidence and len(evidence) < len(goal.required_evidence):
+            return None
+        return CompletionCandidate(
+            acceptance_criteria=tuple(goal.acceptance_criteria),
+            evidence=tuple(evidence[-50:]),
+            modified_paths=changed_paths,
+        )
+
+    async def _acknowledge_cancellation(self, lease: Lease, reason: str) -> bool:
+        """Finalize a cooperative cancellation at a safe worker boundary.
+
+        The client only records ``InterruptRequested`` first.  This method is
+        the sole worker-owned transition to ``RunCancelled`` after any
+        in-flight action has been observed (and, when necessary, marked
+        ``ActionOutcomeUnknown``).  Keeping the callback here also updates the
+        parent projection for child Runs that were actually cancelled.
+        """
+
+        projection = await self.store.load_projection(lease.run_id)
+        if projection.status is RunStatus.CANCEL_REQUESTED:
+            await self._append(lease, "RunCancelled", {"reason": reason})
+            if self.child_cancellation_callback is not None:
+                await self.child_cancellation_callback(lease.run_id, reason)
+            return True
+        if projection.status is RunStatus.CANCELLED:
+            if self.child_cancellation_callback is not None:
+                await self.child_cancellation_callback(lease.run_id, reason)
+            return True
+        return False
+
+    async def _is_child_run(self, run_id: str) -> bool:
+        record = await self.store.load_run_record(run_id)
+        return bool(record.parent_run_id)
 
     async def _active_node_completed(self, run_id: str) -> bool:
         if not self._active_node_id:
@@ -1097,6 +1398,39 @@ class RunWorker:
             committed_progress=committed_progress,
         )
 
+    async def _append_runtime_event(
+        self,
+        run_id: str,
+        event_type: str,
+        payload: Mapping[str, Any],
+        artifact_refs: tuple[str, ...] = (),
+    ) -> RunEvent:
+        """Append a runtime-owned fact without requiring a live worker lease.
+
+        Terminal invocation/outcome telemetry must survive cancellation and
+        lease expiry.  It is still serialized through the same event lock and
+        SQLite writer, but deliberately uses lease epoch zero so a stale
+        worker cannot fence the audit record after its work has stopped.
+        """
+
+        async with self._event_lock:
+            projection = await self.store.load_projection(run_id)
+            event = RunEvent.create(
+                run_id=run_id,
+                sequence=projection.sequence + 1,
+                event_type=event_type,
+                actor=EventActor("runtime", "durable-runtime"),
+                runtime_contract_digest=str(projection.runtime_contract_digest),
+                lease_epoch=0,
+                payload=dict(payload),
+                artifact_refs=artifact_refs,
+            )
+            return await self.store.append(
+                event,
+                expected_sequence=projection.sequence,
+                expected_lease_epoch=None,
+            )
+
     async def _execute_action(
         self,
         lease: Lease,
@@ -1109,6 +1443,11 @@ class RunWorker:
         effect = request.effect_class
         if effect == EffectClass.UNKNOWN:
             effect = contract.effect_class
+        before_plan = await self.store.load_projection(lease.run_id)
+        if before_plan.status in {RunStatus.CANCEL_REQUESTED, RunStatus.CANCELLED}:
+            # The request was planned by the model, but Ctrl+C arrived before
+            # execution.  Do not start a new effect after cancellation.
+            return ActionStatus.CANCELLED
         if not planned:
             await self._plan_action(
                 lease,
@@ -1157,10 +1496,30 @@ class RunWorker:
                 )
             else:
                 result = await self.action_executor(request)
-        except BaseException:
+        except asyncio.CancelledError:
+            # Cancellation is the supervisor's safety boundary.  Never turn
+            # it into OUTCOME_UNKNOWN: doing so lets a wedged action swallow
+            # lease-recovery cancellation and keep a stale worker alive.
+            raise
+        except Exception:
             result = ActionExecutionResult(
                 ActionStatus.OUTCOME_UNKNOWN,
                 error_kind="executor_lost",
+            )
+        cancellation_projection = await self.store.load_projection(lease.run_id)
+        if (
+            cancellation_projection.status in {RunStatus.CANCEL_REQUESTED, RunStatus.CANCELLED}
+            and result.status is not ActionStatus.OUTCOME_UNKNOWN
+        ):
+            # The external effect may have completed concurrently with the
+            # interrupt.  Preserve its artifacts/paths but classify the final
+            # outcome as unknown so continuation never replays it blindly.
+            result = replace(
+                result,
+                status=ActionStatus.OUTCOME_UNKNOWN,
+                observation=None,
+                observation_artifact=None,
+                error_kind=result.error_kind or "cancelled_during_action",
             )
         observation = result.observation
         observation_artifact = result.observation_artifact
@@ -1243,7 +1602,60 @@ class RunWorker:
             event_type = "ActionOutcomeUnknown"
             payload["reason"] = result.error_kind or "unknown"
         await self._append(lease, event_type, payload)
+        if event_type == "ActionSucceeded":
+            verification = self._verification_evidence(request, observation, observation_artifact)
+            if verification is not None:
+                await self._append(
+                    lease,
+                    "VerificationRecorded",
+                    {
+                        "evidence": [verification.to_dict()],
+                        "ok": True,
+                        "source": verification.source,
+                    },
+                    artifact_refs=(verification.digest,),
+                )
         return result.status
+
+    @staticmethod
+    def _verification_evidence(
+        request: ActionRequest,
+        observation: ToolObservation,
+        observation_artifact: str,
+    ) -> EvidenceRef | None:
+        """Turn an explicitly verification-shaped successful action into evidence.
+
+        Arbitrary successful commands are not tests.  The command/source must
+        contain a stable verification marker and the observation must be
+        complete and successful.
+        """
+
+        if observation.status != "succeeded" or not observation.complete:
+            return None
+        command = str(request.arguments.get("command") or "")
+        source = command or request.tool_name
+        marker_text = f"{request.tool_name} {command}".casefold()
+        markers = (
+            "pytest", "unittest", "test", "verify", "check", "lint", "typecheck",
+            "mypy", "ruff", "eslint", "build", "compile", "curl", "health",
+            "readiness", "grpcurl", "cargo test", "go test", "npm test", "npm run",
+        )
+        if not any(marker in marker_text for marker in markers):
+            return None
+        return EvidenceRef(
+            evidence_id=f"verification-{observation.observation_id}",
+            kind=EvidenceKind.TEST,
+            digest=observation_artifact,
+            source=source,
+            recorded_at=time.time(),
+            confidence=1.0,
+            metadata={
+                "action_id": request.action_id,
+                "tool_name": request.tool_name,
+                "status": observation.status,
+                "complete": observation.complete,
+            },
+        )
 
     async def _append_observation_chunks(
         self,
@@ -1321,7 +1733,7 @@ class RunWorker:
     ) -> None:
         projection = await self.store.load_projection(lease.run_id)
         if projection.status is RunStatus.CANCEL_REQUESTED:
-            await self._append(lease, "RunCancelled", {"reason": "cancel requested"})
+            await self._acknowledge_cancellation(lease, "cancel requested")
             return
         await self._append(lease, "RunSegmentFinished", {"segment": segment})
         if not had_action and not had_progress:
@@ -1342,10 +1754,16 @@ class RunWorker:
         return bool(candidate.evidence and candidate.acceptance_criteria)
 
     def _default_messages(self, projection: RunProjection) -> Sequence[Mapping[str, Any]]:
+        objective_text = None
+        if self.capability_runtime is not None:
+            secure_goal = getattr(self.capability_runtime, "secured_goal_text", None)
+            if secure_goal is not None:
+                objective_text = secure_goal(projection)
         return objective_messages(
             projection,
-            cwd=self.store.project_root,
+            cwd=self.working_directory,
             project_instructions=self.project_instructions,
+            objective_text=objective_text,
         )
 
     async def _messages_for_projection(
@@ -1387,11 +1805,31 @@ class RunWorker:
                 payload=dict(payload),
                 artifact_refs=artifact_refs,
             )
-            return await self.store.append(
+            stored = await self.store.append(
                 event,
                 expected_sequence=projection.sequence,
                 expected_lease_epoch=lease.epoch,
             )
+        derived = outcome_for_event(event_type, payload)
+        if derived is not None:
+            outcome_payload = derived.to_dict()
+            outcome_payload["source_event"] = event_type
+            if event_type == "CompletionAccepted":
+                outcome_payload["evidence_refs"] = [
+                    str(item.get("digest"))
+                    for item in (payload.get("evidence") or ())
+                    if isinstance(item, Mapping) and item.get("digest")
+                ]
+            # Terminal lifecycle events can release the worker lease before
+            # their derived telemetry is appended.  Record the immutable
+            # outcome as a runtime-owned, lease-free event so cancellation or
+            # blocking never turns into a misleading LeaseFenceError.
+            await self._append_runtime_event(
+                lease.run_id,
+                "RunOutcomeRecorded",
+                outcome_payload,
+            )
+        return stored
 
 
 __all__ = ["ActionExecutionResult", "RunWorker"]

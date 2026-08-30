@@ -136,6 +136,12 @@ def test_sanitize_redacts():
     assert "[REDACTED:api_key]" in sanitize("x sk-" + "a" * 48 + " y", eng)
 
 
+def test_engine_sanitize_matches_module_helper():
+    eng = build_l5_engine(L5Config())
+    raw = "x sk-" + "a" * 48 + " y"
+    assert eng.sanitize(raw) == sanitize(raw, eng)
+
+
 # --- build_l5_engine / kill-switch / per-layer 开关 ---
 
 def test_build_disabled_returns_none():

@@ -1,0 +1,27 @@
+# ===== Java / Maven =====
+target/
+*.class
+*.jar
+!.mvn/wrapper/*.jar
+.idea/
+*.iml
+.vscode/
+
+# ===== Node / 前端 =====
+frontend/node_modules/
+frontend/dist/
+frontend/.env.local
+frontend/.env.*.local
+frontend/package-lock.json
+
+# ===== 运行数据与凭证 =====
+.env
+logs/*.log
+*.pid
+
+# ===== OS =====
+.DS_Store
+Thumbs.db
+# cc-harness Durable Run state and raw reflection logs (never commit)
+.cc-harness/
+logs/*.jsonl

@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
+import math
 import os
 import re
 import shutil
@@ -347,24 +348,20 @@ class _HarborAdapter:
         )
         if not docker_health["ready"]:
             diagnostic = str(docker_health.get("last_error") or "Docker daemon unavailable")
-            terminal_official = self.slug == "terminal-bench-2.1"
             return TrialOutcome(
-                status=TrialStatus.FAIL if terminal_official else TrialStatus.INVALID,
-                metrics={"reward": 0.0, "errored_trial": 1} if terminal_official else {},
-                failure_reason=(
-                    f"official trial could not start: {diagnostic}" if terminal_official else None
-                ),
+                # No Harbor/model work has started at this point. Keep this
+                # as infrastructure evidence so the runner can retry the
+                # same checkpoint without publishing a false task failure.
+                status=TrialStatus.INVALID,
                 invalid_reason=(
-                    None
-                    if terminal_official
-                    else "Docker daemon health check failed after "
+                    "Docker daemon health check failed after "
                     f"{docker_health['attempts']} attempts: {diagnostic}"
                 ),
                 protocol={
                     "exception_is_infrastructure": True,
                     "transient_infrastructure": True,
                     "docker_healthcheck": docker_health,
-                    "official_error_counted_as_zero": terminal_official,
+                    "official_error_counted_as_zero": False,
                 },
             )
         configured = {
@@ -499,22 +496,21 @@ class _HarborAdapter:
             stdout, stderr = await communicate
         except TimeoutError:
             await _terminate_process_tree(process)
-            terminal_official = self.slug == "terminal-bench-2.1"
             return TrialOutcome(
-                status=TrialStatus.FAIL if terminal_official else TrialStatus.INVALID,
-                metrics={"reward": 0.0, "errored_trial": 1} if terminal_official else {},
-                failure_reason=(
-                    "official trial exceeded the emergency watchdog"
-                    if terminal_official
-                    else None
-                ),
-                invalid_reason=(
-                    None if terminal_official else "Harbor exceeded the external emergency watchdog"
-                ),
+                # An external watchdog is a launcher/runtime boundary, not an
+                # official task assertion. Preserve it as pending evidence;
+                # do not turn a silent process into a zero-reward task fail.
+                status=TrialStatus.INVALID,
+                invalid_reason="Harbor exceeded the external emergency watchdog",
                 protocol={
                     "exception_is_infrastructure": True,
                     "emergency_watchdog": True,
-                    "official_error_counted_as_zero": terminal_official,
+                    # The watchdog fires after a process has been given the
+                    # full liveness window; there is no proof this happened
+                    # before a model request. Never replay it automatically.
+                    "model_phase_started": True,
+                    "transient_infrastructure": False,
+                    "official_error_counted_as_zero": False,
                 },
             )
         except asyncio.CancelledError:
@@ -537,26 +533,17 @@ class _HarborAdapter:
         )
         if not all_job_roots:
             diagnostic = stderr.decode("utf-8", errors="replace")[-4_000:]
-            terminal_official = self.slug == "terminal-bench-2.1"
             return TrialOutcome(
-                status=TrialStatus.FAIL if terminal_official else TrialStatus.INVALID,
-                metrics={"reward": 0.0, "errored_trial": 1} if terminal_official else {},
-                failure_reason=(
-                    f"official Harbor trial produced no auditable job (exit={process.returncode})"
-                    if terminal_official
-                    else None
-                ),
+                status=TrialStatus.INVALID,
                 invalid_reason=(
-                    None
-                    if terminal_official
-                    else f"Harbor produced no auditable job (exit={process.returncode}): {diagnostic}"
+                    f"Harbor produced no auditable job (exit={process.returncode}): {diagnostic}"
                 ),
                 protocol={
                     "launcher_failure": True,
                     "exception_is_infrastructure": True,
                     "transient_infrastructure": _transient_text(diagnostic),
                     "environment_not_ready": _environment_not_ready_text(diagnostic),
-                    "official_error_counted_as_zero": terminal_official,
+                    "official_error_counted_as_zero": False,
                 },
             )
         # A resumed Harbor task can retain a completed/interrupted job and
@@ -641,8 +628,8 @@ class _HarborAdapter:
                         "harbor_exception_type": exception_type,
                         "agent_lifecycle_error": True,
                         "deterministic_verifier_reward_preserved": True,
-                        "usage_telemetry_incomplete": not any(usage.values()),
-                        "failure_diagnostic": serialized[-32_000:],
+                        "usage_telemetry_incomplete": _usage_telemetry_incomplete(usage),
+                        "model_phase_started": bool(usage.get("model_phase_started")),
                         "failure_class": failure_class,
                         "verifier_infrastructure": (
                             failure_class in {"verifier_infrastructure", "mixed"}
@@ -665,59 +652,68 @@ class _HarborAdapter:
             failure_class = _terminal_failure_class(
                 trial_result, verifier_diagnostic=verifier_diagnostic
             )
+            terminal_official = self.slug == "terminal-bench-2.1"
+            terminal_status = (
+                _terminal_official_zero_reward_status(failure_class)
+                if terminal_official
+                else TrialStatus.INVALID
+            )
+            usage = _harbor_usage(stats, trial_result)
             return TrialOutcome(
-                status=(
-                    TrialStatus.FAIL
-                    if self.slug == "terminal-bench-2.1"
-                    else TrialStatus.INVALID
-                ),
+                status=terminal_status,
                 metrics=(
                     {"reward": 0.0, "errored_trial": 1}
-                    if self.slug == "terminal-bench-2.1"
+                    if terminal_official and terminal_status is TrialStatus.FAIL
                     else {}
                 ),
-                failure_reason=(reason if self.slug == "terminal-bench-2.1" else None),
-                invalid_reason=(None if self.slug == "terminal-bench-2.1" else reason),
-                usage=_harbor_usage(stats, trial_result),
+                failure_reason=(
+                    reason if terminal_official and terminal_status is TrialStatus.FAIL else None
+                ),
+                invalid_reason=(
+                    "official verifier did not execute because its infrastructure failed"
+                    if terminal_official and terminal_status is TrialStatus.INVALID
+                    else (None if terminal_official else reason)
+                ),
+                usage=usage,
                 protocol={
                     "harbor_job": job_roots[0].relative_to(context.attempt_root).as_posix(),
-                    "exception_is_infrastructure": True,
                     "harbor_exception_type": exception_type,
                     "failure_diagnostic": serialized[-32_000:],
                     "failure_class": failure_class,
+                    "model_phase_started": bool(usage.get("model_phase_started")),
                     "verifier_infrastructure": (
                         failure_class in {"verifier_infrastructure", "mixed"}
                     ),
+                    "exception_is_infrastructure": terminal_status is TrialStatus.INVALID,
                     "transient_infrastructure": _transient_text(serialized),
                     "environment_not_ready": _environment_not_ready_text(serialized),
-                    "official_error_counted_as_zero": self.slug == "terminal-bench-2.1",
+                    "official_error_counted_as_zero": (
+                        terminal_official and terminal_status is TrialStatus.FAIL
+                    ),
                 },
             )
         reward = _reward(stats)
         if reward is None:
             serialized = _harbor_failure_diagnostic(job_roots[0], job, trial_result)
             _write_failure_diagnostic(context.attempt_root, serialized)
-            terminal_official = self.slug == "terminal-bench-2.1"
+            usage = _harbor_usage(stats, trial_result)
             return TrialOutcome(
-                status=TrialStatus.FAIL if terminal_official else TrialStatus.INVALID,
-                metrics={"reward": 0.0, "errored_trial": 1} if terminal_official else {},
-                failure_reason=(
-                    "official Harbor result did not contain a deterministic reward"
-                    if terminal_official
-                    else None
-                ),
+                # Without a deterministic reward there is no official
+                # assertion to grade. Keep it as infrastructure evidence for
+                # a checkpoint-aware retry rather than inventing reward=0.
+                status=TrialStatus.INVALID,
+                metrics={},
                 invalid_reason=(
-                    None
-                    if terminal_official
-                    else "Harbor result does not contain a deterministic reward"
+                    "Harbor result does not contain a deterministic reward"
                 ),
-                usage=_harbor_usage(stats, trial_result),
+                usage=usage,
                 protocol={
                     "exception_is_infrastructure": True,
                     "failure_diagnostic": serialized[-32_000:],
                     "transient_infrastructure": _transient_text(serialized),
                     "environment_not_ready": _environment_not_ready_text(serialized),
-                    "official_error_counted_as_zero": terminal_official,
+                    "model_phase_started": bool(usage.get("model_phase_started")),
+                    "official_error_counted_as_zero": False,
                 },
             )
         verifier_diagnostic = (
@@ -730,6 +726,7 @@ class _HarborAdapter:
         )
         if verifier_diagnostic:
             _write_failure_diagnostic(context.attempt_root, verifier_diagnostic)
+        usage = _harbor_usage(stats, trial_result)
         status = (
             TrialStatus.PASS
             if reward > 0
@@ -738,7 +735,7 @@ class _HarborAdapter:
         return TrialOutcome(
             status=status,
             metrics={"reward": reward},
-            usage=_harbor_usage(stats, trial_result),
+            usage=usage,
             failure_reason=(
                 "official Harbor grader rejected the solution"
                 if status is TrialStatus.FAIL
@@ -760,6 +757,7 @@ class _HarborAdapter:
                     failure_class in {"verifier_infrastructure", "mixed"}
                 ),
                 "exception_is_infrastructure": status is TrialStatus.INVALID,
+                "model_phase_started": bool(usage.get("model_phase_started")),
                 "transient_infrastructure": (
                     transient_infrastructure_text(verifier_diagnostic)
                     if status is TrialStatus.INVALID
@@ -814,8 +812,13 @@ class TerminalBenchAdapter(_HarborAdapter):
     protocol_version = "terminal-bench-2.1-official-single-trial.v1"
     dataset = TERMINAL_BENCH_21_DATASET
     max_automatic_attempts = 1
+    # This is separate from the one official model attempt.  Only a
+    # pre-model transient launcher/Docker/network failure may consume these
+    # checkpoint-reused infrastructure retries.
+    max_infrastructure_attempts = 10
     adaptations = (
         "Each task runs once, while leaderboard submissions require at least five trials per task.",
+        "Pre-model transient launcher failures may retry up to ten times on the same checkpoint; model-bearing failures are never replayed automatically.",
     )
 
     def check(
@@ -1218,9 +1221,10 @@ def _reward(stats: Mapping[str, Any]) -> float | None:
 
 def _harbor_usage(
     stats: Mapping[str, Any], trial_result: Mapping[str, Any] | None = None
-) -> dict[str, int]:
+) -> dict[str, Any]:
     input_tokens = int(stats.get("n_input_tokens") or 0)
     cached_tokens = int(stats.get("n_cache_tokens") or 0)
+    output_tokens = int(stats.get("n_output_tokens") or 0)
     metadata = ((trial_result or {}).get("agent_result") or {}).get("metadata") or {}
     model_calls = _nonnegative_int(metadata.get("model_calls"))
     tool_calls = _nonnegative_int(metadata.get("tool_calls"))
@@ -1229,17 +1233,83 @@ def _harbor_usage(
         serialized = json.dumps(exception, ensure_ascii=False)
         model_calls = model_calls or _embedded_usage_count(serialized, "model_calls")
         tool_calls = tool_calls or _embedded_usage_count(serialized, "tool_calls")
+    raw_cost = metadata.get("api_reported_cost")
+    try:
+        api_reported_cost = float(raw_cost) if raw_cost is not None else None
+    except (TypeError, ValueError):
+        api_reported_cost = None
+    if api_reported_cost is not None and (
+        not math.isfinite(api_reported_cost) or api_reported_cost < 0
+    ):
+        api_reported_cost = None
+    raw_currency = metadata.get("api_reported_cost_currency")
+    api_reported_cost_currency = (
+        str(raw_currency).strip().upper() if raw_currency is not None else None
+    )
+    raw_status = metadata.get("api_cost_status")
+    api_cost_status = (
+        str(raw_status).strip().lower() if raw_status is not None else None
+    )
+    if api_cost_status is None and api_reported_cost is not None:
+        api_cost_status = "reported"
+    # Some Harbor adapters expose token usage before they populate their
+    # optional model-call counter. Treat that usage as evidence that a
+    # provider call happened; otherwise a missing direct price could be
+    # incorrectly reported as ``unavailable`` instead of ``incomplete``.
+    api_cost_observed = (
+        bool(metadata.get("api_cost_observed"))
+        or model_calls > 0
+        or input_tokens > 0
+        or output_tokens > 0
+    )
+    api_cost_complete = (
+        api_cost_status == "reported" and api_reported_cost is not None
+    )
+    if not api_cost_complete:
+        api_cost_status = "incomplete" if api_cost_observed else "unavailable"
+    provider_cost_microusd = (
+        round(api_reported_cost * 1_000_000)
+        if api_cost_complete and api_reported_cost_currency in (None, "USD")
+        else None
+    )
     return {
         "input_tokens": input_tokens,
         "uncached_input_tokens": max(0, input_tokens - cached_tokens),
         "cache_creation_input_tokens": 0,
         "cache_read_input_tokens": cached_tokens,
-        "output_tokens": int(stats.get("n_output_tokens") or 0),
-        "cost_microusd": round(float(stats.get("cost_usd") or 0) * 1_000_000),
+        "output_tokens": output_tokens,
+        # ``stats.cost_usd`` is not an auditable provider fact by itself; it
+        # may be a framework fallback.  Use only the explicit direct-cost
+        # fields emitted by the cc-harness result envelope.
+        "cost_microusd": provider_cost_microusd,
+        "api_reported_cost": api_reported_cost if api_cost_complete else None,
+        "api_reported_cost_currency": api_reported_cost_currency,
+        "api_cost_source": "provider",
+        "api_cost_status": api_cost_status,
+        "api_cost_observed": api_cost_observed,
+        "api_cost_complete": api_cost_complete,
         "model_calls": model_calls,
+        # Token counters are evidence that the model phase began, not an
+        # inferred number of calls.  The runner uses this boolean solely to
+        # prevent replaying a paid attempt when Harbor omitted its call count.
+        "model_phase_started": bool(model_calls or input_tokens or output_tokens),
         "tool_calls": tool_calls,
         "wall_time_ms": 0,
     }
+
+
+def _usage_telemetry_incomplete(usage: Mapping[str, Any]) -> bool:
+    """Tell the protocol when model/tool usage itself was not observable."""
+
+    return not any(
+        int(usage.get(name) or 0)
+        for name in (
+            "model_calls",
+            "tool_calls",
+            "input_tokens",
+            "output_tokens",
+        )
+    )
 
 
 def _harbor_failure_diagnostic(
@@ -1313,6 +1383,12 @@ def _terminal_failure_class(
     if verifier_infrastructure:
         return "verifier_infrastructure"
     if agent_error:
+        exception_text = " ".join(
+            str(exception.get(name) or "")
+            for name in ("exception_type", "exception_message")
+        )
+        if transient_infrastructure_text(exception_text):
+            return "provider_transport"
         return "agent_runtime"
     return "task_failure"
 
@@ -1326,7 +1402,11 @@ def _terminal_official_zero_reward_status(failure_class: str | None) -> TrialSta
     path instead of being published as a solution failure.
     """
 
-    if failure_class in {"verifier_infrastructure", "mixed"}:
+    if failure_class in {
+        "verifier_infrastructure",
+        "mixed",
+        "provider_transport",
+    }:
         return TrialStatus.INVALID
     return TrialStatus.FAIL
 

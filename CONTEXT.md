@@ -118,6 +118,12 @@ _Avoid_: 把拼接字符串当作唯一工具结果、按工具分别猜测成�
 **模型能力档案（Model Capability Profile）**:
 特定 provider、endpoint 与模型版本实际支持的上下文、输出、工具、流式、视觉、推理、缓存、结构化响应、token 计量和价格能力声明；请求构建、上下文预算、界面和评测只使用已验证能力，实际返回模型身份随调用记录。_Avoid_: 用配置期望冒充服务端事实、把兼容 API 当作完全相同语义、对不支持能力做虚假展示、把估算 usage 写成权威账单、把单个模型特性硬编码为全局默认
 
+**供应商适配边界（Provider Adapter Boundary）**:
+所有模型请求、流式事件、工具调用、完整消息恢复、usage、费用和供应商错误先经过独立的 Provider Adapter；Durable Runtime 只消费统一事件，不直接分支处理某个厂商的字段。首期适配 DeepSeek、GLM、Kimi、MiniMax 和 Qwen 的 OpenAI-compatible 接口，原生厂商协议可在不改变 Runtime 契约的前提下追加。_Avoid_: 在 Runtime 中堆叠厂商特判、把 OpenAI-compatible 当作语义完全相同、静默降级能力、混用不同 provider 的恢复事实
+
+**无损模型消息恢复（Lossless Model Message Replay）**:
+持久化模型返回的完整 provider-neutral 消息及其 provider 专用字段，恢复时由对应适配器按原语义序列化；缺失必需字段时进入可恢复协议错误，不伪造字段、不重放可能产生副作用的工具调用。_Avoid_: 只保存可见文本、丢弃 reasoning/tool 元数据、用空字段糊弄 provider、把恢复失败当作工具未执行
+
 **会话资源预算（Session Resource Budget）**:
 用户为会话或后台任务设置 token、费用、总耗时和工具调用次数上限，接近上限时预警，达到上限后停止启动新模型或工具调用并保存可恢复状态；已启动副作用调用按真实结果或 `outcome_unknown` 收尾。_Avoid_: 超额后继续调用、用估算成本冒充供应商账单、预算停止时丢失任务状态、把被中断调用标记为未执行
 
@@ -140,6 +146,9 @@ _Avoid_: 跨项目共享当前对话、普通启动时隐式续接
 **项目事实存储（Project Fact Store）**:
 位于用户数据目录并按项目身份隔离的本地持久存储，以追加式 SQLite 事件库保存事实和引用，以内容寻址对象库保存大型日志、附件、快照和卸载资产；项目工作区只承载用户主动维护的可版本控制配置。副作用前置事实确认持久化后才允许执行。_Avoid_: 启动即污染仓库、从项目内符号链接选择状态目录、删除并重写整段事件、把大型内容重复塞入消息表、只复制活动 SQLite 主文件作为备份、项目移动时自动合并相似身份
 
+**唯一运行事实源（Single Run Source of Truth）**:
+每个项目只有一条由 Durable Runtime 管理的 SQLite WAL 事件事实流；CLI、TUI、Worker 和 Subagent 都通过该 Runtime 读写，projection、snapshot、报告和界面状态均可从事件重建而不能成为第二事实源。_Avoid_: 各入口维护自己的运行状态、直接修改 projection 当作事实、关闭界面时删除 Run、引入并行的第二条 Durable Runtime 路径
+
 **Headless 会话协议（Headless Session Protocol）**:
 TUI、SDK、benchmark、IDE 与一次性命令共同使用的版本化双向控制协议，以持久化事件序号支持流式观察和断线续读，并以可关联、可幂等的命令处理提交、排队、取消及交互响应。前台附着运行与可持久后台任务具有明确不同的断线生命周期。_Avoid_: 从终端文本猜测状态、各客户端复制 Agent 逻辑、让慢客户端阻塞代理、断线后静默丢失或继续前台任务、把诊断日志混入机器协议
 
@@ -154,6 +163,66 @@ _Avoid_: 隐式扩大工作目录、自动加入 Git 根目录
 **排队消息（Queued Message）**:
 代理执行期间已提交但尚未开始处理的用户消息；同一项目会话始终只有一个活动轮次，排队消息按提交顺序运行。
 _Avoid_: 并发轮次、未提交草稿
+
+**Durable Subagent Dispatch（持久子代理调度）**:
+当前项目所有 SubAgent 与 Agent Team 子任务统一通过唯一 Durable Runtime 路径创建为可恢复的 child Run；不得保留进程内 `SubAgentRunner` 作为并行运行时或隐藏回退路径。子 Run 必须有独立上下文、能力档案、预算、事件序号、检查点和可重放结果。
+_Avoid_: 旧 in-process fan-out 与 Durable Runtime 并存、仅内存摘要、断线后从头执行、恢复时静默切换运行时
+
+**Read-only Child Run（只读子运行）**:
+只进行探索、审查、研究或诊断且不产生工作区写入的 child Run；使用受限只读能力，不创建 Git Worktree，但仍通过 Durable Runtime 持久化其生命周期、工具观察和摘要。
+_Avoid_: 以“只读”名义允许写入、把只读结果直接当作已应用变更、绕过能力权限
+
+**Mutating Child Run（写入型子运行）**:
+任何可能创建、修改或删除项目文件的 child Run；必须在独立 Git Worktree 中执行，完成后产生 Candidate Change Set，父 Run 显式接受、拒绝并重新验证后才影响父工作区。
+_Avoid_: 子 Run 直接写父工作区、共享未提交文件、只依据自然语言摘要合并修改
+
+**Candidate Change Set（候选变更集）**:
+写入型 child Run 提交的 Git 提交、差异、验证证据和来源 Run 身份的不可变交付物；父 Run 必须显式作出接受或拒绝决定，并在接受后重新执行必要验证。
+_Avoid_: 自动覆盖父分支、无验证合并、丢失提交与验证证据
+
+**Parent-coordinated Agent Team（父协调 Agent Team）**:
+当前版本的 Agent Team 只是由父 Run 管理的一组可持久化 child Run；子 Agent 之间暂不直接通信或协作。任务分配、进度、结果和失败状态由父 Run 通过 Durable Runtime 事件收集，未来若增加 peer message 必须另行定义持久化协议与权限边界。
+_Avoid_: 临时 peer socket、共享内存通信、子 Agent 私自改变任务依赖、把并行 fan-out 误称为已实现的全 mesh 团队
+
+**Dynamic Subagent Task Contract（动态子代理任务契约）**:
+子 Agent 要做什么由主 Agent 根据当前目标、结构化上下文、依赖、验收标准、文件范围和实时进展动态决定，不限制为固定角色列表。每次 child Run 创建时，主 Agent 提交版本化任务契约；Runtime 只负责校验并执行其中允许的能力、写入边界、预算、超时/重试策略、输出结构和模型能力档案。主 Agent 不能通过任务文本绕过硬安全边界或能力白名单。
+_Avoid_: 把子 Agent 限制为固定职责、只改角色名称而不改变真实任务、用户运行时覆盖安全策略、用自然语言任务绕过权限和预算
+
+**Required Child Gate（必需子任务门禁）**:
+每个 child Run 的任务规格带有 `required` 标记，默认值为 `true`。所有必需子 Run 必须进入终态，且写入型 Candidate Change Set 必须完成父 Run 的显式接受/拒绝与必要复验，父 Run 才能报告完成；显式 `optional` 的辅助子 Run 失败不会阻塞父 Run，但仍必须保留失败证据。
+_Avoid_: 子 Run 尚未完成就结束父 Run、把失败的必需验证隐藏为成功、把 optional 当作默认、只看自然语言摘要而不检查终态和候选变更门禁
+
+**Classified Child Retry（分类子运行重试）**:
+子 Run 只对网络抖动、服务暂时不可用、Docker 短暂启动失败等可重试故障进行有限重试；确定性任务失败不自动重复模型调用。中断从同一 child Run 的最后完整检查点恢复，副作用结果不确定时使用 `outcome_unknown`，每次重试或恢复都保留关联的 attempt 与事件证据。
+_Avoid_: 所有错误统一重试、盲目重复副作用、把恢复当成从头执行、覆盖原始失败证据
+
+**Structured Child Context（结构化子任务上下文）**:
+child Run 默认只接收版本化的任务目标、验收标准、相关文件范围、已提交观察、必要引用和角色预算，不复制父 Run 的完整对话。确需父背景时，父 Run 显式创建有范围、脱敏、可审计且受预算约束的 context snapshot。
+_Avoid_: 隐式复制完整会话、把未提交临时输出当作事实、用长文本替代引用和检查点、恢复时上下文漂移
+
+**Child Acceptance Contract（子任务验收契约）**:
+`required=true` 的 child Run 必须在创建时提供至少一种可验证验收证据，例如测试命令、文件产物、检查结果或结构化断言；`optional` 探索任务可以没有硬验收标准，但必须返回结构化报告。父 Run 只能依据验收证据和持久化状态判断完成。
+_Avoid_: 空验收标准、用自然语言“完成”替代证据、子 Run 结束即自动视为通过、把失败验证隐藏在摘要中
+
+**Durable Team DAG（持久团队依赖图）**:
+Agent Team 的 child Run 通过版本化 Plan Graph/DAG 表达依赖；无依赖节点可并行，有依赖节点必须等待前置结果提交后再启动，循环依赖在创建时拒绝，子 Agent 无权自行改变依赖关系。父 Run 的完成由必需节点终态、验收证据和候选变更门禁共同决定。
+_Avoid_: 无约束平铺并行、隐式依赖、运行中改图、循环等待、把并发数量当作依赖管理
+
+**Explicit Runtime Termination（显式运行时终止）**:
+child Run 的事实、检查点和事件归 Durable Runtime 保存；普通前端断开、窗口关闭或客户端重启不等于终止。但用户在 TUI 中执行明确的“终止”操作时，必须停止新任务调度并请求所有活动 child Run 安全收尾/取消，保留已完成结果、检查点和 `outcome_unknown` 证据。后续继续由主 Agent 重新读取持久状态，只派发未完成或可恢复的子任务，不重复已完成步骤。
+_Avoid_: 关闭界面误杀后台任务、终止后仍偷偷执行、重启时自动复制旧子 Run、丢失未完成检查点、把取消结果伪装成成功
+
+**Ctrl-C Durable Stop（Ctrl-C 持久终止）**:
+TUI 中第一次 `Ctrl+C` 是唯一的明确运行时终止入口：立即停止新的 child Run 调度，向活动 Worker 请求取消；Worker 在当前模型/工具边界收尾，无法确认的副作用先记录为 `outcome_unknown`，再写入取消事实。若外部进程仍未能安全收尾，租约回收会继续保留其不确定事实，而不会自动重放。终止后的继续操作由主 Agent 读取持久事件和检查点后重新派发，不自动复制旧执行。
+_Avoid_: Ctrl-C 只清屏、只停止前端不停止 Worker、重复按键启动多份取消流程、强杀后丢失检查点、把未知副作用标成未执行
+
+**Natural-language Continuation（自然语言续跑）**:
+续跑不是强制的 slash command。用户在同一项目会话中表达“继续”“接着做”或等价意图时，主 Agent 根据当前会话和最近一次被终止的 Durable Run 读取事件、检查点与工作区事实，再只派发未完成、可恢复或需要核对的 child Run。`/resume` 可以保留为显式会话选择工具，但不是继续任务的必需入口。
+_Avoid_: 把“继续”当普通新任务、要求用户记忆内部命令、自动复制旧执行、跳过 `outcome_unknown` 核对、静默选择其他项目的旧 Run
+
+**Continuation Candidate Resolution（续跑候选解析）**:
+自然语言续跑在当前项目会话只有一个候选 Durable Run 时自动继续；用户明确说“上一个”时选择最近一次被终止的 Run；存在多个候选且意图不明确时展示任务名称与时间并请求选择，不跨项目或跨会话静默恢复。
+_Avoid_: 多个候选时猜测、恢复其他项目的 Run、把普通新会话误接到旧任务、丢失候选选择证据
 
 **权限模式（Permission Mode）**:
 当前项目会话对可询问操作的批准策略，分为逐次确认、项目内编辑免询问和全部可询问操作免询问三档；任何一档都不能覆盖硬拒绝与安全边界。
@@ -293,6 +362,9 @@ _Avoid_: 默认倾倒 JSON、截断模型可见结果、隐藏工具错误、把
 
 **受管命令执行单元（Managed Command Execution Unit）**:
 一次 shell 或结构化进程调用由明确方言、工作目录、受控环境、执行后端、交互模式和资源边界定义；标准输出与错误按序流式记录，大输出可恢复卸载，取消和超时覆盖整个进程树。转入后台后成为持久任务，无法确认完全终止时结果保持 `outcome_unknown`。_Avoid_: PowerShell 命令交给 CMD、继承全部宿主凭据、只终止外层 shell、截断日志却呈现为完整、把前台进程丢到后台后失去身份与控制
+
+**后台命令句柄（Background Command Handle）**:
+显式以后台模式启动的本地命令所对应的持久身份，至少关联 PID、启动时间、日志、readiness、活动快照、退出状态、取消和清理契约；普通前台命令不得因超时或 shell 字符串被隐式转换为后台任务。_Avoid_: 用 `&` 或 `start` 猜测生命周期、返回结果不明却丢失 PID、没有健康检查就宣称服务已就绪、关闭 TUI 自动杀死后台任务
 
 **代理停滞（Agent Stall）**:
 Agent 连续三次执行语义相同的失败操作，且文件、任务状态和验证证据均无可观察变化时进入 `stalled`，停止发起新调用并报告重复模式与解除阻塞所需信息。_Avoid_: 用不同措辞包装相同重试、耗尽总预算才停止、把模型自述当作进展、停滞后静默标记失败或成功
@@ -471,6 +543,33 @@ _Avoid_: 没有任务仍显示占位、伪造进度、后台权限弹窗阻塞�
 
 **证据化完成（Evidence-Backed Completion）**:
 任务只有在验收条件绑定到特定代码快照上的真实测试、构建、检查或 diff 证据后才能标记成功，证据记录命令版本、工作目录和退出状态；未运行、失败或环境不可验证时只能是 `partial` 或 `blocked`。_Avoid_: 模型自行宣称完成、使用修改前测试结果、隐藏未运行验证、把工具启动成功当作验收通过
+
+**运行时拥有的完成候选（Runtime-Owned Completion Candidate）**:
+模型提交的 `CompletionCandidate` 只是验收请求，只能引用当前 Run 已记录的 `criterion_id` 与 `evidence_id`；证据的摘要、digest、来源、退出状态、代码快照和置信状态必须由 Runtime 从事件与验证器结果生成或校验，引用缺失、过期、未知或不匹配时拒绝完成。_Avoid_: 接受模型自填的证据属性、允许自由文本缩小 Goal Contract、跨 Run 复用证据、把候选提交直接当作完成事件
+
+**固定验证计划（Pinned Verification Plan）**:
+Goal Contract 必须携带版本化且可审计的验证器清单，声明每个检查的稳定 ID、类型、允许的命令或目标、工作目录、环境与资源边界、预期结果和副作用等级；模型只能请求清单中的验证器，Runtime 负责执行、记录结果并将其绑定到当前 Run 和代码快照。_Avoid_: 模型临时发明验证命令、静默删除或放宽检查、用未登记的外部结果替代验证器、把验证器请求当作验证已通过
+
+**验证结果四态（Four-State Verification Outcome）**:
+验证结果必须区分 `passed`、`failed`、`environment_not_ready` 和 `outcome_unknown`：业务断言失败拒绝候选并保留可修复错误；验证器环境不可用只进入阻塞并允许有限基础设施重试；超时或副作用无法确认保持未知并先对账；只有全部必需检查为 `passed` 才能接受完成。_Avoid_: 用基础设施故障伪装任务失败、把未知当失败或成功、基础设施重试重复模型调用、部分通过推进 Run 完成
+
+**运行时全量验收（Runtime Full-Gate Verification）**:
+模型可主动请求已登记的单项验证以获得反馈，但提交 `CompletionCandidate` 时，Runtime 必须自动执行并核对 Goal Contract 中全部必需验证器；候选携带的部分 evidence 不能跳过未执行的检查，只有全量必需验证器均为 `passed` 才能发出 `CompletionAccepted`。_Avoid_: 让模型决定最终检查范围、用候选摘要代替验证器运行、只执行最容易通过的子集、在全量验收前推进完成状态
+
+**基础设施重试上限（Infrastructure Retry Cap）**:
+Docker 启动、网络抖动、依赖服务暂不可用等 `environment_not_ready` 只允许针对同一验证阶段进行最多 10 次基础设施重试；每次重试保留原因和证据，且不得重新调用模型或把环境故障记为任务失败。_Avoid_: 无限重试、每次环境重试都消耗模型调用、把环境不可用伪装成业务失败、超过上限后静默继续
+
+**模型驱动修复循环（Model-Directed Repair Loop）**:
+业务验证失败后，Runtime 将结构化失败证据交给模型，由模型决定继续修复、再次验证、停止或请求用户介入；不以固定尝试次数替模型做语义决策。该循环仍必须服从明确的用户取消、运行时安全和资源边界，不能以“模型还想继续”为理由绕过终止或审计规则。_Avoid_: 用固定次数武断终止所有修复、把模型自述当作修复成功、忽略资源耗尽或取消、让模型绕过完成验证
+
+**无进展暂停（No-Progress Stall Pause）**:
+修复循环不设置固定尝试次数上限，但 Runtime 持久化并比较代码快照、动作参数、验证结果和产物指纹；连续循环没有新变更或新证据时进入 `stalled` 暂停，而不是判定失败或继续空转。恢复必须由模型提交新的方案、请求用户介入或明确停止，并保留暂停前的完整证据。_Avoid_: 用重复的相同动作伪造进展、把 stalled 当作 completed/failed、静默丢弃重复证据、自动无限重试同一路径
+
+**环境验证阻塞（Environment Verification Block）**:
+同一验证阶段的 `environment_not_ready` 重试达到 10 次后，Run 必须进入 `blocked`，不记为业务 `failed`，不再调用模型，保留每次环境失败证据并等待环境修复后从检查点恢复。_Avoid_: 超过上限继续重试、把环境故障计入代码失败、丢弃重试证据、修复环境后重新执行已完成的模型步骤
+
+**验证器副作用声明（Verifier Side-Effect Declaration）**:
+验证计划必须预先声明每个验证器可能产生的副作用、目标范围、清理方式和结果确认方法；未声明的外部写入、网络动作、服务启动或数据变更不得执行，无法确认的副作用结果必须保持 `outcome_unknown` 并阻塞完成。_Avoid_: 把验证器当作无副作用黑盒、允许未登记的外部写入、超时后盲目重放、只记录退出码而不记录实际影响
 
 **验收条件完整性（Acceptance-Criteria Integrity）**:
 既定验收条件不能由执行 Agent 静默删除、弱化或改写，不可行时只能提出带理由的变更，由用户或获得授权的协调代理确认并记录事件；自动新增检查不能降低原标准。_Avoid_: 为通过验证修改标准、把实现困难当作条件无效、无审计地替换验收条件、协调代理越权批准
@@ -1177,7 +1276,7 @@ counting launcher setup as an agent failure, selecting the best outcome from mul
 
 **Terminal-Bench Observable Liveness**:
 The serial runner emits a heartbeat every 15 seconds with task position and ID, phase, elapsed and official
-timeout remaining, model/tool call counts, token and estimated cost totals, last event and owned child-process
+timeout remaining, model/tool call counts, token totals and provider-reported cost status, last event and owned child-process
 state. Inner commands persist CPU ticks, descendants, process I/O, sockets and bounded workspace-file
 activity; any observed activity resets the task-class idle budget (1,200 seconds for training/inference,
 900 for build/compile/service, 600 otherwise). Silence alone never proves a hang, and the official total
@@ -1190,7 +1289,7 @@ ETA, cleaning unrelated Docker resources, reporting activity without persisted l
 **Terminal-Bench Evidence Bundle**:
 Each canonical task retains the raw Harbor job, official verifier reward and output, ATIF trajectory, model
 messages, tool calls, commands, exit codes, timestamps, stdout and stderr, failures, timeouts, launch evidence
-and every attempt, together with calls, input/output/cache tokens, latency, estimated cost and cc-harness
+and every attempt, together with calls, input/output/cache tokens, latency, provider-reported cost facts and cc-harness
 security, confirmation, recovery and tool-governance events. Dataset, image, environment and configuration
 identities are recorded without copying credentials or secret environment values. The run atomically publishes
 manifest, catalog, state, progress JSONL, summary, Markdown report, integrity projection and raw artifacts;
@@ -1261,13 +1360,13 @@ _Avoid_: Reusing LoCoMo chat mode, warm memory across tasks, silent model alias 
 shortening hard tasks with an arbitrary local iteration limit
 
 **Terminal-Bench Cost Boundary**:
-The formal run warns at an accumulated CNY estimate of 100 and, at 200, finishes the current task and pauses
-before launching another. It never terminates a valid in-progress task only for cost. Resume may continue after
-explicit budget approval without changing scored protocol, and every budget change is recorded. Provider-reported
-usage and cost take precedence; otherwise the report applies a frozen, versioned DeepSeek tariff and labels the
-value estimated. Tariff changes affect cost attribution only, not task reward or completed evidence.
-_Avoid_: Killing a task mid-flight at the budget line, silently increasing the budget, treating estimated cost
-as provider billing truth, rescoring capability after a price change
+The formal run records provider-reported usage and cost facts when the API supplies them. A missing, malformed,
+or mixed-currency provider cost is reported as `unavailable`/`incomplete`; the runner never derives a tariff from
+token counts and never presents an estimate as a bill. Optional budget controls may stop launching a new task
+only when a provider-reported cost is available; they never terminate a valid in-progress task solely for cost.
+Every budget decision and missing-cost condition remains in the operational evidence without changing reward.
+_Avoid_: Killing a task mid-flight at the budget line, silently increasing the budget, inferring a price from
+tokens, or treating a local estimate as provider billing truth
 
 **Terminal-Bench Version-Explicit Launcher**:
 `scripts/run_eval_terminal_bench_2_1.cmd` resolves only the official
@@ -1761,3 +1860,23 @@ _Avoid_: 前序失败后静默启动依赖任务、把等待审批视为终止�
 **Candidate Change Set（候选变更集）**:
 隔离子运行从固定基线生成、由本地 Git commit 标识并附带修改范围、验证证据和未解决问题的待接纳成果；父上下文默认只投影这些结构化结果，只有父运行将其应用到集成 worktree 并重新验证后，它才属于主任务成果。
 _Avoid_: 子运行提交即视为父任务完成、把 child 全部历史塞入父上下文、直接写入父工作树、只凭子运行局部测试接纳组合变更、冲突时丢弃来源关系
+
+**Official Benchmark Timeout Profile（官方 benchmark 超时档案）**:
+正式 benchmark Run 使用冻结任务清单中每个任务的 `[agent].timeout_sec` 作为 agent trial 的墙钟截止时间，并分别遵守 `[verifier].timeout_sec` 与 `[environment].build_timeout_sec`；内部命令超时和 liveness watchdog 只能观察、发 heartbeat 或在官方截止时停止，不能延长或替代官方 deadline。只有开发模式可以使用独立命令超时，且与官方成绩分开标记。
+_Avoid_: 把 600 秒无输出阈值当成官方总时限、用自定义 timeout multiplier 改写正式成绩、让内部 shell 超时延长 trial、把非官方开发运行混入正式 benchmark 结果
+
+**Deadline-aware Graceful Cancellation（截止时间感知的优雅取消）**:
+Runtime 在官方任务 deadline 之前为活动中的模型和工具动作开启有界的优雅收尾窗口，停止派发新动作并请求协作取消；到达官方 deadline 时停止并回收整个受管进程树，绝不延长 trial。无法对账的副作用必须记为 `outcome_unknown`，除非 Tool Recovery Contract 证明幂等且安全，否则不得自动重放。
+_Avoid_: 以取消宽限期延长官方时间、只杀外层 shell、把未确认副作用当成未执行、无幂等证明自动重放写入动作
+
+**Task-class Liveness Budget（任务类型存活预算）**:
+Runtime 按任务类型使用活动感知的 idle budget：训练/推理 1,200 秒，构建/编译/服务 900 秒，其余任务 600 秒；CPU、进程 I/O、子进程、socket 或受限工作区文件活动会重置 idle 窗口并发出 heartbeat。达到 idle budget 只进入 `stalled` 诊断暂停，不直接判业务失败；冻结任务的官方 deadline 仍是不可延长的硬上限。
+_Avoid_: 用统一无输出阈值杀死长任务、把静默直接当挂死、忽略子进程和文件活动、让 idle budget 覆盖官方 deadline
+
+**Benchmark Liveness Isolation（benchmark 存活信号隔离）**:
+任务类型 idle budget、活动快照、官方 deadline 和 watchdog 决策只属于 Runtime 与受限操作员审计证据，不注入 benchmark 任务、模型可见提示、工具结果或参与者交互界面，以免改变 Agent 行为和破坏可比性；内部监控仍必须保留足够证据。
+_Avoid_: 把评测控制信息写入任务提示、让模型读取 idle 倒计时、把 watchdog 原因伪装成工具输出、为了隐藏信息而删除审计证据
+
+**Managed Process（受管进程）**:
+由 Durable Runtime 持有稳定身份并负责生命周期的长时间运行命令；其存活、就绪、日志、状态查询和安全清理是可审计事实，进程仍存活不等于服务已经就绪。
+_Avoid_: 把长命令当作必须自行退出的一次性调用、用无输出判定服务失败、丢失进程身份、关闭客户端时遗弃进程

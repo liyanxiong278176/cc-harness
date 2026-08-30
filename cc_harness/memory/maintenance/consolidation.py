@@ -4,6 +4,8 @@ import json
 import math
 from typing import TYPE_CHECKING
 
+from cc_harness.sqlite_utils import begin_immediate
+
 if TYPE_CHECKING:
     from cc_harness.memory.store import MemoryStore
 
@@ -93,11 +95,17 @@ async def consolidate(store: "MemoryStore", embedder, llm=None, *,
                 if await store.delete(m.id):
                     pass
             new_mem = await store.add(merged_text, new_emb, "consolidation", session_id=None)
-            await store._db.execute(
-                "UPDATE memories SET cluster_id = ?, merged_from = ? WHERE id = ?",
-                (cluster_id, merged_from, new_mem.id),
-            )
-            await store._db.commit()
+            async with store.write_lock:
+                try:
+                    await begin_immediate(store._db)
+                    await store._db.execute(
+                        "UPDATE memories SET cluster_id = ?, merged_from = ? WHERE id = ?",
+                        (cluster_id, merged_from, new_mem.id),
+                    )
+                    await store._db.commit()
+                except Exception:
+                    await store._db.rollback()
+                    raise
             affected += len(cluster)
         elif action == "update":
             keep = cluster[-1]

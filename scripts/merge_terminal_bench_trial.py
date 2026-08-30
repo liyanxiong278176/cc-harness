@@ -24,7 +24,7 @@ from eval.cc_only.contracts import BenchmarkTask, TrialStatus  # noqa: E402
 from eval.cc_only.runner import (  # noqa: E402
     _base_summary,
     _finalize,
-    _terminal_cost_cny,
+    _terminal_api_cost,
 )
 from eval.cc_only.storage import (  # noqa: E402
     RunStateStore,
@@ -221,7 +221,8 @@ def _rebuild(target: Path, state: dict[str, Any]) -> None:
     summary["environment_not_ready"] = list(
         summary["infrastructure_classification"]["environment_not_ready"]
     )
-    summary["estimated_cost_cny"] = _terminal_cost_cny(results)
+    summary.update(_terminal_api_cost(results))
+    summary["estimated_cost_cny"] = None
     _finalize(adapter, target, RunStateStore(target), state, tasks, summary)
 
 

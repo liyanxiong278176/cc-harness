@@ -120,6 +120,25 @@ def test_git_read_without_path_still_allow():
     assert d.action is Action.ALLOW
 
 
+def test_container_workspace_alias_is_scoped_to_project_root():
+    d = _engine().evaluate(
+        "mcp__filesystem__read_file",
+        {"path": "/workspace/src/a.py"},
+        {"project_root": ROOT},
+    )
+    assert d.action is Action.ALLOW
+
+
+def test_container_workspace_alias_keeps_sensitive_path_deny():
+    d = _engine().evaluate(
+        "mcp__filesystem__read_file",
+        {"path": "/workspace/.env"},
+        {"project_root": ROOT},
+    )
+    assert d.action is Action.DENY
+    assert d.rule_id == "sensitive_credential_path"
+
+
 # --- hard-deny ordering and scope ---
 
 def test_allowlist_cannot_bypass_outside_path_deny():

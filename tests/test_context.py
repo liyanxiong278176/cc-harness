@@ -926,6 +926,51 @@ def test_context_projection_drops_orphaned_provider_tool_results(tmp_path):
     assert projection.messages[-1]["content"] == "current"
 
 
+def test_tool_results_follow_assistant_declaration_order():
+    from cc_harness.context import _repair_tool_result_pairing
+
+    messages = [
+        {
+            "role": "assistant",
+            "content": "working",
+            "tool_calls": [
+                {"id": "call-0", "type": "function", "function": {}},
+                {"id": "call-1", "type": "function", "function": {}},
+            ],
+        },
+        {"role": "tool", "tool_call_id": "call-1", "content": "one"},
+        {"role": "tool", "tool_call_id": "call-0", "content": "zero"},
+    ]
+
+    repaired = _repair_tool_result_pairing(messages)
+
+    assert [message.get("tool_call_id") for message in repaired[1:]] == [
+        "call-0",
+        "call-1",
+    ]
+
+
+def test_tool_pair_repair_removes_only_incomplete_calls():
+    from cc_harness.context import _repair_tool_result_pairing
+
+    messages = [
+        {
+            "role": "assistant",
+            "content": "working",
+            "tool_calls": [
+                {"id": "complete", "type": "function", "function": {}},
+                {"id": "missing", "type": "function", "function": {}},
+            ],
+        },
+        {"role": "tool", "tool_call_id": "complete", "content": "ok"},
+    ]
+
+    repaired = _repair_tool_result_pairing(messages)
+
+    assert repaired[0]["tool_calls"] == [messages[0]["tool_calls"][0]]
+    assert repaired[1]["tool_call_id"] == "complete"
+
+
 @pytest.mark.asyncio
 async def test_compaction_selects_one_tier_without_cascade():
     from cc_harness.context import CompactionTier, maybe_compact

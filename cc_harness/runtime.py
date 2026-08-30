@@ -183,6 +183,7 @@ class SessionRuntime:
             model=self.config.openai_model,
             base_url=self.config.openai_base_url,
             reasoning_effort=effort,
+            thinking_mode=self.config.runtime_environment.get("CC_HARNESS_THINKING_MODE"),
         )
         self.mcp = MCPClient(self.config.mcp_servers)
 
@@ -310,21 +311,25 @@ class SessionRuntime:
             exec_cfg.backend = ExecutorBackend.NATIVE
             self.warnings.append(RuntimeWarning("host execution explicitly enabled"))
         init_session_executor(exec_cfg, str(self.cwd))
-        self.activation_manifest.initialize(
-            "safety",
-            executor_backend=exec_cfg.backend.value,
-            policy_enabled=bool(self.policy and self.policy.enabled),
-            l2_enabled=bool(self.l2_config and self.l2_config.enabled),
-            l5_enabled=self.l5 is not None,
-            pii_active=bool(getattr(self.l5, "pii_active", False)),
-            profile=self.capability_profile.name,
-            provenance_enforced=(
-                self.capability_profile.name == "hardened-safety"
-                or os.getenv("CC_HARNESS_SECURITY_MODE", "").strip().lower()
-                in {"strict", "hardened", "security"}
-            ),
-            output_egress_guard=bool(self.output_egress_guard_enabled),
+        safety_details = (
+            self.shared_services.activation_details()
+            if self.shared_services is not None
+            else {
+                "executor_backend": exec_cfg.backend.value,
+                "policy_enabled": bool(self.policy and self.policy.enabled),
+                "l2_enabled": bool(self.l2_config and self.l2_config.enabled),
+                "l5_enabled": self.l5 is not None,
+                "pii_active": bool(getattr(self.l5, "pii_active", False)),
+                "provenance_enforced": (
+                    self.capability_profile.name == "hardened-safety"
+                    or os.getenv("CC_HARNESS_SECURITY_MODE", "").strip().lower()
+                    in {"strict", "hardened", "security"}
+                ),
+                "output_egress_guard": bool(self.output_egress_guard_enabled),
+            }
         )
+        safety_details["profile"] = self.capability_profile.name
+        self.activation_manifest.initialize("safety", **safety_details)
         safety_artifact = self.cwd / ".cc-harness" / "safety" / f"{self.state.session_id}.json"
         atomic_write_text(
             safety_artifact,
@@ -333,17 +338,7 @@ class SessionRuntime:
                     "schema_version": "cc-harness.safety-session.v1",
                     "session_id": self.state.session_id,
                     "profile": self.capability_profile.name,
-                    "executor_backend": exec_cfg.backend.value,
-                    "policy_enabled": bool(self.policy and self.policy.enabled),
-                    "l2_enabled": bool(self.l2_config and self.l2_config.enabled),
-                    "l5_enabled": self.l5 is not None,
-                    "pii_active": bool(getattr(self.l5, "pii_active", False)),
-                    "provenance_enforced": (
-                        self.capability_profile.name == "hardened-safety"
-                        or os.getenv("CC_HARNESS_SECURITY_MODE", "").strip().lower()
-                        in {"strict", "hardened", "security"}
-                    ),
-                    "output_egress_guard": bool(self.output_egress_guard_enabled),
+                    **safety_details,
                 },
                 ensure_ascii=False,
                 indent=2,
@@ -937,6 +932,7 @@ class SessionRuntime:
             if self.capability_profile.safety and self.l2_config and self.l2_config.enabled:
                 stats.auxiliary_model_calls += scan.model_calls
                 if scan.usage is not None:
+                    stats.api_cost_observed = True
                     stats.api_prompt_tokens += scan.usage.prompt_tokens
                     stats.api_uncached_prompt_tokens += scan.usage.uncached_prompt_tokens
                     stats.api_cache_read_prompt_tokens += scan.usage.cache_read_prompt_tokens
@@ -946,9 +942,10 @@ class SessionRuntime:
                     stats.api_completion_tokens += scan.usage.completion_tokens
                     stats.api_total_tokens += scan.usage.total_tokens
                     if scan.usage.reported_cost is None:
+                        stats.api_cost_complete = False
                         stats.api_reported_cost = None
                         stats.api_reported_cost_currency = None
-                    elif stats.api_reported_cost is None:
+                    elif stats.api_reported_cost is None and stats.api_cost_complete:
                         stats.api_reported_cost = scan.usage.reported_cost
                         stats.api_reported_cost_currency = scan.usage.reported_cost_currency
                     elif stats.api_reported_cost_currency in (
@@ -960,6 +957,7 @@ class SessionRuntime:
                             or scan.usage.reported_cost_currency
                         )
                     else:
+                        stats.api_cost_complete = False
                         stats.api_reported_cost = None
                         stats.api_reported_cost_currency = None
                     stats.api_reported = True

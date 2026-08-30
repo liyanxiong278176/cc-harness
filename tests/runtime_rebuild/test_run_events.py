@@ -150,3 +150,62 @@ def test_runtime_migration_changes_digest_and_fences_old_history() -> None:
     stale = event(4, "WorkerHeartbeat", {"heartbeat_at": "2026-08-17T00:00:00Z"})
     with pytest.raises(EventValidationError, match="stale"):
         EventValidator.validate_event(stale, expected_runtime_contract_digest=new_digest)
+
+
+def test_model_invocation_terminal_usage_and_outcome_are_replayable() -> None:
+    history = [
+        event(1, "RunCreated", {"goal": GOAL.to_dict(), "runtime_contract": CONTRACT.to_dict()}),
+        event(2, "RunQueued", {}),
+        event(3, "RunClaimed", {"worker_id": "worker-1"}, lease_epoch=1),
+        event(
+            4,
+            "ModelInvocationStarted",
+            {"invocation_id": "model-1", "segment": 0, "round": 0},
+            lease_epoch=1,
+        ),
+        event(
+            5,
+            "ModelInvocationFinished",
+            {
+                "invocation_id": "model-1",
+                "status": "succeeded",
+                "duration_ms": 42,
+                "usage": {
+                    "input_tokens": 10,
+                    "cache_read_input_tokens": 8,
+                    "output_tokens": 2,
+                    "model_calls": 1,
+                    "reported_cost": 0.01,
+                    "reported_cost_currency": "USD",
+                },
+            },
+            lease_epoch=1,
+        ),
+        event(
+            6,
+            "RunOutcomeRecorded",
+            {"outcome": "pass", "primary_class": "none", "retryable": False},
+            lease_epoch=1,
+        ),
+    ]
+
+    assert EventValidator.validate_history(history) is RunStatus.RUNNING
+    assert EventCodec.decode(EventCodec.encode(history[5])).payload["outcome"] == "pass"
+
+
+def test_model_invocation_usage_rejects_negative_or_unknown_values() -> None:
+    negative = event(
+        1,
+        "ModelInvocationFinished",
+        {"invocation_id": "model-1", "status": "succeeded", "usage": {"output_tokens": -1}},
+    )
+    with pytest.raises(EventValidationError, match="cannot be negative"):
+        EventValidator.validate_event(negative)
+
+    unknown_status = event(
+        1,
+        "ModelInvocationFinished",
+        {"invocation_id": "model-1", "status": "unknown", "usage": {}},
+    )
+    with pytest.raises(EventValidationError, match="status is invalid"):
+        EventValidator.validate_event(unknown_status)

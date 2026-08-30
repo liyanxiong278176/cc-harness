@@ -18,8 +18,17 @@ def objective_messages(
     *,
     cwd: str | Path | None = None,
     project_instructions: str | None = None,
+    objective_text: str | None = None,
 ) -> tuple[dict[str, Any], ...]:
-    """Return the mandatory instruction and objective portion of a run context."""
+    """Return the mandatory instruction and objective portion of a run context.
+
+    ``objective_text`` is the model-facing representation of the goal.  The
+    durable goal itself remains the raw, authoritative contract; callers may
+    pass the L2 security wrapper here so the provider never receives an
+    unbounded/ambiguous user string.  Keeping this at the message boundary
+    avoids mutating the persisted goal or losing the original text needed for
+    audit and recovery.
+    """
 
     system_content = "You are a durable coding agent."
     if cwd is not None:
@@ -43,6 +52,9 @@ def objective_messages(
         )
     criteria = "\n".join(f"- {item}" for item in projection.goal.acceptance_criteria)
     constraints = "\n".join(f"- {item}" for item in projection.goal.constraints) or "- none"
+    rendered_objective = (
+        objective_text if objective_text is not None else projection.goal.objective
+    )
     return (
         {"role": "system", "content": system_content, "_context_mandatory": True},
         {
@@ -53,7 +65,7 @@ def objective_messages(
                 "make and verify changes. Do not claim completion without evidence. When all "
                 "acceptance criteria are verified, include a <cc-harness-complete> JSON object with "
                 "acceptance_criteria and evidence fields.\n\n"
-                f"Objective:\n{projection.goal.objective}\n\n"
+                f"Objective:\n{rendered_objective}\n\n"
                 f"Acceptance criteria:\n{criteria}\n\n"
                 f"Constraints:\n{constraints}"
             ),
@@ -66,10 +78,15 @@ def assistant_message(
     text: str,
     tool_calls: tuple[Mapping[str, Any], ...] = (),
     *,
-    reasoning_content: str = "",
+    reasoning_content: str | None = None,
 ) -> dict[str, Any]:
     message: dict[str, Any] = {"role": "assistant", "content": text}
-    if reasoning_content:
+    # Thinking-mode providers (notably DeepSeek) require the field to be
+    # present on every assistant tool-call replay, even when this response
+    # carried an empty reasoning stream. ``None`` means the producer did not
+    # provide the field at all; an explicit empty string is retained instead
+    # of being silently dropped.
+    if reasoning_content is not None:
         message["reasoning_content"] = reasoning_content
     if tool_calls:
         message["tool_calls"] = [
@@ -152,6 +169,32 @@ def _handoff_message(store: RunStore, event: Any) -> dict[str, Any] | None:
     }
 
 
+def _resume_message(event: Any) -> dict[str, Any] | None:
+    """Render an explicit resume reason as a new user turn.
+
+    ``RunResumed`` is a durable control event, but its reason is also the
+    user's continuation instruction.  Keeping it only in the event stream
+    means the next model turn sees the old final answer and can repeatedly
+    stall without ever receiving the requested follow-up.  Materialize the
+    reason as a normal user message while retaining an internal marker for
+    audit/debugging; unlike tool output, this is trusted client input.
+    """
+
+    reason = event.payload.get("reason")
+    if not isinstance(reason, str) or not reason.strip():
+        return None
+    return {
+        "role": "user",
+        "content": reason,
+        "_cc_harness_resume_reason": True,
+        # A resume reason is the user's current continuation instruction. It
+        # must survive a context projection/compaction just like the durable
+        # objective; otherwise a resumed run can see only its old final report
+        # and repeatedly stall without acting on the new request.
+        "_context_mandatory": True,
+    }
+
+
 async def materialize_interaction_messages(
     store: RunStore,
     projection: RunProjection,
@@ -192,6 +235,10 @@ async def materialize_interaction_messages(
             messages.append(observation.as_model_message())
         elif event.event_type in {"PredecessorHandoffCommitted", "ChildDelegationCommitted"}:
             message = _handoff_message(store, event)
+            if message is not None:
+                messages.append(message)
+        elif event.event_type == "RunResumed":
+            message = _resume_message(event)
             if message is not None:
                 messages.append(message)
         elif include_legacy and event.event_type == "LegacyRunImported":

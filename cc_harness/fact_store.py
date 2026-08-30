@@ -16,6 +16,8 @@ from typing import Any
 
 import aiosqlite
 
+from .sqlite_utils import begin_immediate
+
 EVENT_SCHEMA_VERSION = 1
 SUMMARY_SCHEMA_VERSION = 1
 MAX_EVENT_PAGE = 1_000
@@ -248,7 +250,7 @@ class ProjectFactStore:
             raise FactStoreError("session_id cannot be empty")
         db = self._require_db()
         async with self._write_lock:
-            await db.execute("BEGIN IMMEDIATE")
+            await begin_immediate(db)
             try:
                 cursor = await db.execute(
                     "INSERT OR IGNORE INTO session "
@@ -289,7 +291,7 @@ class ProjectFactStore:
             raise FactStoreError("event_type and object payload are required")
         db = self._require_db()
         async with self._write_lock:
-            await db.execute("BEGIN IMMEDIATE")
+            await begin_immediate(db)
             try:
                 event = await self._append_event_tx(
                     session_id,
@@ -310,7 +312,7 @@ class ProjectFactStore:
     async def rewind(self, session_id: str, target_seq: int) -> FactEvent:
         db = self._require_db()
         async with self._write_lock:
-            await db.execute("BEGIN IMMEDIATE")
+            await begin_immediate(db)
             try:
                 cursor = await db.execute(
                     "SELECT 1 FROM event WHERE session_id = ? AND seq = ?",
@@ -357,7 +359,7 @@ class ProjectFactStore:
         await asyncio.to_thread(self._write_object, target, content)
         db = self._require_db()
         async with self._write_lock:
-            await db.execute("BEGIN IMMEDIATE")
+            await begin_immediate(db)
             try:
                 await db.execute(
                     "INSERT OR IGNORE INTO artifact "
@@ -406,7 +408,7 @@ class ProjectFactStore:
         artifact = await self.put_object(text.encode("utf-8"), media_type="text/plain; charset=utf-8")
         db = self._require_db()
         async with self._write_lock:
-            await db.execute("BEGIN IMMEDIATE")
+            await begin_immediate(db)
             try:
                 rows = await self._event_rows(session_id, covers_from_seq, covers_through_seq)
                 expected = covers_through_seq - covers_from_seq + 1
@@ -504,7 +506,7 @@ class ProjectFactStore:
         for legacy in snapshot:
             session_id = legacy["session_id"]
             async with self._write_lock:
-                await db.execute("BEGIN IMMEDIATE")
+                await begin_immediate(db)
                 try:
                     marker = await db.execute(
                         "SELECT 1 FROM legacy_import WHERE source_key = ? AND source_session_id = ?",

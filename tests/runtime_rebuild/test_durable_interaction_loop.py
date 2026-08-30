@@ -8,6 +8,7 @@ from cc_harness.capability_runtime import ContextBuild
 from cc_harness.coordinator import RunCoordinator, RunRequest
 from cc_harness.context import CompactionStats, CompactionTier
 from cc_harness.durable_runtime import DurableRuntimeClient
+from cc_harness import interaction_history
 from cc_harness.run_kernel import ModelSegment, ReActKernel
 from cc_harness.run_model import ActionStatus, EvidenceKind, EvidenceRef
 from cc_harness.run_store import RunRecordView, RunStore
@@ -155,3 +156,31 @@ async def test_recall_run_context_uses_durable_lineage_record_without_projection
 
     assert result.is_error is False
     assert "events" in result.llm_text
+
+
+@pytest.mark.asyncio
+async def test_resume_reason_is_materialized_as_latest_user_turn(monkeypatch) -> None:
+    """A natural-language resume must reach the next model invocation."""
+
+    async def _events(_store, _run_id):
+        return (
+            SimpleNamespace(
+                event_type="RunResumed",
+                payload={"reason": "继续验证前端并提交 CompletionCandidate"},
+            ),
+        )
+
+    monkeypatch.setattr(interaction_history, "_read_events", _events)
+    projection = SimpleNamespace(run_id="run-1")
+    messages = await interaction_history.materialize_interaction_messages(
+        SimpleNamespace(), projection
+    )
+
+    assert messages == (
+        {
+            "role": "user",
+            "content": "继续验证前端并提交 CompletionCandidate",
+            "_cc_harness_resume_reason": True,
+            "_context_mandatory": True,
+        },
+    )

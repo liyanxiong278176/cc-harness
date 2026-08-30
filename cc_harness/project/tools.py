@@ -16,7 +16,6 @@ handler 业务错都是开发者自用,所以两字段同内容即可。
 """
 from __future__ import annotations
 
-import asyncio
 import logging
 from datetime import datetime
 from typing import Any
@@ -1189,202 +1188,19 @@ async def dispatch_subagent_handler(
     progress_cb=None,
     failure_pause_cb=None,
 ):
-    """dispatch_subagent 第 9 个 todo tool。
-
-    校验 → 创建 N 个 sub-todo(故意 acceptance_criteria=[]) → asyncio.gather 真并行
-    → _render_subagent_summary 合并。完整实现见 spec 组件 1。
-
-    Args:
-        args: LLM 调工具传入的参数(task_id + sub_specs + max_fan_out + timeout)。
-        service: TodoService 实例(handler 通过 deps['service'] 访问)。
-        session_id: 当前 session(handler 用来标 sub-todo session_id)。
-        cwd: 当前工作目录(handler 当前未用,保留签名)。
-        last_turn_text: 上一轮 LLM 文本(handler 当前未用,保留签名)。
-        dispatch_subagent_runner: SubAgentRunner 实例(inject_todo_tools 由
-            deps['dispatch_subagent_runner'] 注入;**不可为 None** —
-            重要 fix #1)。
-        progress_cb: E1 D6 per-subagent 进度 callback
-            ``async (task_id, status, detail="") -> None``。
-            默认 None 走 ``print_info`` 渲染(icon 字典 lock,spec D6)。
-        failure_pause_cb: E1 D6 失败 pause 决策 callback
-            ``async (SubAgentResult) -> "continue"|"retry"|"abort"``。
-            默认 None(不 pause);仅在 status ∈ {"failed", "timeout", "blocked"} 时触发。
-            "abort" → break(后续 sub-task 不再 pause,但仍走 _render_subagent_summary)。
-
-    Returns:
-        ToolResult:
-        - 校验失败 → is_error=True + 提示("未注入" / "已 done" /
-          "max_fan_out 超出" / "timeout 越界")。
-        - 正常 → _render_subagent_summary 合并结果(仍 is_error=False)。
-    """
-    from cc_harness.project.subagent import (
-        SubAgentResult,
-        SubAgentRunner,
-        _render_subagent_summary,
-        _subagent_err,
+    # The durable runtime is the sole execution path.  This legacy handler is
+    # kept only as a migration/import seam and fails closed before it can create
+    # TodoService tasks or instantiate an in-process SubAgentRunner.
+    return ToolResult.error(
+        "legacy in-process dispatch is disabled",
+        "[Tool Error] use Durable Runtime dispatch_subagent",
+        source="legacy-compatibility",
+        capability="durable_dispatch_required",
     )
-    # E1 D6:实时进度 callback 默认实现(icon 字典 spec D6 lock)
-    if progress_cb is None:
-        from rich.console import Console
-        from cc_harness.render import print_info
 
-        async def progress_cb(task_id: str, status: str, detail: str = ""):
-            icon = {
-                "queued": "○", "running": "⠋", "done": "✓", "failed": "✗",
-            }.get(status, "?")
-            print_info(Console(), f"  {icon} [{task_id}] {status} {detail}")
-
-    del cwd, last_turn_text
-
-    task_id = args.get("task_id")
-    sub_specs = args.get("sub_specs") or []
-
-    # 1. 参数校验(基础存在性优先,int 转换后置 — D1 Task 4 fix Important #2:
-    #    max_fan_out="abc" 之类非 str 错误若前置 → ValueError 未捕获,handler 崩
-    #    而非返回结构化 ToolResult)
-    if not task_id:
-        return _subagent_err("dispatch_subagent", "task_id is required")
-    if not sub_specs:
-        return _subagent_err(
-            "dispatch_subagent", "sub_specs is required (non-empty list)"
-        )
-    try:
-        max_fan_out = int(args.get("max_fan_out", 3))
-        timeout = int(args.get("timeout", 240))
-    except (ValueError, TypeError) as e:
-        return _subagent_err(
-            "dispatch_subagent", f"max_fan_out/timeout 类型错: {e}"
-        )
-    if not (1 <= len(sub_specs) <= max_fan_out):
-        return _subagent_err(
-            "dispatch_subagent",
-            f"sub_specs 长度 {len(sub_specs)} 超出 max_fan_out={max_fan_out}",
-        )
-    if not (1 <= max_fan_out <= 10):
-        return _subagent_err(
-            "dispatch_subagent", "max_fan_out 必须在 [1, 10]"
-        )
-    if not (1 <= timeout <= 3600):
-        return _subagent_err(
-            "dispatch_subagent", f"timeout={timeout} 必须在 [1, 3600]"
-        )
-
-    # 2. parent 存在性 + 状态校验
-    try:
-        parent = await service.get(task_id)
-    except Exception as e:
-        return _subagent_err(
-            "dispatch_subagent", f"task_id={task_id} 不存在: {e}"
-        )
-    if parent.status == "done":
-        return _subagent_err(
-            "dispatch_subagent",
-            f"task_id={task_id} 已 done, 不能再派 subagent",
-        )
-
-    # 所有 spec 必须在任何 sub-todo 落盘前通过校验,避免后项失败留下孤儿。
-    for index, spec in enumerate(sub_specs):
-        if not isinstance(spec, dict):
-            return _subagent_err(
-                "dispatch_subagent", f"sub_specs[{index}] 必须是 object"
-            )
-        title = spec.get("title")
-        if not isinstance(title, str) or not title.strip():
-            return _subagent_err(
-                "dispatch_subagent", f"sub_specs[{index}].title 必须是非空字符串"
-            )
-
-    # 3. runner 注入校验 + 嵌套深度(decision 5:MAX_DEPTH=2)
-    if dispatch_subagent_runner is None:
-        return _subagent_err(
-            "dispatch_subagent",
-            "dispatch_subagent_runner 未注入,agent.run_turn 配置错误",
-        )
-    current_depth = dispatch_subagent_runner.current_depth
-    if current_depth >= SubAgentRunner.MAX_DEPTH:
-        return _subagent_err(
-            "dispatch_subagent",
-            f"subagent 嵌套深度 {current_depth} 超过 max_depth=2",
-        )
-
-    # 4. 创建 N 个 sub-todo(故意 acceptance_criteria=[],
-    #    避免 subagent 末轮空 last_turn_text 误判 acceptance 失败)
-    sub_task_ids: list[tuple[str, dict]] = []
-    for spec in sub_specs:
-        try:
-            t = await service.create(
-                title=spec["title"],
-                acceptance_criteria=[],  # D1 重要 fix
-                parent_task=task_id,
-                session_id=session_id,
-            )
-        except Exception as e:
-            return _subagent_err(
-                "dispatch_subagent", f"创建 sub-task 失败: {e}"
-            )
-        sub_task_ids.append((t.id, spec))
-
-    # 5. 真并行跑 N 个 subagent(E1 D6:每个 task 套 _run_with_progress 触发
-    #    progress_cb queued/running/done|failed,exception 也触发 failed)
-    runner = dispatch_subagent_runner
-
-    async def _run_with_progress(tid: str, spec: dict):
-        await progress_cb(tid, "queued")
-        await progress_cb(tid, "running")
-        try:
-            result = await runner.run(
-                task_id=tid,
-                title=spec.get("title", ""),
-                description=spec.get("description") or "",
-                criteria=spec.get("criteria", []),
-                parent_id=task_id,
-                session_id=session_id,
-                timeout=timeout,
-            )
-            await progress_cb(tid, result.status)
-            return result
-        except Exception as e:
-            await progress_cb(tid, "failed", str(e)[:100])
-            raise
-
-    try:
-        gathered = await asyncio.wait_for(
-            asyncio.gather(*[
-                _run_with_progress(tid, spec)
-                for tid, spec in sub_task_ids
-            ], return_exceptions=True),
-            timeout=timeout * len(sub_specs) + 30,
-        )
-    except asyncio.TimeoutError:
-        return _subagent_err(
-            "dispatch_subagent",
-            f"subagent fan-out 总耗时超过 {timeout * len(sub_specs) + 30}s",
-        )
-
-    results: list[SubAgentResult] = []
-    for (tid, spec), result in zip(sub_task_ids, gathered):
-        if isinstance(result, Exception):
-            results.append(SubAgentResult(
-                task_id=tid,
-                title=spec["title"],
-                status="failed",
-                error=f"runner exception ({type(result).__name__}): {result}",
-                fatal_error=True,
-            ))
-        else:
-            results.append(result)
-
-    # E1 D6:失败 pause 决策(若有未 retry 已 fail 的)
-    # 沿用 plan Task 5 verbatim set: {"failed", "timeout", "blocked"}
-    if failure_pause_cb is not None:
-        for r in results:
-            if isinstance(r, SubAgentResult) and r.status in {"failed", "timeout", "blocked"}:
-                decision = await failure_pause_cb(r)
-                if decision == "abort":
-                    break
-
-    return _render_subagent_summary(results, parent_id=task_id)
-
+    # The legacy implementation intentionally has no execution path.  Keep
+    # this import-compatible seam small so all dispatch goes through the
+    # Durable Runtime handler in ``cc_harness.durable_subagents``.
 
 __all__ = [
     "TODO_LIST_SPEC", "TODO_GET_SPEC", "TODO_CREATE_SPEC", "TODO_UPDATE_SPEC",

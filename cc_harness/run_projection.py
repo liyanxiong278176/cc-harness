@@ -142,6 +142,10 @@ class ChildProjection:
     diff_digest: str | None = None
     modified_paths: tuple[str, ...] = ()
     accepted_sequence: int | None = None
+    required: bool = True
+    effect_class: str = EffectClass.READ_ONLY.value
+    acceptance_criteria: tuple[str, ...] = ()
+    failure_reason: str | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -152,6 +156,10 @@ class ChildProjection:
             "diff_digest": self.diff_digest,
             "modified_paths": list(self.modified_paths),
             "accepted_sequence": self.accepted_sequence,
+            "required": self.required,
+            "effect_class": self.effect_class,
+            "acceptance_criteria": list(self.acceptance_criteria),
+            "failure_reason": self.failure_reason,
         }
 
     @classmethod
@@ -168,6 +176,10 @@ class ChildProjection:
                 if data.get("accepted_sequence") is not None
                 else None
             ),
+            required=bool(data.get("required", True)),
+            effect_class=str(data.get("effect_class", EffectClass.READ_ONLY.value)),
+            acceptance_criteria=tuple(str(item) for item in data.get("acceptance_criteria") or ()),
+            failure_reason=(str(data["failure_reason"]) if data.get("failure_reason") is not None else None),
         )
 
 
@@ -451,7 +463,15 @@ class _MutableProjection:
             observations=tuple(self.observations[key] for key in sorted(self.observations)),
             approvals=tuple(self.approvals[key] for key in sorted(self.approvals)),
             todos=tuple(self.todos[key] for key in sorted(self.todos)),
-            queue=tuple(self.queue[key] for key in sorted(self.queue)),
+            # Queue order is part of the durable input contract.  UUID order
+            # is not FIFO and made follow-ups appear nondeterministically after
+            # a restart; sequence is assigned by the immutable event stream.
+            queue=tuple(
+                sorted(
+                    self.queue.values(),
+                    key=lambda item: (item.queued_sequence, item.follow_up_run_id),
+                )
+            ),
             children=tuple(self.children[key] for key in sorted(self.children)),
             evidence=tuple(self.evidence),
             progress=tuple(dict(item) for item in self.progress),
@@ -772,11 +792,30 @@ class ProjectionBuilder:
             state.children[child_id] = ChildProjection(
                 child_run_id=child_id,
                 node_id=payload.get("node_id"),
+                required=bool(payload.get("required", True)),
+                effect_class=str(payload.get("effect_class", EffectClass.READ_ONLY.value)),
+                acceptance_criteria=tuple(
+                    str(item) for item in payload.get("acceptance_criteria") or ()
+                ),
             )
         elif child is None:
             raise ProjectionError(f"child event has no child run: {child_id}")
         elif event.event_type == "ChildRunClaimed":
             state.children[child_id] = replace(child, status="running")
+        elif event.event_type == "ChildRunCompleted":
+            state.children[child_id] = replace(child, status="completed")
+        elif event.event_type == "ChildRunCancelled":
+            state.children[child_id] = replace(
+                child,
+                status="cancelled",
+                failure_reason=str(payload.get("reason") or "cancelled"),
+            )
+        elif event.event_type == "ChildRunFailed":
+            state.children[child_id] = replace(
+                child,
+                status="failed",
+                failure_reason=str(payload.get("reason") or "child run failed"),
+            )
         elif event.event_type == "ChildCandidateSubmitted":
             state.children[child_id] = replace(
                 child,

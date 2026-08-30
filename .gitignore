@@ -94,3 +94,5 @@ cc_harness/memory/*.db
 /logs/reflection.jsonl
 /logs/*.db-shm
 /logs/*.db-wal
+# Local cc-harness Durable Run state (never commit)
+/.cc-harness-data/

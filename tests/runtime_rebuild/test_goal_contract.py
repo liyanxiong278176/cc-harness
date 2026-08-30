@@ -51,6 +51,14 @@ def test_untrusted_provenance_still_requires_high_risk_review() -> None:
     assert not assessment.accepted
 
 
+def test_explicit_user_confirmation_accepts_high_risk_goal() -> None:
+    service = GoalContractService()
+    goal = service.build("build a production payment service", ["tests pass"])
+    assessment = service.assess(goal, goal_provenance="user_confirmed")
+    assert assessment.decision is GoalDecision.AUTO_ACCEPT
+    assert assessment.accepted
+
+
 @pytest.mark.asyncio
 async def test_terminal_bench_provenance_is_explicit_and_audited(tmp_path, monkeypatch) -> None:
     monkeypatch.setenv("CC_HARNESS_TERMINAL_BENCH", "1")

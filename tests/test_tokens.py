@@ -30,6 +30,46 @@ def test_session_cost_is_unknown_if_any_observed_api_call_lacks_provider_cost():
     assert stats.api_cost_complete is False
 
 
+def test_session_cost_is_unknown_for_mixed_provider_currencies():
+    stats = SessionTokenStats()
+    stats.add(
+        TurnTokenStats(
+            api_reported=True,
+            api_reported_cost=0.1,
+            api_reported_cost_currency="USD",
+        )
+    )
+    stats.add(
+        TurnTokenStats(
+            api_reported=True,
+            api_reported_cost=1.0,
+            api_reported_cost_currency="CNY",
+        )
+    )
+    assert stats.api_reported_cost is None
+    assert stats.api_cost_complete is False
+
+
+def test_session_cost_is_unknown_for_known_and_unknown_currency_mix():
+    stats = SessionTokenStats()
+    stats.add(
+        TurnTokenStats(
+            api_reported=True,
+            api_reported_cost=0.1,
+            api_reported_cost_currency="USD",
+        )
+    )
+    stats.add(
+        TurnTokenStats(
+            api_reported=True,
+            api_reported_cost=1.0,
+            api_reported_cost_currency=None,
+        )
+    )
+    assert stats.api_reported_cost is None
+    assert stats.api_cost_complete is False
+
+
 # --- UsageRecord ---
 
 def test_usage_record_from_api_with_full_usage():

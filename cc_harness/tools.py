@@ -130,6 +130,21 @@ def get_session_executor() -> Executor:
     return _session_executor
 
 
+async def prewarm_session_executor():
+    """Eagerly start the selected executor's service dependencies.
+
+    Native execution has no service to prewarm.  SandboxExecutor exposes a
+    small ``prewarm_server`` capability; keeping this adapter here avoids
+    importing optional OpenSandbox modules during normal package import and
+    gives Durable Runtime one lifecycle seam for startup readiness.
+    """
+    executor = get_session_executor()
+    prewarm = getattr(executor, "prewarm_server", None)
+    if prewarm is None:
+        return None
+    return await prewarm()
+
+
 def reset_session_executor() -> None:
     """Clear session executor state for test and lifecycle isolation."""
     global _session_executor, _session_executor_config
@@ -289,6 +304,15 @@ RUN_COMMAND_SPEC = {
                     "description": (
                         "The shell command to execute. The active session replaces this text "
                         "with its exact platform and command dialect before model use."
+                    ),
+                },
+                "background": {
+                    "type": "boolean",
+                    "default": False,
+                    "description": (
+                        "Start an explicitly long-lived background process. The result includes "
+                        "a PID and stdout/stderr log paths; it is not subject to the foreground "
+                        "idle timeout. Use only for a service or watcher that must outlive this call."
                     ),
                 },
             },

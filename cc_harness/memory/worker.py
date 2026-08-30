@@ -9,6 +9,7 @@ import uuid
 from pathlib import Path
 from typing import Callable
 
+from cc_harness.sqlite_utils import begin_immediate
 from cc_harness.tokens import TokenCounter
 
 
@@ -41,10 +42,16 @@ class LayeredMemoryWorker:
 
     async def start(self) -> None:
         assert self.store._db is not None
-        await self.store._db.execute(
-            "UPDATE memory_pipeline_job SET status='pending' WHERE status='running'"
-        )
-        await self.store._db.commit()
+        async with self.store.write_lock:
+            try:
+                await begin_immediate(self.store._db)
+                await self.store._db.execute(
+                    "UPDATE memory_pipeline_job SET status='pending' WHERE status='running'"
+                )
+                await self.store._db.commit()
+            except Exception:
+                await self.store._db.rollback()
+                raise
         if self._task is None or self._task.done():
             self._task = asyncio.create_task(self._run(), name="cc-harness-memory-pipeline")
         self._wake.set()
@@ -56,14 +63,20 @@ class LayeredMemoryWorker:
         job_id = uuid.uuid4().hex
         payload = json.dumps(messages, ensure_ascii=False, default=str)
         now = time.time()
-        cur = await self.store._db.execute(
-            "INSERT INTO memory_pipeline_job("
-            "id,session_id,turn_idx,payload_json,status,attempts,created_at,updated_at) "
-            "VALUES(?,?,?,?, 'pending',0,?,?) "
-            "ON CONFLICT(session_id,turn_idx) DO NOTHING",
-            (job_id, session_id, turn_idx, payload, now, now),
-        )
-        await self.store._db.commit()
+        async with self.store.write_lock:
+            try:
+                await begin_immediate(self.store._db)
+                cur = await self.store._db.execute(
+                    "INSERT INTO memory_pipeline_job("
+                    "id,session_id,turn_idx,payload_json,status,attempts,created_at,updated_at) "
+                    "VALUES(?,?,?,?, 'pending',0,?,?) "
+                    "ON CONFLICT(session_id,turn_idx) DO NOTHING",
+                    (job_id, session_id, turn_idx, payload, now, now),
+                )
+                await self.store._db.commit()
+            except Exception:
+                await self.store._db.rollback()
+                raise
         queued = cur.rowcount > 0
         if queued:
             self._wake.set()
@@ -98,10 +111,16 @@ class LayeredMemoryWorker:
             except asyncio.CancelledError:
                 pass
         if self.store._db is not None:
-            await self.store._db.execute(
-                "UPDATE memory_pipeline_job SET status='pending' WHERE status='running'"
-            )
-            await self.store._db.commit()
+            async with self.store.write_lock:
+                try:
+                    await begin_immediate(self.store._db)
+                    await self.store._db.execute(
+                        "UPDATE memory_pipeline_job SET status='pending' WHERE status='running'"
+                    )
+                    await self.store._db.commit()
+                except Exception:
+                    await self.store._db.rollback()
+                    raise
 
     async def close(self) -> None:
         await self.stop()
@@ -117,21 +136,26 @@ class LayeredMemoryWorker:
 
     async def _claim(self):
         assert self.store._db is not None
-        cur = await self.store._db.execute(
-            "SELECT id,session_id,turn_idx,payload_json,attempts "
-            "FROM memory_pipeline_job WHERE status='pending' "
-            "ORDER BY created_at,id LIMIT 1"
-        )
-        row = await cur.fetchone()
-        if row is None:
-            return None
-        await self.store._db.execute(
-            "UPDATE memory_pipeline_job SET status='running',attempts=attempts+1,updated_at=? "
-            "WHERE id=?",
-            (time.time(), row[0]),
-        )
-        await self.store._db.commit()
-        return row
+        async with self.store.write_lock:
+            cur = await self.store._db.execute(
+                "SELECT id,session_id,turn_idx,payload_json,attempts "
+                "FROM memory_pipeline_job WHERE status='pending' "
+                "ORDER BY created_at,id LIMIT 1"
+            )
+            row = await cur.fetchone()
+            if row is None:
+                return None
+            try:
+                await self.store._db.execute(
+                    "UPDATE memory_pipeline_job SET status='running',attempts=attempts+1,updated_at=? "
+                    "WHERE id=?",
+                    (time.time(), row[0]),
+                )
+                await self.store._db.commit()
+            except Exception:
+                await self.store._db.rollback()
+                raise
+            return row
 
     async def _process(self, job) -> None:
         job_id, session_id, turn_idx, payload_json, attempts = job
@@ -189,11 +213,17 @@ class LayeredMemoryWorker:
                 self._wake.set()
 
     async def _finish(self, job_id: str, status: str, error: str | None) -> None:
-        await self.store._db.execute(
-            "UPDATE memory_pipeline_job SET status=?,last_error=?,updated_at=? WHERE id=?",
-            (status, error, time.time(), job_id),
-        )
-        await self.store._db.commit()
+        async with self.store.write_lock:
+            try:
+                await begin_immediate(self.store._db)
+                await self.store._db.execute(
+                    "UPDATE memory_pipeline_job SET status=?,last_error=?,updated_at=? WHERE id=?",
+                    (status, error, time.time(), job_id),
+                )
+                await self.store._db.commit()
+            except Exception:
+                await self.store._db.rollback()
+                raise
 
     def _write_artifact(self, job_id: str, **payload) -> Path:
         self.artifact_dir.mkdir(parents=True, exist_ok=True)

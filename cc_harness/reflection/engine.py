@@ -202,6 +202,11 @@ class ReflectionEngine:
     async def _ask_judge_with_fallback(self, system: str, user: str) -> str | None:
         """JUDGE_MODEL → 退回本地 LLMClient → None。"""
         for llm, label in [(self._judge_llm, "judge"), (self._llm_client, "local")]:
+            # ``judge_llm`` is optional in the durable adapter.  Skip an
+            # unconfigured slot instead of trying to call ``None`` and
+            # emitting a misleading warning on every background reflection.
+            if llm is None:
+                continue
             try:
                 if hasattr(llm, "chat"):
                     content = ""

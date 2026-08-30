@@ -63,56 +63,59 @@ class CheckpointService:
         UPSERT checkpoint + INSERT messages。"""
         assert self.store._db is not None
         extra = extra or {}
-        # 同 capture.py:用 SAVEPOINT 代替 BEGIN,防嵌套事务报
-        # "cannot start a transaction within a transaction"
-        await self.store._db.execute("SAVEPOINT checkpoint_sp")
-        try:
-            # Task 9: session_checkpoint FK → web_session(id),先 UPSERT parent。
-            # 用 INSERT OR IGNORE 避免覆盖 WebSessionStore 维护的 cwd/mode/last_active_at;
-            # 首调 save 时 web_session 通常已存在(WebSessionStore.upsert 先调),此条 no-op。
-            now_ts = time.time()
-            await self.store._db.execute(
-                "INSERT OR IGNORE INTO web_session "
-                "(id, cwd, mode, created_at, last_active_at, status, extra_json) "
-                "VALUES (?, ?, ?, ?, ?, 'active', '{}')",
-                (session_id, str(project_root), mode, now_ts, now_ts),
-            )
-            await self.store._db.execute(
-                "INSERT OR REPLACE INTO session_checkpoint "
-                "(session_id, project_root, mode, turn_counter, started_at, ended_at, "
-                " cross_session_mode, extra_json) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-                (
-                    session_id,
-                    str(project_root),
-                    mode,
-                    turn_counter,
-                    started_at,
-                    ended_at,
-                    cross_session_mode,
-                    json.dumps(extra),
-                ),
-            )
-            await self.store._db.execute(
-                "DELETE FROM session_message WHERE session_id = ?",
-                (session_id,),
-            )
-            now = datetime.now().isoformat()
-            for idx, msg in enumerate(messages):
-                await self.store._db.execute(
-                    "INSERT INTO session_message "
-                    "(session_id, turn_idx, role, content_json, ts) "
-                    "VALUES (?, ?, ?, ?, ?)",
-                    (session_id, idx, msg.get("role", ""), json.dumps(msg), now),
-                )
-            await self.store._db.execute("RELEASE SAVEPOINT checkpoint_sp")
-        except BaseException:
+        async with self.store.write_lock:
+            # 同 capture.py:用 SAVEPOINT 代替 BEGIN,防嵌套事务报
+            # "cannot start a transaction within a transaction"
+            await self.store._db.execute("SAVEPOINT checkpoint_sp")
             try:
-                await self.store._db.execute("ROLLBACK TO SAVEPOINT checkpoint_sp")
+                # Task 9: session_checkpoint FK → web_session(id),先 UPSERT parent。
+                # 用 INSERT OR IGNORE 避免覆盖 WebSessionStore 维护的 cwd/mode/last_active_at;
+                # 首调 save 时 web_session 通常已存在(WebSessionStore.upsert 先调),此条 no-op。
+                now_ts = time.time()
+                await self.store._db.execute(
+                    "INSERT OR IGNORE INTO web_session "
+                    "(id, cwd, mode, created_at, last_active_at, status, extra_json) "
+                    "VALUES (?, ?, ?, ?, ?, 'active', '{}')",
+                    (session_id, str(project_root), mode, now_ts, now_ts),
+                )
+                await self.store._db.execute(
+                    "INSERT OR REPLACE INTO session_checkpoint "
+                    "(session_id, project_root, mode, turn_counter, started_at, ended_at, "
+                    " cross_session_mode, extra_json) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                    (
+                        session_id,
+                        str(project_root),
+                        mode,
+                        turn_counter,
+                        started_at,
+                        ended_at,
+                        cross_session_mode,
+                        json.dumps(extra),
+                    ),
+                )
+                await self.store._db.execute(
+                    "DELETE FROM session_message WHERE session_id = ?",
+                    (session_id,),
+                )
+                now = datetime.now().isoformat()
+                for idx, msg in enumerate(messages):
+                    await self.store._db.execute(
+                        "INSERT INTO session_message "
+                        "(session_id, turn_idx, role, content_json, ts) "
+                        "VALUES (?, ?, ?, ?, ?)",
+                        (session_id, idx, msg.get("role", ""), json.dumps(msg), now),
+                    )
                 await self.store._db.execute("RELEASE SAVEPOINT checkpoint_sp")
-            except Exception:
-                pass
-            raise
+                await self.store._db.commit()
+            except BaseException:
+                try:
+                    await self.store._db.execute("ROLLBACK TO SAVEPOINT checkpoint_sp")
+                    await self.store._db.execute("RELEASE SAVEPOINT checkpoint_sp")
+                    await self.store._db.commit()
+                except Exception:
+                    pass
+                raise
 
     async def load_latest(self, project_root: Path) -> CheckpointRecord | None:
         """查最近 1 个 checkpoint(按 ended_at DESC)。按 project_root 过滤。"""
@@ -174,23 +177,25 @@ class WebSessionStore:
 
     async def upsert(self, meta: SessionMeta) -> None:
         assert self.store._db is not None
-        await self.store._db.execute(
-            "INSERT OR REPLACE INTO web_session "
-            "(id, cwd, mode, created_at, last_active_at, status, extra_json) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?)",
-            (
-                meta.session_id, str(meta.cwd), meta.mode,
-                meta.created_at, meta.last_active_at, meta.status, "{}",
-            ),
-        )
-        await self.store._db.commit()
+        async with self.store.write_lock:
+            await self.store._db.execute(
+                "INSERT OR REPLACE INTO web_session "
+                "(id, cwd, mode, created_at, last_active_at, status, extra_json) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?)",
+                (
+                    meta.session_id, str(meta.cwd), meta.mode,
+                    meta.created_at, meta.last_active_at, meta.status, "{}",
+                ),
+            )
+            await self.store._db.commit()
 
     async def delete(self, session_id: str) -> None:
         assert self.store._db is not None
-        await self.store._db.execute(
-            "DELETE FROM web_session WHERE id=?", (session_id,),
-        )
-        await self.store._db.commit()
+        async with self.store.write_lock:
+            await self.store._db.execute(
+                "DELETE FROM web_session WHERE id=?", (session_id,),
+            )
+            await self.store._db.commit()
 
     async def list_active(self) -> list[SessionMeta]:
         assert self.store._db is not None
@@ -211,8 +216,9 @@ class WebSessionStore:
         """更新 last_active_at(每次 turn 末调用)。"""
         import time
         assert self.store._db is not None
-        await self.store._db.execute(
-            "UPDATE web_session SET last_active_at=? WHERE id=?",
-            (time.time(), session_id),
-        )
-        await self.store._db.commit()
+        async with self.store.write_lock:
+            await self.store._db.execute(
+                "UPDATE web_session SET last_active_at=? WHERE id=?",
+                (time.time(), session_id),
+            )
+            await self.store._db.commit()

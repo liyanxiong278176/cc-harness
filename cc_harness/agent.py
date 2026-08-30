@@ -190,9 +190,9 @@ async def run_turn(
     prior_messages: list[dict] | None = None,  # E3 D1:cross-session 旧 messages 摘要上下文
     tool_diff: list[str] | None = None,  # E3 D7:mcp tool 变更 warn 列表
     system_prompt: str | None = None,  # D1 Task 4 fix:subagent override
-    todo_service: "TodoService | None" = None,  # D1 Task 7:TodoService 实例,非 None 时自动构造 SubAgentRunner + 注入 extras
-    session_id: str = "",  # D1 Task 7:handler 用作 active_sessions(显式,不靠 env var)
-    last_turn_text: str = "",  # D1 Task 7:C 阶段 todo_update 完成门 acceptance 校验用
+    todo_service: "TodoService | None" = None,  # legacy compatibility surface; Durable Runtime owns child dispatch
+    session_id: str = "",  # legacy compatibility surface
+    last_turn_text: str = "",  # legacy compatibility surface
     reflection_engine: "ReflectionEngine | None" = None,  # E2 T2.2:默认 None 保持向后兼容
     e1_decompose_enabled: bool = True,  # E1 D7:kill-switch(从 main.py 透传 policy.e1_decompose_enabled,默认 True 向后兼容)
     prompt_capabilities: dict[str, bool] | None = None,
@@ -254,32 +254,13 @@ async def run_turn(
     is not None`,plan/design 模式不渲染。None = kill-switch(向后兼容,
     test_agent.py 不受影响)。
 
-    `system_prompt`(D1 Task 4 fix)可选显式 system prompt override:非 None 时,
+    `system_prompt`可选显式 system prompt override:非 None 时,
     跳过 `_refresh_system_prompt()`(不重建 system 段),直接把此字符串写入
     `messages[0]["content"]`(若 `messages[0]` 是 system)或 insert 新 system
-    消息。**专为 subagent 用**(SubAgentRunner 构造独立 system prompt,不能
-    被主 agent 的 mode-aware rebuild 覆盖)。None = 走默认 _refresh 路径
-    (向后兼容,REPL/test_agent 无感)。
+    消息。None = 走默认 `_refresh_system_prompt` 路径。
 
-    `todo_service`(D1 Task 7)TodoService 实例:非 None 时,run_turn 在构造
-    tool_specs **之前**自动:
-      1. 调 `get_default_runner(llm, mcp, todo_service, project_root=cwd,
-         max_iter=max_iter, policy=policy, l5=l5)` 构造 depth=0 SubAgentRunner
-         (共享 4 资源 — decision 6:llm / mcp / todo_service / policy,
-         加 l5 — D1 Task 4 fix)。
-      2. 调 `inject_todo_tools(todo_service, session_id, cwd=cwd,
-         last_turn_text=last_turn_text, dispatch_subagent_runner=runner)`
-         构造 9 个 todo entries(含 dispatch_subagent),runner 注入 deps。
-      3. 把 todo entries append 到 `extra_native_specs`(若 caller 已传
-         extra_native_specs,合并而非替换 — REPL 当前既传 memory_extras 又
-         将来传 todo_service 时不丢 memory_extras)。None = 跳过 auto-build
-         (向后兼容,旧 caller / test_agent.py 不受影响)。
-
-    `session_id`(D1 Task 7)handler 用作 active_sessions(显式,不靠 env var)。
-    与 `todo_service` 配对使用;todo_service 非 None 时建议传非空 session_id。
-
-    `last_turn_text`(D1 Task 7)C 阶段 todo_update 完成门 acceptance 校验用。
-    todo_service 非 None 时透传给 inject_todo_tools。
+    被调用者应通过 `DurableRuntimeClient` 获得持久化子任务工具；这个
+    compatibility function 不再构造或运行 SubAgentRunner。
 
     Mutates `messages` in place. Async so the repl can call it from its
     persistent event loop without `asyncio.run` overhead.
@@ -610,37 +591,9 @@ async def run_turn(
     # a filtered read-only bundle for fact gathering; the default remains no
     # tools for direct callers and one-shot plan generation.
     if mode in ("coding", "chat") or (mode in ("plan", "design") and allow_read_only_tools):
-        # --- D1 Task 7: todo_service → 自动构造 SubAgentRunner + 注入 extras ---
-        # 共享 4 资源(decision 6: llm / mcp / todo_service / policy) + l5
-        # (D1 Task 4 fix);runner 注入 dispatch_subagent entry 的 deps dict。
-        # 合并而非替换 caller 的 extra_native_specs(REPL 既有 memory_extras
-        # 又传 todo_service 时不丢 memory_extras)。fail-soft: 构造异常时
-        # 跳过 auto-build,继续走默认路径,不崩主循环。
-        if mode in ("coding", "chat") and todo_service is not None:
-            try:
-                from cc_harness.project.extras import inject_todo_tools
-                from cc_harness.project.subagent import get_default_runner
-                _runner = get_default_runner(
-                    llm, mcp, todo_service,
-                    project_root=str(project_root),
-                    max_iter=max_iter,
-                    policy=policy,
-                    l5=l5,
-                    loop_control_config=_loop_cfg,
-                )
-                _todo_extras = inject_todo_tools(
-                    todo_service, session_id,
-                    cwd=str(project_root),
-                    last_turn_text=last_turn_text,
-                    dispatch_subagent_runner=_runner,
-                    progress_cb=subagent_progress_cb,
-                )
-                if extra_native_specs is None:
-                    extra_native_specs = _todo_extras
-                else:
-                    extra_native_specs = list(extra_native_specs) + _todo_extras
-            except Exception as _e:
-                print_warn(console, f"subagent runner 注入失败: {_e}; 跳过 dispatch_subagent")
+        # Child delegation is intentionally absent from the legacy in-process
+        # loop.  DurableRuntimeClient registers the sole dispatch_subagent
+        # implementation and persists every child Run before scheduling it.
 
         # F T7 fix:防御 sync/async MCP(production async + test mock sync 共存,沿 repl.py:253 iscoroutine pattern)
         _tools_result = mcp.list_tools()
@@ -996,7 +949,13 @@ async def run_turn(
         cats = counter.categorize(messages, tools=tool_specs)
         reported_costs = [u.reported_cost for u in iter_usages]
         reported_currencies = {u.reported_cost_currency for u in iter_usages}
-        has_complete_cost = bool(reported_costs) and all(cost is not None for cost in reported_costs)
+        has_complete_cost = (
+            bool(reported_costs)
+            and all(cost is not None for cost in reported_costs)
+            # An amount with an unknown currency must not be silently merged
+            # with an amount in a known currency.
+            and len(reported_currencies) <= 1
+        )
         reported_cost = sum(reported_costs) if has_complete_cost else None
         reported_currency = (
             next(iter(reported_currencies))
@@ -1054,6 +1013,8 @@ async def run_turn(
             api_total_tokens=sum(u.total_tokens for u in iter_usages),
             api_reported_cost=reported_cost,
             api_reported_cost_currency=reported_currency,
+            api_cost_complete=has_complete_cost,
+            api_cost_observed=bool(iter_usages),
             iter_count=len(iter_usages),
             api_reported=bool(iter_usages),
             tool_call_log=tool_call_log,
@@ -1065,8 +1026,13 @@ async def run_turn(
         model_messages: list[dict],
         *,
         tools_override: list[dict] | None = None,
-    ) -> tuple[str, list, str | None, UsageRecord | None]:
-        """Stream exactly one LLM turn. Returns (content, pending, finish_reason, usage).
+    ) -> tuple[str, list, str | None, UsageRecord | None, str]:
+        """Stream one LLM turn.
+
+        Returns ``(content, pending, finish_reason, usage, reasoning_content)``.
+        ``reasoning_content`` is kept separate from visible content because
+        thinking-mode providers (notably DeepSeek-compatible endpoints) require
+        the exact reasoning field when an assistant tool call is replayed.
 
         Buffers content (no real-time printing) because the routing decision —
         has_tool_calls vs final answer — is only known after the "done" event.
@@ -1076,6 +1042,7 @@ async def run_turn(
         pending: list = []
         finish_reason: str | None = None
         usage: UsageRecord | None = None
+        reasoning_content = ""
         stream = llm.chat(
             model_messages,
             tool_specs if tools_override is None else tools_override,
@@ -1097,6 +1064,10 @@ async def run_turn(
                     finish_reason = ev.finish_reason
                     pending = ev.pending
                     usage = ev.usage
+                    # Test doubles and older adapters do not expose the
+                    # optional provider field; protocol adaptation must remain
+                    # backward-compatible with those streams.
+                    reasoning_content = str(getattr(ev, "reasoning_content", "") or "")
                     # Prefer the consolidated content on the done event if set;
                     # fall back to the streamed parts we collected above.
                     content_parts = [ev.content] if ev.content else content_parts
@@ -1104,7 +1075,7 @@ async def run_turn(
             close_stream = getattr(stream, "aclose", None)
             if close_stream is not None:
                 await close_stream()
-        return "".join(content_parts), pending, finish_reason, usage
+        return "".join(content_parts), pending, finish_reason, usage, reasoning_content
 
     async def _constrained_finalizer(
         finding,
@@ -1139,7 +1110,7 @@ async def run_turn(
                 },
             ]
             try:
-                candidate, pending, _finish, usage = await _stream_one_turn(
+                candidate, pending, _finish, usage, _reasoning_content = await _stream_one_turn(
                     finalizer_messages,
                     tools_override=[],
                 )
@@ -1309,7 +1280,7 @@ async def run_turn(
 
         # 1. Stream one LLM turn (buffered — see _stream_one_turn).
         try:
-            content, pending, finish_reason, iter_usage = await _stream_one_turn(
+            content, pending, finish_reason, iter_usage, reasoning_content = await _stream_one_turn(
                 _context_projection.messages,
                 tools_override=[] if _deadline_finalization_only else None,
             )
@@ -1322,8 +1293,8 @@ async def run_turn(
                 "duration_ms": 0,
                 "iteration": iter_count,
             })
-            # D1 Task 4 fix (Important #1):把 fatal 错误塞 stats.error,
-            # 让 SubAgentRunner.run() 检测到 → status="failed"。
+            # Preserve the failure in the turn result so the owning Durable
+            # Worker can persist a recoverable child-run failure.
             _err_stats = _stats()
             _err_stats.error = f"{type(e).__name__}: {e}"
             return _err_stats
@@ -1373,6 +1344,8 @@ async def run_turn(
                 "content": content if content else None,
                 "tool_calls": [_pending_to_openai_tc(p, tc_id) for p, tc_id in zip(pending, tc_ids)],
             }
+            if reasoning_content:
+                assistant_msg["reasoning_content"] = reasoning_content
             messages.append(assistant_msg)
             # 记录到 _tool_retry_log(放在 append 之后,下次再遇同 sig 才计数)
             for p in pending:

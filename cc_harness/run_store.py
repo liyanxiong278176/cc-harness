@@ -16,6 +16,7 @@ from .fact_store import default_user_data_dir, project_identity
 from .run_events import EventActor, EventValidationError, RunEvent
 from .run_model import Lease, Run
 from .run_projection import ProjectionBuilder, ProjectionError, RunProjection
+from .sqlite_utils import begin_immediate
 
 
 class RunStoreError(RuntimeError):
@@ -234,7 +235,7 @@ class RunStore:
     async def create_run(self, run: Run) -> bool:
         db = self._require_db()
         async with self._write_lock:
-            await db.execute("BEGIN IMMEDIATE")
+            await begin_immediate(db)
             try:
                 cursor = await db.execute(
                     """INSERT INTO run_record
@@ -285,7 +286,7 @@ class RunStore:
             event = event_or_command
         db = self._require_db()
         async with self._write_lock:
-            await db.execute("BEGIN IMMEDIATE")
+            await begin_immediate(db)
             try:
                 run_row = await self._run_row_tx(event.run_id)
                 current_sequence = int(run_row["last_sequence"])
@@ -394,23 +395,32 @@ class RunStore:
 
     async def load_projection(self, run_id: str) -> RunProjection:
         db = self._require_db()
-        await self._ensure_run(run_id)
         async with self._write_lock:
-            projection = await self._projection_tx(run_id)
-        cursor = await db.execute(
-            "SELECT projection_digest, last_sequence FROM run_record WHERE run_id = ?", (run_id,)
-        )
-        row = await cursor.fetchone()
-        if row is None:
-            raise RunNotFound(run_id)
-        if int(row[1]) != projection.sequence or row[0] != projection.digest:
-            raise RunStoreError("stored projection cursor does not match event rebuild")
-        return projection
+            # Rebuilding the projection and validating the denormalized cursor
+            # must observe one SQLite snapshot.  Previously the rebuild ran
+            # without a read transaction and the cursor was fetched after the
+            # local lock was released.  A supervisor in another process could
+            # commit an event between those reads, making a healthy stream look
+            # corrupt (and aborting an otherwise recoverable run).
+            await db.execute("BEGIN")
+            try:
+                row = await self._run_row_tx(run_id)
+                projection = await self._projection_tx(run_id, int(row["last_sequence"]))
+                if (
+                    int(row["last_sequence"]) != projection.sequence
+                    or row["projection_digest"] != projection.digest
+                ):
+                    raise RunStoreError("stored projection cursor does not match event rebuild")
+                await db.commit()
+            except BaseException:
+                await db.rollback()
+                raise
+            return projection
 
     async def save_snapshot(self, snapshot: RunProjection) -> None:
         db = self._require_db()
         async with self._write_lock:
-            await db.execute("BEGIN IMMEDIATE")
+            await begin_immediate(db)
             try:
                 run_row = await self._run_row_tx(snapshot.run_id)
                 if snapshot.sequence > int(run_row["last_sequence"]):
@@ -489,7 +499,7 @@ class RunStore:
     async def release_lease(self, run_id: str, epoch: int) -> bool:
         db = self._require_db()
         async with self._write_lock:
-            await db.execute("BEGIN IMMEDIATE")
+            await begin_immediate(db)
             try:
                 cursor = await db.execute(
                     "DELETE FROM run_lease WHERE run_id = ? AND epoch = ?", (run_id, epoch)

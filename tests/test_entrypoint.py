@@ -4,10 +4,24 @@ import pytest
 
 from cc_harness.entrypoint import (
     _has_usable_committed_final,
+    _api_cost_status,
     _run_print,
     async_main,
     build_parser,
 )
+
+
+def test_api_cost_status_requires_provider_fact_and_supports_legacy_direct_cost():
+    assert _api_cost_status(SimpleNamespace(api_reported_cost=None)) == "unavailable"
+    assert _api_cost_status(
+        SimpleNamespace(api_reported_cost=0.25, api_cost_observed=True, api_cost_complete=True)
+    ) == "reported"
+    assert _api_cost_status(
+        SimpleNamespace(api_reported_cost=None, api_cost_observed=True, api_cost_complete=False)
+    ) == "incomplete"
+    # Older callers that only exposed a provider cost remain compatible; no
+    # token tariff is inferred when the cost field is absent.
+    assert _api_cost_status(SimpleNamespace(api_reported_cost=0.25)) == "reported"
 
 
 def test_installed_cli_contract_parses_claude_style_flags(tmp_path):
@@ -206,3 +220,72 @@ async def test_failed_last_observation_does_not_mask_recoverable_failure():
             )
 
     assert not await _has_usable_committed_final(SimpleNamespace(store=Store()), "run")
+
+
+@pytest.mark.asyncio
+async def test_durable_print_aggregates_invocation_usage_once(tmp_path, capsys):
+    from cc_harness.entrypoint import _write_durable_print_result
+
+    class Store:
+        class Artifacts:
+            @staticmethod
+            def read_text(_digest):
+                return '{"role":"assistant","content":"done"}'
+
+        artifacts = Artifacts()
+
+        async def read(self, run_id, *, limit):
+            del run_id, limit
+            return SimpleNamespace(
+                events=[
+                    SimpleNamespace(
+                        event_type="ModelInvocationFinished",
+                        payload={
+                            "invocation_id": "one",
+                            "status": "succeeded",
+                            "usage": {
+                                "input_tokens": 100,
+                                "cache_read_input_tokens": 80,
+                                "output_tokens": 4,
+                                "model_calls": 1,
+                                "reported_cost": 0.1,
+                                "reported_cost_currency": "USD",
+                            },
+                        },
+                    ),
+                    SimpleNamespace(
+                        event_type="ModelInvocationFinished",
+                        payload={
+                            "invocation_id": "two",
+                            "status": "failed",
+                            "usage": {
+                                "input_tokens": 50,
+                                "output_tokens": 2,
+                                "model_calls": 1,
+                                "reported_cost": 0.2,
+                                "reported_cost_currency": "USD",
+                            },
+                        },
+                    ),
+                    # This legacy payload must not be counted a second time
+                    # when invocation terminal facts are present.
+                    SimpleNamespace(
+                        event_type="AssistantMessageCommitted",
+                        payload={
+                            "message_artifact": "message",
+                            "usage": {"input_tokens": 999, "model_calls": 99, "reported_cost": 9},
+                        },
+                    ),
+                ]
+            )
+
+    class Client:
+        store = Store()
+        _llm = SimpleNamespace(model="model-x", resolved_model="model-x")
+
+    assert await _write_durable_print_result(Client(), "run", error=None) == 0
+    payload = __import__("json").loads(capsys.readouterr().out)
+    assert payload["usage"]["model_calls"] == 2
+    assert payload["usage"]["input_tokens"] == 150
+    assert payload["usage"]["api_reported_cost"] == pytest.approx(0.3)
+    assert payload["usage"]["api_cost_status"] == "reported"

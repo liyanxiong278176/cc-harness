@@ -1,0 +1,12 @@
+# Temporary host-port override for local verification.  The application keeps
+# the same internal service ports; only host bindings are moved away from
+# unrelated development containers.
+services:
+  mysql:
+    ports: !override ["13306:3306"]
+  redis:
+    ports: !override ["16379:6379"]
+  rabbitmq:
+    ports: !override ["25672:5672", "25673:15672"]
+  app:
+    ports: !override ["18080:8080"]

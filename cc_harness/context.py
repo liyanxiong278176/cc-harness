@@ -56,6 +56,12 @@ OMITTED_TEMPLATE = "... ({n} lines omitted) ..."
 # Tier 2 assistant fallback when no sentence boundary is present.
 _FALLBACK_CHARS = 200
 
+# Bump when the projection algorithm changes in a way that makes persisted
+# compaction artifacts unsafe to reuse.  This invalidates stale projections on
+# resume instead of replaying an artifact that was produced with the old
+# last-user protect-boundary behavior.
+_COMPACTION_ALGORITHM_VERSION = "v5-authoritative-tail"
+
 # 3-group fence regex for user ```` ``` ```` code blocks (no nested-fence support).
 _CODE_FENCE_RE = re.compile(r"```([^\n]*)\n(.*?)\n```", re.DOTALL)
 
@@ -112,6 +118,7 @@ class ContextProjection:
         *,
         artifact_dir: Path | None = None,
         state_db_path: Path | None = None,
+        call_db_path: Path | None = None,
         context_id: str | None = None,
     ) -> None:
         self.messages = copy.deepcopy(source_messages)
@@ -130,7 +137,9 @@ class ContextProjection:
             self.artifact_dir / "context.sqlite3" if self.artifact_dir is not None else None
         )
         self.state_store = (
-            SqliteContextState(db_path, self.context_id) if db_path is not None else None
+            SqliteContextState(db_path, self.context_id, call_db_path=call_db_path)
+            if db_path is not None
+            else None
         )
         self._restore_latest(source_messages)
         self.messages = _repair_tool_result_pairing(self.messages)
@@ -411,7 +420,10 @@ class ContextProjection:
         self.compaction_version = (expected_parent or self.compaction_version) + 1
         if stats.source_range is None:
             source_protect = find_protect_boundary(
-                source_messages, counter, config.protect_zone_tokens
+                source_messages,
+                counter,
+                config.protect_zone_tokens,
+                preserve_last_user=False,
             )
             stats.source_range = (0, source_protect)
             stats.delta_range = (0, source_protect)
@@ -942,6 +954,7 @@ def _compaction_key(
 ) -> str:
     """Return the idempotent identity for one logical compaction."""
     fingerprint = {
+        "algorithm_version": _COMPACTION_ALGORITHM_VERSION,
         "tier": tier,
         "thresholds": [
             config.tier1_threshold,
@@ -960,41 +973,73 @@ def _compaction_key(
 
 
 def _repair_tool_result_pairing(messages: list[dict]) -> list[dict]:
-    """Drop persisted tool results whose assistant tool call was compacted away.
+    """Normalize provider tool-call turns without mutating the source log.
 
     Tier-3 compaction can place a protect boundary between an assistant
-    ``tool_calls`` message and its result.  The source transcript remains
-    authoritative, but the model-facing projection must not send an orphaned
-    ``role=tool`` message to providers such as OpenAI.  Keep legacy/tool-log
-    messages without a ``tool_call_id`` untouched; only repair messages that
-    use the provider's explicit tool-call protocol.
+    ``tool_calls`` message and its result.  Parallel tool execution can also
+    persist results in completion order rather than the order declared by the
+    assistant.  The source transcript remains authoritative, but the
+    model-facing projection must present one contiguous, declaration-ordered
+    result for every retained call.  Incomplete calls are removed from the
+    model-facing assistant message (and their unmatched results are dropped)
+    instead of fabricating a result that never happened.
+
+    Keep legacy/tool-log messages without a ``tool_call_id`` untouched; only
+    repair messages that use the provider's explicit tool-call protocol.
     """
     repaired: list[dict] = []
-    active_tool_ids: set[str] | None = None
-    for message in messages:
+    index = 0
+    while index < len(messages):
+        message = messages[index]
         role = message.get("role")
-        if role == "assistant":
-            tool_calls = message.get("tool_calls") or []
-            ids = {
-                str(tool_call.get("id"))
-                for tool_call in tool_calls
+        if role == "assistant" and message.get("tool_calls"):
+            tool_calls = [
+                tool_call
+                for tool_call in (message.get("tool_calls") or [])
                 if isinstance(tool_call, dict) and tool_call.get("id")
-            }
-            active_tool_ids = ids or None
-            repaired.append(message)
+            ]
+            # Tool results are committed independently and may arrive in a
+            # different order from the model response.  Only inspect the
+            # contiguous provider result block; anything later is an orphan
+            # and must not be pulled across another assistant/user message.
+            result_by_id: dict[str, dict] = {}
+            next_index = index + 1
+            while next_index < len(messages) and messages[next_index].get("role") == "tool":
+                result = messages[next_index]
+                result_id = result.get("tool_call_id")
+                if result_id and str(result_id) not in result_by_id:
+                    result_by_id[str(result_id)] = result
+                next_index += 1
+
+            complete_calls = [
+                tool_call
+                for tool_call in tool_calls
+                if str(tool_call["id"]) in result_by_id
+            ]
+            if len(complete_calls) == len(tool_calls):
+                repaired.append(message)
+            else:
+                # Preserve visible assistant text/reasoning, but never send a
+                # malformed tool-call declaration to a provider.
+                repaired_message = dict(message)
+                if complete_calls:
+                    repaired_message["tool_calls"] = complete_calls
+                else:
+                    repaired_message.pop("tool_calls", None)
+                repaired.append(repaired_message)
+            for tool_call in complete_calls:
+                repaired.append(result_by_id[str(tool_call["id"])])
+            index = next_index
             continue
 
         if role == "tool" and message.get("tool_call_id"):
-            call_id = str(message["tool_call_id"])
-            if active_tool_ids is None or call_id not in active_tool_ids:
-                continue
-            repaired.append(message)
-            active_tool_ids.discard(call_id)
+            # A provider tool result is valid only in the branch above, where
+            # it is paired with the immediately preceding assistant message.
+            index += 1
             continue
 
-        if role != "tool":
-            active_tool_ids = None
         repaired.append(message)
+        index += 1
     return repaired
 
 
@@ -1121,15 +1166,23 @@ def _snip_code_body(body: str, head: int, tail: int, *, force: bool = False) -> 
 
 
 def find_protect_boundary(
-    messages: list[dict], counter: TokenCounter, budget_tokens: int
+    messages: list[dict],
+    counter: TokenCounter,
+    budget_tokens: int,
+    *,
+    preserve_last_user: bool = True,
 ) -> int:
     """Return the slice index ``b`` such that ``messages[b:]`` is the protect zone.
 
     Walks from the tail accumulating tokens; once the running total reaches
-    ``budget_tokens``, returns ``position + 1``. Clamp: the boundary never
+    ``budget_tokens``, returns ``position + 1``. By default the boundary never
     crosses the last ``role == user`` message (so the most recent user input is
-    always protected). Returns 0 when the whole list fits the budget (all
-    protected).
+    always protected). Durable projections can disable that positional clamp:
+    authoritative messages mark the current instruction as mandatory, and a
+    long-running autonomous transcript may contain only its initial user
+    message. Clamping to that old message would then protect the entire
+    transcript and make compaction unable to fit the provider window. Returns 0
+    when the whole list fits the budget (all protected).
     """
     if not messages:
         return 0
@@ -1140,10 +1193,11 @@ def find_protect_boundary(
             boundary = i + 1
             break
         cumulative += _count_msg_tokens(messages[i], counter)
-    # Clamp: never move the boundary past the last user message index.
-    last_user = _last_user_idx(messages)
-    if last_user is not None and boundary > last_user:
-        boundary = last_user
+    if preserve_last_user:
+        # Clamp: never move the boundary past the last user message index.
+        last_user = _last_user_idx(messages)
+        if last_user is not None and boundary > last_user:
+            boundary = last_user
     return boundary
 
 
@@ -1457,8 +1511,26 @@ async def apply_tier3_summarize(
         # preserve older summary fragments byte-for-byte. Direct callers keep
         # the historical previous-summary merge behavior.
         content = "" if authoritative_messages is not None else (prev_content or "")
-        for chunk in _summary_chunks(delta_messages, config, counter):
-            rendered_delta = _render_messages_for_summary(chunk)
+        if authoritative_messages is not None:
+            # Durable compaction must remain bounded even when a checkpoint is
+            # rebased after a long interruption.  Sending one capped delta is
+            # both cheaper and lease-safe; the omission marker makes the loss
+            # explicit while the authoritative source refs retain recovery
+            # access to the complete transcript.
+            rendered_deltas = [
+                _cap_delta_size(
+                    _render_messages_for_summary(delta_messages),
+                    delta_messages,
+                    config,
+                    counter,
+                )
+            ]
+        else:
+            rendered_deltas = [
+                _render_messages_for_summary(chunk)
+                for chunk in _summary_chunks(delta_messages, config, counter)
+            ]
+        for rendered_delta in rendered_deltas:
             user_prompt = summary_user_prompt(content or None, rendered_delta)
             summary_messages = [
                 {"role": "system", "content": SUMMARY_SYSTEM_PROMPT},
@@ -1636,8 +1708,16 @@ async def maybe_compact(
                 ratio_after=ratio,
             )
 
+        # In durable mode the authoritative source marks current instructions
+        # as mandatory. Do not use the legacy positional last-user clamp here:
+        # an autonomous run normally has one initial user message, so that
+        # clamp would protect the whole transcript and defeat compaction.
+        preserve_last_user = authoritative_messages is None
         protect_until = find_protect_boundary(
-            messages, counter, config.protect_zone_tokens
+            messages,
+            counter,
+            config.protect_zone_tokens,
+            preserve_last_user=preserve_last_user,
         )
         if protect_until == 0 or protect_until >= len(messages):
             return CompactionStats(
@@ -1692,7 +1772,10 @@ async def maybe_compact(
                     1 if authoritative_messages[0].get("role") == "system" else 0
                 )
             authoritative_protect = find_protect_boundary(
-                authoritative_messages, counter, config.protect_zone_tokens
+                authoritative_messages,
+                counter,
+                config.protect_zone_tokens,
+                preserve_last_user=False,
             )
         else:
             authoritative_protect = None

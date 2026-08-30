@@ -20,6 +20,7 @@ from uuid import uuid4
 
 from cc_harness.atomic import atomic_write_text
 from cc_harness.memory.offload.models import OffloadResult
+from cc_harness.sqlite_utils import begin_immediate_sync
 
 
 def gen_id(content: str | None = None) -> str:
@@ -161,7 +162,7 @@ def _commit_sqlite_manifest(db_path: Path, context_id: str, record: dict) -> Non
             END;
             """
         )
-        db.execute("BEGIN IMMEDIATE")
+        begin_immediate_sync(db)
         db.execute(
             "INSERT OR IGNORE INTO context_offload_node"
             "(context_id, node_id, content_digest, result_ref, payload_json, created_at) "

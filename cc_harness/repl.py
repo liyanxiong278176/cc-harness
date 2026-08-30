@@ -107,11 +107,53 @@ _HELP_TEXT = """\
   /mode                    查看当前模式
   /help                    显示本帮助
   /clear                   清空会话历史(保留 system 消息)
+  /usage                   查看 Durable Run 的 API token、缓存命中和实时费用
   exit, quit               退出(cc-harness)
 """
 
+_DURABLE_CONTINUE_RE = re.compile(
+    r"^(?:继续|接着(?:做|处理|上次)?|恢复(?:任务|执行)?|continue(?:\s+where\s+you\s+left\s+off)?)"
+    r"[\s。！!,.，]*$",
+    re.IGNORECASE,
+)
 
-async def run_durable_repl(client, *, initial_prompt: str | None = None) -> None:
+
+def _is_durable_continuation(text: str) -> bool:
+    """Recognise natural continuation without exposing a prompt-level command."""
+
+    return bool(_DURABLE_CONTINUE_RE.fullmatch(text.strip()))
+
+
+def _format_durable_usage(summary: dict) -> str:
+    """Render safe durable usage facts without exposing prompt contents."""
+
+    prompt = int(summary.get("input_tokens", 0) or 0)
+    output = int(summary.get("output_tokens", 0) or 0)
+    cache = int(summary.get("cache_read_input_tokens", 0) or 0)
+    cache_rate = cache / prompt if prompt else 0.0
+    status = str(summary.get("cost_status") or "unavailable")
+    cost = summary.get("reported_cost")
+    currency = str(summary.get("reported_cost_currency") or "").strip()
+    cost_label = (
+        f"{currency + ' ' if currency else ''}{cost:g}"
+        if cost is not None else status
+    )
+    models = ", ".join(str(item) for item in summary.get("models", ())) or "unknown"
+    return (
+        f"API input={prompt:,} output={output:,} "
+        f"cache_hit={cache:,}/{prompt:,} ({cache_rate:.0%}) "
+        f"model_calls={int(summary.get('model_calls', 0) or 0)} "
+        f"cost={cost_label} model={models}"
+    )
+
+
+async def run_durable_repl(
+    client,
+    *,
+    initial_prompt: str | None = None,
+    continue_latest: bool = False,
+    resume_run_id: str | None = None,
+) -> None:
     """Minimal coordinator REPL used by the rebuilt client entrypoint.
 
     Ordinary text is always a follow-up command; it is never passed to
@@ -121,38 +163,169 @@ async def run_durable_repl(client, *, initial_prompt: str | None = None) -> None
 
     console = Console()
     active_run_id: str | None = None
-    if initial_prompt:
+
+    async def _resume_from_candidates(
+        candidates, *, reason: str, ask_when_ambiguous: bool = False
+    ) -> str | None:
+        """Select a recoverable root Run without turning ``/resume`` into a task."""
+
+        if not candidates:
+            print_info(console, "没有可恢复的 Durable Run；请先描述要执行的新任务")
+            return None
+        selected = candidates[0] if len(candidates) == 1 else None
+        if selected is None and ask_when_ambiguous:
+            print_info(
+                console,
+                "可恢复的任务:\n"
+                + "\n".join(
+                    f"{view.run_id} [{view.status.value}] seq={view.sequence}"
+                    for view in candidates
+                ),
+            )
+            try:
+                selected_id = (await _read_user("输入要恢复的 Run ID（空白取消）: ")).strip()
+            except (EOFError, KeyboardInterrupt):
+                return None
+            if not selected_id:
+                return None
+            selected = next(
+                (view for view in candidates if view.run_id == selected_id), None
+            )
+            if selected is None:
+                print_info(console, f"未知 Run ID: {selected_id}")
+                return None
+        if selected is None:
+            print_info(
+                console,
+                "可继续的任务:\n"
+                + "\n".join(
+                    f"{view.run_id} [{view.status.value}] seq={view.sequence}"
+                    for view in candidates
+                ),
+            )
+            return None
+        return await client.continue_run(selected.run_id, reason=reason)
+
+    if resume_run_id is not None or continue_latest:
+        candidates = await client.continuation_candidates()
+        if resume_run_id not in {None, "picker"}:
+            if any(view.run_id == resume_run_id for view in candidates):
+                active_run_id = await client.continue_run(
+                    resume_run_id, reason="explicit session continuation"
+                )
+                print_info(console, f"已从检查点继续: {active_run_id}")
+            else:
+                print_info(console, f"找不到可恢复的 Durable Run: {resume_run_id}")
+        elif resume_run_id == "picker":
+            active_run_id = await _resume_from_candidates(
+                candidates,
+                reason="explicit session picker",
+                ask_when_ambiguous=True,
+            )
+            if active_run_id is not None:
+                print_info(console, f"已从检查点继续: {active_run_id}")
+        elif continue_latest:
+            active_run_id = await _resume_from_candidates(
+                candidates,
+                reason="latest session continuation",
+                ask_when_ambiguous=False,
+            )
+            if active_run_id is not None:
+                print_info(console, f"已从检查点继续: {active_run_id}")
+    elif initial_prompt:
         active_run_id = await client.submit(initial_prompt)
         print_info(console, f"queued run: {active_run_id}")
     while True:
         try:
             raw = (await _read_user("> [durable] ")).strip()
-        except (EOFError, KeyboardInterrupt):
+        except EOFError:
             break
+        except KeyboardInterrupt:
+            # Ctrl+C is a runtime operation, not a UI-only interrupt: stop
+            # scheduling, request cancellation for every descendant, keep all
+            # checkpoints, and let a later natural-language "继续" recover.
+            if active_run_id is None:
+                print_info(console, "当前没有运行中的任务")
+                continue
+            await client.terminate_run_tree(active_run_id, reason="explicit Ctrl+C termination")
+            print_info(console, f"已终止任务树并保留检查点: {active_run_id}; 输入“继续”可恢复")
+            active_run_id = None
+            continue
         if not raw:
             continue
         if raw.casefold() in {"exit", "quit"}:
             break
         if raw == "/help":
-            print_info(console, "普通消息=follow-up; /status /interrupt /cancel /resume /approve /reject /list")
+            print_info(console, "普通消息=follow-up; 继续/接着做=恢复最近任务; /status /usage /interrupt /cancel /resume /approve /reject /list")
             continue
         if raw == "/list":
             views = await client.coordinator.list()
             print_info(console, "\n".join(f"{view.run_id} [{view.status.value}]" for view in views) or "(no runs)")
             continue
         if active_run_id is None:
+            if raw in {"/status", "/usage"}:
+                print_info(console, "当前没有活动的 Durable Run")
+                continue
+            if raw == "/resume":
+                active_run_id = await _resume_from_candidates(
+                    await client.continuation_candidates(),
+                    reason="explicit /resume session selection",
+                    ask_when_ambiguous=True,
+                )
+                if active_run_id is not None:
+                    print_info(console, f"已恢复: {active_run_id}")
+                continue
+            if _is_durable_continuation(raw):
+                candidates = await client.continuation_candidates()
+                if len(candidates) == 1:
+                    active_run_id = await client.continue_run(candidates[0].run_id)
+                    print_info(console, f"已从检查点继续: {active_run_id}")
+                elif len(candidates) > 1:
+                    print_info(console, "可继续的任务:\n" + "\n".join(
+                        f"{view.run_id} [{view.status.value}] seq={view.sequence}" for view in candidates
+                    ))
+                else:
+                    print_info(console, "没有可恢复的 Durable Run；请先描述要执行的新任务")
+                continue
             active_run_id = await client.submit(raw)
             print_info(console, f"queued run: {active_run_id}")
             continue
+        if _is_durable_continuation(raw):
+            view = await client.coordinator.inspect(active_run_id)
+            if view.status.value in {"cancelled", "stalled", "failed_recoverable", "waiting_on_predecessor"}:
+                active_run_id = await client.continue_run(active_run_id)
+                print_info(console, f"已从检查点继续: {active_run_id}")
+            elif view.status.value in {"completed", "failed_terminal"}:
+                print_info(console, f"任务已经处于终态: {active_run_id} [{view.status.value}]")
+            else:
+                receipt = await client.coordinator.send(active_run_id, raw)
+                print_info(console, f"已将继续意图交给当前运行: {receipt.follow_up_run_id}")
+            continue
         if raw == "/status":
             view = await client.coordinator.inspect(active_run_id)
-            print_info(console, f"{view.run_id} [{view.status.value}] seq={view.sequence}")
+            usage = await client.usage_for_run(active_run_id)
+            print_info(
+                console,
+                f"{view.run_id} [{view.status.value}] seq={view.sequence}\n"
+                f"{_format_durable_usage(usage)}",
+            )
+        elif raw == "/usage":
+            print_info(console, _format_durable_usage(await client.usage_for_run(active_run_id)))
         elif raw == "/interrupt":
             await client.coordinator.interrupt(active_run_id, "client interrupt")
         elif raw == "/cancel":
-            await client.coordinator.cancel(active_run_id, "client cancel")
+            await client.terminate_run_tree(active_run_id, reason="client cancel")
+            print_info(console, f"已终止任务树并保留检查点: {active_run_id}")
+            active_run_id = None
         elif raw == "/resume":
-            await client.coordinator.resume(active_run_id)
+            resumed = await _resume_from_candidates(
+                await client.continuation_candidates(),
+                reason="explicit /resume session selection",
+                ask_when_ambiguous=True,
+            )
+            if resumed is not None:
+                active_run_id = resumed
+                print_info(console, f"已恢复: {active_run_id}")
         elif raw.startswith("/follow-up "):
             receipt = await client.coordinator.send(active_run_id, raw.removeprefix("/follow-up "))
             print_info(console, f"queued follow-up: {receipt.follow_up_run_id}")
@@ -466,13 +639,8 @@ async def run_repl(
             print_warn(console, f"todo service 加载失败: {e}; todo tools 跳过")
             state.todo_service = None
 
-    # 3) 注入 todo tools(拼接时 None-safe)
-    # D1 final:不再在这里预 inject todo tools(预 build 时 dispatch_subagent_runner
-    # 是 None → handler 返 "未注入" 错误)。改成 run_turn 时直接传 todo_service +
-    # session_id + last_turn_text,让 agent.run_turn 在 dispatch 前自动构造
-    # SubAgentRunner 并注入 dispatch_subagent_runner(基于 Task 7 path)。
-    # state.todo_extras 仍保留 dataclass 字段,但 REPL 不再赋值非空 list —
-    # 避免与 run_turn 内部 Task 7 路径双重注入 extras。
+    # 3) Todo state is kept for compatibility with the old projection, but
+    # child dispatch is owned exclusively by DurableRuntimeClient.
     state.todo_extras = []
 
     # 4) Resume 询问(只在 turns==0 时触发;auto 静默,ask 询问,manual 不主动)
@@ -1080,6 +1248,11 @@ def _collect_disk_changes(cwd: str, since: float) -> list[tuple[str, int, float,
     root = Path(cwd)
     if not root.exists():
         return []
+    # Filesystem timestamps on Windows (and on some mounted workspaces) can
+    # be quantized or lag the wall clock used for ``since`` by a few
+    # milliseconds.  Keep the summary complete for files created at the
+    # beginning of a turn without widening the reporting window materially.
+    effective_since = float(since) - 1.0
     results: list[tuple[str, int, float, str | None]] = []
     for p in root.rglob("*"):
         if not p.is_file():
@@ -1088,7 +1261,7 @@ def _collect_disk_changes(cwd: str, since: float) -> list[tuple[str, int, float,
             stat = p.stat()
         except OSError:
             continue
-        if stat.st_mtime < since:
+        if stat.st_mtime < effective_since:
             continue
         preview: str | None = None
         # Finding 9 fix:敏感/隐藏配置文件(.env / 凭据 / SSH 私钥等)即使 < 500B

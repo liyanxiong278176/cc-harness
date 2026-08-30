@@ -1,8 +1,8 @@
 # cc-harness
 
-一个在当前终端中运行的 coding agent。默认打开 focus-first fullscreen workspace，
-对话和工具活动在同一个 alternate screen 中呈现，退出后恢复调用者的 shell；
-需要可恢复任务控制面时，可显式选择 Durable Runtime。
+一个在当前终端中运行的 coding agent。默认使用唯一的 Durable Runtime：任务、
+子任务、工具动作、审批和 checkpoint 写入本地事件存储；TUI 只是控制面，关闭
+窗口不会取消已提交的运行，重新打开后可用自然语言“继续”恢复。
 项目不依赖 Textual。
 
 ## 安装与启动
@@ -54,12 +54,31 @@ API key，并保存到 `~/.cc-harness/.env`。配置优先级为：进程环境�
 `.env` > 用户 `~/.cc-harness/.env`。MCP 配置按用户级、项目级顺序合并，项目
 同名配置覆盖用户配置。
 
+### 沙箱服务自动启动
+
+默认执行后端是 OpenSandbox。Durable supervisor 启动时会自动检查并启动（或复用）
+`opensandbox-server`，确认 HTTP `/health` 和安全配置后才接受任务；首次执行命令时
+才创建具体的沙箱容器。服务不可用会在模型调用前明确失败，不会偷偷改用宿主机执行。
+代码工作区会以可写挂载提供给沙箱中的命令工具，以便创建和修改项目文件；`.env`、
+`.ssh`、`.git/config` 等敏感路径会用空的只读遮罩覆盖，仍不会暴露给容器。
+首次安装需要可用的 Docker 和沙箱依赖：
+
+```powershell
+python -m pip install -e ".[sandbox]"
+```
+
+如需使用已经单独运行的服务，请在进程环境变量中设置
+`CC_HARNESS_SANDBOX_SERVER_CONFIG_PATH`，或在项目 `policy.yaml` 的
+`executor.sandbox.server_config_path` 中指定实际 TOML 路径，以便运行时校验 allowlist、
+`dns+nft` 出站策略和 Docker 安全限制。明确使用宿主机执行时才传 `--host-execution`；
+该模式不会启动 OpenSandbox。
+
 ## 常用启动方式
 
 ```powershell
-cc-harness                         # 默认打开 fullscreen focus workspace
-cc-harness --runtime durable       # 使用可恢复 Durable Runtime 控制面
-cc-harness --runtime legacy --tui default # 兼容的原生 scrollback 视图
+cc-harness                         # 默认打开 Durable Runtime 控制面
+cc-harness --runtime durable       # 显式选择唯一的 Durable Runtime（默认）
+cc-harness --command supervisor    # 仅启动后台 Durable supervisor
 cc-harness -c                      # 继续当前目录最近的会话
 cc-harness -r                      # 选择当前目录的历史会话
 cc-harness -r SESSION_ID           # 继续指定会话
@@ -85,7 +104,10 @@ cc-harness -p "summarize this repo" # 非交互打印模式
   `.cc-harness/settings.json` 的 `ui` 下设置 `"capture_mouse": true`，此时终端原生选择可能需要按住终端的修饰键。
 - Inspector 只显示版本、摘要、token/cache 计数、digest、耗时和错误数量；永不显示有效提示词、规则正文、来源映射或可重建片段。
 - `Alt+P` 选择模型；`Alt+T` 切换推理强度；`Alt+V` 从剪贴板附加图片。
-- `Ctrl+C` 取消当前请求或清空当前输入；`Ctrl+D` 或 `/exit` 保存并退出。
+- Durable TUI 中 `Ctrl+C` 终止当前 Run 及其子任务树：先停止新调度，再由
+  worker 在安全边界收尾；无法确认的副作用保留为 `outcome_unknown`。检查点
+  不会丢失，之后输入“继续”由主 Agent 读取状态后恢复；`Ctrl+D` 或 `/exit`
+  只关闭控制界面，不会取消后台任务。
 - 连按两次 `Esc` 会清空并暂存当前草稿；空输入时打开对话检查点恢复选择。
 - 在输入框输入 `/` 会立即打开带说明的命令候选；继续输入可过滤，使用方向键和 `Enter` 选择。
 - 命令候选使用中文解释；`/compact`、`/resume`、`/tools`、`/mcp` 等异步命令执行期间会在状态栏显示命令名和已用时间，完成后再提交结果。
@@ -146,14 +168,12 @@ CC_HARNESS_TOOL_BUNDLES=core,web
 ```text
 cc-harness / python main.py
   -> entrypoint.py
-  -> DurableRuntimeClient         # 默认：可恢复任务、supervisor、审批、事件
+  -> DurableRuntimeClient         # 唯一运行时：事件、审批、checkpoint、supervisor
+  -> detached Durable supervisor  # TUI 关闭后继续消费同一个本地 Run Store
   -> durable REPL                 # 轻量控制面，不复制运行状态
 
-legacy 兼容入口
-  -> SessionRuntime               # 配置、模型、MCP、策略、memory、session
-  -> FullscreenTerminalApp        # focus workspace + Run Inspector
-  -> InlineTerminalApp            # `/tui default` 兼容 scrollback 视图
-  -> agent.run_turn               # 单一结构化事件流
+旧 SessionRuntime/FullscreenTerminalApp 代码只用于历史数据迁移与测试兼容，
+不再是可选择的运行时，也不会作为 Durable Run 的回退或子 agent 执行路径。
 ```
 
 提示词采用版本化稳定前缀 + 动态运行时后缀；外部规则已经过审核、适配并固定在
@@ -167,6 +187,26 @@ legacy 兼容入口
 python -m pytest tests -q
 python -m ruff check cc_harness tests
 ```
+
+### 生产就绪检查
+
+发布前可运行无模型的生产门禁；它会检查实际 Compose 配置、构建并启动镜像，
+执行健康检查（以及可选迁移和冒烟命令），最后清理容器。没有健康 URL 或任一
+必需步骤失败时，结果明确为未就绪，不会把单元测试结果冒充生产验证：
+
+```powershell
+python scripts/check_production_readiness.py --project-root . `
+  --compose-file docker-compose.yml `
+  --health-url http://127.0.0.1:8080/health `
+  --migration-command docker compose run --rm app migrate `
+  --smoke-command pytest tests/production -q
+
+# 仅查看将执行的步骤（不会启动 Docker，也不会产生模型调用）
+python scripts/check_production_readiness.py --dry-run --json
+```
+
+门禁输出 `ProductionReadinessReport`，包含每一步的退出码、耗时、脱敏日志和
+失败原因，适合保存到发布证据中。
 
 产品决策与边界见 [CONTEXT.md](CONTEXT.md)、[设计说明](docs/specs/2026-08-02-claude-code-classic-ui-parity-design.md)
 和 [ADR](docs/adr/)。

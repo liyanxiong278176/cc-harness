@@ -1,3 +1,4 @@
+import asyncio
 import json
 import os
 import sys
@@ -183,6 +184,40 @@ async def test_executor_writes_command_liveness_evidence(tmp_path: Path, monkeyp
     assert events[0]["event"] == "start"
     assert events[-1]["event"] == "finish"
     assert events[0]["command_digest"].startswith("sha256:")
+
+
+@pytest.mark.asyncio
+async def test_executor_background_process_returns_handle_and_kill(tmp_path: Path, monkeypatch):
+    """Long-lived commands return an auditable handle and never idle-time out."""
+
+    progress = tmp_path / "progress.jsonl"
+    monkeypatch.setenv(RUN_COMMAND_PROGRESS_FILE_ENV, str(progress))
+    monkeypatch.setenv("CC_HARNESS_PROGRESS_HEARTBEAT_S", "0.02")
+    command = "Start-Sleep -Seconds 60" if sys.platform == "win32" else "sleep 60"
+    executor = NativeExecutor(project_root=tmp_path, timeout_s=2)
+    pid: int | None = None
+    try:
+        result = await executor.run({"command": command, "background": True}, cwd=tmp_path)
+        assert not result.is_error
+        assert result.metadata["background"] is True
+        assert result.metadata["background_supported"] is True
+        assert result.metadata["state"] == "running"
+        pid = int(result.metadata["pid"])
+        assert executor.background_status(pid)["state"] == "running"
+        await asyncio.sleep(0.08)
+        events = [
+            json.loads(line)
+            for line in progress.read_text(encoding="utf-8").splitlines()
+        ]
+        assert events[0]["event"] == "background_start"
+        assert any(event["event"] == "background_heartbeat" for event in events)
+        assert not any(event.get("idle_timed_out") for event in events)
+    finally:
+        await executor.kill()
+    assert pid is not None
+    assert executor.background_status(pid) is None
+    events = [json.loads(line) for line in progress.read_text(encoding="utf-8").splitlines()]
+    assert events[-1]["event"] == "background_finish"
 
 
 @pytest.mark.skipif(sys.platform == "win32", reason="POSIX process-group semantics")

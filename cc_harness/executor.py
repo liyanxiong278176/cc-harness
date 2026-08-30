@@ -510,6 +510,20 @@ class ShellProfile:
         return [self.executable, "-c", command]
 
 
+@dataclass
+class _BackgroundProcess:
+    process: subprocess.Popen
+    command_digest: str
+    started: float
+    stdout_path: Path
+    stderr_path: Path
+    progress_path: Path | None
+    heartbeat_interval: float
+    activity: dict[str, Any]
+    heartbeat_task: asyncio.Task[None] | None = None
+    finish_recorded: bool = False
+
+
 def _select_shell_profile(
     *,
     platform: str | None = None,
@@ -663,9 +677,254 @@ class NativeExecutor:
         self.project_root = Path(project_root)
         self.timeout_s = resolve_run_command_timeout(timeout_s)
         self.shell_profile = _select_shell_profile()
+        self._background_processes: dict[int, _BackgroundProcess] = {}
 
     def _build_env(self) -> dict[str, str]:
         return strip_harness_runtime_loader(strip_secrets(dict(os.environ)))
+
+    @staticmethod
+    def _log_size(path: Path) -> int:
+        try:
+            return max(0, path.stat().st_size)
+        except OSError:
+            return 0
+
+    def _background_metadata(self, entry: _BackgroundProcess) -> dict[str, Any]:
+        returncode = entry.process.poll()
+        state = "running" if returncode is None else "exited"
+        if returncode is None:
+            snapshot = _process_activity_snapshot(entry.process.pid, self.project_root)
+            if _activity_changed(entry.activity.get("snapshot"), snapshot):
+                now = time.monotonic()
+                entry.activity["last_activity"] = now
+                entry.activity["activity_events"] = int(entry.activity.get("activity_events", 0)) + 1
+            entry.activity["snapshot"] = snapshot
+        else:
+            snapshot = dict(entry.activity.get("snapshot") or {})
+        return {
+            "background": True,
+            "background_supported": True,
+            "state": state,
+            "pid": entry.process.pid,
+            "exit_code": returncode,
+            "timed_out": False,
+            "idle_timed_out": False,
+            "command_digest": entry.command_digest,
+            "stdout_log": str(entry.stdout_path),
+            "stderr_log": str(entry.stderr_path),
+            "progress_file": str(entry.progress_path) if entry.progress_path else None,
+            "stdout_bytes": self._log_size(entry.stdout_path),
+            "stderr_bytes": self._log_size(entry.stderr_path),
+            "activity_events": int(entry.activity.get("activity_events", 0)),
+            "activity": snapshot,
+            "started_at_monotonic": entry.started,
+        }
+
+    async def _background_heartbeat(self, entry: _BackgroundProcess) -> None:
+        """Persist liveness for a detached command without imposing idle timeout."""
+
+        try:
+            while entry.process.poll() is None:
+                await asyncio.sleep(entry.heartbeat_interval)
+                if entry.process.poll() is not None:
+                    break
+                now = time.monotonic()
+                snapshot = _process_activity_snapshot(entry.process.pid, self.project_root)
+                if _activity_changed(entry.activity.get("snapshot"), snapshot):
+                    entry.activity["last_activity"] = now
+                    entry.activity["activity_events"] = int(entry.activity.get("activity_events", 0)) + 1
+                entry.activity["snapshot"] = snapshot
+                if entry.progress_path is not None:
+                    _append_progress(
+                        entry.progress_path,
+                        event="background_heartbeat",
+                        command_digest=entry.command_digest,
+                        pid=entry.process.pid,
+                        elapsed_s=now - entry.started,
+                        stdout_bytes=self._log_size(entry.stdout_path),
+                        stderr_bytes=self._log_size(entry.stderr_path),
+                        idle_s=now - float(entry.activity.get("last_activity", now)),
+                        activity=entry.activity,
+                    )
+        finally:
+            # Cancellation is the normal shutdown path.  Do not publish an
+            # exited event while the process is still alive; the owner records
+            # the final return code after its process-group termination.
+            if entry.process.poll() is not None:
+                self._record_background_finish(entry)
+
+    def _record_background_finish(self, entry: _BackgroundProcess) -> None:
+        if entry.finish_recorded or entry.progress_path is None:
+            return
+        returncode = entry.process.poll()
+        if returncode is None:
+            return
+        now = time.monotonic()
+        _append_progress(
+            entry.progress_path,
+            event="background_finish",
+            command_digest=entry.command_digest,
+            pid=entry.process.pid,
+            elapsed_s=now - entry.started,
+            returncode=returncode,
+            stdout_bytes=self._log_size(entry.stdout_path),
+            stderr_bytes=self._log_size(entry.stderr_path),
+            idle_s=now - float(entry.activity.get("last_activity", now)),
+            activity=entry.activity,
+        )
+        entry.finish_recorded = True
+
+    async def _run_background(
+        self,
+        command: str,
+        *,
+        command_digest: str,
+        progress_path: Path | None,
+    ) -> ToolResult:
+        """Start an explicitly requested long-lived process and return its handle."""
+
+        process_dir = self.project_root / ".cc-harness" / "processes"
+        stamp = f"{time.time_ns()}-{command_digest[7:19]}"
+        stdout_path = process_dir / f"{stamp}.stdout.log"
+        stderr_path = process_dir / f"{stamp}.stderr.log"
+        stdout_file = None
+        stderr_file = None
+        try:
+            process_dir.mkdir(parents=True, exist_ok=True)
+            stdout_file = stdout_path.open("ab")
+            stderr_file = stderr_path.open("ab")
+            process_options: dict[str, object] = {}
+            if os.name == "posix":
+                process_options["start_new_session"] = True
+            elif os.name == "nt":
+                process_options["creationflags"] = (
+                    getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
+                    | getattr(subprocess, "CREATE_NO_WINDOW", 0)
+                )
+            process = subprocess.Popen(
+                self.shell_profile.argv(command),
+                stdin=subprocess.DEVNULL,
+                stdout=stdout_file,
+                stderr=stderr_file,
+                cwd=str(self.project_root),
+                env=self._build_env(),
+                close_fds=os.name != "nt",
+                **process_options,
+            )
+        except Exception as exc:
+            for handle in (stdout_file, stderr_file):
+                if handle is not None:
+                    handle.close()
+            return ToolResult.error(
+                display=f"background process failed to start: {exc}",
+                llm=f"[Tool Error] background process failed to start: {type(exc).__name__}: {exc}",
+                metadata={
+                    "background": True,
+                    "background_supported": True,
+                    "state": "failed",
+                    "exit_code": None,
+                    "exception": type(exc).__name__,
+                    "command_digest": command_digest,
+                    "stdout_log": str(stdout_path),
+                    "stderr_log": str(stderr_path),
+                    "progress_file": str(progress_path) if progress_path else None,
+                },
+            )
+        finally:
+            # Popen owns duplicated descriptors; the parent must not hold them.
+            for handle in (stdout_file, stderr_file):
+                if handle is not None and not handle.closed:
+                    handle.close()
+
+        started = time.monotonic()
+        entry = _BackgroundProcess(
+            process=process,
+            command_digest=command_digest,
+            started=started,
+            stdout_path=stdout_path,
+            stderr_path=stderr_path,
+            progress_path=progress_path,
+            heartbeat_interval=_resolve_progress_heartbeat(os.getenv(RUN_COMMAND_HEARTBEAT_ENV)),
+            activity={
+                "last_output": started,
+                "last_activity": started,
+                "activity_events": 0,
+                "snapshot": _process_activity_snapshot(process.pid, self.project_root),
+            },
+        )
+        self._background_processes[process.pid] = entry
+        if progress_path is not None:
+            _append_progress(
+                progress_path,
+                event="background_start",
+                command_digest=command_digest,
+                pid=process.pid,
+                elapsed_s=0,
+                stdout_bytes=0,
+                stderr_bytes=0,
+                idle_s=0,
+                activity=entry.activity,
+            )
+        entry.heartbeat_task = asyncio.create_task(self._background_heartbeat(entry))
+        metadata = self._background_metadata(entry)
+        return ToolResult.success(
+            (
+                f"background process started (pid={process.pid}); "
+                f"stdout: {stdout_path}; stderr: {stderr_path}"
+            ),
+            metadata=metadata,
+        )
+
+    def background_status(self, pid: int) -> dict[str, Any] | None:
+        entry = self._background_processes.get(int(pid))
+        return self._background_metadata(entry) if entry is not None else None
+
+    async def _terminate_background_process(self, entry: _BackgroundProcess) -> None:
+        if entry.heartbeat_task is not None and not entry.heartbeat_task.done():
+            entry.heartbeat_task.cancel()
+            await asyncio.gather(entry.heartbeat_task, return_exceptions=True)
+        process = entry.process
+        if process.poll() is None:
+            if os.name == "posix":
+                try:
+                    os.killpg(process.pid, signal.SIGTERM)
+                except ProcessLookupError:
+                    pass
+                try:
+                    await asyncio.to_thread(process.wait, 1)
+                except subprocess.TimeoutExpired:
+                    try:
+                        os.killpg(process.pid, signal.SIGKILL)
+                    except ProcessLookupError:
+                        pass
+            else:
+                try:
+                    await asyncio.to_thread(
+                        subprocess.run,
+                        ["taskkill", "/PID", str(process.pid), "/T", "/F"],
+                        check=False,
+                        capture_output=True,
+                        timeout=5,
+                    )
+                except (OSError, subprocess.TimeoutExpired):
+                    try:
+                        process.kill()
+                    except ProcessLookupError:
+                        pass
+            try:
+                await asyncio.to_thread(process.wait, 5)
+            except (subprocess.TimeoutExpired, OSError):
+                pass
+        self._record_background_finish(entry)
+
+    async def kill(self) -> bool:
+        """Stop all explicitly detached commands owned by this executor."""
+
+        entries = list(self._background_processes.values())
+        for entry in entries:
+            await self._terminate_background_process(entry)
+            self._background_processes.pop(entry.process.pid, None)
+        return True
 
     async def run(self, args: dict, *, cwd: Path) -> ToolResult:
         command = args.get("command", "")
@@ -695,6 +954,12 @@ class NativeExecutor:
             "activity_events": 0,
             "snapshot": {},
         }
+        if bool(args.get("background", False)):
+            return await self._run_background(
+                command,
+                command_digest=command_digest,
+                progress_path=progress_path,
+            )
         try:
             process_options: dict[str, object] = {}
             if os.name == "posix":

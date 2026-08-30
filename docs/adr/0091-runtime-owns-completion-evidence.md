@@ -1,0 +1,3 @@
+# Runtime owns completion evidence
+
+`CompletionCandidate` remains the model-facing request format, but it is never authoritative: the model may reference only Goal Contract criterion IDs and evidence IDs already committed to the current Run. The Runtime recomputes or verifies every evidence attribute (digest, source, command, exit status, workspace/code snapshot, freshness, and confidence) from the append-only event ledger and deterministic verifier artifacts; missing, stale, unknown, cross-run, or mismatched evidence produces a recoverable completion rejection, and only an accepted candidate may advance Plan/Todo/Run state.

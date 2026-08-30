@@ -1,0 +1,85 @@
+# ============================================================
+# campus-web 配置
+# 关键连接参数全部支持环境变量覆盖(docker-compose 注入),默认值为本地 dev。
+# ============================================================
+server:
+  port: ${SERVER_PORT:8080}
+
+spring:
+  application:
+    name: campus-web
+
+  # ---------- 数据源(CAMPUS_DB_*) ----------
+  datasource:
+    driver-class-name: ${CAMPUS_DB_DRIVER:com.mysql.cj.jdbc.Driver}
+    url: ${CAMPUS_DB_URL:jdbc:mysql://localhost:3306/campus_delivery?useUnicode=true&characterEncoding=utf8&serverTimezone=Asia/Shanghai&useSSL=false&allowPublicKeyRetrieval=true}
+    username: ${CAMPUS_DB_USERNAME:root}
+    password: ${CAMPUS_DB_PASSWORD:root}
+    hikari:
+      maximum-pool-size: ${CAMPUS_DB_POOL_MAX:20}
+      minimum-idle: 5
+      connection-timeout: 30000
+
+  # ---------- Redis(CAMPUS_REDIS_*) ----------
+  data:
+    redis:
+      host: ${CAMPUS_REDIS_HOST:localhost}
+      port: ${CAMPUS_REDIS_PORT:6379}
+      password: ${CAMPUS_REDIS_PASSWORD:}
+      database: ${CAMPUS_REDIS_DATABASE:0}
+      timeout: 3000ms
+
+  # ---------- RabbitMQ(CAMPUS_RABBIT_*) ----------
+  rabbitmq:
+    host: ${CAMPUS_RABBIT_HOST:localhost}
+    port: ${CAMPUS_RABBIT_PORT:5672}
+    username: ${CAMPUS_RABBIT_USERNAME:guest}
+    password: ${CAMPUS_RABBIT_PASSWORD:guest}
+    virtual-host: ${CAMPUS_RABBIT_VHOST:/}
+    listener:
+      simple:
+        # 手动确认: NotificationConsumer 消费成功手动 ack,失败抛 AmqpRejectAndDontRequeueException 进 DLQ
+        acknowledge-mode: manual
+        default-requeue-rejected: false
+        prefetch: 10
+        retry:
+          enabled: false
+
+  # ---------- Jackson ----------
+  jackson:
+    time-zone: Asia/Shanghai
+    serialization:
+      write-dates-as-timestamps: false
+
+# ---------- MyBatis-Plus ----------
+mybatis-plus:
+  mapper-locations: classpath*:/mapper/**/*.xml
+  type-aliases-package: com.campus.dao.entity
+  configuration:
+    map-underscore-to-camel-case: true
+    log-impl: org.apache.ibatis.logging.slf4j.Slf4jImpl
+  global-config:
+    banner: false
+    db-config:
+      id-type: auto
+      # 逻辑删除(所有表统一 deleted 字段)
+      logic-delete-field: deleted
+      logic-delete-value: 1
+      logic-not-delete-value: 0
+
+# ---------- 应用自定义 ----------
+app:
+  mq:
+    # 无 MQ 环境(纯测试)可关闭;开启后由 MqRelayJob 投递 outbox、NotificationConsumer 消费转站内通知
+    enabled: ${APP_MQ_ENABLED:true}
+  jwt:
+    # JwtUtils 直接读取环境变量 APP_JWT_SECRET(≥32 字节);此处仅作配置占位说明
+    secret: ${APP_JWT_SECRET:}
+  seed:
+    # 启动时把种子演示账号的占位密码重置为 123456、占位手机号(E_)重加密(幂等)
+    demo-password-reset: ${APP_SEED_DEMO_PASSWORD_RESET:true}
+
+logging:
+  level:
+    com.campus: INFO
+    com.campus.dao: DEBUG

@@ -28,42 +28,44 @@ async def capture(store, session_id: str, messages: list[dict], turn_idx: int) -
     from cc_harness.memory.extract import extract_dates, extract_entities, extract_keywords
 
     assert store._db is not None
-    # 防嵌套事务:aiosqlite 在 autocommit 模式下,显式 BEGIN 在已开事务的
-    # 连接上会报 "cannot start a transaction within a transaction"。
-    # 用 SAVEPOINT 代替 BEGIN —— SAVEPOINT 天然支持嵌套,出错只回滚本段。
-    await store._db.execute("SAVEPOINT capture_sp")
-    try:
-        ts = time.time()
-        inserted = 0
-        for message_idx, m in enumerate(messages):
-            role = m.get("role", "?")
-            if role == "system":
-                continue
-            content = m.get("content", "")
-            if isinstance(content, list):
-                content = "<multimodal>"
-            text = str(content)
-            dates = _join(extract_dates(text))
-            entities = _join(extract_entities(text))
-            keywords = _join(extract_keywords(text, n=5))
-            digest = hashlib.sha256(
-                f"{role}\x00{text}".encode("utf-8", errors="replace")
-            ).hexdigest()
-            cur = await store._db.execute(
-                "INSERT INTO conversation(session_id,turn_idx,role,content,ts,"
-                "dates,entities,keywords,message_idx,content_digest) "
-                "VALUES(?,?,?,?,?,?,?,?,?,?) "
-                "ON CONFLICT(session_id,message_idx) WHERE message_idx IS NOT NULL DO NOTHING",
-                (session_id, turn_idx, role, text, ts, dates, entities, keywords,
-                 message_idx, digest))
-            inserted += max(cur.rowcount, 0)
-        await store._db.execute("RELEASE SAVEPOINT capture_sp")
-        await store._db.commit()
-        return inserted
-    except BaseException:
+    # The capture operation is a multi-row write.  Serialize it with the
+    # other services sharing this connection, while retaining a SAVEPOINT so
+    # callers that already opened a transaction can still use capture.
+    async with store.write_lock:
+        await store._db.execute("SAVEPOINT capture_sp")
         try:
-            await store._db.execute("ROLLBACK TO SAVEPOINT capture_sp")
+            ts = time.time()
+            inserted = 0
+            for message_idx, m in enumerate(messages):
+                role = m.get("role", "?")
+                if role == "system":
+                    continue
+                content = m.get("content", "")
+                if isinstance(content, list):
+                    content = "<multimodal>"
+                text = str(content)
+                dates = _join(extract_dates(text))
+                entities = _join(extract_entities(text))
+                keywords = _join(extract_keywords(text, n=5))
+                digest = hashlib.sha256(
+                    f"{role}\x00{text}".encode("utf-8", errors="replace")
+                ).hexdigest()
+                cur = await store._db.execute(
+                    "INSERT INTO conversation(session_id,turn_idx,role,content,ts,"
+                    "dates,entities,keywords,message_idx,content_digest) "
+                    "VALUES(?,?,?,?,?,?,?,?,?,?) "
+                    "ON CONFLICT(session_id,message_idx) WHERE message_idx IS NOT NULL DO NOTHING",
+                    (session_id, turn_idx, role, text, ts, dates, entities, keywords,
+                     message_idx, digest))
+                inserted += max(cur.rowcount, 0)
             await store._db.execute("RELEASE SAVEPOINT capture_sp")
-        except Exception:
-            pass
-        raise
+            await store._db.commit()
+            return inserted
+        except BaseException:
+            try:
+                await store._db.execute("ROLLBACK TO SAVEPOINT capture_sp")
+                await store._db.execute("RELEASE SAVEPOINT capture_sp")
+                await store._db.commit()
+            except Exception:
+                pass
+            raise

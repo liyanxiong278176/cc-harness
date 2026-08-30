@@ -91,7 +91,7 @@ def load_config(env_path: Path, mcp_json_path: Path) -> AppConfig:
             key: value
             for key, value in os.environ.items()
             if key.startswith(("MEMORY_", "EMBEDDING_"))
-            or key == "CC_HARNESS_TOOL_BUNDLES"
+            or key in {"CC_HARNESS_TOOL_BUNDLES", "CC_HARNESS_THINKING_MODE"}
         },
     )
 
@@ -129,7 +129,7 @@ def load_layered_config(
         for key in set(user_env) | set(project_env) | set(process_env)
             if (
                 key.startswith(("MEMORY_", "EMBEDDING_"))
-                or key == "CC_HARNESS_TOOL_BUNDLES"
+                or key in {"CC_HARNESS_TOOL_BUNDLES", "CC_HARNESS_THINKING_MODE"}
             )
             and (selected := value(key)) is not None
     }

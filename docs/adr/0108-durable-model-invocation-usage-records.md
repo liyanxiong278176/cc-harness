@@ -1,0 +1,3 @@
+# ADR 0108: Persist a terminal usage record for every model invocation
+
+Every model request has one durable lifecycle: `ModelInvocationStarted` followed by exactly one terminal usage/outcome record. The terminal record includes the invocation identity, provider and resolved model, request correlation data, success/failure/cancellation outcome, input/output/cache counters, cache ratio, provider-reported cost and currency, cost status, and timestamps. Compaction and other internal model calls use the same contract with an explicit kind. Reports and the TUI aggregate these records; missing provider cost remains `unavailable` and is never replaced by a local tariff estimate.

@@ -1,0 +1,31 @@
+{
+  "name": "campus-delivery-frontend",
+  "version": "1.0.0",
+  "private": true,
+  "description": "校园外卖前端: React + Ant Design,用户端 / 商家端 / 骑手端同仓路由分区",
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "build": "vite build",
+    "preview": "vite preview",
+    "test": "node --test tests/",
+    "test:ui": "npm test",
+    "verify:syntax": "node scripts/verify-syntax.cjs",
+    "verify:static": "node scripts/verify-static.cjs"
+  },
+  "dependencies": {
+    "@ant-design/icons": "^5.3.7",
+    "antd": "^5.16.5",
+    "dayjs": "^1.11.11",
+    "react": "^18.3.1",
+    "react-dom": "^18.3.1",
+    "react-router-dom": "^6.23.1"
+  },
+  "devDependencies": {
+    "@vitejs/plugin-react": "^4.3.0",
+    "vite": "^5.2.12"
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}

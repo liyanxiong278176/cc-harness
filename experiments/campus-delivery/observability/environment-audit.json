@@ -1,0 +1,45 @@
+{
+  "audit_id": "ENV-AUDIT-001",
+  "audited_at": "SESSION-RUN-1",
+  "executor": "sandbox-shell (run_command) + file tools (Write/Edit/Read)",
+  "path_mapping": "host:/mnt/d/agent_learning/cc-harness/experiments/campus-delivery == container:/workspace",
+  "os": {
+    "distro": "Debian GNU/Linux 13 (trixie)",
+    "arch": "x86_64",
+    "cpus": 20,
+    "workspace_mount": "writable (653G, 228G free)",
+    "tmp": "writable"
+  },
+  "runtimes": {
+    "java": {"present": false, "detail": "'java' command not found; no /usr/lib/jvm"},
+    "maven": {"present": false, "detail": "'mvn' command not found"},
+    "docker": {"present": false, "detail": "'docker' and 'docker compose' not found"},
+    "node": {"present": true, "version": "v20.19.2"},
+    "npm": {"present": true, "version": "9.2.0", "registry_reachable": false},
+    "python3": {"present": true, "version": "3.12.14", "yaml_module": false},
+    "git": {"present": true, "version": "2.47.3"},
+    "curl": {"present": true, "network": "NO_DNS"}
+  },
+  "network": {
+    "dns_resolution": "FAILED (getent hosts repo.maven.apache.org -> empty)",
+    "curl_maven_central": "Could not resolve host: repo.maven.apache.org",
+    "apt_update": "Failed to fetch deb.debian.org: Could not resolve",
+    "gateway_tcp_80": "Connection refused",
+    "http_proxy": "none set",
+    "verdict": "AIR_GAPPED / OFFLINE"
+  },
+  "implications": [
+    "Cannot install JDK 17 / Maven / Docker.",
+    "Cannot download Maven dependencies (Spring Boot, MyBatis-Plus, etc.) -> Java compilation & execution NOT POSSIBLE in this sandbox.",
+    "Cannot download npm packages -> Vite/React build & Vitest execution NOT POSSIBLE.",
+    "Cannot run MySQL/Redis/RabbitMQ -> real integration & Docker health-check NOT POSSIBLE.",
+    "Available verification: Node syntax checks, node:test unit tests for dependency-free JS, static audits, file inventory checks, git diff/commit."
+  ],
+  "evidence_refs": [
+    "run_command: java/mvn/docker not found",
+    "curl exit 6 'Could not resolve host'",
+    "apt-get update DNS failure",
+    "tcp connect to gateway 192.168.65.7:80 refused"
+  ],
+  "remediation_path": "Run build/verify phases on a networked host with JDK17+Maven+Docker (commands in docs/operations.md), or re-run cc-harness in a networked sandbox."
+}

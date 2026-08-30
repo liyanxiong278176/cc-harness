@@ -1,0 +1,3 @@
+# ADR 0109: Record one structured terminal outcome for every run
+
+Every terminal or paused run outcome is represented by an immutable structured outcome record rather than only a free-form error string. The record carries the lifecycle outcome, one primary failure class, optional secondary causes, retryability, evidence references, attempt/recovery metadata, and the next-action hint; later evidence may append a reclassification event without mutating history. Benchmark adapters map these facts to their official pass/fail/invalid vocabulary, while the Runtime and UI use the same taxonomy for recovery and diagnostics.

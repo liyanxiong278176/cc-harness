@@ -329,14 +329,41 @@ async def ensure_server(port: int, host: str = "127.0.0.1",
     _fork_server → _set_allowed_host_paths(server 0.2.1 空=拒绝所有 host mount)。
     """
     endpoint = (host, port)
+    config_path_provided = config_path is not None
+    # Resolve the default before probing the endpoint as well.  A previously
+    # trusted endpoint still needs to be re-attested when the caller's
+    # required mount paths change (for example after a workspace mask refresh).
+    # Keeping one effective path also makes owned and externally managed
+    # servers follow the same security contract.
+    config_path = (
+        Path(config_path).expanduser().resolve()
+        if config_path is not None
+        else (Path.home() / ".cc-harness-sandbox.toml").resolve()
+    )
     if await ping(host, port):
         trusted = _TRUSTED_ENDPOINTS.get(endpoint)
         if trusted is not None:
+            if require_external_attestation:
+                if not trusted.owned and not config_path_provided:
+                    raise ServerAttestationError(
+                        "external OpenSandbox server requires server_config_path attestation"
+                    )
+                attested = attest_server_config(
+                    config_path,
+                    host=host,
+                    port=port,
+                    required_host_paths=allowed_host_paths or [],
+                    max_pids=pids_limit,
+                )
+                # Preserve ownership from the process that originally started
+                # the server while refreshing the path/config attestation.
+                trusted = ServerState(**{**attested.__dict__, "owned": trusted.owned})
+                _TRUSTED_ENDPOINTS[endpoint] = trusted
             return trusted
         if not await health(host, port):
             raise ServerAttestationError("reachable port is not an OpenSandbox health endpoint")
         if require_external_attestation:
-            if config_path is None:
+            if not config_path_provided:
                 raise ServerAttestationError(
                     "external OpenSandbox server requires server_config_path attestation"
                 )
@@ -353,12 +380,14 @@ async def ensure_server(port: int, host: str = "127.0.0.1",
         return state
     if not _docker_available():
         return None
-    config_path = config_path or (Path.home() / ".cc-harness-sandbox.toml")
     proc = await _fork_server(port, host, config_path, allowed_host_paths, pids_limit)
     loop = asyncio.get_running_loop()
     deadline = loop.time() + ready_timeout
     while loop.time() < deadline:
-        if await ping(host, port):
+        # TCP accept can happen before the ASGI app has mounted /health.  Do
+        # not mark the server ready (and let Sandbox.create race it) until the
+        # HTTP health contract is also satisfied.
+        if await ping(host, port) and await health(host, port):
             if _OWNED_PROC[0] is not None:
                 _kill_proc_tree(_OWNED_PROC[0])
             _OWNED_PROC[0] = proc

@@ -262,27 +262,28 @@ class MemoryService:
         Returns the number of deleted rows from ``memories``.
         """
         assert self.store._db is not None, "store.init_schema first"
-        cur = await self.store._db.execute(
-            "SELECT id FROM memories WHERE source LIKE ?", (tag_pattern,)
-        )
-        rows = await cur.fetchall()
-        if not rows:
-            return 0
-        ids = [r[0] for r in rows]
-        placeholders = ",".join("?" * len(ids))
-        try:
-            del_cur = await self.store._db.execute(
-                f"DELETE FROM memories WHERE id IN ({placeholders})", ids
+        async with self.store.write_lock:
+            cur = await self.store._db.execute(
+                "SELECT id FROM memories WHERE source LIKE ?", (tag_pattern,)
             )
-            await self.store._db.execute(
-                f"DELETE FROM vec_memories WHERE id IN ({placeholders})", ids
-            )
-            await self.store._db.commit()
-        except Exception:
-            # 两条 DELETE 同一事务;任一失败回滚,避免 memories/vec 不一致
-            await self.store._db.rollback()
-            raise
-        return del_cur.rowcount
+            rows = await cur.fetchall()
+            if not rows:
+                return 0
+            ids = [r[0] for r in rows]
+            placeholders = ",".join("?" * len(ids))
+            try:
+                del_cur = await self.store._db.execute(
+                    f"DELETE FROM memories WHERE id IN ({placeholders})", ids
+                )
+                await self.store._db.execute(
+                    f"DELETE FROM vec_memories WHERE id IN ({placeholders})", ids
+                )
+                await self.store._db.commit()
+            except Exception:
+                # 两条 DELETE 同一事务;任一失败回滚,避免 memories/vec 不一致
+                await self.store._db.rollback()
+                raise
+            return del_cur.rowcount
 
 
 _HISTORY_FACT_SPLIT_RE = re.compile(

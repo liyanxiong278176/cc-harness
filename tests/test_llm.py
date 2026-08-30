@@ -8,8 +8,32 @@ from cc_harness.llm import (
     LLMClient,
     PendingToolCall,
     StreamEvent,
+    _thinking_replay_error,
+    _retryable_provider_error,
     accumulate_delta,
+    normalize_thinking_mode,
 )
+
+
+def test_normalize_thinking_mode_aliases_and_rejects_unknown_values():
+    assert normalize_thinking_mode(None) == "auto"
+    assert normalize_thinking_mode("on") == "enabled"
+    assert normalize_thinking_mode("OFF") == "disabled"
+    with pytest.raises(ValueError, match="thinking mode"):
+        normalize_thinking_mode("sometimes")
+
+
+def test_thinking_replay_error_requires_the_provider_protocol_message():
+    assert _thinking_replay_error(
+        RuntimeError("Error code: 400: reasoning_content in the thinking mode must be passed back")
+    )
+    assert not _thinking_replay_error(RuntimeError("Error code: 400: invalid api key"))
+
+
+def test_read_timeout_is_a_retryable_transport_error():
+    assert _retryable_provider_error(RuntimeError("read timeout"))
+    assert _retryable_provider_error(type("ReadTimeout", (Exception,), {})(""))
+    assert not _retryable_provider_error(RuntimeError("invalid api key"))
 
 def test_pending_tool_call_index_optional():
     p = PendingToolCall()
@@ -202,6 +226,61 @@ async def test_chat_content_preferred_over_reasoning_when_both_present():
             final = ev
     assert final is not None
     assert final.content == "ANSWER"
+
+
+@pytest.mark.asyncio
+async def test_chat_disabled_sends_provider_thinking_extension():
+    chunks = [_FakeChunk(_FakeChoiceDelta(content="ok"), finish_reason="stop")]
+    client = _make_client(chunks)
+    client.thinking_mode = "disabled"
+    events = [event async for event in client.chat(messages=[{"role": "user", "content": "x"}], tools=[])]
+    assert events[-1].content == "ok"
+    kwargs = client._client.chat.completions.create.await_args.kwargs
+    assert kwargs["extra_body"] == {"thinking": {"type": "disabled"}}
+
+
+@pytest.mark.asyncio
+async def test_chat_falls_back_once_when_thinking_replay_is_rejected():
+    chunks = [_FakeChunk(_FakeChoiceDelta(content="recovered"), finish_reason="stop")]
+    client = LLMClient(
+        api_key="sk-test",
+        model="deepseek-v4-flash",
+        base_url=None,
+        thinking_mode="auto",
+        reasoning_effort="high",
+    )
+    mock = MagicMock()
+    calls = []
+
+    async def create(**kwargs):
+        calls.append(kwargs)
+        if len(calls) == 1:
+            raise RuntimeError(
+                "Error code: 400 - The `reasoning_content` in the thinking mode must be passed back to the API."
+            )
+        return aiter(chunks)
+
+    mock.chat.completions.create = AsyncMock(side_effect=create)
+    client._client = mock
+    messages = [
+        {"role": "user", "content": "continue"},
+        {
+            "role": "assistant",
+            "content": "",
+            "reasoning_content": "",
+            "tool_calls": [{"id": "call-1", "type": "function", "function": {"name": "x", "arguments": "{}"}}],
+        },
+    ]
+    events = [event async for event in client.chat(messages=messages, tools=[])]
+    assert events[-1].content == "recovered"
+    assert client.thinking_mode == "disabled"
+    assert client.thinking_fallback_used is True
+    assert len(calls) == 2
+    assert calls[1]["extra_body"] == {"thinking": {"type": "disabled"}}
+    assert "reasoning_effort" not in calls[1]
+    assert all("reasoning_content" not in message for message in calls[1]["messages"])
+    # The input transcript is copied, never mutated by the fallback.
+    assert messages[1]["reasoning_content"] == ""
 
 
 @pytest.mark.asyncio

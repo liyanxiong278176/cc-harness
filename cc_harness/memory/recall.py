@@ -44,21 +44,23 @@ async def layered_recall(
 
 
 def layered_memory_fingerprint(persona_path: Path, scenarios_dir: Path) -> str:
-    """Return a lightweight version fingerprint for the current L2/L3 snapshot.
+    """Return a content-aware version fingerprint for the current L2/L3 snapshot.
 
-    Only file metadata is inspected.  The expensive L1 hybrid search and L2/L3
-    content reads are therefore skipped while a session's snapshot is unchanged.
+    L2/L3 files are normally small, so include a SHA-256 of each selected file
+    in addition to metadata.  Metadata-only fingerprints can miss an editor
+    that preserves size and nanosecond mtime; that would incorrectly reuse a
+    stale durable injection after restart.
     """
     persona_path = Path(persona_path)
     scenarios_dir = Path(scenarios_dir)
     persona_meta = _file_metadata(persona_path)
-    latest: dict[str, tuple[int, int, int, str]] = {}
+    latest: dict[str, tuple[int, int, int, str, str]] = {}
     if scenarios_dir.exists():
         for path in scenarios_dir.glob("*.md"):
             stat = path.stat()
             session_id = _extract_session_id(path.stem)
             version = _filename_version(path.stem)
-            candidate = (version, stat.st_mtime_ns, stat.st_size, path.name)
+            candidate = (version, stat.st_mtime_ns, stat.st_size, path.name, _file_digest(path))
             if session_id not in latest or candidate > latest[session_id]:
                 latest[session_id] = candidate
     payload = {
@@ -199,11 +201,20 @@ def _filename_version(stem: str) -> int:
     return 0
 
 
-def _file_metadata(path: Path) -> tuple[int, int] | None:
+def _file_metadata(path: Path) -> tuple[int, int, str] | None:
     if not path.exists():
         return None
     stat = path.stat()
-    return stat.st_mtime_ns, stat.st_size
+    return stat.st_mtime_ns, stat.st_size, _file_digest(path)
+
+
+def _file_digest(path: Path) -> str:
+    """Hash one advisory memory file without allowing I/O errors to block runs."""
+
+    try:
+        return hashlib.sha256(path.read_bytes()).hexdigest()
+    except OSError:
+        return "unreadable"
 
 
 def _metadata_int(text: str, key: str, default: int) -> int:

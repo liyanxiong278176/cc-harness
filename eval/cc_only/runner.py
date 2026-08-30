@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import json
 import hashlib
+import math
 import platform
 from collections import Counter
 from collections.abc import Callable, Mapping, Sequence
@@ -28,6 +29,10 @@ from .launch import final_result, run_cc_prompt
 from .storage import RunStateStore, atomic_json, atomic_text, digest_file, read_json, utc_now
 
 MAX_AUTOMATIC_ATTEMPTS = 3
+# Infrastructure retries are not scored model attempts.  They are allowed
+# only for a transient failure that demonstrably happened before the agent
+# made a model request, and they reuse the same attempt/checkpoint.
+MAX_INFRASTRUCTURE_ATTEMPTS = 10
 COOLDOWNS = (30.0, 60.0)
 _RETRYABLE_RESULT_MARKERS = (
     "402",
@@ -45,6 +50,43 @@ def _generation_attempt_count(trial: Mapping[str, Any], generation: int) -> int:
         int(attempt.get("retry_generation", 0)) == generation
         and attempt.get("status") != TrialStatus.INTERRUPTED.value
         for attempt in trial.get("attempts", [])
+    )
+
+
+def _model_call_count(outcome: TrialOutcome) -> int:
+    """Read model-call evidence without guessing from token counters."""
+
+    usage = outcome.usage if isinstance(outcome.usage, Mapping) else {}
+    raw = usage.get("model_calls")
+    try:
+        return max(0, int(raw or 0))
+    except (TypeError, ValueError):
+        return 0
+
+
+def _model_phase_started(outcome: TrialOutcome) -> bool:
+    """Return whether durable evidence shows a model request had begun.
+
+    A provider adapter may lose its explicit call counter while still
+    returning token usage.  Token presence is sufficient to fence a retry, but
+    it is intentionally *not* converted into a guessed call count.
+    """
+
+    protocol = outcome.protocol or {}
+    if bool(protocol.get("model_phase_started")):
+        return True
+    usage = outcome.usage if isinstance(outcome.usage, Mapping) else {}
+    if _model_call_count(outcome) > 0:
+        return True
+    return any(
+        int(usage.get(name) or 0) > 0
+        for name in (
+            "input_tokens",
+            "uncached_input_tokens",
+            "cache_creation_input_tokens",
+            "cache_read_input_tokens",
+            "output_tokens",
+        )
     )
 
 
@@ -84,7 +126,9 @@ def _classify_terminal_infrastructure(outcome: TrialOutcome) -> str:
     ``transient`` is the only class that receives an automatic second attempt.
     Environment and deterministic runtime defects are retained as evidence and
     deferred so a broken verifier or runtime cannot spend model calls in a
-    retry loop.
+    retry loop.  An unclassified exception is deliberately conservative: it is
+    not evidence of a pre-model transient outage and therefore must not be
+    replayed automatically.
     """
 
     protocol = outcome.protocol or {}
@@ -135,8 +179,11 @@ def _classify_terminal_infrastructure(outcome: TrialOutcome) -> str:
         return "transient"
     if protocol.get("transient_infrastructure") is False:
         return "deterministic"
-    # Unknown launcher/provider failures remain conservatively retryable.
-    return "transient"
+    # Unknown failures are not safe to replay: without an explicit transport
+    # marker we cannot prove that the model phase was never entered. Preserve
+    # evidence and defer for an operator/model-directed recovery instead of
+    # risking a second official model attempt.
+    return "deterministic"
 
 
 async def run_benchmark(
@@ -363,29 +410,59 @@ async def run_benchmark(
 
     task_results: list[dict[str, Any]] = []
     terminal_cost_warned = False
+    terminal_cost_boundary_warned = False
     for sequence, task in enumerate(tasks, 1):
         if adapter.slug == "terminal-bench-2.1":
             completed_results = _persisted_results(output_root, state)
-            cost_cny = _terminal_cost_cny(completed_results)
-            if cost_cny >= 100 and not terminal_cost_warned:
-                progress(f"Terminal-Bench cost warning: estimated CNY {cost_cny:.2f}")
+            api_cost = _terminal_api_cost(completed_results)
+            direct_currency = api_cost["api_reported_cost_currency"]
+            direct_amount = api_cost["api_reported_cost"]
+            if (
+                api_cost["api_cost_status"] == "reported"
+                and direct_currency == "CNY"
+                and direct_amount is not None
+                and direct_amount >= 100
+                and not terminal_cost_warned
+            ):
+                progress(f"Terminal-Bench provider cost warning: CNY {direct_amount:.2f}")
                 terminal_cost_warned = True
-            if cost_limit_cny is not None and cost_cny >= cost_limit_cny:
+            if (
+                cost_limit_cny is not None
+                and api_cost["api_cost_status"] == "reported"
+                and direct_currency == "CNY"
+                and direct_amount is not None
+                and direct_amount >= cost_limit_cny
+            ):
                 progress(
                     "Terminal-Bench paused at task boundary: "
-                    f"estimated CNY {cost_cny:.2f} reached limit {cost_limit_cny:.2f}"
+                    f"provider-reported CNY {direct_amount:.2f} reached limit "
+                    f"{cost_limit_cny:.2f}"
                 )
                 state.setdefault("operational_pauses", []).append(
                     {
                         "timestamp": utc_now(),
                         "reason": "cost_limit",
-                        "estimated_cost_cny": round(cost_cny, 6),
+                        "api_reported_cost": round(direct_amount, 6),
+                        "api_reported_cost_currency": direct_currency,
+                        "api_cost_source": "provider",
+                        "api_cost_status": api_cost["api_cost_status"],
                         "limit_cny": cost_limit_cny,
                         "next_task": task.task_id,
                     }
                 )
                 store.save(state)
                 break
+            if (
+                cost_limit_cny is not None
+                and api_cost["api_cost_observed"]
+                and api_cost["api_cost_status"] != "reported"
+                and not terminal_cost_boundary_warned
+            ):
+                progress(
+                    "Terminal-Bench cost limit not enforced: provider-reported CNY "
+                    f"cost is {api_cost['api_cost_status']}"
+                )
+                terminal_cost_boundary_warned = True
         trial = state["trials"][task.task_id]
         if trial.get("status") in {TrialStatus.PASS.value, TrialStatus.FAIL.value}:
             progress(f"skip terminal {sequence}/{len(tasks)} {task.task_id}: {trial['status']}")
@@ -412,6 +489,22 @@ async def run_benchmark(
         # reuse_interrupted=True)`` is specifically able to resume it.
         generation_attempts = _generation_attempt_count(trial, generation)
         max_attempts = int(getattr(adapter, "max_automatic_attempts", MAX_AUTOMATIC_ATTEMPTS))
+        # A Terminal-Bench adapter's one attempt is the official model
+        # attempt.  A transient launcher/Docker/network failure before that
+        # attempt starts is different: it may be retried up to ten times
+        # without another model call, while still reusing the same durable
+        # workspace and attempt record.
+        if adapter.slug == "terminal-bench-2.1":
+            max_attempts = max(
+                max_attempts,
+                int(
+                    getattr(
+                        adapter,
+                        "max_infrastructure_attempts",
+                        max_attempts,
+                    )
+                ),
+            )
         while generation_attempts < max_attempts:
             attempt, attempt_root, record = store.begin_attempt(
                 state,
@@ -526,6 +619,11 @@ async def run_benchmark(
                 trial.pop("result", None)
                 trial["selected_attempt"] = None
                 generation_attempts += 1
+                model_calls = _model_call_count(outcome)
+                pre_model_transient = (
+                    infrastructure_class == "transient"
+                    and not _model_phase_started(outcome)
+                )
                 if infrastructure_class in {"environment_not_ready", "deterministic"}:
                     state.setdefault("operational_pauses", []).append(
                         {
@@ -540,6 +638,28 @@ async def run_benchmark(
                     progress(
                         f"Terminal-Bench deferred {infrastructure_class} task "
                         f"{task.task_id}; no automatic model retry was performed."
+                    )
+                    break
+                if not pre_model_transient:
+                    # Once a model request was observed, retrying the official
+                    # task would create a second scored attempt. Keep the
+                    # infrastructure evidence pending for an explicit,
+                    # checkpoint-aware recovery instead.
+                    state.setdefault("operational_pauses", []).append(
+                        {
+                            "timestamp": utc_now(),
+                            "task_id": task.task_id,
+                            "attempt": attempt,
+                            "reason": "terminal_infrastructure_after_model",
+                            "model_calls": model_calls,
+                            "evidence": result_path.relative_to(output_root).as_posix(),
+                        }
+                    )
+                    store.save(state)
+                    progress(
+                        f"Terminal-Bench deferred infrastructure-blocked task "
+                        f"{task.task_id}; model activity was observed, so no "
+                        "automatic second scored attempt was performed."
                     )
                     break
                 if generation_attempts >= max_attempts:
@@ -677,7 +797,11 @@ async def run_benchmark(
         summary["environment_not_ready"] = list(
             summary["infrastructure_classification"]["environment_not_ready"]
         )
-        summary["estimated_cost_cny"] = _terminal_cost_cny(task_results)
+        api_cost = _terminal_api_cost(task_results)
+        summary.update(api_cost)
+        # Kept as a null compatibility field so consumers cannot accidentally
+        # interpret an old tariff estimate as a current bill.
+        summary["estimated_cost_cny"] = None
     return _finalize(adapter, output_root, store, state, tasks, summary)
 
 
@@ -704,6 +828,99 @@ def _terminal_cost_cny(results: Sequence[Mapping[str, Any]]) -> float:
         # cache miss 3.0, cache hit 0.10, output 9.0.
         total += ((uncached + cache_create) * 3.0 + cached * 0.10 + output * 9.0) / 1_000_000
     return total
+
+
+def _terminal_api_cost(results: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
+    """Aggregate only provider-reported cost facts.
+
+    Token counts are deliberately ignored.  A result with model activity but
+    no valid provider price makes the aggregate ``incomplete``; this prevents
+    a partial bill from being presented as a complete total.  Currency is
+    treated strictly, so amounts in different or unknown currencies are not
+    added together.
+    """
+
+    observed_calls = 0
+    priced_calls = 0
+    observed_without_price = False
+    amounts: list[float] = []
+    currencies: list[str | None] = []
+
+    def finite_amount(value: Any) -> float | None:
+        if isinstance(value, bool) or value is None:
+            return None
+        try:
+            parsed = float(value)
+        except (TypeError, ValueError):
+            return None
+        return parsed if math.isfinite(parsed) and parsed >= 0 else None
+
+    def call_count(value: Any) -> int:
+        try:
+            return max(0, int(value or 0))
+        except (TypeError, ValueError):
+            return 0
+
+    for result in results:
+        raw_usage = result.get("usage")
+        usage = raw_usage if isinstance(raw_usage, Mapping) else {}
+        calls = call_count(usage.get("model_calls"))
+        raw_cost = usage.get("api_reported_cost")
+        if raw_cost is None:
+            raw_cost = result.get("api_reported_cost")
+        amount = finite_amount(raw_cost)
+        raw_currency = usage.get("api_reported_cost_currency")
+        if raw_currency is None:
+            raw_currency = result.get("api_reported_cost_currency")
+        currency = str(raw_currency).strip().upper() if raw_currency is not None else None
+        raw_status = usage.get("api_cost_status")
+        if raw_status is None:
+            raw_status = result.get("api_cost_status")
+        status = str(raw_status).strip().lower() if raw_status is not None else None
+
+        # Older direct-provider envelopes had the amount but no explicit
+        # status.  Accept that shape as a direct fact; never fall back to the
+        # legacy ``cost_microusd`` token tariff.
+        if status is None and amount is not None:
+            status = "reported"
+        observed = bool(usage.get("api_cost_observed")) or calls > 0 or amount is not None
+        if not observed:
+            continue
+        effective_calls = calls or 1
+        observed_calls += effective_calls
+        if status == "reported" and amount is not None:
+            priced_calls += effective_calls
+            amounts.append(amount)
+            currencies.append(currency)
+        else:
+            observed_without_price = True
+
+    distinct_currencies = set(currencies)
+    currency_complete = len(distinct_currencies) <= 1
+    if currencies and None in distinct_currencies and len(distinct_currencies) > 1:
+        currency_complete = False
+    if amounts and not observed_without_price and currency_complete:
+        currency = currencies[0] if currencies else None
+        return {
+            "api_reported_cost": sum(amounts),
+            "api_reported_cost_currency": currency,
+            "api_cost_source": "provider",
+            "api_cost_status": "reported",
+            "api_cost_observed": True,
+            "api_cost_complete": True,
+            "api_cost_observed_calls": observed_calls,
+            "api_cost_priced_calls": priced_calls,
+        }
+    return {
+        "api_reported_cost": None,
+        "api_reported_cost_currency": None,
+        "api_cost_source": "provider",
+        "api_cost_status": "incomplete" if observed_calls else "unavailable",
+        "api_cost_observed": bool(observed_calls),
+        "api_cost_complete": False,
+        "api_cost_observed_calls": observed_calls,
+        "api_cost_priced_calls": priced_calls,
+    }
 
 
 def _load_task_selection(
@@ -1065,15 +1282,31 @@ def _report(adapter: BenchmarkAdapter, summary: Mapping[str, Any]) -> str:
         )
     if adapter.slug == "terminal-bench-2.1":
         metrics = summary.get("benchmark_metrics") or {}
+        api_cost_status = str(summary.get("api_cost_status") or "unavailable")
+        api_cost = summary.get("api_reported_cost")
+        api_currency = str(summary.get("api_reported_cost_currency") or "").strip()
+        if api_cost_status == "reported" and api_cost is not None:
+            cost_line = (
+                "- API-reported cost (provider): "
+                f"{float(api_cost):.6f}{(' ' + api_currency) if api_currency else ''}"
+            )
+        elif api_cost_status == "incomplete":
+            cost_line = (
+                "- API-reported cost (provider): incomplete "
+                "(at least one model call had no valid provider price)"
+            )
+        else:
+            cost_line = "- API-reported cost (provider): unavailable"
         lines.extend(
             (
                 "## Official Single-Pass View",
                 "",
                 f"- Success rule: `{metrics.get('official_success_rule', 'reward > 0')}`",
-                f"- Successful tasks: {metrics.get('successful_tasks', 0)}/89",
+                f"- Successful tasks: {metrics.get('successful_tasks', 0)}/"
+                f"{summary.get('task_count') or len(summary.get('task_results') or ())}",
                 f"- Single-pass accuracy: {_format_rate(metrics.get('single_pass_accuracy'))}",
                 "- Leaderboard compatible: no (one trial per task; official submissions require at least five)",
-                f"- Estimated cost (CNY, high-demand tariff): {float(summary.get('estimated_cost_cny') or 0):.2f}",
+                cost_line,
                 "",
                 "## Per-Task Results",
                 "",

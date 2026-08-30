@@ -7,6 +7,8 @@ import hashlib
 import json
 import os
 import re
+import subprocess
+import sys
 from dataclasses import replace
 from pathlib import Path
 from typing import Any, Mapping, Sequence
@@ -15,24 +17,42 @@ from .action_contracts import ToolContractRegistry, ToolRecoveryContract
 from .activation import ActivationManifest, CapabilityProfile
 from .capability_runtime import AgentCapabilityRuntime
 from .capability_services import SharedCapabilityServices
-from .config import load_layered_config
+from .config import ExecutorBackend, load_layered_config
+from .context import _repair_tool_result_pairing
 from .coordinator import RunCoordinator, RunRequest
 from .credential_broker import ActionScopedCapabilityBroker, CredentialBrokerError
 from .interaction_history import materialize_interaction_messages
 from .project_instructions import load_project_instructions
 from .tool_bundles import parse_tool_bundles, select_tool_specs
-from .llm import LLMClient
+from .llm import LLMClient, ProviderProtocolError, normalize_thinking_mode
 from .mcp_client import MCPClient, ToolResult
 from .native_tools import NATIVE_FILE_TOOLS
 from .policy import Action
 from .run_kernel import ActionRequest, ModelAdapter, ModelSegment, ReActKernel
-from .run_model import ActionStatus, CompletionCandidate, EffectClass
+from .run_events import EventActor
+from .run_model import ActionStatus, CompletionCandidate, EffectClass, RunStatus
 from .run_store import RunNotFound, RunStore, RunStoreError
+from .run_telemetry import aggregate_model_usage
 from .supervisor import LocalSupervisor
-from .tools import RUN_COMMAND_SPEC, init_session_executor, run_command, shutdown_session_executor
+from .tools import (
+    RUN_COMMAND_SPEC,
+    init_session_executor,
+    prewarm_session_executor,
+    run_command,
+    shutdown_session_executor,
+)
 from .l5 import sanitize
 from .tool_observation import CONTINUE_TOOL_RESULT_SPEC, ToolObservation, make_observation
 from .worker import ActionExecutionResult, RunWorker
+from .durable_subagents import (
+    ACCEPT_CHILD_CANDIDATE_SPEC,
+    DISPATCH_SUBAGENT_SPEC,
+    REJECT_CHILD_CANDIDATE_SPEC,
+    durable_accept_child_candidate_handler,
+    durable_dispatch_subagent_handler,
+    durable_reject_child_candidate_handler,
+)
+from .worktrees import WorktreeManager
 
 
 _COMPLETION_BLOCK = re.compile(
@@ -150,8 +170,20 @@ class DurableModelAdapter(ModelAdapter):
         self.tool_bundles = tool_bundles
 
     @staticmethod
-    def _provider_messages(messages: Sequence[Mapping[str, Any]]) -> list[dict[str, Any]]:
-        """Drop durable bookkeeping keys before crossing the provider boundary."""
+    def _provider_messages(
+        messages: Sequence[Mapping[str, Any]],
+        *,
+        thinking_mode: str = "auto",
+        reasoning_content_required: bool = False,
+    ) -> list[dict[str, Any]]:
+        """Build provider messages without changing replay semantics.
+
+        Durable event metadata is deliberately removed at this boundary, but
+        provider-owned fields are copied verbatim.  Thinking-mode providers
+        require the original ``reasoning_content`` next to an assistant tool
+        call; when that field is required, a missing value is a protocol error
+        rather than an opportunity to synthesize an empty string.
+        """
 
         allowed = {
             "role",
@@ -162,10 +194,45 @@ class DurableModelAdapter(ModelAdapter):
             "reasoning_content",
             "refusal",
         }
-        return [
-            {key: value for key, value in dict(message).items() if key in allowed}
-            for message in messages
-        ]
+        mode = normalize_thinking_mode(thinking_mode)
+        strict_reasoning = mode == "enabled" or (
+            mode == "auto" and reasoning_content_required
+        )
+        if strict_reasoning:
+            # Validate the authoritative assistant artifacts before repairing
+            # malformed tool turns.  A missing provider-owned reasoning field
+            # is a deterministic replay error and must remain visible rather
+            # than being hidden by dropping the incomplete tool call.
+            for index, message in enumerate(messages):
+                if message.get("role") != "assistant" or not message.get("tool_calls"):
+                    continue
+                if "reasoning_content" not in message:
+                    raise ProviderProtocolError(
+                        "assistant tool-call replay is missing reasoning_content",
+                        field="reasoning_content",
+                        message_index=index,
+                    )
+                if not isinstance(message["reasoning_content"], str):
+                    raise ProviderProtocolError(
+                        "assistant tool-call reasoning_content must be a string",
+                        field="reasoning_content",
+                        message_index=index,
+                    )
+
+        result: list[dict[str, Any]] = []
+        # This is a final provider-boundary guard.  Durable projections already
+        # normalize turns, but custom message providers and restored legacy
+        # contexts can bypass that path.  Never fabricate a missing result;
+        # retain only complete, declaration-ordered tool-call pairs.
+        normalized_messages = _repair_tool_result_pairing(
+            [dict(message) for message in messages]
+        )
+        for message in normalized_messages:
+            copied = {key: value for key, value in dict(message).items() if key in allowed}
+            if mode == "disabled":
+                copied.pop("reasoning_content", None)
+            result.append(copied)
+        return result
 
     async def complete(
         self,
@@ -177,8 +244,16 @@ class DurableModelAdapter(ModelAdapter):
         finish_reason = "model_stop"
         usage = None
         reasoning_content = ""
+        thinking_mode = getattr(self.llm, "thinking_mode", "auto")
+        reasoning_content_required = bool(
+            getattr(self.llm, "reasoning_content_required", False)
+        )
         stream = self.llm.chat(
-            self._provider_messages(messages),
+            self._provider_messages(
+                messages,
+                thinking_mode=thinking_mode,
+                reasoning_content_required=reasoning_content_required,
+            ),
             [dict(item) for item in tools],
         )
         try:
@@ -250,6 +325,20 @@ class DurableModelAdapter(ModelAdapter):
         if usage is not None:
             usage_payload["reported_cost"] = usage.reported_cost
             usage_payload["reported_cost_currency"] = usage.reported_cost_currency
+        # Provider/model identity is stored with the usage event, not inferred
+        # later from mutable process configuration.  This is especially
+        # important when a resumed run changes the requested model.
+        usage_payload["model"] = str(getattr(self.llm, "resolved_model", None) or self.llm.model)
+        usage_payload["thinking_mode"] = str(getattr(self.llm, "thinking_mode", "auto"))
+        usage_payload["thinking_fallback_used"] = bool(
+            getattr(self.llm, "thinking_fallback_used", False)
+        )
+        base_url = str(getattr(self.llm, "base_url", None) or "")
+        usage_payload["provider"] = (
+            base_url.split("//", 1)[-1].split("/", 1)[0]
+            if base_url
+            else "openai-compatible"
+        )
         from .prompt_rules import production_rule_metadata
         from .tool_bundles import bundle_digest
         system_content = next(
@@ -292,8 +381,9 @@ class DurableRuntimeClient:
 
     Creating a client is intentionally configuration-light: status/list and
     migration commands must work even when model credentials are unavailable.
-    The execution service is opt-in through ``start_supervisor`` or the CLI
-    ``--command supervisor``.
+    Interactive control uses ``start_detached_supervisor`` so closing the TUI
+    does not cancel work; direct/headless execution may opt into
+    ``start_supervisor`` or the CLI ``--command supervisor``.
     """
 
     def __init__(self, store: RunStore, coordinator: RunCoordinator) -> None:
@@ -323,24 +413,30 @@ class DurableRuntimeClient:
     ) -> "DurableRuntimeClient":
         store = RunStore(Path(cwd), data_root=data_root)
         await store.open()
-        return cls(store, RunCoordinator(store))
+        worktrees = WorktreeManager(Path(cwd), state_root=store.state_dir, artifacts=store.artifacts)
+        return cls(store, RunCoordinator(store, worktrees=worktrees))
 
     async def submit(
         self,
         objective: str,
         acceptance_criteria: tuple[str, ...] = ("request addressed",),
+        *,
+        confirm_high_risk: bool = False,
     ) -> str:
         # Terminal-Bench supplies a frozen official task statement inside an
         # isolated Harbor container.  Its instructions can describe external
         # operations (for example ``git push``) without being a live user's
         # request.  Keep the provenance explicit and auditable; never infer it
         # from the objective text.
-        goal_provenance = (
-            "official_benchmark"
-            if os.getenv("CC_HARNESS_TRUSTED_BENCHMARK_TASK", "") == "1"
+        if (
+            os.getenv("CC_HARNESS_TRUSTED_BENCHMARK_TASK", "") == "1"
             and os.getenv("CC_HARNESS_TERMINAL_BENCH", "") == "1"
-            else "user"
-        )
+        ):
+            goal_provenance = "official_benchmark"
+        elif confirm_high_risk:
+            goal_provenance = "user_confirmed"
+        else:
+            goal_provenance = "user"
         return (
             await self.coordinator.submit(
                 RunRequest(
@@ -350,6 +446,202 @@ class DurableRuntimeClient:
                 )
             )
         ).run_id
+
+    async def _resolve_run_root(self, run_id: str) -> Path:
+        """Resolve a child execution root from the parent's persisted DAG."""
+        try:
+            record = await self.store.load_run_record(run_id)
+            if record.parent_run_id:
+                parent = await self.store.load_projection(record.parent_run_id)
+                child = next((item for item in parent.children if item.child_run_id == run_id), None)
+                node = next((item for item in parent.plan.nodes if child and item.node_id == child.node_id), None)
+                if node and node.worktree_id:
+                    path = Path(node.worktree_id).resolve()
+                    if path.is_dir():
+                        return path
+        except Exception:  # noqa: BLE001 - recovery falls back to the project root
+            pass
+        return self.cwd
+
+    async def _on_child_completed(self, child_run_id: str, candidate: CompletionCandidate) -> None:
+        try:
+            record = await self.store.load_run_record(child_run_id)
+            if not record.parent_run_id:
+                return
+            child_projection = await self.store.load_projection(child_run_id)
+            parent = await self.store.load_projection(record.parent_run_id)
+            child = next((item for item in parent.children if item.child_run_id == child_run_id), None)
+            if child is None or child.status in {"completed", "accepted", "candidate_submitted"}:
+                return
+            node = next((item for item in parent.plan.nodes if item.node_id == child.node_id), None)
+            if node is None or node.effect_class == EffectClass.READ_ONLY.value:
+                await self.coordinator._append(
+                    record.parent_run_id,
+                    "ChildRunCompleted",
+                    {"child_run_id": child_run_id},
+                    EventActor("coordinator", "local-coordinator"),
+                )
+                return
+            if self.coordinator.worktrees is None or not node.worktree_id or not node.worktree_base_commit:
+                raise RuntimeError("mutating child has no isolated worktree metadata")
+            worktree = self.coordinator.worktrees.create_child(
+                record.parent_run_id,
+                child_run_id,
+                base_commit=node.worktree_base_commit,
+                depth=node.depth,
+                write=True,
+            )
+            change_set = self.coordinator.worktrees.commit_candidate(
+                worktree,
+                message=(child_projection.goal.objective if child_projection.goal else f"child {child_run_id}")[:200],
+                owned_paths=node.owned_paths,
+                verification_evidence=candidate.evidence,
+            )
+            await self.coordinator.submit_child_candidate(record.parent_run_id, change_set)
+        except Exception as exc:  # noqa: BLE001 - preserve a durable conflict instead of failing silently
+            try:
+                record = await self.store.load_run_record(child_run_id)
+                if record.parent_run_id:
+                    await self.coordinator._append(
+                        record.parent_run_id,
+                        "IntegrationConflictRaised",
+                        {"child_run_id": child_run_id, "paths": [], "reason": str(exc)},
+                        EventActor("coordinator", "local-coordinator"),
+                    )
+            except Exception:
+                pass
+
+    async def _on_child_cancelled(self, child_run_id: str, reason: str) -> None:
+        try:
+            record = await self.store.load_run_record(child_run_id)
+            if not record.parent_run_id:
+                return
+            parent = await self.store.load_projection(record.parent_run_id)
+            child = next((item for item in parent.children if item.child_run_id == child_run_id), None)
+            if child and child.status not in {"cancelled", "completed", "accepted", "candidate_submitted"}:
+                await self.coordinator._append(record.parent_run_id, "ChildRunCancelled", {"child_run_id": child_run_id, "reason": reason}, EventActor("coordinator", "local-coordinator"))
+        except Exception:
+            pass
+
+    async def _on_child_failed(self, child_run_id: str, reason: str) -> None:
+        try:
+            record = await self.store.load_run_record(child_run_id)
+            if not record.parent_run_id:
+                return
+            parent = await self.store.load_projection(record.parent_run_id)
+            child = next((item for item in parent.children if item.child_run_id == child_run_id), None)
+            if child and child.status not in {"failed", "cancelled", "completed", "accepted", "candidate_submitted"}:
+                await self.coordinator._append(
+                    record.parent_run_id,
+                    "ChildRunFailed",
+                    {"child_run_id": child_run_id, "reason": reason},
+                    EventActor("coordinator", "local-coordinator"),
+                )
+        except Exception:
+            pass
+
+    async def run_tree(self, root_run_id: str) -> tuple[str, ...]:
+        """Return a root Run plus all persisted descendants in stable order."""
+        records = await self.store.list_runs()
+        children: dict[str, list[str]] = {}
+        for record in records:
+            if record.parent_run_id:
+                children.setdefault(record.parent_run_id, []).append(record.run_id)
+        result: list[str] = []
+        stack = [root_run_id]
+        while stack:
+            current = stack.pop(0)
+            if current in result:
+                continue
+            result.append(current)
+            stack.extend(sorted(children.get(current, ())))
+        return tuple(result)
+
+    async def usage_for_run(self, root_run_id: str) -> dict[str, Any]:
+        """Aggregate provider usage for a root Run and its durable descendants."""
+
+        run_ids = await self.run_tree(root_run_id)
+        events = []
+        for run_id in run_ids:
+            page = await self.store.read(run_id, limit=100_000)
+            events.extend(page.events)
+        summary = aggregate_model_usage(events)
+        summary.update({"run_id": root_run_id, "run_count": len(run_ids)})
+        return summary
+
+    async def terminate_run_tree(
+        self,
+        root_run_id: str,
+        *,
+        reason: str = "explicit Ctrl+C termination",
+        grace_seconds: float = 1.0,
+    ) -> None:
+        """Stop scheduling and durably request cancellation for the whole tree."""
+        run_ids = await self.run_tree(root_run_id)
+        for run_id in reversed(run_ids):
+            try:
+                await self.coordinator.interrupt(run_id, reason)
+            except Exception:
+                continue
+        if grace_seconds > 0:
+            await asyncio.sleep(grace_seconds)
+        for run_id in reversed(run_ids):
+            try:
+                receipt = await self.coordinator.cancel(run_id, reason)
+                # A queued child has no worker to emit the parent-side child
+                # cancellation event.  Mirror only an already-finalized
+                # cancellation; a live worker remains CANCEL_REQUESTED until
+                # its safe boundary records outcome_unknown/RunCancelled.
+                if receipt.status is RunStatus.CANCELLED:
+                    await self._on_child_cancelled(run_id, reason)
+            except Exception:
+                continue
+        if self.supervisor is not None:
+            await self.supervisor.stop(drain=False)
+            self.supervisor = None
+
+    async def continuation_candidates(self) -> tuple[Any, ...]:
+        """Find recoverable root Runs in this project only."""
+        records = {record.run_id: record for record in await self.store.list_runs()}
+        views = await self.coordinator.list()
+        eligible = {
+            RunStatus.CANCELLED,
+            RunStatus.STALLED,
+            RunStatus.FAILED_RECOVERABLE,
+            RunStatus.WAITING_ON_PREDECESSOR,
+        }
+        return tuple(
+            view for view in views
+            if records.get(view.run_id) is not None
+            and records[view.run_id].parent_run_id is None
+            and view.status in eligible
+        )
+
+    async def continue_run(self, run_id: str, *, reason: str = "natural-language continuation") -> str:
+        root_view = await self.coordinator.inspect(run_id)
+        await self.coordinator.resume(run_id, reason)
+        # Ctrl+C/cancellation is recorded independently for every Run in the
+        # tree.  Once the parent is resumed, re-queue only recoverable
+        # descendants; terminal failures and already completed children stay
+        # untouched.  This keeps continuation checkpoint-based and avoids
+        # creating duplicate child Runs.
+        recoverable = {
+            RunStatus.CANCELLED,
+            RunStatus.STALLED,
+            RunStatus.FAILED_RECOVERABLE,
+            RunStatus.WAITING_ON_PREDECESSOR,
+        }
+        if root_view.status in recoverable:
+            for descendant_id in (await self.run_tree(run_id))[1:]:
+                descendant = await self.coordinator.inspect(descendant_id)
+                if descendant.status in recoverable:
+                    await self.coordinator.resume(
+                        descendant_id,
+                        f"{reason}; recover descendant checkpoint",
+                    )
+        if self.supervisor is None:
+            await self.start_supervisor()
+        return run_id
 
     async def start_supervisor(
         self,
@@ -383,6 +675,7 @@ class DurableRuntimeClient:
             model=config.openai_model,
             base_url=config.openai_base_url,
             reasoning_effort=reasoning_effort,
+            thinking_mode=config.runtime_environment.get("CC_HARNESS_THINKING_MODE"),
         )
         self._activation_manifest.set_resolved_model(config.openai_model)
         self._mcp = MCPClient(config.mcp_servers)
@@ -402,6 +695,31 @@ class DurableRuntimeClient:
         self._policy = self._services.policy
         executor_config = self._services.executor_config
         init_session_executor(executor_config, str(self.cwd))
+        # Mark the session executor as owned before any eager preflight.  If
+        # Docker/OpenSandbox is unavailable, client.close() must still clean
+        # masks, an owned server process, and the executor singleton.
+        self._execution_started = True
+        if executor_config.backend is ExecutorBackend.SANDBOX:
+            try:
+                server_state = await prewarm_session_executor()
+            except Exception as exc:
+                self._activation_manifest.degrade(
+                    "runtime",
+                    f"sandbox_server_unavailable:{type(exc).__name__}:{exc}",
+                )
+                raise
+            self._activation_manifest.initialize(
+                "runtime",
+                sandbox_server_ready=True,
+                sandbox_server_owned=bool(getattr(server_state, "owned", False)),
+                sandbox_server_endpoint=(
+                    f"{executor_config.sandbox.server_host}:"
+                    f"{executor_config.sandbox.server_port}"
+                ),
+                sandbox_server_version=getattr(server_state, "server_version", None),
+                sandbox_server_config_digest=getattr(server_state, "config_digest", None),
+                sandbox_server_egress_mode=getattr(server_state, "egress_mode", None),
+            )
         self._activation_manifest.initialize(
             "safety",
             policy_path=str(self.cwd / "policy.yaml"),
@@ -417,6 +735,16 @@ class DurableRuntimeClient:
         self._activation_manifest.initialize(
             "context",
             context_window=self._capabilities.context_config.context_window,
+            context_window_source=self._capabilities.context_config.context_window_source,
+            context_window_verified=self._capabilities.context_config.context_window_verified,
+            thresholds=[
+                self._capabilities.context_config.tier1_threshold,
+                self._capabilities.context_config.tier2_threshold,
+                self._capabilities.context_config.tier3_threshold,
+            ],
+            output_reserve_tokens=self._capabilities.context_config.output_reserve_tokens,
+            tool_schema_reserve_tokens=self._capabilities.context_config.tool_schema_reserve_tokens,
+            fail_closed=self._capabilities.context_config.fail_closed,
             offload_enabled=self._capabilities.memory_config.offload_enabled,
         )
         if self._capabilities.memory_deps:
@@ -424,9 +752,19 @@ class DurableRuntimeClient:
                 "memory",
                 configured_enabled=bool(self._capabilities.memory_config.enabled),
                 pipeline_enabled=bool(self._capabilities.memory_config.pipeline_enabled),
+                layered_inject=bool(self._capabilities.memory_config.layered_inject),
+                capture_enabled=bool(self._capabilities.memory_config.capture_enabled),
+                background_services=sorted(self._capabilities.background_services),
             )
         else:
-            self._activation_manifest.initialize("memory", configured_enabled=False)
+            self._activation_manifest.initialize(
+                "memory",
+                configured_enabled=bool(self._capabilities.memory_config.enabled),
+                pipeline_enabled=False,
+                layered_inject=False,
+                capture_enabled=False,
+                unavailable=True,
+            )
         self._activation_manifest.initialize(
             "background_services",
             enabled_services=sorted(self._capabilities.background_services),
@@ -459,7 +797,8 @@ class DurableRuntimeClient:
                 self._capabilities,
                 extras=run_extras,
             )
-            return RunWorker(
+            worker_ref: dict[str, RunWorker] = {}
+            worker = RunWorker(
                 self.store,
                 kernel,
                 worker_id=f"{base_worker_id}-{counter}",
@@ -471,6 +810,7 @@ class DurableRuntimeClient:
                     handler_deps=run_handler_deps,
                     contracts=run_contracts,
                     l5=self._services.l5 if self._services is not None else None,
+                    working_root=worker_ref.get("worker", None).working_directory if worker_ref.get("worker") else self.cwd,
                 ),
                 contracts=run_contracts,
                 available_tools=run_tool_specs,
@@ -481,7 +821,13 @@ class DurableRuntimeClient:
                     self.project_instructions.text
                     if self.project_instructions is not None else None
                 ),
+                child_completion_callback=self._on_child_completed,
+                child_cancellation_callback=self._on_child_cancelled,
+                child_failure_callback=self._on_child_failed,
+                working_directory_resolver=self._resolve_run_root,
             )
+            worker_ref["worker"] = worker
+            return worker
 
         self.supervisor = LocalSupervisor(
             self.store,
@@ -489,13 +835,125 @@ class DurableRuntimeClient:
             max_workers=max_workers,
         )
         await self.supervisor.start()
-        self._execution_started = True
         return self.supervisor
 
-    async def run_supervisor_forever(self, **kwargs: Any) -> None:
+    def start_detached_supervisor(
+        self,
+        *,
+        reasoning_effort: str | None = None,
+        host_execution: bool = False,
+    ) -> int:
+        """Ensure a supervisor process owns execution independently of the TUI.
+
+        The interactive client is only a control plane.  A PID marker under the
+        durable project state prevents duplicate supervisors; stale markers are
+        harmless and are replaced.  Closing the terminal therefore closes only
+        the UI/store client, while the detached worker keeps consuming queued
+        Runs from the same SQLite event log.
+        """
+
+        if self.supervisor is not None:
+            raise RuntimeError("a local supervisor is already attached to this client")
+        pid_path = self.store.state_dir / "supervisor.pid"
+        try:
+            existing_pid = int(pid_path.read_text(encoding="utf-8").strip())
+        except (OSError, ValueError):
+            existing_pid = None
+        if existing_pid is not None:
+            try:
+                os.kill(existing_pid, 0)
+            except PermissionError:
+                return existing_pid
+            except (OSError, ProcessLookupError):
+                existing_pid = None
+            else:
+                return existing_pid
+
+        log_path = self.store.state_dir / "supervisor.log"
+        log_path.parent.mkdir(parents=True, exist_ok=True)
+        command = [
+            sys.executable,
+            "-m",
+            "cc_harness.entrypoint",
+            "--command",
+            "supervisor",
+            "--cwd",
+            str(self.cwd),
+            "--data-root",
+            str(self.store.data_root.resolve()),
+        ]
+        if reasoning_effort:
+            command.extend(("--effort", reasoning_effort))
+        if host_execution:
+            command.append("--host-execution")
+        log_file = log_path.open("a", encoding="utf-8")
+        popen_kwargs: dict[str, Any] = {
+            "cwd": str(self.cwd),
+            "stdin": subprocess.DEVNULL,
+            "stdout": log_file,
+            "stderr": subprocess.STDOUT,
+            "close_fds": True,
+        }
+        if os.name == "nt":
+            detached = getattr(subprocess, "DETACHED_PROCESS", 0x00000008)
+            new_group = getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0x00000200)
+            popen_kwargs["creationflags"] = detached | new_group
+        else:
+            popen_kwargs["start_new_session"] = True
+        try:
+            process = subprocess.Popen(command, **popen_kwargs)
+        except Exception:
+            log_file.close()
+            raise
+        finally:
+            # The child has its own inherited descriptor; the TUI must not keep
+            # the log file open after spawning it.
+            if not log_file.closed:
+                log_file.close()
+        pid_path.write_text(str(process.pid), encoding="utf-8")
+        return process.pid
+
+    async def run_supervisor_forever(
+        self,
+        *,
+        auto_approve: bool = False,
+        **kwargs: Any,
+    ) -> None:
+        """Keep the detached supervisor alive until the caller stops it.
+
+        Non-interactive callers may explicitly select ``bypass-prompts``.  In
+        that mode the supervisor must also drive the durable approval queue;
+        otherwise a worker reaches ``awaiting_approval`` and remains parked
+        forever because there is no REPL control loop to grant the request.
+        The default remains approval-gated and sleeps as before.
+        """
+
         await self.start_supervisor(**kwargs)
         while True:
-            await asyncio.sleep(3600)
+            # A defensive self-heal for an unexpected supervisor-loop task
+            # failure.  The detached process remains the single owner, but a
+            # transient tick exception must not leave queued durable runs
+            # invisible until the process is manually restarted.
+            if self.supervisor is not None:
+                await self.supervisor.start()
+            if auto_approve:
+                for view in await self.coordinator.list():
+                    if view.status is not RunStatus.AWAITING_APPROVAL:
+                        continue
+                    pending = [
+                        item
+                        for item in view.projection.approvals
+                        if item.status.value == "requested"
+                    ]
+                    for approval in pending:
+                        await self.coordinator.approve(
+                            run_id=view.run_id,
+                            approval_id=approval.approval_id,
+                            action_args_digest=approval.action_args_digest,
+                        )
+                await asyncio.sleep(0.25)
+            else:
+                await asyncio.sleep(3600)
 
     def issue_action_capability(
         self,
@@ -603,6 +1061,34 @@ class DurableRuntimeClient:
                 "source": contract.metadata["source"],
             }
             specs.append(copied)
+        for spec, name, handler in (
+            (DISPATCH_SUBAGENT_SPEC, "dispatch_subagent", durable_dispatch_subagent_handler),
+            (ACCEPT_CHILD_CANDIDATE_SPEC, "accept_child_candidate", durable_accept_child_candidate_handler),
+            (REJECT_CHILD_CANDIDATE_SPEC, "reject_child_candidate", durable_reject_child_candidate_handler),
+        ):
+            copied = json.loads(json.dumps(spec, ensure_ascii=False))
+            copied.setdefault("function", {})["x-cc-harness-capability"] = {
+                "effect": EffectClass.READ_ONLY.value,
+                "requires_user_intent": False,
+                "source": "durable-child-coordinator",
+            }
+            contracts.register(
+                ToolRecoveryContract(
+                    name,
+                    EffectClass.READ_ONLY,
+                    retryable=False,
+                    max_retries=0,
+                    idempotent=False,
+                    parallelizable=False,
+                    requires_approval=False,
+                    child_allowed=True,
+                    metadata={"source": "durable-child-coordinator"},
+                )
+            )
+            handlers[name] = handler
+            handler_deps[name] = {"coordinator": self.coordinator}
+            self._security_capability_metadata[name] = dict(copied["function"]["x-cc-harness-capability"])
+            specs.append(copied)
         if capabilities is not None:
             for extra in extras if extras is not None else capabilities.tool_extras:
                 spec = json.loads(json.dumps(extra["spec"], ensure_ascii=False))
@@ -649,6 +1135,9 @@ class DurableRuntimeClient:
                 "run_command",
                 "ContinueToolResult",
                 "RecallRunContext",
+                "dispatch_subagent",
+                "accept_child_candidate",
+                "reject_child_candidate",
                 *NATIVE_FILE_TOOLS,
             }
             native_names.update(
@@ -691,6 +1180,7 @@ class DurableRuntimeClient:
         *,
         handlers: Mapping[str, Any],
         handler_deps: Mapping[str, Mapping[str, Any]],
+        working_root: Path | None = None,
     ) -> ToolResult:
         observation_id = str(request.arguments.get("observation_id") or "")
         cursor = str(request.arguments.get("next_cursor") or "")
@@ -751,7 +1241,7 @@ class DurableRuntimeClient:
             args["cursor"] = numeric_cursor
         result = await handlers[original_tool](
             args,
-            cwd=str(self.cwd),
+            cwd=str(working_root or self.cwd),
             **dict(handler_deps.get(original_tool) or {}),
         )
         if not isinstance(result, ToolResult):
@@ -858,7 +1348,9 @@ class DurableRuntimeClient:
         handler_deps: Mapping[str, Mapping[str, Any]],
         contracts: ToolContractRegistry,
         l5,
+        working_root: Path | None = None,
     ) -> ActionExecutionResult:
+        execution_root = Path(working_root or self.cwd).resolve()
         result: ToolResult | None = None
         if self._policy is not None:
             projection = await self.store.load_projection(run_id)
@@ -875,7 +1367,7 @@ class DurableRuntimeClient:
                 request.tool_name,
                 policy_arguments,
                 {
-                    "project_root": self.cwd,
+                    "project_root": execution_root,
                     "provenance_mode": self._services.provenance_mode
                     if self._services is not None
                     else False,
@@ -902,7 +1394,7 @@ class DurableRuntimeClient:
         command_lock = request.tool_name == "run_command"
         if command_lock:
             await self._workspace_command_lock.acquire()
-        workspace_before = _workspace_snapshot(self.cwd) if command_lock else {}
+        workspace_before = _workspace_snapshot(execution_root) if command_lock else {}
         try:
             execution_request = request
             capability_id = request.arguments.get("capability_id")
@@ -931,14 +1423,18 @@ class DurableRuntimeClient:
                     execution_request,
                     handlers=handlers,
                     handler_deps=handler_deps,
+                    working_root=execution_root,
                 )
             elif request.tool_name == "RecallRunContext":
                 result = await self._recall_run_context(run_id, execution_request.arguments)
             elif request.tool_name in handlers:
+                dependencies = dict(handler_deps.get(request.tool_name) or {})
+                if request.tool_name in {"dispatch_subagent", "accept_child_candidate", "reject_child_candidate"}:
+                    dependencies["run_id"] = run_id
                 result = await handlers[request.tool_name](
                     execution_request.arguments,
-                    cwd=str(self.cwd),
-                    **dict(handler_deps.get(request.tool_name) or {}),
+                    cwd=str(execution_root),
+                    **dependencies,
                 )
             elif self._mcp is not None:
                 result = await self._mcp.call_tool(
@@ -952,7 +1448,7 @@ class DurableRuntimeClient:
             if not isinstance(result, ToolResult):
                 result = ToolResult.success(str(result))
             if command_lock:
-                workspace_after = _workspace_snapshot(self.cwd)
+                workspace_after = _workspace_snapshot(execution_root)
                 change_set = _workspace_change_set(workspace_before, workspace_after)
                 baseline_encoded = json.dumps(
                     workspace_before,
@@ -1000,6 +1496,14 @@ class DurableRuntimeClient:
                         f"<stored in result artifact; {len(value)} characters>"
                     )
         metadata = _sanitize_value(dict(result.metadata), l5)
+        # Persist a redacted argument snapshot with every observation.  The
+        # runtime completion gate and recovery path need to know whether a
+        # successful command was a verification/readiness probe; keeping this
+        # in the observation artifact avoids guessing from model prose.
+        metadata.setdefault(
+            "request_arguments",
+            _sanitize_value(dict(execution_request.arguments), l5),
+        )
         metadata.setdefault("sanitized_by_l5", l5 is not None)
         metadata.setdefault("safety_applied", self._policy is not None)
         model_text = text
@@ -1201,6 +1705,12 @@ class DurableRuntimeClient:
         if self.supervisor is not None:
             await self.supervisor.stop(drain=False)
             self.supervisor = None
+        pid_path = self.store.state_dir / "supervisor.pid"
+        try:
+            if int(pid_path.read_text(encoding="utf-8").strip()) == os.getpid():
+                pid_path.unlink(missing_ok=True)
+        except (OSError, ValueError):
+            pass
         if self._mcp is not None:
             await self._mcp.shutdown()
             self._mcp = None

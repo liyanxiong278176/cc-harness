@@ -8,7 +8,7 @@ from __future__ import annotations
 from typing import Literal
 
 import jsonschema
-from pydantic import BaseModel, ConfigDict, ValidationError, field_validator, model_validator
+from pydantic import BaseModel, ConfigDict, StrictBool, ValidationError, field_validator, model_validator
 
 _MCP_SCHEMAS: dict[str, dict] = {}
 
@@ -20,6 +20,10 @@ class RunCommandArgs(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     command: str
+    # Do not coerce arbitrary model strings/numbers ("yes", 1) into a
+    # lifecycle request.  The executor must receive an explicit boolean so a
+    # provider cannot accidentally detach a process or silently ignore it.
+    background: StrictBool = False
 
     @field_validator("command")
     @classmethod

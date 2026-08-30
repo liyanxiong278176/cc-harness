@@ -106,6 +106,17 @@ class L5Engine:
             # fail-open:scan 异常时原文返回(审计层若接入会记 scan_error)。
             return ScanOutcome(text, {}, self.pii_active)
 
+    def sanitize(self, text: str) -> str:
+        """Return sanitized text for integrations using the engine API.
+
+        Drift/reflection integrations historically called ``sanitize`` on the
+        configured engine, while the public helper lives at module scope.
+        Keep both entry points backed by the same scan implementation so an
+        enabled L5 engine cannot fail because of an API-shape mismatch.
+        """
+
+        return self.scan(text).sanitized_text
+
 
 def sanitize(text: str, engine: L5Engine | None) -> str:
     """便捷:engine=None/非 str/空 → 原文直通;否则返回 sanitized_text。"""

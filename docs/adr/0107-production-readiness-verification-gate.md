@@ -1,0 +1,3 @@
+# ADR 0107: Require a production-readiness verification gate
+
+`production-ready` is an evidence-backed release state, not a description inferred from unit tests. Before a release receives that state, the project must build the release Docker image, start the production-shaped Compose environment with PostgreSQL and Redis, apply migrations, pass readiness checks, and complete representative authentication/CRUD, dependency-failure, and restart/recovery smoke tests. The gate records image and configuration digests, dependency versions, logs, and verifier results; failures caused by unavailable infrastructure remain `environment_not_ready`, while application defects remain task failures.

@@ -62,6 +62,7 @@ from eval.cc_only.runner import (
     _generation_attempt_count,
     _retryable_infrastructure_result,
     _safe_progress,
+    _terminal_api_cost,
     _terminal_cost_cny,
     run_benchmark,
 )
@@ -193,6 +194,58 @@ def test_terminal_bench_conservative_cost_uses_peak_cny_tariff() -> None:
     assert cost == pytest.approx(15.1)
 
 
+def test_terminal_bench_api_cost_uses_provider_fact_only() -> None:
+    cost = _terminal_api_cost(
+        [
+            {
+                "usage": {
+                    "model_calls": 2,
+                    "api_reported_cost": 0.25,
+                    "api_reported_cost_currency": "USD",
+                    "api_cost_status": "reported",
+                    "api_cost_observed": True,
+                }
+            },
+            {
+                "usage": {
+                    "model_calls": 1,
+                    "api_reported_cost": 0.10,
+                    "api_reported_cost_currency": "USD",
+                    "api_cost_status": "reported",
+                    "api_cost_observed": True,
+                }
+            },
+        ]
+    )
+
+    assert cost["api_reported_cost"] == pytest.approx(0.35)
+    assert cost["api_reported_cost_currency"] == "USD"
+    assert cost["api_cost_status"] == "reported"
+    assert cost["api_cost_observed_calls"] == 3
+
+
+def test_terminal_bench_api_cost_marks_unpriced_model_activity_incomplete() -> None:
+    cost = _terminal_api_cost(
+        [{"usage": {"model_calls": 1, "api_cost_status": "unavailable"}}]
+    )
+
+    assert cost["api_reported_cost"] is None
+    assert cost["api_cost_status"] == "incomplete"
+    assert cost["api_cost_complete"] is False
+
+
+def test_terminal_bench_api_cost_does_not_add_mixed_currencies() -> None:
+    cost = _terminal_api_cost(
+        [
+            {"usage": {"model_calls": 1, "api_reported_cost": 1, "api_cost_status": "reported", "api_reported_cost_currency": "USD"}},
+            {"usage": {"model_calls": 1, "api_reported_cost": 1, "api_cost_status": "reported", "api_reported_cost_currency": "CNY"}},
+        ]
+    )
+
+    assert cost["api_reported_cost"] is None
+    assert cost["api_cost_status"] == "incomplete"
+
+
 def test_terminal_bench_retries_named_rate_limit_exceptions() -> None:
     assert _transient_text("ApiRateLimitError: provider returned 429") is True
     assert _transient_text("ApiUsageLimitError: quota temporarily exceeded") is True
@@ -280,6 +333,57 @@ def test_terminal_bench_preserves_agent_and_tool_call_telemetry() -> None:
 
     assert usage["model_calls"] == 7
     assert usage["tool_calls"] == 9
+
+
+def test_terminal_bench_harbor_usage_preserves_direct_provider_cost() -> None:
+    usage = _harbor_usage(
+        {
+            "n_input_tokens": 100,
+            "n_cache_tokens": 80,
+            "n_output_tokens": 20,
+            # This framework field is intentionally ignored unless the agent
+            # envelope carries the direct provider fact as well.
+            "cost_usd": 999.0,
+        },
+        {
+            "agent_result": {
+                "metadata": {
+                    "model_calls": 2,
+                    "tool_calls": 1,
+                    "api_reported_cost": 0.125,
+                    "api_reported_cost_currency": "USD",
+                    "api_cost_status": "reported",
+                    "api_cost_observed": True,
+                    "api_cost_complete": True,
+                }
+            }
+        },
+    )
+
+    assert usage["api_reported_cost"] == pytest.approx(0.125)
+    assert usage["api_cost_status"] == "reported"
+    assert usage["cost_microusd"] == 125_000
+
+
+def test_terminal_bench_harbor_usage_does_not_use_framework_cost_fallback() -> None:
+    usage = _harbor_usage(
+        {"n_input_tokens": 100, "cost_usd": 0.25},
+        {"agent_result": {"metadata": {"model_calls": 1}}},
+    )
+
+    assert usage["cost_microusd"] is None
+    assert usage["api_reported_cost"] is None
+    assert usage["api_cost_status"] == "incomplete"
+
+
+def test_terminal_bench_harbor_usage_detects_token_activity_without_call_count() -> None:
+    usage = _harbor_usage(
+        {"n_input_tokens": 12, "n_output_tokens": 4},
+        {"agent_result": {"metadata": {}}},
+    )
+
+    assert usage["api_cost_observed"] is True
+    assert usage["api_cost_status"] == "incomplete"
 
 
 def test_terminal_bench_recovers_telemetry_from_rate_limit_error_text() -> None:

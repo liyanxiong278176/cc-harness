@@ -74,6 +74,26 @@ def config(**values) -> ContextConfig:
     return ContextConfig(**defaults)
 
 
+def test_call_manifest_can_use_dedicated_database(tmp_path):
+    """High-frequency call telemetry must not contend with the run event DB."""
+
+    runtime_db = tmp_path / "runtime.db"
+    call_db = tmp_path / "context-calls.sqlite3"
+    state = SqliteContextState(runtime_db, "call-run", call_db_path=call_db)
+
+    uri = state.record_call({"schema_version": "test", "turn": 1})
+
+    assert uri.startswith(f"sqlite:///{call_db.resolve().as_posix()}")
+    with sqlite3.connect(call_db) as db:
+        row = db.execute(
+            "SELECT call_sequence, payload_json FROM context_call_manifest "
+            "WHERE context_id='call-run'"
+        ).fetchone()
+    assert row is not None
+    assert row[0] == 1
+    assert json.loads(row[1])["turn"] == 1
+
+
 @pytest.mark.asyncio
 async def test_compaction_has_no_post_transform_ratio_gate(tmp_path):
     source = [
@@ -389,3 +409,37 @@ async def test_mandatory_working_state_survives_summary(tmp_path):
     assert any(message.get("content") == "recalled project fact" for message in projection.messages)
     summary = next(message for message in projection.messages if message.get("_compaction_summary"))
     assert summary["role"] == "system"
+
+
+@pytest.mark.asyncio
+async def test_durable_summary_does_not_protect_entire_autonomous_transcript(tmp_path):
+    """The initial objective must not pin every later tool turn in the protect zone."""
+
+    source = [
+        {"role": "system", "content": "rules", "_context_mandatory": True},
+        {"role": "user", "content": "long-running objective", "_context_mandatory": True},
+    ]
+    source.extend(
+        {"role": "tool", "content": "tool output " * 20}
+        for _ in range(100)
+    )
+    summary_llm = SummaryLLM()
+    projection = ContextProjection(source, artifact_dir=tmp_path, context_id="autonomous")
+    stats = await projection.compact(
+        source,
+        None,
+        CharCounter(),
+        config(
+            context_window=2_000,
+            protect_zone_tokens=50,
+            tier1_threshold=0.01,
+            tier2_threshold=0.02,
+            tier3_threshold=0.03,
+        ),
+        summary_llm,
+    )
+
+    assert stats.summarized
+    assert stats.error is None
+    assert stats.after_tokens <= 2_000
+    assert summary_llm.calls == 1

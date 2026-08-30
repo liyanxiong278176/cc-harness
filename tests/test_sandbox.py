@@ -85,6 +85,8 @@ async def test_run_nonzero_exit_returns_error_toolresult(tmp_path):
         result = await ex.run({"command": "bad-cmd"}, cwd=tmp_path)
     assert result.is_error is True
     assert "boom" in result.llm_text
+    assert result.metadata["exit_code"] == 2
+    assert result.metadata["timed_out"] is False
 
 
 @pytest.mark.asyncio
@@ -115,7 +117,7 @@ async def test_command_timeout_destroys_sandbox(tmp_path, monkeypatch):
 
 @pytest.mark.asyncio
 async def test_ensure_sandbox_passes_mount(tmp_path, monkeypatch):
-    """Sandbox.create 收到项目根 RO volume mount(volumes=,真 SDK 签名)。"""
+    """Sandbox.create receives the writable project volume and masked overlays."""
     from cc_harness.sandbox import SandboxExecutor, _HAS_SANDBOX_SDK
     from cc_harness.config import SandboxConfig
     # Task-4 forward-fix:commands.run 必须是 AsyncMock,否则 await MagicMock
@@ -295,6 +297,26 @@ async def test_workspace_secret_is_overlaid_with_empty_read_only_mask(tmp_path):
     assert mask.read_only is True
     assert mask_path.read_bytes() == b""
     assert secret not in mask_path.read_text(encoding="utf-8")
+
+
+@pytest.mark.asyncio
+async def test_workspace_volume_is_writable_while_sensitive_masks_stay_read_only(tmp_path):
+    from cc_harness.config import SandboxConfig
+    from cc_harness.sandbox import SandboxExecutor
+
+    (tmp_path / ".env").write_text("API_KEY=must-stay-on-host", encoding="utf-8")
+    executor = SandboxExecutor(SandboxConfig(), project_root=tmp_path)
+    await executor._refresh_workspace_masks()
+
+    volumes = executor._volumes()
+    workspace = next(volume for volume in volumes if volume.mount_path == "/workspace")
+    masks = [volume for volume in volumes if volume.mount_path != "/workspace"]
+
+    assert workspace.read_only is False
+    assert masks
+    assert all(volume.read_only is True for volume in masks)
+
+    executor._mask_plan.cleanup()
 
 
 @pytest.mark.asyncio
@@ -541,6 +563,23 @@ async def test_ensure_sandbox_calls_ensure_server(tmp_path, monkeypatch):
         ex = SandboxExecutor(SandboxConfig(), project_root=tmp_path)
         await ex.run({"command": "echo ok"}, cwd=tmp_path)
     assert called["port"] == 8000   # SandboxConfig.server_port 默认
+
+
+@pytest.mark.asyncio
+async def test_prewarm_server_does_not_create_a_container(tmp_path, monkeypatch):
+    """Startup prewarm owns only the server; the first command creates a sandbox."""
+    from cc_harness.sandbox import SandboxExecutor
+    from cc_harness.config import SandboxConfig
+
+    sdk = MagicMock()
+    sdk.create = AsyncMock()
+    monkeypatch.setattr("cc_harness.sandbox.Sandbox", sdk)
+    executor = SandboxExecutor(SandboxConfig(), project_root=tmp_path)
+
+    state = await executor.prewarm_server()
+
+    assert state.owned is False
+    sdk.create.assert_not_called()
 
 
 @pytest.mark.asyncio

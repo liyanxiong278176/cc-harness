@@ -11,8 +11,9 @@ deps 包含:
     cwd             str 当前工作目录(handler 当前未用,保留以便未来 path 归一化)
     last_turn_text  str 上一轮 LLM 输出文本(C Task 3:todo_update 完成门
                     acceptance 校验要用;其余 handler 收到但 del)
-    dispatch_subagent_runner  SubAgentRunner 实例(D1 Task 5:dispatch_subagent 专用,
-                    主 agent.run_turn 构造后注入;缺省 None 时 handler 返 is_error)
+    dispatch_subagent_runner  仅为旧导入方保留的兼容参数。它不会被使用或
+                    构造 SubAgentRunner；子任务必须通过 Durable Runtime 的
+                    parent-coordinated dispatch handler 创建。
 
 注入路径参考:`cc_harness/memory/extras.py:build_memory_extras`。
 """
@@ -44,7 +45,7 @@ from cc_harness.project.tools import (
 def inject_todo_tools(
     service: TodoService, session_id: str, cwd: str = "",
     last_turn_text: str = "",
-    dispatch_subagent_runner=None,  # D1 Task 5 新增
+    dispatch_subagent_runner=None,  # 旧签名兼容；故意忽略，禁止 in-process dispatch
     progress_cb=None,
 ) -> list[dict]:
     """Return `extra_native_specs` entries for all 9 todo tools(8 + dispatch_subagent)。
@@ -54,9 +55,9 @@ def inject_todo_tools(
         session_id: 当前 REPL/CLI session id(handler 用于 append active_sessions)。
         cwd: 当前工作目录(handler 当前未用;保留签名,未来 path 归一化用)。
         last_turn_text: 上一轮 LLM 输出文本(C Task 3 todo_update 完成门用)。
-        dispatch_subagent_runner: D1 Task 5 新增 — 主 agent.run_turn 构造后注入,
-            handler 通过 deps['dispatch_subagent_runner'] 取用。None 表示未注入,
-            handler 收到会返 ToolResult.is_error=True("未注入 subagent runner")。
+        dispatch_subagent_runner: 旧签名兼容参数。它被故意忽略；旧
+            ``dispatch_subagent_handler`` 只会 fail closed。生产调度由
+            ``cc_harness.durable_subagents`` 通过 Durable Runtime 完成。
 
     Returns:
         list of ``{"spec": ..., "handler": ..., "deps": ...}``,长度固定为 9。
@@ -66,7 +67,9 @@ def inject_todo_tools(
         "session_id": session_id,
         "cwd": cwd,
         "last_turn_text": last_turn_text,
-        "dispatch_subagent_runner": dispatch_subagent_runner,  # D1 Task 5 新增
+        # Do not place a runner in deps: this legacy adapter must never provide
+        # an in-process execution path. The parameter remains only so old
+        # importers fail closed without an API break.
     }
     dispatch_deps = {**deps, "progress_cb": progress_cb}
     return [

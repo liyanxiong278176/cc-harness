@@ -157,3 +157,42 @@ async def test_worker_retries_only_idempotent_read_after_lease_expiry(tmp_path) 
         assert (await store.load_projection(handle.run_id)).status.value == "completed"
     finally:
         await store.close()
+
+
+@pytest.mark.asyncio
+async def test_worker_propagates_action_cancellation_to_supervisor(tmp_path) -> None:
+    """Supervisor cancellation must not be converted into an unknown result."""
+
+    project = tmp_path / "project"
+    project.mkdir()
+    store = RunStore(project, data_root=tmp_path / "data")
+    await store.open()
+    started = asyncio.Event()
+
+    async def blocking_executor(request):
+        del request
+        started.set()
+        await asyncio.Event().wait()
+
+    try:
+        handle = await RunCoordinator(store).submit(RunRequest("cancel action", ("read",)))
+        worker = RunWorker(
+            store,
+            ReActKernel(FakeModel()),
+            worker_id="worker-cancelled",
+            action_executor=blocking_executor,
+        )
+        lease = await worker.claim(handle.run_id)
+        request = ActionRequest(
+            "cancelled-read",
+            "Read",
+            {"path": "README.md"},
+            effect_class=EffectClass.READ_ONLY,
+        )
+        task = asyncio.create_task(worker._execute_action(lease, request))
+        await asyncio.wait_for(started.wait(), timeout=1.0)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+    finally:
+        await store.close()

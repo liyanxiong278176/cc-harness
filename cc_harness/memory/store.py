@@ -1,5 +1,6 @@
 """SQLite + sqlite-vec memory storage. Pure CRUD — no LLM, no orchestration."""
 from __future__ import annotations
+import asyncio
 import logging
 import re
 import time
@@ -8,6 +9,8 @@ from dataclasses import dataclass
 from pathlib import Path
 import aiosqlite
 import numpy as np
+
+from cc_harness.sqlite_utils import begin_immediate
 
 logger = logging.getLogger(__name__)
 
@@ -63,6 +66,24 @@ class MemoryStore:
         self.embedding_dim = embedding_dim
         self.project_scope = project_scope
         self._db: aiosqlite.Connection | None = None
+        # One connection is shared by the runtime's capture, memory pipeline,
+        # checkpoint and maintenance services.  SQLite serializes writers at
+        # the database level, but a process-local lock is still required to
+        # keep aiosqlite coroutines from interleaving BEGIN/COMMIT sequences on
+        # the same connection.
+        self._write_lock = asyncio.Lock()
+
+    @property
+    def write_lock(self) -> asyncio.Lock:
+        """Serialize writes that share this store connection.
+
+        Callers outside ``MemoryStore`` (checkpoint/capture/worker services)
+        use this lock around multi-statement transactions.  Cross-process
+        contention is handled separately by ``BEGIN IMMEDIATE`` with bounded
+        backoff.
+        """
+
+        return self._write_lock
 
     async def init_schema(self) -> None:
         # Support in-memory mode (":memory:") for fast integration tests.
@@ -75,6 +96,9 @@ class MemoryStore:
         await self._db.enable_load_extension(False)
         # F T4 D2: PRAGMA foreign_keys = ON, 启用 ON DELETE CASCADE(spec D2 防 orphan)
         await self._db.execute("PRAGMA foreign_keys = ON")
+        # Keep transient writer contention bounded instead of failing a
+        # request immediately with ``database is locked``.
+        await self._db.execute("PRAGMA busy_timeout = 30000")
         # 2026-07-30: WAL 模式 + synchronous=NORMAL,防 kill -9 残留把 DB
         # 弄成 "database disk image is malformed" 的硬坏。
         # WAL 把写放到 .wal 边文件,commit 时 checkpoint 进主 DB,
@@ -330,26 +354,67 @@ class MemoryStore:
         旧调用方不传时退化为空串(向后兼容)。
         """
         assert self._db is not None
-        await self._db.execute(
-            "INSERT INTO conversation(session_id, turn_idx, role, content, ts, "
-            "dates, entities, keywords) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-            (session_id, turn_idx, role, content, ts, dates, entities, keywords),
-        )
-        await self._db.commit()
+        async with self._write_lock:
+            try:
+                await begin_immediate(self._db)
+                await self._db.execute(
+                    "INSERT INTO conversation(session_id, turn_idx, role, content, ts, "
+                    "dates, entities, keywords) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                    (session_id, turn_idx, role, content, ts, dates, entities, keywords),
+                )
+                await self._db.commit()
+            except Exception:
+                await self._db.rollback()
+                raise
 
     async def add(self, text: str, embedding: list[float], source: str,
                   session_id: str | None = None, layer: str = "L1",
                   *, version: int = 1, supersedes_id: str | None = None,
                   provenance_json: str = "{}") -> Memory:
         assert self._db is not None, "init_schema first"
+        async with self._write_lock:
+            try:
+                await begin_immediate(self._db)
+                mem = await self._insert_unlocked(
+                    text,
+                    embedding,
+                    source,
+                    session_id=session_id,
+                    layer=layer,
+                    version=version,
+                    supersedes_id=supersedes_id,
+                    provenance_json=provenance_json,
+                )
+                await self._db.commit()
+                return mem
+            except Exception:
+                await self._db.rollback()
+                raise
+
+    async def _insert_unlocked(
+        self,
+        text: str,
+        embedding: list[float],
+        source: str,
+        *,
+        session_id: str | None = None,
+        layer: str = "L1",
+        version: int = 1,
+        supersedes_id: str | None = None,
+        provenance_json: str = "{}",
+    ) -> Memory:
+        """Insert one memory while the caller owns ``write_lock``/transaction."""
+
+        assert self._db is not None, "init_schema first"
         if len(embedding) != self.embedding_dim:
             raise ValueError(f"embedding dim {len(embedding)} != configured {self.embedding_dim}")
+        now = time.time()
         mem = Memory(
             id=uuid.uuid4().hex,
             text=text,
             embedding=embedding,
-            created_at=time.time(),
-            updated_at=time.time(),
+            created_at=now,
+            updated_at=now,
             source=source,
             layer=layer,
             session_id=session_id,
@@ -371,7 +436,6 @@ class MemoryStore:
             "INSERT INTO vec_memories (id, embedding) VALUES (?, ?)",
             (mem.id, blob),
         )
-        await self._db.commit()
         return mem
 
     async def update(self, id: str, text: str, embedding: list[float]) -> Memory:
@@ -380,37 +444,41 @@ class MemoryStore:
             raise ValueError(f"embedding dim {len(embedding)} != configured {self.embedding_dim}")
         now = time.time()
         blob = _vec_to_blob(embedding)
-        try:
-            await self._db.execute(
-                "UPDATE memories SET text=?, embedding=?, updated_at=? WHERE id=?",
-                (text, blob, now, id),
-            )
-            await self._db.execute(
-                "UPDATE vec_memories SET embedding=? WHERE id=?",
-                (blob, id),
-            )
-            await self._db.commit()
-        except Exception:
-            # 两条 UPDATE 在同一隐式事务内;任一失败回滚,避免 text/vector 不一致
-            await self._db.rollback()
-            raise
+        async with self._write_lock:
+            try:
+                await begin_immediate(self._db)
+                await self._db.execute(
+                    "UPDATE memories SET text=?, embedding=?, updated_at=? WHERE id=?",
+                    (text, blob, now, id),
+                )
+                await self._db.execute(
+                    "UPDATE vec_memories SET embedding=? WHERE id=?",
+                    (blob, id),
+                )
+                await self._db.commit()
+            except Exception:
+                # 两条 UPDATE 在同一显式事务内;任一失败回滚,避免 text/vector 不一致
+                await self._db.rollback()
+                raise
         fetched = await self.get(id)
         assert fetched is not None
         return fetched
 
     async def delete(self, id: str) -> bool:
         assert self._db is not None
-        try:
-            cur = await self._db.execute(
-                "UPDATE memories SET validity='tombstoned', tombstoned_at=?, updated_at=? "
-                "WHERE id=? AND validity='active'",
-                (time.time(), time.time(), id),
-            )
-            await self._db.execute("DELETE FROM vec_memories WHERE id=?", (id,))
-            await self._db.commit()
-        except Exception:
-            await self._db.rollback()
-            raise
+        async with self._write_lock:
+            try:
+                await begin_immediate(self._db)
+                cur = await self._db.execute(
+                    "UPDATE memories SET validity='tombstoned', tombstoned_at=?, updated_at=? "
+                    "WHERE id=? AND validity='active'",
+                    (time.time(), time.time(), id),
+                )
+                await self._db.execute("DELETE FROM vec_memories WHERE id=?", (id,))
+                await self._db.commit()
+            except Exception:
+                await self._db.rollback()
+                raise
         return cur.rowcount > 0
 
     async def supersede(
@@ -418,30 +486,33 @@ class MemoryStore:
         session_id: str | None = None, provenance_json: str = "{}",
     ) -> Memory:
         """Create a new active version and retain the prior row for provenance."""
-        old = await self.get(id)
-        if old is None or old.validity != "active":
-            raise KeyError(f"active memory not found: {id}")
         assert self._db is not None
-        await self._db.execute(
-            "UPDATE memories SET validity='superseded', updated_at=? WHERE id=?",
-            (time.time(), id),
-        )
-        await self._db.execute("DELETE FROM vec_memories WHERE id=?", (id,))
-        try:
-            new = await self.add(
-                text,
-                embedding,
-                source or old.source,
-                session_id=session_id if session_id is not None else old.session_id,
-                layer=old.layer,
-                version=old.version + 1,
-                supersedes_id=old.id,
-                provenance_json=provenance_json,
-            )
-        except Exception:
-            await self._db.rollback()
-            raise
-        return new
+        async with self._write_lock:
+            try:
+                await begin_immediate(self._db)
+                old = await self.get(id)
+                if old is None or old.validity != "active":
+                    raise KeyError(f"active memory not found: {id}")
+                await self._db.execute(
+                    "UPDATE memories SET validity='superseded', updated_at=? WHERE id=?",
+                    (time.time(), id),
+                )
+                await self._db.execute("DELETE FROM vec_memories WHERE id=?", (id,))
+                new = await self._insert_unlocked(
+                    text,
+                    embedding,
+                    source or old.source,
+                    session_id=session_id if session_id is not None else old.session_id,
+                    layer=old.layer,
+                    version=old.version + 1,
+                    supersedes_id=old.id,
+                    provenance_json=provenance_json,
+                )
+                await self._db.commit()
+                return new
+            except Exception:
+                await self._db.rollback()
+                raise
 
     async def get(self, id: str) -> Memory | None:
         assert self._db is not None
@@ -624,9 +695,10 @@ class MemoryStore:
             return []
 
     async def close(self) -> None:
-        if self._db is not None:
-            await self._db.close()
-            self._db = None
+        async with self._write_lock:
+            if self._db is not None:
+                await self._db.close()
+                self._db = None
 
     # --- E2 reflection memory (T3.1) ---
 
@@ -666,24 +738,36 @@ class MemoryStore:
             return
         now = time.time()
         placeholders = ",".join("?" * len(ids))
-        await self._db.execute(
-            f"UPDATE memories SET recall_count = recall_count + 1, last_recalled_at = ? "
-            f"WHERE id IN ({placeholders})",
-            [now, *ids],
-        )
-        await self._db.commit()
+        async with self._write_lock:
+            try:
+                await begin_immediate(self._db)
+                await self._db.execute(
+                    f"UPDATE memories SET recall_count = recall_count + 1, last_recalled_at = ? "
+                    f"WHERE id IN ({placeholders})",
+                    [now, *ids],
+                )
+                await self._db.commit()
+            except Exception:
+                await self._db.rollback()
+                raise
 
     async def update_staleness_bulk(self, id_to_score: dict[str, float]) -> None:
         """批量更新 staleness 列。LLM 复检结果写入。"""
         assert self._db is not None
         if not id_to_score:
             return
-        for mid, score in id_to_score.items():
-            await self._db.execute(
-                "UPDATE memories SET staleness = ? WHERE id = ?",
-                (max(0.0, min(1.0, score)), mid),
-            )
-        await self._db.commit()
+        async with self._write_lock:
+            try:
+                await begin_immediate(self._db)
+                for mid, score in id_to_score.items():
+                    await self._db.execute(
+                        "UPDATE memories SET staleness = ? WHERE id = ?",
+                        (max(0.0, min(1.0, score)), mid),
+                    )
+                await self._db.commit()
+            except Exception:
+                await self._db.rollback()
+                raise
 
     async def list_with_staleness(self, *, staleness_min: float = 0.0,
                                   staleness_max: float = 1.0,

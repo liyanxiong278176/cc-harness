@@ -49,6 +49,29 @@ async def test_read_rejects_workspace_escape_and_binary(tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_container_workspace_alias_maps_to_project_root(tmp_path):
+    target = tmp_path / "observability" / "audit.json"
+    target.parent.mkdir()
+    target.write_text('{"ok": true}\n', encoding="utf-8")
+
+    result = _payload(await read_tool({"path": "/workspace/observability/audit.json"}, cwd=str(tmp_path)))
+    assert result["content"].replace("\r\n", "\n") == '{"ok": true}\n'
+
+    written = _payload(
+        await write_tool(
+            {
+                "path": "/workspace/observability/new.json",
+                "content": "{}\n",
+                "mode": "create_only",
+            },
+            cwd=str(tmp_path),
+        )
+    )
+    assert written["path"] == "observability/new.json"
+    assert (tmp_path / "observability" / "new.json").read_text() == "{}\n"
+
+
+@pytest.mark.asyncio
 async def test_edit_requires_current_hash_and_one_exact_match(tmp_path):
     target = tmp_path / "module.py"
     target.write_text("value = 1\n", encoding="utf-8")
