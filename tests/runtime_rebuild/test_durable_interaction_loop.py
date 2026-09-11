@@ -47,6 +47,25 @@ class TwoRoundModel:
         )
 
 
+class BenchmarkFinalModel:
+    """Finish after a successful action without emitting a local test marker."""
+
+    def __init__(self) -> None:
+        self.calls = 0
+
+    async def complete(self, messages, tools):
+        del messages, tools
+        self.calls += 1
+        if self.calls == 1:
+            return ModelSegment(
+                text="inspect",
+                tool_calls=(
+                    {"id": "read-1", "name": "Read", "arguments": {"path": "a.txt"}},
+                ),
+            )
+        return ModelSegment(text="task addressed")
+
+
 async def _success(request):
     return ActionExecutionResult(ActionStatus.SUCCEEDED, read_paths=(request.arguments["path"],))
 
@@ -82,6 +101,42 @@ async def test_model_sees_only_committed_observation_in_same_segment(tmp_path) -
             "ToolObservationCommitted"
         )
         assert event_types.index("ToolObservationCommitted") < event_types.index("ActionSucceeded")
+    finally:
+        await store.close()
+
+
+@pytest.mark.asyncio
+async def test_official_benchmark_cannot_finish_after_successful_non_test_action(
+    tmp_path, monkeypatch
+) -> None:
+    """A read-only observation is not a completion proof on the benchmark path."""
+
+    monkeypatch.setenv("CC_HARNESS_TERMINAL_BENCH", "1")
+    monkeypatch.setenv("CC_HARNESS_TRUSTED_BENCHMARK_TASK", "1")
+    project = tmp_path / "project"
+    project.mkdir()
+    store = RunStore(project, data_root=tmp_path / "data")
+    await store.open()
+    try:
+        handle = await RunCoordinator(store).submit(RunRequest("inspect", ("done",)))
+        model = BenchmarkFinalModel()
+        worker = RunWorker(
+            store,
+            ReActKernel(model),
+            worker_id="benchmark-worker",
+            action_executor=_success,
+        )
+        await worker.execute(await worker.claim(handle.run_id))
+
+        projection = await store.load_projection(handle.run_id)
+        # The worker yields for a continuation instead of accepting the
+        # read-only result; a subsequent segment must perform verification.
+        assert projection.status.value == "queued"
+        events = (await store.read(handle.run_id)).events
+        accepted = [event for event in events if event.event_type == "CompletionAccepted"]
+        assert accepted == []
+        assert any(event.event_type == "RunYielded" for event in events)
+        assert model.calls == 2
     finally:
         await store.close()
 

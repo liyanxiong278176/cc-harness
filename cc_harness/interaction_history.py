@@ -13,6 +13,49 @@ from .run_store import RunStore
 from .tool_observation import ToolObservation
 
 
+MESSAGE_SCHEMA_VERSION = "cc-harness.interaction-message.v2"
+_MESSAGE_ROLES = {"system", "developer", "user", "assistant", "tool"}
+
+
+def _json_copy(value: Any) -> Any:
+    """Return a JSON-safe deep copy used at the durable message boundary."""
+
+    try:
+        return json.loads(json.dumps(value, ensure_ascii=False))
+    except (TypeError, ValueError) as exc:
+        raise ValueError("durable interaction message must be JSON serializable") from exc
+
+
+def canonical_message(value: Mapping[str, Any]) -> dict[str, Any]:
+    """Validate and copy a provider-neutral message without dropping fields.
+
+    The event artifact is the lossless source of truth.  We retain the
+    standard chat fields (including reasoning/refusal/tool pairing) and the
+    bounded provider metadata namespace.  Internal audit markers are retained
+    too, but the provider adapter strips them before an outbound request.
+    """
+
+    if not isinstance(value, Mapping):
+        raise ValueError("interaction message must be an object")
+    role = value.get("role")
+    if not isinstance(role, str) or role not in _MESSAGE_ROLES:
+        raise ValueError("interaction message role is invalid")
+    message = _json_copy(dict(value))
+    message["role"] = role
+    message.setdefault("_message_schema", MESSAGE_SCHEMA_VERSION)
+    if "tool_calls" in message and message["tool_calls"] is not None:
+        if not isinstance(message["tool_calls"], list):
+            raise ValueError("interaction message tool_calls must be a list")
+        if any(not isinstance(item, Mapping) for item in message["tool_calls"]):
+            raise ValueError("interaction message tool_calls entries must be objects")
+    if role == "tool" and "tool_call_id" not in message:
+        raise ValueError("tool interaction message requires tool_call_id")
+    for field in ("reasoning_content", "refusal"):
+        if field in message and message[field] is not None and not isinstance(message[field], str):
+            raise ValueError(f"interaction message {field} must be a string or null")
+    return message
+
+
 def objective_messages(
     projection: RunProjection,
     *,
@@ -79,8 +122,15 @@ def assistant_message(
     tool_calls: tuple[Mapping[str, Any], ...] = (),
     *,
     reasoning_content: str | None = None,
+    refusal: str | None = None,
+    stop_reason: str | None = None,
+    provider_metadata: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
-    message: dict[str, Any] = {"role": "assistant", "content": text}
+    message: dict[str, Any] = {
+        "role": "assistant",
+        "content": text,
+        "_message_schema": MESSAGE_SCHEMA_VERSION,
+    }
     # Thinking-mode providers (notably DeepSeek) require the field to be
     # present on every assistant tool-call replay, even when this response
     # carried an empty reasoning stream. ``None`` means the producer did not
@@ -88,24 +138,45 @@ def assistant_message(
     # of being silently dropped.
     if reasoning_content is not None:
         message["reasoning_content"] = reasoning_content
+    if refusal is not None:
+        message["refusal"] = str(refusal)
+    if stop_reason is not None:
+        message["stop_reason"] = str(stop_reason)
+    if provider_metadata:
+        # Provider metadata is audit-only.  It is intentionally kept under a
+        # namespaced field and stripped by DurableModelAdapter._provider_messages
+        # before any replay request is sent.
+        message["_provider_metadata"] = dict(provider_metadata)
     if tool_calls:
-        message["tool_calls"] = [
-            {
-                "id": str(call.get("id") or ""),
-                "type": "function",
-                "function": {
-                    "name": str(call.get("name") or call.get("tool_name") or ""),
-                    "arguments": json.dumps(
-                        call.get("arguments", call.get("args", {})),
-                        ensure_ascii=False,
-                        sort_keys=True,
-                        separators=(",", ":"),
-                    ),
-                },
-            }
-            for call in tool_calls
-        ]
-    return message
+        encoded_calls: list[dict[str, Any]] = []
+        for call in tool_calls:
+            # Preserve an already provider-shaped tool call verbatim.  The
+            # normalized shape below is used for our internal ActionRequest
+            # representation and remains compatible with OpenAI-style APIs.
+            if isinstance(call.get("function"), Mapping):
+                encoded_calls.append(_json_copy(dict(call)))
+                continue
+            encoded_calls.append(
+                {
+                    "id": str(call.get("id") or ""),
+                    "type": str(call.get("type") or "function"),
+                    "function": {
+                        "name": str(call.get("name") or call.get("tool_name") or ""),
+                        "arguments": (
+                            call.get("arguments")
+                            if isinstance(call.get("arguments"), str)
+                            else json.dumps(
+                                call.get("arguments", call.get("args", {})),
+                                ensure_ascii=False,
+                                sort_keys=True,
+                                separators=(",", ":"),
+                            )
+                        ),
+                    },
+                }
+            )
+        message["tool_calls"] = encoded_calls
+    return canonical_message(message)
 
 
 async def _read_events(store: RunStore, run_id: str):
@@ -221,7 +292,14 @@ async def materialize_interaction_messages(
             except (OSError, ValueError, TypeError):
                 continue
             if isinstance(value, Mapping) and value.get("role") == "assistant":
-                messages.append(dict(value))
+                try:
+                    messages.append(canonical_message(value))
+                except ValueError:
+                    # A malformed artifact is not allowed to become a model
+                    # request after a crash.  The event remains available for
+                    # audit and the worker can surface the missing/invalid
+                    # message as a recoverable runtime error.
+                    continue
         elif event.event_type == "ToolObservationCommitted":
             artifact = event.payload.get("observation_artifact")
             if not artifact:
@@ -258,4 +336,10 @@ async def materialize_interaction_messages(
     return tuple(messages)
 
 
-__all__ = ["assistant_message", "materialize_interaction_messages", "objective_messages"]
+__all__ = [
+    "MESSAGE_SCHEMA_VERSION",
+    "assistant_message",
+    "canonical_message",
+    "materialize_interaction_messages",
+    "objective_messages",
+]

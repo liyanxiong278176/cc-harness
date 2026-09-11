@@ -57,10 +57,21 @@ name-based triage sets, not a claim that every member will fail.
 
 ## Gate and evidence contract
 
-The formal launcher requires the zero-model check, official oracle, synthetic
-canary, and a complete task-level prewarm. The prewarm summary must report
+The formal launcher requires the zero-model readiness check and a matching
+frozen agent artifact before it starts any model-bearing Harbor task. The
+check validates the local WSL/native-Docker host, Harbor import, the agent-only
+overlay, and the frozen bootstrap inputs; it never replaces an official task
+or verifier. The official Harbor task run remains responsible for creating the
+task image, running `/tests/test.sh`, and producing the reward.
+
+The oracle run, synthetic canary, task-level prewarm, and the full
+`apt/curl/uv/pytest` network soak are optional diagnostics. They may be run
+separately while troubleshooting, but are not implicit formal gates: making
+them mandatory adds an unrelated image/network dependency and can turn a
+healthy official environment into a false `environment_not_ready` result.
+When a prewarm is requested, its summary still records
 `docker_image_started`, `verifier_imports`, `test_sh_syntax_and_executable`,
 `verifier_smoke`, `tiktoken_cache`, `data_disk_network`, and `timeout_config`
-as true for every selected task, with zero model calls and matching frozen
-wheel identity. The smoke is diagnostic only; the official report retains
-only Harbor's task `pass`/`fail` outcomes as benchmark scores.
+with zero model calls and matching frozen wheel identity. Prewarm/oracle
+results are evidence only; the reportable score retains Harbor's official
+task `pass`/`fail` outcomes.

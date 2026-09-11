@@ -7,8 +7,10 @@ import json
 import hashlib
 import math
 import platform
+import time
 from collections import Counter
 from collections.abc import Callable, Mapping, Sequence
+from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -33,6 +35,11 @@ MAX_AUTOMATIC_ATTEMPTS = 3
 # only for a transient failure that demonstrably happened before the agent
 # made a model request, and they reuse the same attempt/checkpoint.
 MAX_INFRASTRUCTURE_ATTEMPTS = 10
+# Ten retries with the current 30/60 second backoff finish well below this
+# bound, while the deadline protects us if a caller supplies a different
+# backoff or a provider keeps returning immediately.  The budget is local to
+# one logical task attempt and is never used to replay a model-bearing trial.
+MAX_INFRASTRUCTURE_RETRY_SECONDS = 15 * 60
 COOLDOWNS = (30.0, 60.0)
 _RETRYABLE_RESULT_MARKERS = (
     "402",
@@ -41,6 +48,48 @@ _RETRYABLE_RESULT_MARKERS = (
     "quota exceeded",
     "payment required",
 )
+
+
+@dataclass(frozen=True)
+class RetryBudget:
+    """Bounded budget for pre-model environment recovery.
+
+    A retry is permitted only while both limits hold.  The monotonic start
+    time is deliberately not serialized into benchmark results (it is a
+    process-local clock), while the resulting exhaustion reason is persisted
+    in the operational pause ledger by ``run_benchmark``.  This makes the
+    policy auditable without allowing wall-clock changes to extend a run.
+    """
+
+    max_attempts: int = MAX_INFRASTRUCTURE_ATTEMPTS
+    deadline_seconds: float = MAX_INFRASTRUCTURE_RETRY_SECONDS
+    started_at: float = field(default_factory=time.monotonic, repr=False)
+
+    def __post_init__(self) -> None:
+        if self.max_attempts < 1:
+            raise ValueError("retry budget max_attempts must be positive")
+        if self.deadline_seconds <= 0 or not math.isfinite(self.deadline_seconds):
+            raise ValueError("retry budget deadline_seconds must be finite and positive")
+
+    def elapsed_seconds(self, *, now: float | None = None) -> float:
+        current = time.monotonic() if now is None else float(now)
+        return max(0.0, current - self.started_at)
+
+    def can_retry(self, attempts_consumed: int, *, now: float | None = None) -> bool:
+        return (
+            max(0, int(attempts_consumed)) < self.max_attempts
+            and self.elapsed_seconds(now=now) < self.deadline_seconds
+        )
+
+    def remaining_seconds(self, *, now: float | None = None) -> float:
+        return max(0.0, self.deadline_seconds - self.elapsed_seconds(now=now))
+
+    def exhaustion_reason(self, attempts_consumed: int, *, now: float | None = None) -> str | None:
+        if max(0, int(attempts_consumed)) >= self.max_attempts:
+            return "max_attempts"
+        if self.remaining_seconds(now=now) <= 0:
+            return "deadline"
+        return None
 
 
 def _generation_attempt_count(trial: Mapping[str, Any], generation: int) -> int:
@@ -132,14 +181,6 @@ def _classify_terminal_infrastructure(outcome: TrialOutcome) -> str:
     """
 
     protocol = outcome.protocol or {}
-    # Once the model phase has completed, a verifier bootstrap outage must not
-    # trigger another paid/official agent trial.  Defer the task until the
-    # formal verifier environment is ready; the retained Harbor evidence still
-    # carries the untouched official reward.
-    if protocol.get("verifier_infrastructure") is True:
-        return "environment_not_ready"
-    if protocol.get("environment_not_ready") is True:
-        return "environment_not_ready"
     diagnostic = protocol.get("failure_diagnostic") or protocol.get("diagnostic") or ""
     reason = " ".join(
         str(value or "")
@@ -159,8 +200,34 @@ def _classify_terminal_infrastructure(outcome: TrialOutcome) -> str:
     )
     # Harbor versions before the retry contract sometimes set
     # ``transient_infrastructure=false`` for package-manager/TLS failures.
-    # The evidence text is more specific than that generic flag, so recognize
-    # known transport and Docker-startup outages before honoring the flag.
+    # Docker address-pool exhaustion and host OOM are special: they are
+    # unambiguously pre-model resource outages and remain retryable even when
+    # Harbor also marks the environment as not ready.  Generic verifier
+    # bootstrap/network evidence stays environment_not_ready when that flag is
+    # present, preserving the no-second-model-attempt fence.
+    host_transient_markers = (
+        "address pool",
+        "fully subnetted",
+        "cannot allocate memory",
+        "errno 12",
+        "out of memory",
+        "no space left on device",
+    )
+    if transient_infrastructure_text(reason) and any(
+        marker in reason for marker in host_transient_markers
+    ):
+        return "transient"
+    # Once the model phase has completed, a verifier bootstrap outage must not
+    # trigger another paid/official agent trial.  Defer the task until the
+    # formal verifier environment is ready; the retained Harbor evidence still
+    # carries the untouched official reward.  This check intentionally comes
+    # *after* transient marker detection: Docker address-pool exhaustion and
+    # host OOM are often reported alongside Harbor's environment_not_ready
+    # flag, but are bounded pre-model outages and may safely be retried.
+    if protocol.get("verifier_infrastructure") is True:
+        return "environment_not_ready"
+    if protocol.get("environment_not_ready") is True:
+        return "environment_not_ready"
     if transient_infrastructure_text(reason):
         return "transient"
     environment_markers = (
@@ -196,6 +263,7 @@ async def run_benchmark(
     retry_invalid: bool = False,
     watchdog_seconds: int = 7_200,
     cooldown_scale: float = 1.0,
+    infrastructure_retry_deadline_seconds: float | None = None,
     cost_limit_cny: float | None = None,
     task_limit: int | None = None,
     qa_limit: int | None = None,
@@ -205,6 +273,7 @@ async def run_benchmark(
     rerun_sample: str | None = None,
     task_ids: Sequence[str] | None = None,
     task_manifest: Path | None = None,
+    trials_per_task: int = 1,
     progress: Callable[[str], None] = print,
 ) -> dict[str, Path]:
     project_root = project_root.resolve()
@@ -213,12 +282,23 @@ async def run_benchmark(
         raise ValueError("watchdog_seconds must be at least 60")
     if cooldown_scale < 0:
         raise ValueError("cooldown_scale cannot be negative")
+    if infrastructure_retry_deadline_seconds is not None and (
+        infrastructure_retry_deadline_seconds <= 0
+        or not math.isfinite(infrastructure_retry_deadline_seconds)
+    ):
+        raise ValueError("infrastructure_retry_deadline_seconds must be finite and positive")
     if cost_limit_cny is not None and cost_limit_cny <= 0:
         raise ValueError("cost_limit_cny must be positive")
     if task_limit is not None and task_limit <= 0:
         raise ValueError("task_limit must be positive")
     if qa_limit is not None and qa_limit <= 0:
         raise ValueError("qa_limit must be positive")
+    if not isinstance(trials_per_task, int) or trials_per_task < 1:
+        raise ValueError("trials_per_task must be a positive integer")
+    if trials_per_task != 1 and adapter.slug != "terminal-bench-2.1":
+        raise ValueError(
+            "trials_per_task is currently supported only for Terminal-Bench 2.1"
+        )
     if rerun_sample is not None and adapter.slug != "locomo-memory":
         raise ValueError("rerun_sample is currently supported only for locomo-memory")
     if rerun_sample is not None and sample_filter is not None:
@@ -265,8 +345,14 @@ async def run_benchmark(
         "capability_profile": adapter.capability_profile,
         "cache_only": cache_only,
         "cache_refresh": cache_refresh,
+        "trials_per_task": trials_per_task,
         "adaptations": list(adapter.adaptations),
         "watchdog_seconds": watchdog_seconds,
+        "infrastructure_retry_deadline_seconds": (
+            infrastructure_retry_deadline_seconds
+            if infrastructure_retry_deadline_seconds is not None
+            else MAX_INFRASTRUCTURE_RETRY_SECONDS
+        ),
         "runtime": {
             "python": platform.python_version(),
             "platform": platform.platform(),
@@ -411,6 +497,14 @@ async def run_benchmark(
     task_results: list[dict[str, Any]] = []
     terminal_cost_warned = False
     terminal_cost_boundary_warned = False
+    # A pre-model infrastructure failure must pause the whole benchmark, not
+    # just the current task.  Continuing to the next task can create a second
+    # invalid Harbor environment while the host/runtime defect is still
+    # unresolved (and leaves the checkpoint looking as if work is progressing
+    # when it is not).  Transient pre-model failures may still use the bounded
+    # retry loop below; once that loop gives up, this flag stops the outer task
+    # loop so the same checkpoint can be repaired and resumed explicitly.
+    pause_after_infrastructure = False
     for sequence, task in enumerate(tasks, 1):
         if adapter.slug == "terminal-bench-2.1":
             completed_results = _persisted_results(output_root, state)
@@ -505,6 +599,14 @@ async def run_benchmark(
                     )
                 ),
             )
+        infrastructure_budget = RetryBudget(
+            max_attempts=max_attempts,
+            deadline_seconds=(
+                infrastructure_retry_deadline_seconds
+                if infrastructure_retry_deadline_seconds is not None
+                else MAX_INFRASTRUCTURE_RETRY_SECONDS
+            ),
+        )
         while generation_attempts < max_attempts:
             attempt, attempt_root, record = store.begin_attempt(
                 state,
@@ -546,6 +648,7 @@ async def run_benchmark(
                         qa_limit=qa_limit,
                         cache_only=cache_only,
                         cache_refresh=cache_refresh,
+                        trials_per_task=trials_per_task,
                     )
                 )
             except (asyncio.CancelledError, KeyboardInterrupt):
@@ -604,9 +707,32 @@ async def run_benchmark(
                         progress=attempt_progress,
                         task_index=sequence,
                         task_total=len(tasks),
+                        trials_per_task=trials_per_task,
                     ),
                     outcome,
                 )
+            # Guard evidence is written in the attempt scope so it survives a
+            # paused/resumed run.  Fold the bounded JSON envelopes into the
+            # selected result as well, giving reports one auditable event
+            # ledger without exposing secrets or changing the official grade.
+            guard_evidence: list[dict[str, Any]] = []
+            for guard_name in (
+                "guard-precheck.json",
+                "guard-prevent.json",
+                "guard-recover.json",
+                "guard-post-cleanup.json",
+            ):
+                guard_path = attempt_root / guard_name
+                if not guard_path.is_file():
+                    continue
+                try:
+                    payload = read_json(guard_path)
+                except (OSError, TypeError, ValueError):
+                    continue
+                guard_evidence.append({"source": guard_name, **payload})
+            if guard_evidence:
+                result["infrastructure_events"] = guard_evidence
+                atomic_json(result_path, result)
             if terminal_infrastructure:
                 record["infrastructure_evidence"] = result_path.relative_to(
                     output_root
@@ -639,6 +765,7 @@ async def run_benchmark(
                         f"Terminal-Bench deferred {infrastructure_class} task "
                         f"{task.task_id}; no automatic model retry was performed."
                     )
+                    pause_after_infrastructure = True
                     break
                 if not pre_model_transient:
                     # Once a model request was observed, retrying the official
@@ -661,6 +788,7 @@ async def run_benchmark(
                         f"{task.task_id}; model activity was observed, so no "
                         "automatic second scored attempt was performed."
                     )
+                    pause_after_infrastructure = True
                     break
                 if generation_attempts >= max_attempts:
                     state["retry_generation"] = generation + 1
@@ -677,18 +805,59 @@ async def run_benchmark(
                     progress(
                         "Terminal-Bench deferred infrastructure-blocked task "
                         f"{task.task_id}; evidence retained at {result_path.name}. "
-                        "Continuing with the remaining tasks; rerun the same immutable "
-                        "command later to retry pending tasks."
+                        "The benchmark is paused; repair the environment and rerun the "
+                        "same immutable command later to retry pending tasks."
                     )
+                    pause_after_infrastructure = True
+                    break
+                if not infrastructure_budget.can_retry(generation_attempts):
+                    state["retry_generation"] = generation + 1
+                    exhausted = infrastructure_budget.exhaustion_reason(generation_attempts)
+                    state.setdefault("operational_pauses", []).append(
+                        {
+                            "timestamp": utc_now(),
+                            "task_id": task.task_id,
+                            "attempt": attempt,
+                            "reason": "terminal_infrastructure_deferred",
+                            "budget_exhausted": exhausted or "deadline",
+                            "retry_attempts": generation_attempts,
+                            "retry_deadline_seconds": infrastructure_budget.deadline_seconds,
+                            "retry_elapsed_seconds": round(
+                                infrastructure_budget.elapsed_seconds(), 3
+                            ),
+                            "evidence": result_path.relative_to(output_root).as_posix(),
+                        }
+                    )
+                    store.save(state)
+                    progress(
+                        "Terminal-Bench deferred infrastructure-blocked task "
+                        f"{task.task_id}; retry budget exhausted "
+                        f"({exhausted or 'deadline'})."
+                    )
+                    pause_after_infrastructure = True
                     break
                 delay = COOLDOWNS[min(generation_attempts - 1, len(COOLDOWNS) - 1)]
                 delay *= cooldown_scale
+                delay = min(delay, infrastructure_budget.remaining_seconds())
                 progress(
                     f"retry infrastructure {task.task_id} after {delay:.0f}s"
                 )
                 await asyncio.sleep(delay)
                 continue
             store.finish_attempt(state, task.task_id, record, outcome.status, result_path)
+            # A task may have been paused after a genuine infrastructure
+            # attempt and then resumed successfully (or with an ordinary
+            # verifier-reported failure).  Keep that original attempt-level
+            # evidence, but do not let its stale trial-level classification
+            # contaminate the terminal outcome or aggregate report.
+            if adapter.slug == "terminal-bench-2.1" and outcome.status in {
+                TrialStatus.PASS,
+                TrialStatus.FAIL,
+            }:
+                state["trials"][task.task_id].pop("infrastructure_class", None)
+                state["trials"][task.task_id].pop("infrastructure_evidence", None)
+                state["trials"][task.task_id].pop("pause_reason", None)
+                store.save(state)
             progress(f"complete {task.task_id}: {outcome.status.value}")
             generation_attempts += 1
             if outcome.status is not TrialStatus.INVALID:
@@ -710,12 +879,27 @@ async def run_benchmark(
                 progress(f"retry invalid {task.task_id} after {delay:.0f}s")
                 await asyncio.sleep(delay)
 
+        if pause_after_infrastructure:
+            # Leave all later tasks pending.  The resume path will recover the
+            # interrupted attempt and retry only the infrastructure-blocked
+            # task after the operator has repaired the environment.
+            break
+
     for task in tasks:
         trial = state["trials"][task.task_id]
         path = trial.get("result")
         if isinstance(path, str) and (output_root / path).is_file():
             task_results.append(read_json(output_root / path))
     summary = _base_summary(adapter, tasks, state, task_results, checked.as_dict())
+    if adapter.slug == "terminal-bench-2.1":
+        # The adapter's public ``summarize`` method is also used directly by
+        # compatibility tests.  Publish the selected task count here so a
+        # bounded diagnostic run reports its own denominator while a full run
+        # retains the canonical 89-task denominator.
+        try:
+            setattr(adapter, "_summary_task_count", len(tasks))
+        except Exception:
+            pass
     summary["benchmark_metrics"] = dict(adapter.summarize(task_results))
     if adapter.slug == "terminal-bench-2.1":
         summary["task_results"] = [
@@ -724,12 +908,40 @@ async def run_benchmark(
                 "group": result.get("group"),
                 "status": result.get("status"),
                 "reward": (result.get("metrics") or {}).get("reward", 0),
+                "trial_rewards": (result.get("metrics") or {}).get("trial_rewards") or [],
+                "trial_count": (result.get("metrics") or {}).get("trial_count", 1),
+                "trial_pass_count": (result.get("metrics") or {}).get("trial_pass_count", 0),
+                "trial_fail_count": (result.get("metrics") or {}).get("trial_fail_count", 0),
+                "trial_invalid_count": (result.get("metrics") or {}).get("trial_invalid_count", 0),
                 "attempt": result.get("attempt"),
                 "failure_reason": result.get("failure_reason") or result.get("invalid_reason"),
                 "failure_class": (result.get("protocol") or {}).get("failure_class"),
+                "failure_root_cause": (result.get("protocol") or {}).get("failure_root_cause")
+                or (result.get("runtime_diagnostic") or {}).get("root_cause"),
                 "usage": result.get("usage") or {},
+                "official_result": result.get("official_result") or {},
+                "runtime_diagnostic": result.get("runtime_diagnostic") or {},
             }
             for result in task_results
+        ]
+        # Keep the official verifier ledger and the runtime lifecycle ledger
+        # side by side.  Reports can therefore explain a stalled/blocked
+        # runtime without turning an already verified reward into a failure.
+        summary["official_result_ledger"] = [
+            {
+                "task_id": result.get("task_id"),
+                **dict(result.get("official_result") or {}),
+            }
+            for result in task_results
+            if result.get("official_result")
+        ]
+        summary["runtime_diagnostic_ledger"] = [
+            {
+                "task_id": result.get("task_id"),
+                **dict(result.get("runtime_diagnostic") or {}),
+            }
+            for result in task_results
+            if result.get("runtime_diagnostic")
         ]
         summary["pending_tasks"] = [
             task.task_id
@@ -797,6 +1009,16 @@ async def run_benchmark(
         summary["environment_not_ready"] = list(
             summary["infrastructure_classification"]["environment_not_ready"]
         )
+        root_causes = Counter(
+            str(
+                (result.get("protocol") or {}).get("failure_root_cause")
+                or (result.get("runtime_diagnostic") or {}).get("root_cause")
+                or "unknown"
+            )
+            for result in task_results
+            if result.get("status") in {TrialStatus.FAIL.value, TrialStatus.INVALID.value}
+        )
+        summary["failure_root_cause_counts"] = dict(sorted(root_causes.items()))
         api_cost = _terminal_api_cost(task_results)
         summary.update(api_cost)
         # Kept as a null compatibility field so consumers cannot accidentally
@@ -1282,6 +1504,25 @@ def _report(adapter: BenchmarkAdapter, summary: Mapping[str, Any]) -> str:
         )
     if adapter.slug == "terminal-bench-2.1":
         metrics = summary.get("benchmark_metrics") or {}
+        repeated_trials = int(metrics.get("trials_per_task") or 1) >= 5
+        view_title = "Official Repeated-Trial View" if repeated_trials else "Official Single-Pass View"
+        success_label = (
+            f"- Successful trials: {metrics.get('successful_trials', 0)}/"
+            f"{metrics.get('official_trial_count', metrics.get('official_denominator', 0))}"
+            if repeated_trials
+            else f"- Successful tasks: {metrics.get('successful_tasks', 0)}/"
+            f"{summary.get('task_count') or len(summary.get('task_results') or ())}"
+        )
+        accuracy_label = (
+            f"- Leaderboard accuracy: {_format_rate(metrics.get('leaderboard_accuracy'))}"
+            if repeated_trials
+            else f"- Single-pass accuracy: {_format_rate(metrics.get('single_pass_accuracy'))}"
+        )
+        compatibility_label = (
+            "- Leaderboard compatible: yes (five or more trials per task)"
+            if repeated_trials
+            else "- Leaderboard compatible: no (one trial per task; official submissions require at least five)"
+        )
         api_cost_status = str(summary.get("api_cost_status") or "unavailable")
         api_cost = summary.get("api_reported_cost")
         api_currency = str(summary.get("api_reported_cost_currency") or "").strip()
@@ -1299,32 +1540,93 @@ def _report(adapter: BenchmarkAdapter, summary: Mapping[str, Any]) -> str:
             cost_line = "- API-reported cost (provider): unavailable"
         lines.extend(
             (
-                "## Official Single-Pass View",
+                f"## {view_title}",
                 "",
                 f"- Success rule: `{metrics.get('official_success_rule', 'reward > 0')}`",
-                f"- Successful tasks: {metrics.get('successful_tasks', 0)}/"
-                f"{summary.get('task_count') or len(summary.get('task_results') or ())}",
-                f"- Single-pass accuracy: {_format_rate(metrics.get('single_pass_accuracy'))}",
-                "- Leaderboard compatible: no (one trial per task; official submissions require at least five)",
+                success_label,
+                accuracy_label,
+                compatibility_label,
+                f"- Trials per task requested: {metrics.get('trials_per_task', 1)}",
                 cost_line,
                 "",
                 "## Per-Task Results",
                 "",
-                "| Task | Category | Status | Reward | Attempt | Attribution | Failure |",
-                "|---|---|---:|---:|---:|---|---|",
+                "| Task | Category | Status | Mean reward | Trials | Pass/Fail/Invalid | Attempt | Attribution | Root cause | Failure |",
+                "|---|---|---:|---:|---:|---|---:|---|---|---|",
             )
         )
         for item in summary.get("task_results") or ():
             failure = str(item.get("failure_reason") or "").replace("|", "\\|").replace("\n", " ")
             if len(failure) > 160:
                 failure = failure[:157] + "..."
+            root_cause = str(item.get("failure_root_cause") or "-").replace("|", "\\|")
             lines.append(
                 f"| `{item.get('task_id')}` | `{item.get('group') or 'uncategorized'}` | "
                 f"`{item.get('status')}` | {float(item.get('reward') or 0):.3f} | "
-                f"{item.get('attempt') or '-'} | "
-                f"`{item.get('failure_class') or '-'}` | {failure or '-'} |"
+                f"{item.get('trial_count') or 1} | "
+                f"{item.get('trial_pass_count', 0)}/{item.get('trial_fail_count', 0)}/"
+                f"{item.get('trial_invalid_count', 0)} | {item.get('attempt') or '-'} | "
+                f"`{item.get('failure_class') or '-'}` | `{root_cause}` | {failure or '-'} |"
             )
         lines.append("")
+        root_cause_counts = summary.get("failure_root_cause_counts") or {}
+        if root_cause_counts:
+            lines.extend(
+                (
+                    "## Failure Root-Cause Summary",
+                    "",
+                    "Diagnostic labels are non-scoring telemetry; official reward and verifier status remain authoritative.",
+                    "",
+                    "| Root cause | Failed/invalid tasks |",
+                    "|---|---:|",
+                )
+            )
+            for root_cause, count in sorted(root_cause_counts.items()):
+                lines.append(f"| `{root_cause}` | {count} |")
+            lines.append("")
+        official_ledger = summary.get("official_result_ledger") or ()
+        runtime_ledger = summary.get("runtime_diagnostic_ledger") or ()
+        if official_ledger:
+            lines.extend(
+                (
+                    "## Official Verifier Ledger",
+                    "",
+                    "The official Harbor verifier is the scoring authority; runtime diagnostics below do not override its reward.",
+                    "",
+                    "| Task | Reward | Verifier executed | Official status | Source |",
+                    "|---|---:|---|---|---|",
+                )
+            )
+            for item in official_ledger:
+                lines.append(
+                    f"| `{item.get('task_id')}` | "
+                    f"{_format_reward(item.get('reward'))} | "
+                    f"{str(bool(item.get('verifier_executed'))).lower()} | "
+                    f"`{item.get('status') or 'unknown'}` | "
+                    f"`{item.get('source') or '-'}` |"
+                )
+            lines.append("")
+        if runtime_ledger:
+            lines.extend(
+                (
+                    "## Runtime Diagnostic Ledger",
+                    "",
+                    "These lifecycle facts (for example stalled/blocked) are retained for recovery and attribution only.",
+                    "",
+                    "| Task | Runtime status | Exception | Reconciled with official result | Model phase |",
+                    "|---|---|---|---|---|",
+                )
+            )
+            for item in runtime_ledger:
+                error = str(item.get("error") or item.get("exception_type") or "-").replace("|", "\\|").replace("\n", " ")
+                if len(error) > 120:
+                    error = error[:117] + "..."
+                lines.append(
+                    f"| `{item.get('task_id')}` | `{item.get('status') or '-'}` | {error} | "
+                    f"{str(bool(item.get('reconciled'))).lower()} | "
+                    f"{str(bool(item.get('model_phase_started'))).lower()} |"
+                )
+            lines.append("")
         pending_tasks = summary.get("pending_tasks") or ()
         if pending_tasks:
             lines.extend(
@@ -1356,6 +1658,15 @@ def _report(adapter: BenchmarkAdapter, summary: Mapping[str, Any]) -> str:
 
 def _format_rate(value: Any) -> str:
     return "-" if value is None else f"{float(value):.3f}"
+
+
+def _format_reward(value: Any) -> str:
+    if value is None:
+        return "-"
+    try:
+        return f"{float(value):.3f}"
+    except (TypeError, ValueError):
+        return "-"
 
 
 def _validate_catalog(tasks: tuple[BenchmarkTask, ...]) -> None:

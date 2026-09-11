@@ -24,11 +24,36 @@ ORACLE_TASK = "compile-compcert"
 ORACLE_HARBOR_TASK = f"terminal-bench/{ORACLE_TASK}"
 FORMAL_NETWORK_PROBE_IMAGE = "alexgshaw/bn-fit-modify:20251031"
 FORMAL_NETWORK_PROBE_ATTEMPTS = 3
+# The official Terminal-Bench protocol starts Harbor directly.  Keep the
+# verifier-bootstrap soak as an opt-in diagnostic only; making it a mandatory
+# gate introduced an extra image/network dependency that is not part of the
+# benchmark and caused false ``environment_not_ready`` results before any
+# official task had started.
+FORMAL_NETWORK_PROBE_ENV = "CC_HARNESS_TERMINAL_REQUIRE_NETWORK_PROBE"
 FORMAL_NETWORK_PROBE_SCRIPT = r"""
 set -eu
 export DEBIAN_FRONTEND=noninteractive
-apt-get update
-apt-get install -y curl
+# Docker's HTTP/80 route to the Ubuntu mirrors is unavailable in some
+# environments (502/timeouts), while the same official mirrors are reachable
+# over HTTPS. Normalize only the transport; the distribution, suites and
+# package origins remain the official image defaults.
+for source in /etc/apt/sources.list /etc/apt/sources.list.d/*.list /etc/apt/sources.list.d/*.sources; do
+  [ -f "$source" ] || continue
+  sed -i \
+    -e 's|http://archive.ubuntu.com/ubuntu|https://archive.ubuntu.com/ubuntu|g' \
+    -e 's|http://security.ubuntu.com/ubuntu|https://security.ubuntu.com/ubuntu|g' \
+    "$source" || true
+done
+# Minimal task images may not contain a CA bundle yet.  Keep HTTPS as the
+# transport, but temporarily disable peer/host verification only for this
+# bootstrap transaction; installing ca-certificates below restores verified
+# TLS for every subsequent command.
+apt_tls_opts=""
+if [ ! -s /etc/ssl/certs/ca-certificates.crt ]; then
+  apt_tls_opts="-o Acquire::https::Verify-Peer=false -o Acquire::https::Verify-Host=false"
+fi
+apt-get update $apt_tls_opts
+apt-get install $apt_tls_opts -y curl
 curl -LsSf https://astral.sh/uv/0.9.5/install.sh | sh
 source /root/.local/bin/env
 uvx \
@@ -341,7 +366,12 @@ def require_formal_gates(
     check_identity = (check_manifest.get("adapter_run_identity") or {})
     if check_identity.get("wheel_sha256") != expected["wheel_sha256"]:
         raise RuntimeError("Terminal-Bench zero-model check used a different frozen wheel")
-    require_formal_verifier_network(project_root)
+    # Harbor owns the official task/verifier lifecycle.  Do not add a second
+    # synthetic/soak gate to the scored path.  Operators can explicitly opt
+    # into the diagnostic when they are troubleshooting Docker egress:
+    # ``CC_HARNESS_TERMINAL_REQUIRE_NETWORK_PROBE=1``.
+    if os.environ.get(FORMAL_NETWORK_PROBE_ENV) == "1":
+        require_formal_verifier_network(project_root)
 
 
 def require_formal_verifier_network(project_root: Path) -> None:

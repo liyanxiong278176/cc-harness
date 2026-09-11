@@ -805,7 +805,13 @@ class SessionRuntime:
             # chain-of-thought text before a tool call.
             "visible_thought_required": False,
         }
-        completion_contract = completion_contract_from_instruction(user_text)
+        completion_contract = completion_contract_from_instruction(
+            user_text,
+            trusted_public_instruction=(
+                os.getenv("CC_HARNESS_TERMINAL_BENCH", "") == "1"
+                and os.getenv("CC_HARNESS_TRUSTED_BENCHMARK_TASK", "") == "1"
+            ),
+        )
         runtime_contract = {
             "acceptance": list(completion_contract.required_paths),
             "artifacts": list(completion_contract.required_paths),

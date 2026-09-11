@@ -51,6 +51,8 @@ class ModelSegment:
     stop_reason: str = "model_stop"
     usage: Mapping[str, Any] = field(default_factory=dict)
     reasoning_content: str = ""
+    refusal: str | None = None
+    provider_metadata: Mapping[str, Any] = field(default_factory=dict)
 
     @classmethod
     def from_mapping(cls, value: Mapping[str, Any]) -> "ModelSegment":
@@ -69,6 +71,12 @@ class ModelSegment:
             stop_reason=str(value.get("stop_reason") or "model_stop"),
             usage=(dict(value["usage"]) if isinstance(value.get("usage"), Mapping) else {}),
             reasoning_content=str(value.get("reasoning_content") or ""),
+            refusal=(str(value["refusal"]) if value.get("refusal") is not None else None),
+            provider_metadata=(
+                dict(value["provider_metadata"])
+                if isinstance(value.get("provider_metadata"), Mapping)
+                else {}
+            ),
         )
 
 
@@ -102,6 +110,8 @@ class SegmentOutcome:
     stop_reason: str = "model_stop"
     usage: Mapping[str, Any] = field(default_factory=dict)
     reasoning_content: str = ""
+    refusal: str | None = None
+    provider_metadata: Mapping[str, Any] = field(default_factory=dict)
 
 
 class AgentKernel(Protocol):
@@ -160,6 +170,8 @@ class ReActKernel:
             stop_reason=segment.stop_reason,
             usage=dict(segment.usage),
             reasoning_content=segment.reasoning_content,
+            refusal=segment.refusal,
+            provider_metadata=dict(segment.provider_metadata),
         )
 
     @staticmethod

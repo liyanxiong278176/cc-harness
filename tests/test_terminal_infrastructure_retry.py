@@ -4,7 +4,7 @@ import asyncio
 from pathlib import Path
 
 from eval.cc_only.contracts import BenchmarkTask, CheckResult, EvalProfile, TrialOutcome, TrialStatus
-from eval.cc_only.runner import run_benchmark
+from eval.cc_only.runner import RetryBudget, run_benchmark
 from eval.cc_only.storage import read_json
 
 
@@ -142,3 +142,37 @@ def test_unclassified_infrastructure_failure_is_deferred_without_replay() -> Non
     )
 
     assert _classify_terminal_infrastructure(outcome) == "deterministic"
+
+
+def test_retry_budget_enforces_attempt_and_deadline_limits() -> None:
+    budget = RetryBudget(max_attempts=2, deadline_seconds=5.0, started_at=100.0)
+    assert budget.can_retry(0, now=104.9)
+    assert budget.can_retry(1, now=104.9)
+    assert not budget.can_retry(2, now=104.9)
+    assert budget.exhaustion_reason(2, now=104.9) == "max_attempts"
+    assert not budget.can_retry(1, now=105.0)
+    assert budget.exhaustion_reason(1, now=105.0) == "deadline"
+
+
+def test_retry_budget_deadline_pauses_without_another_model_attempt(tmp_path: Path) -> None:
+    adapter = _TransientAdapter(failures=4)
+    output = tmp_path / "result"
+
+    asyncio.run(
+        run_benchmark(
+            adapter,
+            tmp_path,
+            output,
+            profile=EvalProfile.FULL,
+            cooldown_scale=0,
+            infrastructure_retry_deadline_seconds=0.000001,
+        )
+    )
+
+    state = read_json(output / "state.json")
+    trial = state["trials"]["terminal-bench/retry-fixture"]
+    assert adapter.calls == 1
+    assert trial["status"] == "pending"
+    pause = state["operational_pauses"][-1]
+    assert pause["reason"] == "terminal_infrastructure_deferred"
+    assert pause["budget_exhausted"] == "deadline"

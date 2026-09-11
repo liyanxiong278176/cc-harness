@@ -116,15 +116,44 @@ def test_systemd_worker_receives_wsl_docker_and_terminal_environment(
 ) -> None:
     monkeypatch.setenv("WSL_DISTRO_NAME", "Ubuntu")
     monkeypatch.setenv("DOCKER_HOST", "unix:///var/run/docker.sock")
+    monkeypatch.setenv("DOCKER_CONFIG", "/home/lyx/.config/cc-harness/docker-terminal-bench")
+    monkeypatch.setenv("XDG_CACHE_HOME", "/home/lyx/.cache")
+    monkeypatch.setenv("TMPDIR", "/home/lyx/.cache/cc-harness/tmp")
+    monkeypatch.setenv("UV_PROJECT_ENVIRONMENT", "/home/lyx/.local/share/cc-harness/venv")
+    monkeypatch.setenv("UV_CACHE_DIR", "/home/lyx/.cache/uv")
+    monkeypatch.setenv("DOCKER_CONTEXT", "desktop-linux")
     monkeypatch.setenv("CC_HARNESS_TERMINAL_AGENT_RUNTIME", "1")
     monkeypatch.setenv("CC_HARNESS_TERMINAL_NETWORK_TRANSPORT", "proxy")
+    monkeypatch.setenv("CC_HARNESS_ALLOW_RESUME_RUNTIME_REPAIR", "1")
 
     arguments = supervisor._worker_environment_arguments()
 
     assert "--setenv=WSL_DISTRO_NAME=Ubuntu" in arguments
     assert "--setenv=DOCKER_HOST=unix:///var/run/docker.sock" in arguments
+    assert "--setenv=DOCKER_CONTEXT=" in arguments
+    assert "--setenv=DOCKER_CONFIG=/home/lyx/.config/cc-harness/docker-terminal-bench" in arguments
+    assert "--setenv=XDG_CACHE_HOME=/home/lyx/.cache" in arguments
+    assert "--setenv=TMPDIR=/home/lyx/.cache/cc-harness/tmp" in arguments
+    assert "--setenv=UV_PROJECT_ENVIRONMENT=/home/lyx/.local/share/cc-harness/venv" in arguments
+    assert "--setenv=UV_CACHE_DIR=/home/lyx/.cache/uv" in arguments
     assert "--setenv=CC_HARNESS_TERMINAL_AGENT_RUNTIME=1" in arguments
     assert "--setenv=CC_HARNESS_TERMINAL_NETWORK_TRANSPORT=proxy" in arguments
+    assert "--setenv=CC_HARNESS_ALLOW_RESUME_RUNTIME_REPAIR=1" in arguments
+
+
+def test_direct_network_transport_clears_inherited_proxy_environment(monkeypatch) -> None:
+    monkeypatch.delenv("HTTP_PROXY", raising=False)
+    monkeypatch.delenv("HTTPS_PROXY", raising=False)
+    monkeypatch.delenv("ALL_PROXY", raising=False)
+    monkeypatch.delenv("http_proxy", raising=False)
+    monkeypatch.delenv("https_proxy", raising=False)
+    monkeypatch.delenv("all_proxy", raising=False)
+    monkeypatch.setenv("CC_HARNESS_TERMINAL_NETWORK_TRANSPORT", "direct-public.v1")
+
+    arguments = supervisor._worker_environment_arguments()
+
+    for name in ("HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "http_proxy", "https_proxy", "all_proxy"):
+        assert f"--setenv={name}=" in arguments
 
 
 def test_new_run_rotates_stale_worker_log_before_launch(monkeypatch, tmp_path: Path) -> None:

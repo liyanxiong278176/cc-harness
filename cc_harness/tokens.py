@@ -75,7 +75,13 @@ class UsageRecord:
             reported_cost = value(usage, "total_cost", None)
         try:
             parsed_cost = float(reported_cost) if reported_cost is not None else None
-            normalized_cost = parsed_cost if parsed_cost is not None and math.isfinite(parsed_cost) else None
+            normalized_cost = (
+                parsed_cost
+                if parsed_cost is not None
+                and math.isfinite(parsed_cost)
+                and parsed_cost >= 0
+                else None
+            )
         except (TypeError, ValueError):
             normalized_cost = None
         currency = value(usage, "cost_currency", None) or value(usage, "currency", None)
@@ -83,10 +89,17 @@ class UsageRecord:
             currency = str(currency).strip().upper() or None
         cache_read = min(prompt_tokens, nonnegative_int(cache_read))
         cache_creation = min(prompt_tokens - cache_read, nonnegative_int(cache_creation))
+        completion_tokens = nonnegative_int(value(usage, "completion_tokens", 0))
+        total_tokens = nonnegative_int(value(usage, "total_tokens", 0))
+        # Some OpenAI-compatible gateways omit ``total_tokens`` even though
+        # prompt/completion counts are present.  Preserve an auditable total
+        # instead of reporting zero (and never infer a monetary cost).
+        if total_tokens == 0 and (prompt_tokens or completion_tokens):
+            total_tokens = prompt_tokens + completion_tokens
         return cls(
             prompt_tokens=prompt_tokens,
-            completion_tokens=nonnegative_int(value(usage, "completion_tokens", 0)),
-            total_tokens=nonnegative_int(value(usage, "total_tokens", 0)),
+            completion_tokens=completion_tokens,
+            total_tokens=total_tokens,
             cache_read_prompt_tokens=cache_read,
             cache_creation_prompt_tokens=cache_creation,
             reported_cost=normalized_cost,
@@ -228,6 +241,15 @@ class TurnTokenStats:
     compaction: Any = None  # Plan3: CompactionStats obj (context.py) or None
     error: str | None = None  # D1 Task 4 fix:run_turn fatal error message(if any)
     prompt_metadata: dict | None = None  # safe version/digest only; never prompt text
+    # Provider response facts retained for the usage/audit envelope.  These
+    # are bounded identifiers, never prompt text or credentials.
+    api_provider_metadata: list[dict] = field(default_factory=list)
+    api_providers: list[str] = field(default_factory=list)
+    api_models: list[str] = field(default_factory=list)
+    api_stop_reasons: dict[str, int] = field(default_factory=dict)
+    # One bounded envelope per provider call.  Monetary fields are copied
+    # only when the provider reports them; token counts never become a price.
+    api_invocations: list[dict] = field(default_factory=list)
 
     @property
     def breakdown_subtotal(self) -> int:
@@ -272,6 +294,11 @@ class SessionTokenStats:
     iters_total: int = 0
     auxiliary_model_calls: int = 0
     turns_with_usage: int = 0
+    api_provider_metadata: list[dict] = field(default_factory=list)
+    api_providers: list[str] = field(default_factory=list)
+    api_models: list[str] = field(default_factory=list)
+    api_stop_reasons: dict[str, int] = field(default_factory=dict)
+    api_invocations: list[dict] = field(default_factory=list)
 
     @property
     def breakdown_subtotal(self) -> int:
@@ -360,3 +387,18 @@ class SessionTokenStats:
         self.auxiliary_model_calls += turn.auxiliary_model_calls
         if turn.api_reported:
             self.turns_with_usage += 1
+        for metadata in turn.api_provider_metadata:
+            if metadata not in self.api_provider_metadata and len(self.api_provider_metadata) < 32:
+                self.api_provider_metadata.append(dict(metadata))
+        for provider in turn.api_providers:
+            if provider not in self.api_providers:
+                self.api_providers.append(str(provider))
+        for model in turn.api_models:
+            if model not in self.api_models:
+                self.api_models.append(str(model))
+        for reason, count in turn.api_stop_reasons.items():
+            self.api_stop_reasons[str(reason)] = self.api_stop_reasons.get(str(reason), 0) + int(count)
+        for invocation in turn.api_invocations:
+            if len(self.api_invocations) >= 512:
+                break
+            self.api_invocations.append(dict(invocation))

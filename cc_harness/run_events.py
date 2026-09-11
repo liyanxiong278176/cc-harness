@@ -547,6 +547,29 @@ class EventValidator:
                 if name in payload:
                     if not isinstance(payload[name], int) or payload[name] < 0:
                         raise EventValidationError(f"outcome {name} must be a non-negative integer")
+            outcome_details = payload.get("details")
+            if outcome_details is not None and not isinstance(outcome_details, Mapping):
+                raise EventValidationError("outcome details must be an object")
+            if isinstance(outcome_details, Mapping):
+                failure_evidence = outcome_details.get("failure_evidence")
+                if failure_evidence is not None:
+                    if not isinstance(failure_evidence, Mapping):
+                        raise EventValidationError("outcome failure_evidence must be an object")
+                    for name in ("primary_class", "reason", "source"):
+                        if not isinstance(failure_evidence.get(name), str) or not failure_evidence[name].strip():
+                            raise EventValidationError(
+                                f"outcome failure_evidence.{name} must be a non-empty string"
+                            )
+                    for name in ("model_phase_started", "verifier_executed", "retryable"):
+                        if name in failure_evidence and not isinstance(failure_evidence[name], bool):
+                            raise EventValidationError(
+                                f"outcome failure_evidence.{name} must be boolean"
+                            )
+                    refs = failure_evidence.get("evidence_refs")
+                    if refs is not None and not isinstance(refs, (list, tuple)):
+                        raise EventValidationError(
+                            "outcome failure_evidence.evidence_refs must be a list"
+                        )
         if event.event_type == "ToolObservationChunkCommitted":
             if not isinstance(payload["chunk_index"], int) or payload["chunk_index"] < 0:
                 raise EventValidationError("observation chunk_index must be non-negative")

@@ -9,6 +9,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import json
+import os
 import traceback
 import re
 import time
@@ -21,12 +22,20 @@ from .activation import ActivationManifest
 from .capability_runtime import AgentCapabilityRuntime
 from .interaction_history import assistant_message, materialize_interaction_messages, objective_messages
 from .lease import LeaseManager
+from .loop_control import (
+    TaskContract,
+    artifact_validation_issues,
+    completion_contract_from_instruction,
+    _normalise_command,
+    _text_digest,
+)
 from .llm import ProviderProtocolError
 from .run_events import EventActor, RunEvent
 from .run_kernel import ActionRequest, AgentKernel, SegmentContext
 from .run_model import (
     ActionStatus,
     CompletionCandidate,
+    CompletionGate,
     EffectClass,
     EvidenceKind,
     EvidenceRef,
@@ -34,7 +43,7 @@ from .run_model import (
     RunStatus,
 )
 from .run_projection import RunProjection
-from .run_store import RunStore
+from .run_store import LeaseFenceError, RunStore, RunStoreError, SequenceConflict
 from .run_outcomes import outcome_for_event
 from .tool_observation import ToolObservation, make_observation
 
@@ -64,6 +73,97 @@ _SENSITIVE_KEY = re.compile(
     r"(?:api.?key|access.?token|authorization|cookie|credential|password|passwd|private.?key|secret|token)",
     re.IGNORECASE,
 )
+
+# Completion evidence is derived from durable tool observations, never from a
+# model's final prose.  Keep this vocabulary provider/task agnostic while
+# avoiding the old substring-only ``test`` check (which treated ``latest`` or
+# ``test-data.txt`` as a verification command).
+_VERIFICATION_COMMAND_RE = re.compile(
+    r"(?:\b(?:pytest|unittest|mypy|ruff|eslint|pyright|pylint|bandit)\b|"
+    r"\b(?:npm|pnpm|yarn)\s+(?:run\s+)?test\b|"
+    r"\b(?:cargo|go|dotnet|mvnw?|gradlew?)\s+test\b|"
+    r"\b(?:make|just|task)\s+(?:test|check|verify|lint|validate)\b|"
+    r"\bctest(?:\s|$)|"
+    r"(?:^|[;&|\s])(?:\./)?(?:tests?/[A-Za-z0-9_.-]+|test(?:s)?\.(?:sh|py|js|ts)|run_tests?)(?:\s|$)|"
+    r"\b(?:python(?:3)?|bash|sh|node|ruby|perl)\b[^;&|\n]*(?:\btests?\b|test[_./-])|"
+    r"\b(?:verify|validate|lint|typecheck|compile|build|smoke)\b|"
+    r"\b(?:git\s+(?:status|diff(?:\s+--check)?))\b|"
+    r"\b(?:curl|wget|grpcurl)\b|\b(?:nc|netcat)\s+-z\b|"
+    r"\b(?:systemctl\s+is-active|service\s+\S+\s+status)\b|"
+    r"\b(?:sha256sum|sha512sum|md5sum|cmp|stat|file|command\s+-v|which)\b|"
+    r"(?:^|\s)--(?:check|verify|validate)\b)",
+    re.IGNORECASE,
+)
+
+
+def _is_verification_command(tool_name: str, command: str) -> bool:
+    """Return whether a successful command is decisive completion evidence."""
+
+    if tool_name != "run_command":
+        return False
+    return bool(_VERIFICATION_COMMAND_RE.search(command or ""))
+
+
+def _observation_is_decisive(
+    observation: ToolObservation,
+    *,
+    command: str = "",
+) -> bool:
+    """Return whether an observation proves progress beyond a read-only lookup.
+
+    Verification commands are decisive by definition.  A successful mutation
+    is also a meaningful completion boundary for the official benchmark when
+    the task's external verifier is the final oracle.  The latter is guarded
+    by durable effect/changed-path metadata, never by model prose, so a plain
+    ``Read``/``Glob``/``Grep`` result cannot close a run accidentally.
+    """
+
+    if _is_verification_command(observation.tool_name, command):
+        return True
+    if observation.modified_paths:
+        return True
+    effect = str(observation.effect_class or "").casefold()
+    if effect in {
+        EffectClass.WORKSPACE_MUTATION.value,
+        EffectClass.EXTERNAL_SIDE_EFFECT.value,
+    }:
+        return True
+    change_set = observation.metadata.get("workspace_change_set")
+    return isinstance(change_set, Mapping) and bool(
+        change_set.get("changed_paths") or change_set.get("created_paths")
+    )
+
+
+def _is_benchmark_task() -> bool:
+    """Identify the frozen official benchmark path without trusting task text."""
+
+    return (
+        os.getenv("CC_HARNESS_TERMINAL_BENCH", "") == "1"
+        and os.getenv("CC_HARNESS_TRUSTED_BENCHMARK_TASK", "") == "1"
+    )
+
+
+def _goal_public_text(goal) -> str:
+    """Render the durable public goal for deterministic contract extraction.
+
+    Completion obligations must be derived from the objective, acceptance
+    criteria, and constraints together.  Reusing only ``goal.objective``
+    silently drops output paths or verification requirements that were stored
+    in the structured contract during run creation.
+    """
+
+    if goal is None:
+        return ""
+    sections = [str(goal.objective or "")]
+    if goal.acceptance_criteria:
+        sections.append(
+            "Acceptance criteria:\n" + "\n".join(f"- {item}" for item in goal.acceptance_criteria)
+        )
+    if goal.constraints:
+        sections.append(
+            "Constraints:\n" + "\n".join(f"- {item}" for item in goal.constraints)
+        )
+    return "\n\n".join(section for section in sections if section.strip())
 
 
 def _redact_argument_values(value: Any, *, key: str = "") -> Any:
@@ -112,6 +212,10 @@ class RunWorker:
         self.action_executor = action_executor
         self.contracts = contracts or ToolContractRegistry.first_party()
         self.completion_verifier = completion_verifier
+        # Completion is a runtime-owned protocol boundary.  Keep the optional
+        # legacy verifier seam, but always run the structural gate first so a
+        # model's prose can never transition a run to completed by itself.
+        self.completion_gate = CompletionGate()
         self._uses_default_messages = message_provider is None
         self.message_provider = message_provider or self._default_messages
         self.available_tools = tuple(dict(item) for item in available_tools)
@@ -350,6 +454,15 @@ class RunWorker:
                         "duration_ms": round((time.monotonic() - invocation_started) * 1000, 3),
                         "usage": dict(getattr(outcome, "usage", {}) or {}),
                     }
+                    if outcome is not None:
+                        finished_payload["stop_reason"] = str(
+                            getattr(outcome, "stop_reason", "") or "model_stop"
+                        )
+                        finished_payload["provider_metadata"] = dict(
+                            getattr(outcome, "provider_metadata", None)
+                            or (getattr(outcome, "usage", {}) or {}).get("provider_metadata")
+                            or {}
+                        )
                     if invocation_error:
                         finished_payload["error"] = invocation_error
                     with contextlib.suppress(Exception):
@@ -515,6 +628,13 @@ class RunWorker:
                 had_action=had_action,
                 had_progress=had_progress,
             )
+        except LeaseFenceError:
+            # A supervisor may reclaim an expired lease while a provider or
+            # subprocess is still unwinding.  The old worker is intentionally
+            # fenced and must exit quietly; emitting RunFailed here would race
+            # the replacement worker and turn a recoverable hand-off into a
+            # false Runtime/Harbor infrastructure failure.
+            return
         except ProviderProtocolError as exc:
             # Protocol failures are deterministic and must be visible in the
             # durable stream.  Never retry by fabricating provider fields or
@@ -562,7 +682,13 @@ class RunWorker:
                 heartbeat_task.cancel()
                 with contextlib.suppress(asyncio.CancelledError):
                     await heartbeat_task
-            await self.lease_manager.release(current_lease)
+            # Runtime shutdown can race with a provider cancellation.  The
+            # supervisor normally awaits workers before closing the store, but
+            # a process-level shutdown may still reach this finally block
+            # after the store has been closed.  Lease release is cleanup, not
+            # a reason to surface a second unhandled failure.
+            with contextlib.suppress(RunStoreError, ValueError):
+                await self.lease_manager.release(current_lease)
 
     async def heartbeat(self, lease: Lease) -> Lease:
         async with self._event_lock:
@@ -1065,6 +1191,17 @@ class RunWorker:
             outcome.model_text,
             calls,
             reasoning_content=str(getattr(outcome, "reasoning_content", "") or ""),
+            refusal=(
+                str(getattr(outcome, "refusal"))
+                if getattr(outcome, "refusal", None) is not None
+                else None
+            ),
+            stop_reason=str(getattr(outcome, "stop_reason", "") or "model_stop"),
+            provider_metadata=(
+                getattr(outcome, "provider_metadata", None)
+                or (getattr(outcome, "usage", {}) or {}).get("provider_metadata")
+                or None
+            ),
         )
         artifact = self.store.artifacts.put_text(
             json.dumps(message, ensure_ascii=False, sort_keys=True, separators=(",", ":")),
@@ -1080,6 +1217,11 @@ class RunWorker:
                 "round": round_index,
                 "content_digest": artifact.digest,
                 "stop_reason": outcome.stop_reason,
+                "provider_metadata": dict(
+                    getattr(outcome, "provider_metadata", None)
+                    or (getattr(outcome, "usage", {}) or {}).get("provider_metadata")
+                    or {}
+                ),
                 "tool_call_ids": [
                     request.action_id
                     for request in (
@@ -1097,12 +1239,72 @@ class RunWorker:
         candidate: CompletionCandidate | None,
     ) -> bool:
         projection = await self.store.load_projection(lease.run_id)
+        # Completion is a state transition, not a cosmetic model response.
+        # Refuse it while the durable projection still contains an unresolved
+        # error, a requested approval, or an action that has not reached a
+        # terminal successful boundary.  This also covers provider-supplied
+        # candidates: canonical evidence alone must not hide a later failed or
+        # outcome-unknown action in the same turn.
+        if projection.working_state.unresolved_errors:
+            return False
+        if any(item.status.value == "requested" for item in projection.approvals):
+            return False
+        latest_actions: dict[str, Any] = {}
+        for action in projection.actions:
+            previous = latest_actions.get(action.action_id)
+            if previous is None or action.attempt > previous.attempt:
+                latest_actions[action.action_id] = action
+        if any(
+            action.status
+            in {
+                ActionStatus.PLANNED,
+                ActionStatus.PREPARED,
+                ActionStatus.STARTED,
+                ActionStatus.FAILED,
+                ActionStatus.OUTCOME_UNKNOWN,
+            }
+            for action in latest_actions.values()
+        ):
+            return False
         source = "model"
+        # A model candidate is only a request to complete.  On the official
+        # benchmark path, canonicalize every evidence reference against the
+        # append-only observation ledger before it can reach CompletionAccepted.
+        # This prevents fabricated digests, stale evidence, and read-only
+        # observations from being mistaken for proof.  User runs retain the
+        # existing custom-verifier seam for backwards compatibility.
+        if candidate is not None and _is_benchmark_task():
+            candidate = await self._canonicalize_benchmark_candidate(lease.run_id, candidate)
+            if candidate is None:
+                return False
+        if (
+            candidate is not None
+            and self.completion_verifier is None
+            and not await self._candidate_evidence_is_durable(lease.run_id, candidate)
+        ):
+            await self._append(
+                lease,
+                "StallDiagnosisRecorded",
+                {
+                    "diagnosis": "completion evidence is not bound to a durable tool observation",
+                },
+            )
+            return False
         if candidate is None:
             candidate = await self._synthesize_completion_candidate(lease, projection)
             if candidate is None:
                 return False
             source = "runtime"
+        task_completion = completion_contract_from_instruction(
+            _goal_public_text(projection.goal) if projection.goal is not None else "",
+            trusted_public_instruction=_is_benchmark_task(),
+        )
+        if not await self._durable_contract_satisfied(
+            lease.run_id,
+            projection,
+            task_completion,
+        ):
+            return False
         required_pending = tuple(
             item.child_run_id
             for item in projection.children
@@ -1115,8 +1317,41 @@ class RunWorker:
                     sorted(set(candidate.unaccepted_children).union(required_pending))
                 ),
             )
+        task_contract = (
+            TaskContract.from_goal(
+                projection.goal,
+                completion=completion_contract_from_instruction(
+                    _goal_public_text(projection.goal),
+                    trusted_public_instruction=_is_benchmark_task(),
+                ),
+            )
+            if projection.goal is not None
+            else None
+        )
+        gate = self.completion_gate.evaluate(
+            candidate,
+            projection.goal,
+            strict_digests=_is_benchmark_task(),
+        )
+        if not gate.accepted:
+            await self._append(
+                lease,
+                "StallDiagnosisRecorded",
+                {
+                    "diagnosis": "completion gate rejected: " + "; ".join(gate.issues),
+                    "issues": list(gate.issues),
+                },
+            )
+            return False
         submitted_payload = candidate.to_dict()
-        submitted_payload.update({"source": source, "synthesized": source == "runtime"})
+        submitted_payload.update(
+            {
+                "source": source,
+                "synthesized": source == "runtime",
+                "gate": gate.to_dict(),
+                "task_contract": task_contract.to_dict() if task_contract is not None else None,
+            }
+        )
         await self._append(lease, "CompletionCandidateSubmitted", submitted_payload)
         verifier = self.completion_verifier or self._valid_candidate
         if verifier(candidate):
@@ -1166,10 +1401,231 @@ class RunWorker:
                 }
             )
             await self._append(lease, "CompletionAccepted", accepted_payload)
+            with contextlib.suppress(Exception):
+                await self.store.checkpoint(lease.run_id)
             if self.child_completion_callback is not None and await self._is_child_run(lease.run_id):
                 await self.child_completion_callback(lease.run_id, candidate)
             return True
         return False
+
+    async def _durable_contract_satisfied(
+        self,
+        run_id: str,
+        projection: RunProjection,
+        contract,
+    ) -> bool:
+        """Apply executable completion obligations before the structural gate.
+
+        The model candidate is only a declaration of intent.  This check uses
+        the append-only observation ledger and filesystem, so a final sentence
+        cannot bypass missing artifacts, required verification, or an
+        unready service.  Official benchmark tasks may rely on Harbor as the
+        external oracle when no explicit local verification command was
+        requested; explicit task commands remain mandatory.
+        """
+
+        if artifact_validation_issues(
+            self.working_directory,
+            contract.required_artifacts,
+            allowed_external_roots=contract.allowed_external_roots,
+        ):
+            return False
+        if (
+            contract.require_verification_after_code_changes
+            and projection.working_state.modified_paths
+            and not _is_benchmark_task()
+            and (
+                projection.working_state.last_verification_sequence
+                < projection.working_state.last_mutation_sequence
+                or projection.working_state.last_verification_ok is not True
+            )
+        ):
+            return False
+        events = await self._read_all_events(run_id)
+        successful_commands: set[str] = set()
+        healthy_service = False
+        for event in events:
+            if event.event_type != "ToolObservationCommitted":
+                continue
+            if event.payload.get("status") != "succeeded" or not bool(
+                event.payload.get("complete", True)
+            ):
+                continue
+            artifact = str(event.payload.get("observation_artifact") or "")
+            if not artifact:
+                continue
+            try:
+                observation = ToolObservation.from_dict(
+                    json.loads(self.store.artifacts.read_text(artifact))
+                )
+            except (OSError, TypeError, ValueError, KeyError, json.JSONDecodeError):
+                continue
+            metadata = observation.metadata
+            arguments = metadata.get("request_arguments")
+            command = (
+                str(arguments.get("command") or "")
+                if isinstance(arguments, Mapping)
+                else ""
+            )
+            if _is_verification_command(observation.tool_name, command):
+                successful_commands.add(
+                    _text_digest(_normalise_command(command))
+                )
+            if observation.tool_name == "service_status":
+                health_status = str(metadata.get("health_status") or "")
+                healthy_service = healthy_service or health_status == "healthy"
+            readiness = metadata.get("readiness")
+            if isinstance(readiness, Mapping) and readiness.get("status") == "ready":
+                healthy_service = True
+
+        for command in contract.verification_commands:
+            if _text_digest(_normalise_command(command)) not in successful_commands:
+                return False
+        if contract.require_service_health_check and not healthy_service:
+            return False
+        return True
+
+    async def _candidate_evidence_is_durable(
+        self,
+        run_id: str,
+        candidate: CompletionCandidate,
+    ) -> bool:
+        """Reject fabricated full digests while preserving legacy short refs.
+
+        Evidence references are intentionally opaque to the model.  A custom
+        completion verifier remains an explicit extension point, but the
+        default worker binds production-shaped SHA-256 references to a
+        successful, complete observation (or one of its content blocks).  A
+        short digest is treated as a legacy test fixture and is left to the
+        structural gate for backwards compatibility.
+        """
+
+        strong_digests = {
+            str(item.digest)
+            for item in candidate.evidence
+            if str(item.digest).startswith("sha256:")
+            and len(str(item.digest).removeprefix("sha256:")) == 64
+        }
+        if not strong_digests:
+            return True
+        durable: set[str] = set()
+        for event in await self._read_all_events(run_id):
+            if (
+                event.event_type != "ToolObservationCommitted"
+                or event.payload.get("status") != "succeeded"
+                or not bool(event.payload.get("complete", True))
+            ):
+                continue
+            observation_artifact = str(event.payload.get("observation_artifact") or "")
+            if not observation_artifact:
+                continue
+            durable.add(observation_artifact)
+            try:
+                observation = ToolObservation.from_dict(
+                    json.loads(self.store.artifacts.read_text(observation_artifact))
+                )
+            except (OSError, TypeError, ValueError, KeyError, json.JSONDecodeError):
+                continue
+            durable.update(
+                str(block.artifact_ref)
+                for block in observation.content
+                if block.artifact_ref and self.store.artifacts.exists(block.artifact_ref)
+            )
+        return strong_digests.issubset(durable)
+
+    async def _read_all_events(self, run_id: str) -> tuple[RunEvent, ...]:
+        events: list[RunEvent] = []
+        after = 0
+        while True:
+            page = await self.store.read(run_id, after=after, limit=1000)
+            events.extend(page.events)
+            if page.next_cursor is None:
+                return tuple(events)
+            after = page.next_cursor
+
+    async def _canonicalize_benchmark_candidate(
+        self,
+        run_id: str,
+        candidate: CompletionCandidate,
+    ) -> CompletionCandidate | None:
+        """Bind model evidence to successful, complete observations in this Run.
+
+        The provider can only refer to digests exposed in committed tool
+        results.  We rebuild the corresponding ``EvidenceRef`` from the event
+        ledger so source/kind/confidence/timestamps cannot be forged in model
+        output.  A benchmark candidate also needs at least one decisive
+        observation; a plain Read/Glob/Grep result is not proof.
+        """
+
+        events = await self._read_all_events(run_id)
+        evidence_by_digest: dict[str, EvidenceRef] = {}
+        decisive_digests: set[str] = set()
+        for event in events:
+            if event.event_type != "ToolObservationCommitted":
+                continue
+            if event.payload.get("status") != "succeeded" or not bool(
+                event.payload.get("complete", True)
+            ):
+                continue
+            artifact = str(event.payload.get("observation_artifact") or "")
+            if not artifact:
+                continue
+            try:
+                observation = ToolObservation.from_dict(
+                    json.loads(self.store.artifacts.read_text(artifact))
+                )
+            except (OSError, TypeError, ValueError, KeyError, json.JSONDecodeError):
+                continue
+            arguments = observation.metadata.get("request_arguments")
+            command = (
+                str(arguments.get("command") or "")
+                if isinstance(arguments, Mapping)
+                else ""
+            )
+            source = command or observation.tool_name
+            verified = _is_verification_command(observation.tool_name, command)
+            decisive = _observation_is_decisive(observation, command=command)
+            reference = EvidenceRef(
+                evidence_id=(
+                    f"verification-{observation.observation_id}"
+                    if verified
+                    else f"action-{observation.observation_id}"
+                ),
+                kind=EvidenceKind.TEST if verified else EvidenceKind.ACTION_RESULT,
+                digest=artifact,
+                source=source,
+                recorded_at=time.time(),
+                confidence=1.0,
+                metadata={
+                    "action_id": observation.action_id,
+                    "tool_name": observation.tool_name,
+                    "status": observation.status,
+                    "complete": observation.complete,
+                    "canonicalized": True,
+                },
+            )
+            evidence_by_digest.setdefault(artifact, reference)
+            if decisive:
+                decisive_digests.add(artifact)
+            # The model normally sees the observation digest.  Keep the tool
+            # result artifact as an accepted alias for providers that expose
+            # that lower-level pointer instead.
+            for block in observation.content:
+                if block.artifact_ref and self.store.artifacts.exists(block.artifact_ref):
+                    alias = replace(reference, digest=block.artifact_ref)
+                    evidence_by_digest.setdefault(block.artifact_ref, alias)
+                    if decisive:
+                        decisive_digests.add(block.artifact_ref)
+
+        canonical: list[EvidenceRef] = []
+        for evidence in candidate.evidence:
+            reference = evidence_by_digest.get(evidence.digest)
+            if reference is None:
+                return None
+            canonical.append(reference)
+        if not canonical or not any(item.digest in decisive_digests for item in canonical):
+            return None
+        return replace(candidate, evidence=tuple(canonical))
 
     async def _synthesize_completion_candidate(
         self,
@@ -1180,8 +1636,10 @@ class RunWorker:
 
         A model's final sentence is never treated as completion evidence.  The
         gate requires complete successful observations, no unresolved latest
-        action, and a post-mutation verification for code changes. Service
-        goals additionally require a successful health/readiness-shaped probe.
+        action, and at least one decisive observation. Ordinary user runs
+        require a verification command; trusted official benchmark runs may
+        use a successful durable mutation because Harbor remains the external
+        oracle. Service goals additionally require a health/readiness probe.
         """
 
         goal = projection.goal
@@ -1212,14 +1670,7 @@ class RunWorker:
         ):
             return None
 
-        events: list[RunEvent] = []
-        after = 0
-        while True:
-            page = await self.store.read(lease.run_id, after=after, limit=1000)
-            events.extend(page.events)
-            if page.next_cursor is None:
-                break
-            after = page.next_cursor
+        events = await self._read_all_events(lease.run_id)
 
         evidence: list[EvidenceRef] = []
         verification_evidence: list[EvidenceRef] = []
@@ -1248,14 +1699,7 @@ class RunWorker:
             )
             source = command or observation.tool_name
             marker_text = f"{observation.tool_name} {command}".casefold()
-            is_verification = any(
-                marker in marker_text
-                for marker in (
-                    "pytest", "unittest", "test", "verify", "check", "lint", "typecheck",
-                    "mypy", "ruff", "eslint", "build", "compile", "cargo test", "go test",
-                    "npm test",
-                )
-            )
+            is_verification = _is_verification_command(observation.tool_name, command)
             if any(
                 marker in marker_text
                 for marker in ("curl", "health", "readiness", "grpcurl", "nc ", "ss ")
@@ -1268,7 +1712,12 @@ class RunWorker:
                 source=source,
                 recorded_at=time.time(),
                 confidence=1.0,
-                metadata={"action_id": observation.action_id, "status": observation.status},
+                metadata={
+                    "action_id": observation.action_id,
+                    "status": observation.status,
+                    "effect_class": observation.effect_class,
+                    "modified_paths": list(observation.modified_paths),
+                },
             )
             evidence.append(ref)
             if is_verification:
@@ -1276,12 +1725,42 @@ class RunWorker:
         if not evidence:
             return None
 
+        # Explicit output paths in the task statement are part of the goal
+        # contract.  Validate them against the current workspace before
+        # accepting any candidate; merely mentioning or reading the path is
+        # not enough.  ``/app`` is Harbor's task root, so map that prefix to
+        # the durable worker root while rejecting paths outside its scope.
+        output_contract = completion_contract_from_instruction(
+            _goal_public_text(goal),
+            trusted_public_instruction=_is_benchmark_task(),
+        )
+        if artifact_validation_issues(
+            self.working_directory,
+            output_contract.required_artifacts,
+            allowed_external_roots=output_contract.allowed_external_roots,
+        ):
+            return None
+
         changed_paths = tuple(sorted(set(projection.working_state.modified_paths)))
-        # Runtime synthesis is deliberately stricter than a model-submitted
-        # candidate: at least one explicit verification-shaped action must
-        # have succeeded.  A read-only observation alone is not proof that the
-        # user's acceptance criteria were met.
-        if not verification_evidence:
+        # A read-only observation (or a model's final sentence) is never proof.
+        # For official benchmark tasks Harbor is the final correctness oracle,
+        # so a successful durable mutation is enough to close the runtime
+        # boundary; interactive/user runs retain the stricter verification
+        # requirement.
+        decisive_evidence = [
+            ref
+            for ref in evidence
+            if ref.kind == EvidenceKind.TEST
+            or str(ref.metadata.get("effect_class") or "")
+            in {
+                EffectClass.WORKSPACE_MUTATION.value,
+                EffectClass.EXTERNAL_SIDE_EFFECT.value,
+            }
+            or bool(ref.metadata.get("modified_paths"))
+        ]
+        if not decisive_evidence:
+            return None
+        if not _is_benchmark_task() and not verification_evidence:
             return None
         goal_text = f"{goal.objective} {' '.join(goal.acceptance_criteria)}".casefold()
         service_goal = any(
@@ -1297,6 +1776,26 @@ class RunWorker:
             evidence=tuple(evidence[-50:]),
             modified_paths=changed_paths,
         )
+
+    def _workspace_path(self, raw_path: str) -> Path | None:
+        """Resolve an explicit output path under the worker's project root."""
+
+        candidate = Path(raw_path)
+        root = self.working_directory.resolve()
+        if candidate.is_absolute():
+            try:
+                relative = candidate.relative_to(Path("/app"))
+            except ValueError:
+                return None
+            candidate = root / relative
+        else:
+            candidate = root / candidate
+        try:
+            resolved = candidate.resolve(strict=False)
+            resolved.relative_to(root)
+        except (OSError, ValueError):
+            return None
+        return resolved
 
     async def _acknowledge_cancellation(self, lease: Lease, reason: str) -> bool:
         """Finalize a cooperative cancellation at a safe worker boundary.
@@ -1414,22 +1913,33 @@ class RunWorker:
         """
 
         async with self._event_lock:
-            projection = await self.store.load_projection(run_id)
-            event = RunEvent.create(
-                run_id=run_id,
-                sequence=projection.sequence + 1,
-                event_type=event_type,
-                actor=EventActor("runtime", "durable-runtime"),
-                runtime_contract_digest=str(projection.runtime_contract_digest),
-                lease_epoch=0,
-                payload=dict(payload),
-                artifact_refs=artifact_refs,
-            )
-            return await self.store.append(
-                event,
-                expected_sequence=projection.sequence,
-                expected_lease_epoch=None,
-            )
+            # Projection reads and SQLite appends are separate operations.  A
+            # stale worker or another runtime-owned telemetry writer can win
+            # that small window, so rebuild the event against the latest
+            # sequence instead of surfacing a false infrastructure failure.
+            for conflict_attempt in range(3):
+                projection = await self.store.load_projection(run_id)
+                event = RunEvent.create(
+                    run_id=run_id,
+                    sequence=projection.sequence + 1,
+                    event_type=event_type,
+                    actor=EventActor("runtime", "durable-runtime"),
+                    runtime_contract_digest=str(projection.runtime_contract_digest),
+                    lease_epoch=0,
+                    payload=dict(payload),
+                    artifact_refs=artifact_refs,
+                )
+                try:
+                    return await self.store.append(
+                        event,
+                        expected_sequence=projection.sequence,
+                        expected_lease_epoch=None,
+                    )
+                except SequenceConflict:
+                    if conflict_attempt == 2:
+                        raise
+                    await asyncio.sleep(0)
+            raise AssertionError("unreachable")
 
     async def _execute_action(
         self,
@@ -1634,13 +2144,7 @@ class RunWorker:
             return None
         command = str(request.arguments.get("command") or "")
         source = command or request.tool_name
-        marker_text = f"{request.tool_name} {command}".casefold()
-        markers = (
-            "pytest", "unittest", "test", "verify", "check", "lint", "typecheck",
-            "mypy", "ruff", "eslint", "build", "compile", "curl", "health",
-            "readiness", "grpcurl", "cargo test", "go test", "npm test", "npm run",
-        )
-        if not any(marker in marker_text for marker in markers):
+        if not _is_verification_command(request.tool_name, command):
             return None
         return EvidenceRef(
             evidence_id=f"verification-{observation.observation_id}",
@@ -1736,6 +2240,11 @@ class RunWorker:
             await self._acknowledge_cancellation(lease, "cancel requested")
             return
         await self._append(lease, "RunSegmentFinished", {"segment": segment})
+        # Persist a replayable projection before yielding or entering a
+        # terminal boundary.  Snapshot failures are observability failures and
+        # must not mask the authoritative event stream.
+        with contextlib.suppress(Exception):
+            await self.store.checkpoint(lease.run_id)
         if not had_action and not had_progress:
             await self._append(
                 lease,
@@ -1743,9 +2252,13 @@ class RunWorker:
                 {"diagnosis": "model returned no action, progress, or verifiable completion candidate"},
             )
             await self._append(lease, "RunStalled", {"reason": "no verifiable progress"})
+            with contextlib.suppress(Exception):
+                await self.store.checkpoint(lease.run_id)
             return
         if self.continue_segments:
             await self._append(lease, "RunYielded", {"segment": segment})
+            with contextlib.suppress(Exception):
+                await self.store.checkpoint(lease.run_id)
 
     @staticmethod
     def _valid_candidate(candidate: CompletionCandidate) -> bool:
@@ -1794,22 +2307,45 @@ class RunWorker:
         artifact_refs: tuple[str, ...] = (),
     ) -> RunEvent:
         async with self._event_lock:
-            projection = await self.store.load_projection(lease.run_id)
-            event = RunEvent.create(
-                run_id=lease.run_id,
-                sequence=projection.sequence + 1,
-                event_type=event_type,
-                actor=EventActor("worker", self.worker_id),
-                runtime_contract_digest=str(projection.runtime_contract_digest),
-                lease_epoch=lease.epoch,
-                payload=dict(payload),
-                artifact_refs=artifact_refs,
-            )
-            stored = await self.store.append(
-                event,
-                expected_sequence=projection.sequence,
-                expected_lease_epoch=lease.epoch,
-            )
+            # A reclaimed worker can finish an in-flight provider call after a
+            # replacement has appended an event.  SequenceConflict is checked
+            # before lease fencing in RunStore, so verify the lease and either
+            # retry against the fresh projection (same epoch) or stop the stale
+            # worker cleanly (new epoch).
+            for conflict_attempt in range(3):
+                projection = await self.store.load_projection(lease.run_id)
+                event = RunEvent.create(
+                    run_id=lease.run_id,
+                    sequence=projection.sequence + 1,
+                    event_type=event_type,
+                    actor=EventActor("worker", self.worker_id),
+                    runtime_contract_digest=str(projection.runtime_contract_digest),
+                    lease_epoch=lease.epoch,
+                    payload=dict(payload),
+                    artifact_refs=artifact_refs,
+                )
+                try:
+                    stored = await self.store.append(
+                        event,
+                        expected_sequence=projection.sequence,
+                        expected_lease_epoch=lease.epoch,
+                    )
+                    break
+                except SequenceConflict:
+                    current = await self.store.current_lease(lease.run_id)
+                    if (
+                        current is None
+                        or current.epoch != lease.epoch
+                        or current.worker_id != lease.worker_id
+                    ):
+                        raise LeaseFenceError(
+                            "worker lease was fenced while appending an event"
+                        )
+                    if conflict_attempt == 2:
+                        raise
+                    await asyncio.sleep(0)
+            else:
+                raise AssertionError("unreachable")
         derived = outcome_for_event(event_type, payload)
         if derived is not None:
             outcome_payload = derived.to_dict()

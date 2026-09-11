@@ -671,6 +671,8 @@ class CompletionCandidate:
         )
 
     def validate(self, goal: GoalContract) -> None:
+        if not self.acceptance_criteria:
+            raise CompletionEvidenceError("completion requires acceptance criteria")
         expected = set(goal.acceptance_criteria)
         supplied = set(self.acceptance_criteria)
         missing_criteria = expected - supplied
@@ -680,6 +682,12 @@ class CompletionCandidate:
             )
         if not self.evidence:
             raise CompletionEvidenceError("completion requires verification evidence")
+        if len(supplied) != len(self.acceptance_criteria):
+            raise CompletionEvidenceError("completion acceptance criteria contain duplicates")
+        if any(not isinstance(item, EvidenceRef) or not item.digest or item.confidence <= 0 for item in self.evidence):
+            raise CompletionEvidenceError(
+                "completion evidence must use non-empty references with positive confidence"
+            )
         if self.unresolved_errors:
             raise CompletionEvidenceError(f"unresolved errors: {sorted(self.unresolved_errors)}")
         if self.outcome_unknown_actions:
@@ -696,6 +704,45 @@ class CompletionCandidate:
             raise CompletionEvidenceError(
                 f"excluded scope changed: {sorted(self.excluded_scope_violations)}"
             )
+
+
+@dataclass(frozen=True)
+class CompletionGateResult:
+    """Explainable result of the runtime-owned completion gate."""
+
+    accepted: bool
+    issues: tuple[str, ...] = ()
+
+    def to_dict(self) -> dict[str, Any]:
+        return {"accepted": self.accepted, "issues": list(self.issues)}
+
+
+class CompletionGate:
+    """Single structural gate shared by workers and replay/inspection tools."""
+
+    def evaluate(
+        self,
+        candidate: CompletionCandidate | None,
+        goal: GoalContract | None,
+        *,
+        strict_digests: bool = False,
+    ) -> CompletionGateResult:
+        if candidate is None:
+            return CompletionGateResult(False, ("completion candidate is missing",))
+        if goal is None:
+            return CompletionGateResult(False, ("active goal contract is missing",))
+        try:
+            candidate.validate(goal)
+        except CompletionEvidenceError as exc:
+            return CompletionGateResult(False, (str(exc),))
+        if strict_digests and any(
+            not item.digest.startswith("sha256:")
+            or len(item.digest.removeprefix("sha256:")) != 64
+            or any(character not in "0123456789abcdef" for character in item.digest[7:])
+            for item in candidate.evidence
+        ):
+            return CompletionGateResult(False, ("completion evidence digests are not valid sha256 references",))
+        return CompletionGateResult(True)
 
 
 @dataclass(frozen=True)
@@ -991,6 +1038,8 @@ __all__ = [
     "CandidateChangeSet",
     "ChildRunStatus",
     "CompletionCandidate",
+    "CompletionGate",
+    "CompletionGateResult",
     "CompletionEvidenceError",
     "DomainValidationError",
     "EffectClass",

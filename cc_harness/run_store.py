@@ -5,6 +5,8 @@ from __future__ import annotations
 import asyncio
 import json
 import time
+from contextlib import asynccontextmanager, suppress
+from collections.abc import AsyncIterator
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -86,17 +88,28 @@ class RunStore:
         self.artifacts = artifact_store or ArtifactStore(self.state_dir / "objects")
         self._db: aiosqlite.Connection | None = None
         self._write_lock = asyncio.Lock()
+        self._open_lock = asyncio.Lock()
 
     async def open(self) -> "RunStore":
-        if self._db is not None:
-            return self
-        self.state_dir.mkdir(parents=True, exist_ok=True)
-        self._db = await aiosqlite.connect(self.db_path, timeout=30)
-        await self._db.executescript(
+        async with self._open_lock:
+            if self._db is not None:
+                return self
+            self.state_dir.mkdir(parents=True, exist_ok=True)
+            # Keep the connection in SQLite autocommit mode.  Every public
+            # operation below owns an explicit transaction, which prevents an
+            # implicit transaction from surviving task cancellation and later
+            # making a cleanup/read path fail with "transaction within a
+            # transaction".
+            self._db = await aiosqlite.connect(
+                self.db_path, timeout=30, isolation_level=None
+            )
+            await self._db.executescript(
             """
             PRAGMA journal_mode=WAL;
+            PRAGMA synchronous=NORMAL;
             PRAGMA foreign_keys=ON;
             PRAGMA busy_timeout=30000;
+            PRAGMA wal_autocheckpoint=1000;
 
             CREATE TABLE IF NOT EXISTS project_record (
                 project_id TEXT PRIMARY KEY,
@@ -199,74 +212,147 @@ class RunStore:
                 SELECT RAISE(ABORT, 'run snapshots are immutable');
             END;
             """
-        )
-        # The rebuild is allowed to open a store created by an earlier
-        # rehearsal. Keep schema evolution additive and transactional so a
-        # restart never loses the lease fencing cursor or action references.
-        for table, column, definition in (
-            ("run_record", "lease_epoch", "INTEGER NOT NULL DEFAULT 0"),
-            ("action_attempt", "arguments_artifact", "TEXT"),
-        ):
-            cursor = await self._db.execute(f"PRAGMA table_info({table})")
-            columns = {str(row[1]) for row in await cursor.fetchall()}
-            if column not in columns:
-                await self._db.execute(
-                    f"ALTER TABLE {table} ADD COLUMN {column} {definition}"
-                )
-        now = time.time()
-        await self._db.execute(
-            "INSERT OR IGNORE INTO project_record(project_id, canonical_root, created_at) VALUES (?, ?, ?)",
-            (self.project_id, self.canonical_root, now),
-        )
-        cursor = await self._db.execute(
-            "SELECT canonical_root FROM project_record WHERE project_id = ?", (self.project_id,)
-        )
-        row = await cursor.fetchone()
-        if row is None or row[0] != self.canonical_root:
-            raise RunStoreError("project identity collision or mismatched project root")
-        await self._db.commit()
-        return self
+            )
+            # The rebuild is allowed to open a store created by an earlier
+            # rehearsal. Keep schema evolution additive and transactional so a
+            # restart never loses the lease fencing cursor or action references.
+            for table, column, definition in (
+                ("run_record", "lease_epoch", "INTEGER NOT NULL DEFAULT 0"),
+                ("action_attempt", "arguments_artifact", "TEXT"),
+            ):
+                cursor = await self._db.execute(f"PRAGMA table_info({table})")
+                columns = {str(row[1]) for row in await cursor.fetchall()}
+                if column not in columns:
+                    await self._db.execute(
+                        f"ALTER TABLE {table} ADD COLUMN {column} {definition}"
+                    )
+            now = time.time()
+            await self._db.execute(
+                "INSERT OR IGNORE INTO project_record(project_id, canonical_root, created_at) VALUES (?, ?, ?)",
+                (self.project_id, self.canonical_root, now),
+            )
+            cursor = await self._db.execute(
+                "SELECT canonical_root FROM project_record WHERE project_id = ?", (self.project_id,)
+            )
+            row = await cursor.fetchone()
+            if row is None or row[0] != self.canonical_root:
+                raise RunStoreError("project identity collision or mismatched project root")
+            await self._db.commit()
+            return self
 
     async def close(self) -> None:
-        if self._db is not None:
-            await self._db.close()
-            self._db = None
+        async with self._open_lock:
+            async with self._write_lock:
+                if self._db is not None:
+                    await self._rollback_open_transaction(self._db)
+                    await self._db.close()
+                    self._db = None
+
+    @staticmethod
+    async def _rollback_open_transaction(db: aiosqlite.Connection) -> None:
+        """Best-effort rollback used at cancellation/close boundaries.
+
+        A worker can be cancelled at any await point, including immediately
+        after SQLite has accepted ``BEGIN IMMEDIATE``.  The previous code put
+        ``begin_immediate`` before its ``try`` block, so that cancellation left
+        the connection inside a transaction and the next ``BEGIN`` raised a
+        nested-transaction error.  Rollback is idempotent in autocommit mode;
+        shielding it lets the aiosqlite worker finish even when the caller is
+        being cancelled.
+        """
+
+        # Do not inspect ``db.in_transaction`` before queueing the rollback.
+        # That property is read directly from sqlite's connection while
+        # aiosqlite executes statements on its worker thread, so it can be
+        # stale when a cancelled ``BEGIN`` is still queued.  In that race the
+        # old check returned early, the queued BEGIN then opened a transaction,
+        # and the next reader raised ``cannot start a transaction within a
+        # transaction``.  Queueing an unconditional rollback establishes the
+        # ordering on the aiosqlite worker and is harmless when no transaction
+        # is active.
+        rollback_task = asyncio.create_task(db.rollback())
+        try:
+            await asyncio.shield(rollback_task)
+        except aiosqlite.OperationalError as exc:
+            if "no transaction is active" not in str(exc).lower():
+                raise
+        except BaseException:
+            # Preserve the original cancellation/error.  The shielded task is
+            # still allowed to drain on the aiosqlite worker thread.
+            with suppress(BaseException):
+                await asyncio.shield(rollback_task)
+
+    @asynccontextmanager
+    async def _transaction(
+        self, db: aiosqlite.Connection, *, write: bool
+    ) -> AsyncIterator[aiosqlite.Connection]:
+        """Own one explicit transaction and always clean it up.
+
+        ``RunStore`` serializes operations with ``_write_lock``; therefore an
+        already-open transaction can only be a leftover from a cancelled
+        operation.  Roll it back before starting, and roll back again on every
+        exceptional exit (including ``asyncio.CancelledError``).
+        """
+
+        await self._rollback_open_transaction(db)
+        try:
+            if write:
+                await begin_immediate(db)
+            else:
+                await db.execute("BEGIN")
+            try:
+                yield db
+            except BaseException:
+                await self._rollback_open_transaction(db)
+                raise
+            else:
+                try:
+                    await db.commit()
+                except BaseException:
+                    await self._rollback_open_transaction(db)
+                    raise
+        except BaseException:
+            # Covers cancellation/failure while BEGIN itself is being queued.
+            await self._rollback_open_transaction(db)
+            raise
 
     async def create_run(self, run: Run) -> bool:
         db = self._require_db()
         async with self._write_lock:
-            await begin_immediate(db)
             try:
-                cursor = await db.execute(
-                    """INSERT INTO run_record
-                       (run_id, project_id, parent_run_id, predecessor_run_id, status,
-                        runtime_contract_digest, last_sequence, projection_digest,
-                        created_at, updated_at)
-                       VALUES (?, ?, ?, ?, ?, ?, 0, ?, ?, ?)""",
-                    (
-                        run.run_id,
-                        self.project_id,
-                        run.parent_run_id,
-                        run.predecessor_run_id,
-                        run.status.value,
-                        run.runtime_contract.digest,
-                        RunProjection.empty(run.run_id).digest,
-                        run.created_at,
-                        run.created_at,
-                    ),
-                )
-                await db.commit()
+                async with self._transaction(db, write=True):
+                    cursor = await db.execute(
+                        """INSERT INTO run_record
+                           (run_id, project_id, parent_run_id, predecessor_run_id, status,
+                            runtime_contract_digest, last_sequence, projection_digest,
+                            created_at, updated_at)
+                           VALUES (?, ?, ?, ?, ?, ?, 0, ?, ?, ?)""",
+                        (
+                            run.run_id,
+                            self.project_id,
+                            run.parent_run_id,
+                            run.predecessor_run_id,
+                            run.status.value,
+                            run.runtime_contract.digest,
+                            RunProjection.empty(run.run_id).digest,
+                            run.created_at,
+                            run.created_at,
+                        ),
+                    )
             except aiosqlite.IntegrityError as exc:
-                await db.rollback()
                 raise RunStoreError(f"run already exists or project is invalid: {run.run_id}") from exc
         return cursor.rowcount == 1
 
     async def run_exists(self, run_id: str) -> bool:
         """Return whether a run record exists without rebuilding its projection."""
-        cursor = await self._require_db().execute(
-            "SELECT 1 FROM run_record WHERE run_id = ? LIMIT 1", (run_id,)
-        )
-        return await cursor.fetchone() is not None
+        db = self._require_db()
+        async with self._write_lock:
+            async with self._transaction(db, write=False):
+                cursor = await db.execute(
+                    "SELECT 1 FROM run_record WHERE run_id = ? LIMIT 1", (run_id,)
+                )
+                exists = await cursor.fetchone() is not None
+                return exists
 
     async def append(
         self,
@@ -286,112 +372,109 @@ class RunStore:
             event = event_or_command
         db = self._require_db()
         async with self._write_lock:
-            await begin_immediate(db)
             try:
-                run_row = await self._run_row_tx(event.run_id)
-                current_sequence = int(run_row["last_sequence"])
-                if expected_sequence is not None and expected_sequence != current_sequence:
-                    raise SequenceConflict(
-                        f"expected sequence {expected_sequence}, current is {current_sequence}"
+                async with self._transaction(db, write=True):
+                    run_row = await self._run_row_tx(event.run_id)
+                    current_sequence = int(run_row["last_sequence"])
+                    if expected_sequence is not None and expected_sequence != current_sequence:
+                        raise SequenceConflict(
+                            f"expected sequence {expected_sequence}, current is {current_sequence}"
+                        )
+                    if event.sequence != current_sequence + 1:
+                        raise SequenceConflict(
+                            f"event sequence {event.sequence}, expected {current_sequence + 1}"
+                        )
+                    if current_sequence == 0 and event.event_type != "RunCreated":
+                        raise RunStoreError("a run stream must begin with RunCreated")
+                    if current_sequence > 0 and event.event_type == "RunCreated":
+                        raise RunStoreError("RunCreated can only be the first event")
+                    await self._validate_lease_tx(event, run_row, expected_lease_epoch)
+                    current_projection = await self._projection_tx(event.run_id, current_sequence)
+                    if event.event_type != "RunRuntimeMigrated":
+                        if event.runtime_contract_digest != str(run_row["runtime_contract_digest"]):
+                            raise LeaseFenceError("event runtime contract digest is stale")
+                    elif str(event.payload["previous_runtime_contract_digest"]) != str(
+                        run_row["runtime_contract_digest"]
+                    ):
+                        raise LeaseFenceError("runtime migration does not start from the pinned contract")
+                    new_projection = ProjectionBuilder().rebuild([event], snapshot=current_projection)
+                    if snapshot is not None:
+                        if snapshot.run_id != new_projection.run_id:
+                            raise RunStoreError("snapshot run_id does not match event stream")
+                        if snapshot.sequence != new_projection.sequence:
+                            raise RunStoreError("snapshot must cover the appended event")
+                        if snapshot.digest != new_projection.digest:
+                            raise RunStoreError("snapshot digest does not match projection")
+                    await db.execute(
+                        """INSERT INTO run_event
+                           (run_id, sequence, event_id, event_type, schema_version, occurred_at,
+                            actor_kind, actor_id, causation_id, correlation_id, lease_epoch,
+                            runtime_contract_digest, payload_json, artifact_refs_json)
+                           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                        (
+                            event.run_id,
+                            event.sequence,
+                            event.event_id,
+                            event.event_type,
+                            event.schema_version,
+                            event.occurred_at,
+                            event.actor.kind,
+                            event.actor.actor_id,
+                            event.causation_id,
+                            event.correlation_id,
+                            event.lease_epoch,
+                            event.runtime_contract_digest,
+                            json.dumps(event.payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")),
+                            json.dumps(list(event.artifact_refs), ensure_ascii=False, separators=(",", ":")),
+                        ),
                     )
-                if event.sequence != current_sequence + 1:
-                    raise SequenceConflict(
-                        f"event sequence {event.sequence}, expected {current_sequence + 1}"
+                    runtime_digest = (
+                        str(event.payload["new_runtime_contract_digest"])
+                        if event.event_type == "RunRuntimeMigrated"
+                        else str(run_row["runtime_contract_digest"])
                     )
-                if current_sequence == 0 and event.event_type != "RunCreated":
-                    raise RunStoreError("a run stream must begin with RunCreated")
-                if current_sequence > 0 and event.event_type == "RunCreated":
-                    raise RunStoreError("RunCreated can only be the first event")
-                await self._validate_lease_tx(event, run_row, expected_lease_epoch)
-                current_projection = await self._projection_tx(event.run_id, current_sequence)
-                if event.event_type != "RunRuntimeMigrated":
-                    if event.runtime_contract_digest != str(run_row["runtime_contract_digest"]):
-                        raise LeaseFenceError("event runtime contract digest is stale")
-                elif str(event.payload["previous_runtime_contract_digest"]) != str(
-                    run_row["runtime_contract_digest"]
-                ):
-                    raise LeaseFenceError("runtime migration does not start from the pinned contract")
-                new_projection = ProjectionBuilder().rebuild([event], snapshot=current_projection)
-                if snapshot is not None:
-                    if snapshot.run_id != new_projection.run_id:
-                        raise RunStoreError("snapshot run_id does not match event stream")
-                    if snapshot.sequence != new_projection.sequence:
-                        raise RunStoreError("snapshot must cover the appended event")
-                    if snapshot.digest != new_projection.digest:
-                        raise RunStoreError("snapshot digest does not match projection")
-                await db.execute(
-                    """INSERT INTO run_event
-                       (run_id, sequence, event_id, event_type, schema_version, occurred_at,
-                        actor_kind, actor_id, causation_id, correlation_id, lease_epoch,
-                        runtime_contract_digest, payload_json, artifact_refs_json)
-                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-                    (
-                        event.run_id,
-                        event.sequence,
-                        event.event_id,
-                        event.event_type,
-                        event.schema_version,
-                        event.occurred_at,
-                        event.actor.kind,
-                        event.actor.actor_id,
-                        event.causation_id,
-                        event.correlation_id,
-                        event.lease_epoch,
-                        event.runtime_contract_digest,
-                        json.dumps(event.payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")),
-                        json.dumps(list(event.artifact_refs), ensure_ascii=False, separators=(",", ":")),
-                    ),
-                )
-                runtime_digest = (
-                    str(event.payload["new_runtime_contract_digest"])
-                    if event.event_type == "RunRuntimeMigrated"
-                    else str(run_row["runtime_contract_digest"])
-                )
-                await db.execute(
-                    """UPDATE run_record
-                       SET status = ?, runtime_contract_digest = ?, last_sequence = ?,
-                           projection_digest = ?, updated_at = ?
-                       WHERE run_id = ?""",
-                    (
-                        new_projection.status.value,
-                        runtime_digest,
-                        new_projection.sequence,
-                        new_projection.digest,
-                        time.time(),
-                        event.run_id,
-                    ),
-                )
-                await self._persist_projection_tx(new_projection)
-                await self._persist_lease_tx(event, run_row)
-                if snapshot is not None:
-                    await self._insert_snapshot_tx(snapshot)
-                await db.commit()
+                    await db.execute(
+                        """UPDATE run_record
+                           SET status = ?, runtime_contract_digest = ?, last_sequence = ?,
+                               projection_digest = ?, updated_at = ?
+                           WHERE run_id = ?""",
+                        (
+                            new_projection.status.value,
+                            runtime_digest,
+                            new_projection.sequence,
+                            new_projection.digest,
+                            time.time(),
+                            event.run_id,
+                        ),
+                    )
+                    await self._persist_projection_tx(new_projection)
+                    await self._persist_lease_tx(event, run_row)
+                    if snapshot is not None:
+                        await self._insert_snapshot_tx(snapshot)
             except aiosqlite.IntegrityError as exc:
-                await db.rollback()
                 if "event_id" in str(exc).lower():
                     raise DuplicateEventError(f"event id already exists: {event.event_id}") from exc
                 raise RunStoreError(str(exc)) from exc
-            except BaseException:
-                await db.rollback()
-                raise
         return event
 
     async def read(self, run_id: str, *, after: int = 0, limit: int = 200) -> EventPage:
         if after < 0 or limit < 1:
             raise RunStoreError("after must be non-negative and limit must be positive")
         db = self._require_db()
-        await self._ensure_run(run_id)
-        cursor = await db.execute(
-            """SELECT run_id, sequence, event_id, event_type, schema_version, occurred_at,
-                      actor_kind, actor_id, causation_id, correlation_id, lease_epoch,
-                      runtime_contract_digest, payload_json, artifact_refs_json
-               FROM run_event WHERE run_id = ? AND sequence > ? ORDER BY sequence LIMIT ?""",
-            (run_id, after, limit + 1),
-        )
-        rows = await cursor.fetchall()
-        has_more = len(rows) > limit
-        events = tuple(self._event_from_row(row) for row in rows[:limit])
-        return EventPage(events, events[-1].sequence if has_more and events else None)
+        async with self._write_lock:
+            async with self._transaction(db, write=False):
+                await self._ensure_run(run_id)
+                cursor = await db.execute(
+                    """SELECT run_id, sequence, event_id, event_type, schema_version, occurred_at,
+                              actor_kind, actor_id, causation_id, correlation_id, lease_epoch,
+                              runtime_contract_digest, payload_json, artifact_refs_json
+                       FROM run_event WHERE run_id = ? AND sequence > ? ORDER BY sequence LIMIT ?""",
+                    (run_id, after, limit + 1),
+                )
+                rows = await cursor.fetchall()
+                has_more = len(rows) > limit
+                events = tuple(self._event_from_row(row) for row in rows[:limit])
+                return EventPage(events, events[-1].sequence if has_more and events else None)
 
     async def load_projection(self, run_id: str) -> RunProjection:
         db = self._require_db()
@@ -402,8 +485,7 @@ class RunStore:
             # local lock was released.  A supervisor in another process could
             # commit an event between those reads, making a healthy stream look
             # corrupt (and aborting an otherwise recoverable run).
-            await db.execute("BEGIN")
-            try:
+            async with self._transaction(db, write=False):
                 row = await self._run_row_tx(run_id)
                 projection = await self._projection_tx(run_id, int(row["last_sequence"]))
                 if (
@@ -411,32 +493,44 @@ class RunStore:
                     or row["projection_digest"] != projection.digest
                 ):
                     raise RunStoreError("stored projection cursor does not match event rebuild")
-                await db.commit()
-            except BaseException:
-                await db.rollback()
-                raise
             return projection
 
     async def save_snapshot(self, snapshot: RunProjection) -> None:
         db = self._require_db()
         async with self._write_lock:
-            await begin_immediate(db)
-            try:
+            async with self._transaction(db, write=True):
                 run_row = await self._run_row_tx(snapshot.run_id)
                 if snapshot.sequence > int(run_row["last_sequence"]):
                     raise RunStoreError("snapshot sequence is ahead of the event stream")
                 await self._insert_snapshot_tx(snapshot)
-                await db.commit()
-            except BaseException:
-                await db.rollback()
-                raise
+
+    async def checkpoint(self, run_id: str) -> RunProjection:
+        """Materialize an atomic projection checkpoint for crash recovery.
+
+        The checkpoint is taken under the same writer transaction as the
+        denormalized cursor read.  This avoids the old race where a supervisor
+        could observe a snapshot from one sequence together with a cursor from
+        another and incorrectly mark a healthy run as corrupt.
+        """
+
+        db = self._require_db()
+        async with self._write_lock:
+            async with self._transaction(db, write=True):
+                row = await self._run_row_tx(run_id)
+                projection = await self._projection_tx(run_id, int(row["last_sequence"]))
+                await self._insert_snapshot_tx(projection)
+                return projection
 
     async def snapshot_sequences(self, run_id: str) -> tuple[int, ...]:
-        await self._ensure_run(run_id)
-        cursor = await self._require_db().execute(
-            "SELECT sequence FROM run_snapshot WHERE run_id = ? ORDER BY sequence", (run_id,)
-        )
-        return tuple(int(row[0]) for row in await cursor.fetchall())
+        db = self._require_db()
+        async with self._write_lock:
+            async with self._transaction(db, write=False):
+                await self._ensure_run(run_id)
+                cursor = await db.execute(
+                    "SELECT sequence FROM run_snapshot WHERE run_id = ? ORDER BY sequence", (run_id,)
+                )
+                values = tuple(int(row[0]) for row in await cursor.fetchall())
+                return values
 
     async def list_runs(self, statuses: set[str] | None = None) -> tuple[RunRecordView, ...]:
         query = (
@@ -451,63 +545,72 @@ class RunStore:
             query += f" WHERE status IN ({placeholders})"
             params = ordered
         query += " ORDER BY updated_at, run_id"
-        cursor = await self._require_db().execute(query, params)
-        return tuple(
-            RunRecordView(
-                str(row[0]),
-                str(row[1]),
-                int(row[2]),
-                str(row[3]),
-                (str(row[4]) if row[4] else None),
-                (str(row[5]) if row[5] else None),
-            )
-            for row in await cursor.fetchall()
-        )
+        db = self._require_db()
+        async with self._write_lock:
+            async with self._transaction(db, write=False):
+                cursor = await db.execute(query, params)
+                rows = await cursor.fetchall()
+                views = tuple(
+                    RunRecordView(
+                        str(row[0]),
+                        str(row[1]),
+                        int(row[2]),
+                        str(row[3]),
+                        (str(row[4]) if row[4] else None),
+                        (str(row[5]) if row[5] else None),
+                    )
+                    for row in rows
+                )
+                return views
 
     async def load_run_record(self, run_id: str) -> RunRecordView:
         """Load durable run lineage used by context recall authorization."""
-
-        cursor = await self._require_db().execute(
-            """SELECT run_id, status, last_sequence, runtime_contract_digest,
-                      parent_run_id, predecessor_run_id
-               FROM run_record WHERE run_id = ?""",
-            (run_id,),
-        )
-        row = await cursor.fetchone()
-        if row is None:
-            raise RunNotFound(run_id)
-        return RunRecordView(
-            str(row[0]),
-            str(row[1]),
-            int(row[2]),
-            str(row[3]),
-            (str(row[4]) if row[4] else None),
-            (str(row[5]) if row[5] else None),
-        )
+        db = self._require_db()
+        async with self._write_lock:
+            async with self._transaction(db, write=False):
+                cursor = await db.execute(
+                    """SELECT run_id, status, last_sequence, runtime_contract_digest,
+                              parent_run_id, predecessor_run_id
+                       FROM run_record WHERE run_id = ?""",
+                    (run_id,),
+                )
+                row = await cursor.fetchone()
+                if row is None:
+                    raise RunNotFound(run_id)
+                view = RunRecordView(
+                    str(row[0]),
+                    str(row[1]),
+                    int(row[2]),
+                    str(row[3]),
+                    (str(row[4]) if row[4] else None),
+                    (str(row[5]) if row[5] else None),
+                )
+                return view
 
     async def current_lease(self, run_id: str) -> Lease | None:
-        await self._ensure_run(run_id)
-        cursor = await self._require_db().execute(
-            "SELECT run_id, worker_id, epoch, acquired_at, expires_at FROM run_lease WHERE run_id = ?",
-            (run_id,),
-        )
-        row = await cursor.fetchone()
-        if row is None:
-            return None
-        return Lease(str(row[0]), str(row[1]), int(row[2]), float(row[3]), float(row[4]))
+        db = self._require_db()
+        async with self._write_lock:
+            async with self._transaction(db, write=False):
+                await self._ensure_run(run_id)
+                cursor = await db.execute(
+                    "SELECT run_id, worker_id, epoch, acquired_at, expires_at FROM run_lease WHERE run_id = ?",
+                    (run_id,),
+                )
+                row = await cursor.fetchone()
+                lease = (
+                    None
+                    if row is None
+                    else Lease(str(row[0]), str(row[1]), int(row[2]), float(row[3]), float(row[4]))
+                )
+                return lease
 
     async def release_lease(self, run_id: str, epoch: int) -> bool:
         db = self._require_db()
         async with self._write_lock:
-            await begin_immediate(db)
-            try:
+            async with self._transaction(db, write=True):
                 cursor = await db.execute(
                     "DELETE FROM run_lease WHERE run_id = ? AND epoch = ?", (run_id, epoch)
                 )
-                await db.commit()
-            except BaseException:
-                await db.rollback()
-                raise
         return cursor.rowcount == 1
 
     async def _projection_tx(self, run_id: str, through_sequence: int | None = None) -> RunProjection:

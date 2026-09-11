@@ -45,9 +45,18 @@ def _observability_resume_compatible(
     The adapter identity includes a dirty-worktree digest.  That is useful for
     preventing accidental result mixing, but it also blocks resuming a run
     when the only code change is supervisor observability.  Require an explicit
-    opt-in and compare every frozen field except that digest; scoring inputs,
-    model, dataset, Docker/runtime identities and time budgets must still be
-    byte-for-byte identical.
+    opt-in and compare every frozen field except that digest.  A Docker Desktop
+    restart can also change the daemon's display name, API patch/minor version,
+    or the implicit value of ``DOCKER_HOST`` while keeping the same native
+    Linux socket and ext4 data root.  Those are runtime observations rather
+    than scoring inputs, so normalize only that narrowly-defined native-daemon
+    drift.  Dataset, model, task/verifier inputs, wheel, and time budgets stay
+    frozen.  A narrowly-scoped runtime repair may also change the Harbor
+    plugin (for example, to repair an agent-container trust store before the
+    official verifier runs), but only with the explicit
+    ``CC_HARNESS_ALLOW_RESUME_RUNTIME_REPAIR=1`` opt-in.  The repair is
+    recorded in ``resume-compatibility.json``; task data and verifier inputs
+    remain frozen.
     """
 
     if os.environ.get("CC_HARNESS_ALLOW_OBSERVABILITY_RESUME") != "1":
@@ -68,6 +77,13 @@ def _observability_resume_compatible(
     current_identity = dict(current_identity)
     previous_identity.pop("git_dirty_digest", None)
     current_identity.pop("git_dirty_digest", None)
+    if previous_identity.get("harbor_plugin_sha256") != current_identity.get(
+        "harbor_plugin_sha256"
+    ):
+        if os.environ.get("CC_HARNESS_ALLOW_RESUME_RUNTIME_REPAIR") != "1":
+            return False
+        previous_identity.pop("harbor_plugin_sha256", None)
+        current_identity.pop("harbor_plugin_sha256", None)
     if previous_identity.get("wheel_sha256") != current_identity.get("wheel_sha256"):
         # A functional harness repair is shipped through the frozen wheel.  It
         # is allowed only with a second, explicit opt-in; the ordinary
@@ -77,25 +93,72 @@ def _observability_resume_compatible(
             return False
         previous_identity.pop("wheel_sha256", None)
         current_identity.pop("wheel_sha256", None)
+    backends: list[dict[str, Any]] = []
     for identity in (previous_identity, current_identity):
         backend = identity.get("execution_backend")
         if not isinstance(backend, dict):
             continue
+        backends.append(backend)
         storage = backend.get("docker_storage")
         if not isinstance(storage, dict):
             continue
         source = storage.get("source")
-        if (
-            isinstance(source, str)
-            and storage.get("filesystem") == "ext4"
-            and storage.get("target") == "/var/lib/docker"
-        ):
-            normalized_backend = dict(backend)
-            normalized_storage = dict(storage)
-            normalized_storage["source"] = re.sub(
-                r"^/dev/sd[a-z]+(?=\[)", "/dev/sd*", source
+        filesystem = storage.get("filesystem")
+        target = storage.get("target")
+        if not isinstance(source, str) or filesystem != "ext4":
+            continue
+
+        # Docker Desktop's WSL integration reports the same ext4 data volume
+        # in two equivalent ways across a distro restart:
+        #   /dev/sdf[/var/lib/docker] mounted at /var/lib/docker
+        #   /dev/sdf mounted at / (with DockerRootDir=/var/lib/docker)
+        # Treat only these native Docker-root forms as equivalent.  Do not
+        # weaken the rest of the immutable backend identity (daemon name,
+        # version, socket, etc.).
+        source_device = source.split("[", 1)[0]
+        if target not in {"/", "/var/lib/docker"}:
+            continue
+        if not re.fullmatch(r"/dev/sd[a-z]+", source_device):
+            continue
+        normalized_backend = dict(backend)
+        normalized_storage = dict(storage)
+        normalized_storage["source"] = "/dev/sd*"
+        normalized_storage["target"] = "/var/lib/docker"
+        normalized_backend["docker_storage"] = normalized_storage
+        identity["execution_backend"] = normalized_backend
+
+    # Docker Desktop may recreate the native daemon during a restart or
+    # upgrade.  The daemon name and server version are not benchmark inputs;
+    # requiring the stable native checks above prevents accepting a remote or
+    # non-Linux daemon under this compatibility path.  Treat an omitted host
+    # (Docker's default) and the native Unix socket as equivalent.
+    if len(backends) == 2:
+        for identity in (previous_identity, current_identity):
+            backend = identity.get("execution_backend")
+            if not isinstance(backend, dict):
+                continue
+            checks = backend.get("checks")
+            storage = backend.get("docker_storage")
+            if not isinstance(checks, dict) or not isinstance(storage, dict):
+                continue
+            required_checks = (
+                "linux",
+                "wsl2",
+                "docker_binary_native",
+                "docker_context_default",
+                "docker_daemon_ready",
+                "docker_server_linux",
+                "docker_root_native",
+                "docker_socket_native",
+                "docker_storage_ext",
             )
-            normalized_backend["docker_storage"] = normalized_storage
+            if not all(checks.get(name) is True for name in required_checks):
+                continue
+            normalized_backend = dict(backend)
+            normalized_backend["docker_name"] = "<native-linux-daemon>"
+            normalized_backend["docker_server_version"] = "<native-linux-daemon>"
+            if backend.get("docker_host") in {None, "", "unix:///var/run/docker.sock"}:
+                normalized_backend["docker_host"] = "unix:///var/run/docker.sock"
             identity["execution_backend"] = normalized_backend
     previous["adapter_run_identity"] = previous_identity
     current["adapter_run_identity"] = current_identity
@@ -174,7 +237,12 @@ def task_path_slug(value: str, *, maximum: int = 12) -> str:
     return f"{prefix}-{digest}"
 
 
-_HARBOR_JOBS_ROOT_MAX_CHARS = 150
+# Keep enough budget for Harbor's appended timestamp/task/artifacts suffix on
+# both /mnt/d and WSL-local temporary roots.  The previous 150-character
+# threshold made compaction depend on the host's pytest temp prefix: a legacy
+# task path could pass the check in WSL and still exceed the Windows-compatible
+# budget once Harbor appended its nested job directories.
+_HARBOR_JOBS_ROOT_MAX_CHARS = 100
 
 
 def _compact_interrupted_attempt_path(
@@ -263,6 +331,12 @@ class RunStateStore:
                         ),
                         "authorized_by": [
                             "CC_HARNESS_ALLOW_OBSERVABILITY_RESUME=1",
+                            *(
+                                ["CC_HARNESS_ALLOW_RESUME_RUNTIME_REPAIR=1"]
+                                if os.environ.get("CC_HARNESS_ALLOW_RESUME_RUNTIME_REPAIR")
+                                == "1"
+                                else []
+                            ),
                             *(
                                 ["CC_HARNESS_ALLOW_RESUME_ARTIFACT_REFRESH=1"]
                                 if os.environ.get("CC_HARNESS_ALLOW_RESUME_ARTIFACT_REFRESH")

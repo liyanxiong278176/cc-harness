@@ -1,0 +1,279 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1800" height="3800" viewBox="0 0 1800 3800">
+  <defs>
+    <marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="9" markerHeight="9" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="#cbd5e1"/>
+    </marker>
+    <marker id="arrowBlue" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="9" markerHeight="9" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="#7dd3fc"/>
+    </marker>
+    <marker id="arrowAmber" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="9" markerHeight="9" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="#fbbf24"/>
+    </marker>
+    <style>
+      .bg { fill:#111827; }
+      .title { fill:#f8fafc; font:700 38px 'Microsoft YaHei','Segoe UI',sans-serif; }
+      .subtitle { fill:#94a3b8; font:400 20px 'Microsoft YaHei','Segoe UI',sans-serif; }
+      .section { fill:#cbd5e1; font:700 22px 'Microsoft YaHei','Segoe UI',sans-serif; letter-spacing:1px; }
+      .node { fill:#202938; stroke:#8aa4c8; stroke-width:2; }
+      .nodeBlue { fill:#172b3d; stroke:#38bdf8; stroke-width:2; }
+      .nodeGreen { fill:#19332f; stroke:#34d399; stroke-width:2; }
+      .nodeAmber { fill:#3a2d16; stroke:#fbbf24; stroke-width:2; }
+      .nodeRed { fill:#3b2027; stroke:#fb7185; stroke-width:2; }
+      .nodePurple { fill:#2d2445; stroke:#c4b5fd; stroke-width:2; }
+      .label { fill:#f8fafc; font:700 25px 'Microsoft YaHei','Segoe UI',sans-serif; }
+      .desc { fill:#cbd5e1; font:400 19px 'Microsoft YaHei','Segoe UI',sans-serif; }
+      .small { fill:#94a3b8; font:400 17px 'Microsoft YaHei','Segoe UI',sans-serif; }
+      .edge { stroke:#cbd5e1; stroke-width:3; fill:none; marker-end:url(#arrow); }
+      .edgeBlue { stroke:#7dd3fc; stroke-width:3; fill:none; marker-end:url(#arrowBlue); }
+      .edgeGreen { stroke:#34d399; stroke-width:3; fill:none; marker-end:url(#arrow); }
+      .edgeAmber { stroke:#fbbf24; stroke-width:3; fill:none; marker-end:url(#arrowAmber); }
+      .edgeDashed { stroke:#94a3b8; stroke-width:2.5; stroke-dasharray:9 8; fill:none; marker-end:url(#arrow); }
+      .edgeText { fill:#e2e8f0; font:400 18px 'Microsoft YaHei','Segoe UI',sans-serif; }
+      .band { fill:#0f172a; stroke:#334155; stroke-width:1; }
+    </style>
+  </defs>
+
+  <rect class="bg" x="0" y="0" width="1800" height="3800"/>
+  <text class="title" x="900" y="58" text-anchor="middle">Agent Runtime 完整执行流程</text>
+  <text class="subtitle" x="900" y="92" text-anchor="middle">只展示 Runtime：任务编排、持久化执行、模型循环、审批、恢复与终态</text>
+
+  <!-- stage bands -->
+  <rect class="band" x="25" y="125" width="1750" height="1070" rx="18"/>
+  <text class="section" x="55" y="165">一、准入与计划 Admission &amp; Planning（决定 Run 能否执行）</text>
+  <rect class="band" x="25" y="1220" width="1750" height="520" rx="18"/>
+  <text class="section" x="55" y="1260">二、调度与租约 Scheduling</text>
+  <rect class="band" x="25" y="1865" width="1750" height="1135" rx="18"/>
+  <text class="section" x="55" y="1905">三、Worker / Segment 执行循环</text>
+  <rect class="band" x="25" y="3025" width="1750" height="735" rx="18"/>
+  <text class="section" x="55" y="3065">四、完成、失败与恢复 Recovery</text>
+
+  <!-- main spine: admission -->
+  <rect class="node" x="575" y="195" width="650" height="108" rx="14"/>
+  <text class="label" x="900" y="233" text-anchor="middle">用户提交任务 · User Request</text>
+  <text class="desc" x="900" y="270" text-anchor="middle">作用：提出目标、约束和期望结果</text>
+
+  <rect class="node" x="575" y="345" width="650" height="108" rx="14"/>
+  <text class="label" x="900" y="383" text-anchor="middle">RunCoordinator.submit</text>
+  <text class="desc" x="900" y="420" text-anchor="middle">作用：Runtime 的统一入口，创建一次可恢复执行</text>
+
+  <rect class="nodeBlue" x="575" y="495" width="650" height="108" rx="14"/>
+  <text class="label" x="900" y="533" text-anchor="middle">Create Run: DRAFT</text>
+  <text class="desc" x="900" y="570" text-anchor="middle">作用：生成唯一 run_id，绑定项目和 Runtime Contract</text>
+
+  <rect class="nodeBlue" x="575" y="645" width="650" height="108" rx="14"/>
+  <text class="label" x="900" y="683" text-anchor="middle">Goal Contract</text>
+  <text class="desc" x="900" y="720" text-anchor="middle">作用：目标、验收标准、允许/禁止范围、所需证据</text>
+
+  <rect class="nodeAmber" x="575" y="795" width="650" height="112" rx="14"/>
+  <text class="label" x="900" y="833" text-anchor="middle">Goal / Safety Gate ?</text>
+  <text class="desc" x="900" y="870" text-anchor="middle">作用：检查目标是否明确、是否越权、是否需要用户决策</text>
+
+  <!-- blocked branch -->
+  <rect class="nodeRed" x="90" y="815" width="390" height="112" rx="14"/>
+  <text class="label" x="285" y="853" text-anchor="middle">RunBlocked</text>
+  <text class="desc" x="285" y="890" text-anchor="middle">作用：歧义、越权或缺少授权时暂停</text>
+  <path class="edge" d="M575 851 H480"/>
+  <text class="edgeText" x="515" y="825" text-anchor="middle">否</text>
+  <path class="edgeDashed" d="M285 927 C285 980 420 1005 575 1005"/>
+  <text class="small" x="360" y="987">补充目标/授权后重新评估</text>
+
+  <!-- continue planning -->
+  <rect class="node" x="575" y="945" width="650" height="92" rx="14"/>
+  <text class="label" x="900" y="981" text-anchor="middle">Plan Discovery</text>
+  <text class="desc" x="900" y="1015" text-anchor="middle">作用：探索任务并生成可执行计划</text>
+  <path class="edge" d="M900 907 V945"/>
+  <text class="edgeText" x="930" y="930">是</text>
+
+  <rect class="node" x="575" y="1065" width="650" height="92" rx="14"/>
+  <text class="label" x="900" y="1101" text-anchor="middle">PlanGraph + Todo</text>
+  <text class="desc" x="900" y="1135" text-anchor="middle">作用：表达节点、依赖、文件所有权和进度</text>
+  <path class="edge" d="M900 1037 V1065"/>
+
+  <rect class="nodeAmber" x="575" y="1185" width="650" height="112" rx="14"/>
+  <text class="label" x="900" y="1223" text-anchor="middle">Readiness Gate ?</text>
+  <text class="desc" x="900" y="1260" text-anchor="middle">作用：检查前序 Run、节点依赖、路径所有权和审批前置</text>
+  <path class="edge" d="M900 1157 V1185"/>
+
+  <!-- waiting / queued -->
+  <rect class="nodeAmber" x="90" y="1310" width="390" height="108" rx="14"/>
+  <text class="label" x="285" y="1348" text-anchor="middle">Waiting on predecessor</text>
+  <text class="desc" x="285" y="1385" text-anchor="middle">作用：等待前置条件，不占用 Worker</text>
+  <path class="edge" d="M575 1241 C510 1241 510 1364 480 1364"/>
+  <text class="edgeText" x="520" y="1215">否</text>
+  <path class="edgeDashed" d="M285 1418 C285 1460 430 1460 575 1399"/>
+  <text class="small" x="355" y="1360">依赖完成后入队</text>
+
+  <rect class="nodeGreen" x="575" y="1345" width="650" height="108" rx="14"/>
+  <text class="label" x="900" y="1383" text-anchor="middle">RunQueued</text>
+  <text class="desc" x="900" y="1420" text-anchor="middle">作用：把可执行 Run 放入持久化队列</text>
+  <path class="edge" d="M900 1297 V1345"/>
+  <text class="edgeText" x="930" y="1325">是</text>
+
+  <!-- scheduler -->
+  <rect class="node" x="575" y="1300" width="650" height="102" rx="14" opacity="0"/>
+  <rect class="node" x="575" y="1465" width="650" height="108" rx="14"/>
+  <text class="label" x="900" y="1503" text-anchor="middle">LocalSupervisor</text>
+  <text class="desc" x="900" y="1540" text-anchor="middle">作用：扫描队列、分配 Worker、维护并发与项目根串行</text>
+  <path class="edge" d="M900 1453 V1465"/>
+
+  <rect class="nodeAmber" x="575" y="1610" width="650" height="108" rx="14"/>
+  <text class="label" x="900" y="1648" text-anchor="middle">Claim Lease + lease_epoch</text>
+  <text class="desc" x="900" y="1685" text-anchor="middle">作用：锁定执行权；fencing 拒绝旧 Worker 写入</text>
+  <path class="edge" d="M900 1573 V1610"/>
+
+  <rect class="nodeBlue" x="575" y="1755" width="650" height="108" rx="14"/>
+  <text class="label" x="900" y="1793" text-anchor="middle">RunWorker + Heartbeat</text>
+  <text class="desc" x="900" y="1830" text-anchor="middle">作用：持有租约执行，持续续租并报告存活</text>
+  <path class="edge" d="M900 1718 V1755"/>
+
+  <!-- execution loop -->
+  <rect class="nodeBlue" x="575" y="1950" width="650" height="108" rx="14"/>
+  <text class="label" x="900" y="1988" text-anchor="middle">RunSegmentStarted</text>
+  <text class="desc" x="900" y="2025" text-anchor="middle">作用：一次绑定一个 PlanGraph 节点 / Todo</text>
+  <path class="edge" d="M900 1863 V1950"/>
+
+  <rect class="node" x="575" y="2095" width="650" height="108" rx="14"/>
+  <text class="label" x="900" y="2133" text-anchor="middle">Load Run Snapshot / Projection</text>
+  <text class="desc" x="900" y="2170" text-anchor="middle">作用：从事件和 Checkpoint 恢复当前工作状态</text>
+  <path class="edge" d="M900 2058 V2095"/>
+
+  <rect class="nodePurple" x="575" y="2240" width="650" height="108" rx="14"/>
+  <text class="label" x="900" y="2278" text-anchor="middle">Model Invocation → Agent Loop</text>
+  <text class="desc" x="900" y="2315" text-anchor="middle">作用：模型读取状态，决定回答、调用工具或继续探索</text>
+  <path class="edge" d="M900 2203 V2240"/>
+
+  <rect class="nodeAmber" x="575" y="2385" width="650" height="108" rx="14"/>
+  <text class="label" x="900" y="2423" text-anchor="middle">Response Type ?</text>
+  <text class="desc" x="900" y="2460" text-anchor="middle">作用：区分最终结果与下一次工具动作</text>
+  <path class="edge" d="M900 2348 V2385"/>
+
+  <!-- final candidate branch -->
+  <rect class="nodeGreen" x="90" y="2390" width="390" height="108" rx="14"/>
+  <text class="label" x="285" y="2428" text-anchor="middle">Completion Candidate</text>
+  <text class="desc" x="285" y="2465" text-anchor="middle">作用：提交模型认为已经完成的结果</text>
+  <path class="edge" d="M575 2439 H480"/>
+  <text class="edgeText" x="520" y="2415">最终回答</text>
+  <path class="edgeDashed" d="M285 2498 V3160 H575"/>
+
+  <!-- tool action -->
+  <rect class="node" x="1330" y="2390" width="390" height="108" rx="14"/>
+  <text class="label" x="1525" y="2428" text-anchor="middle">Prepare Action</text>
+  <text class="desc" x="1525" y="2465" text-anchor="middle">作用：整理工具名、参数与来源</text>
+  <path class="edge" d="M1225 2439 H1330"/>
+  <text class="edgeText" x="1278" y="2415">工具调用</text>
+
+  <rect class="nodeAmber" x="1330" y="2535" width="390" height="125" rx="14"/>
+  <text class="label" x="1525" y="2573" text-anchor="middle">Action Validation</text>
+  <text class="desc" x="1525" y="2610" text-anchor="middle">作用：Schema、权限、路径、来源和预算检查</text>
+  <path class="edge" d="M1525 2498 V2535"/>
+
+  <rect class="nodeAmber" x="1330" y="2700" width="390" height="108" rx="14"/>
+  <text class="label" x="1525" y="2738" text-anchor="middle">Action Policy</text>
+  <text class="desc" x="1525" y="2775" text-anchor="middle">作用：确定 ALLOW / ASK / DENY</text>
+  <path class="edge" d="M1525 2660 V2700"/>
+
+  <rect class="nodeGreen" x="1330" y="2845" width="390" height="108" rx="14"/>
+  <text class="label" x="1525" y="2883" text-anchor="middle">ALLOW → Dispatch Tool</text>
+  <text class="desc" x="1525" y="2920" text-anchor="middle">作用：通过检查后真正调用工具</text>
+  <path class="edge" d="M1525 2808 V2845"/>
+
+  <rect class="nodeAmber" x="1330" y="2990" width="390" height="108" rx="14"/>
+  <text class="label" x="1525" y="3028" text-anchor="middle">ASK → User Approval</text>
+  <text class="desc" x="1525" y="3065" text-anchor="middle">作用：高风险动作先暂停，等待用户确认</text>
+  <path class="edgeAmber" d="M1330 2754 C1260 2754 1260 3044 1330 3044"/>
+  <text class="edgeText" x="1265" y="2915" text-anchor="middle">ASK</text>
+  <path class="edgeGreen" d="M1330 3044 C1245 3044 1245 2899 1330 2899"/>
+  <text class="edgeText" x="1240" y="2960" text-anchor="middle">确认</text>
+  <path class="edgeDashed" d="M1330 3044 H480"/>
+  <text class="edgeText" x="900" y="3022" text-anchor="middle">拒绝</text>
+
+  <rect class="nodeRed" x="90" y="2700" width="390" height="108" rx="14"/>
+  <text class="label" x="285" y="2738" text-anchor="middle">DENY / Action Rejected</text>
+  <text class="desc" x="285" y="2775" text-anchor="middle">作用：不发送工具请求，记录拒绝原因</text>
+  <path class="edge" d="M1330 2754 H480"/>
+  <text class="edgeText" x="900" y="2730" text-anchor="middle">DENY</text>
+  <path class="edgeDashed" d="M285 2808 C285 2860 430 2875 575 2875"/>
+  <text class="small" x="360" y="2855">返回模型重新规划或阻断</text>
+
+  <!-- observation loop -->
+  <rect class="nodeBlue" x="575" y="3020" width="650" height="108" rx="14"/>
+  <text class="label" x="900" y="3058" text-anchor="middle">Tool Observation Committed</text>
+  <text class="desc" x="900" y="3095" text-anchor="middle">作用：工具结果先写入事件，再允许下一轮模型读取</text>
+  <path class="edgeBlue" d="M1330 2899 C1230 2899 1230 3074 1225 3074"/>
+  <text class="edgeText" x="1260" y="2960" text-anchor="middle">结果</text>
+
+  <rect class="node" x="575" y="3165" width="650" height="108" rx="14"/>
+  <text class="label" x="900" y="3203" text-anchor="middle">Update Working State / Todo</text>
+  <text class="desc" x="900" y="3240" text-anchor="middle">作用：更新进度、证据、节点状态和下一步计划</text>
+  <path class="edge" d="M900 3128 V3165"/>
+  <path class="edgeDashed" d="M575 3219 C480 3219 480 2294 575 2294"/>
+  <text class="small" x="455" y="2780" transform="rotate(-90 455 2780)">继续 Agent Loop</text>
+
+  <!-- persistence column -->
+  <rect class="nodePurple" x="1330" y="3150" width="390" height="112" rx="14"/>
+  <text class="label" x="1525" y="3188" text-anchor="middle">RunStore: Append-only Events</text>
+  <text class="desc" x="1525" y="3225" text-anchor="middle">作用：记录每个状态、动作和结果，作为事实来源</text>
+  <path class="edgeDashed" d="M1225 3219 H1330"/>
+
+  <rect class="nodePurple" x="1330" y="3295" width="390" height="112" rx="14"/>
+  <text class="label" x="1525" y="3333" text-anchor="middle">Checkpoint / Projection</text>
+  <text class="desc" x="1525" y="3370" text-anchor="middle">作用：加速恢复；可由事件重建和校验</text>
+  <path class="edgeDashed" d="M1525 3262 V3295"/>
+
+  <rect class="nodePurple" x="1330" y="3440" width="390" height="112" rx="14"/>
+  <text class="label" x="1525" y="3478" text-anchor="middle">Audit / Activation Records</text>
+  <text class="desc" x="1525" y="3515" text-anchor="middle">作用：记录租约、审批、策略和执行证据</text>
+  <path class="edgeDashed" d="M1525 3407 V3440"/>
+
+  <!-- completion / recovery section -->
+  <rect class="nodeGreen" x="575" y="3320" width="650" height="108" rx="14"/>
+  <text class="label" x="900" y="3358" text-anchor="middle">Completion Verifier</text>
+  <text class="desc" x="900" y="3395" text-anchor="middle">作用：检查目标、证据、错误、待审批和范围是否满足</text>
+  <path class="edge" d="M900 3273 V3320"/>
+
+  <rect class="nodeGreen" x="575" y="3465" width="300" height="108" rx="14"/>
+  <text class="label" x="725" y="3503" text-anchor="middle">RunCompleted</text>
+  <text class="desc" x="725" y="3540" text-anchor="middle">输出最终结果</text>
+  <path class="edge" d="M900 3428 C900 3460 875 3519 875 3519"/>
+  <text class="edgeText" x="835" y="3460">通过</text>
+
+  <rect class="node" x="925" y="3465" width="300" height="108" rx="14"/>
+  <text class="label" x="1075" y="3503" text-anchor="middle">Replan / Continue</text>
+  <text class="desc" x="1075" y="3540" text-anchor="middle">未满足则回到下一 Segment</text>
+  <path class="edgeDashed" d="M900 3428 C900 3460 925 3519 925 3519"/>
+  <text class="edgeText" x="965" y="3460">不通过</text>
+  <path class="edgeDashed" d="M1075 3465 C1075 3400 1200 3350 1225 2294"/>
+
+  <!-- recovery side -->
+  <rect class="nodeRed" x="90" y="3150" width="390" height="112" rx="14"/>
+  <text class="label" x="285" y="3188" text-anchor="middle">Heartbeat Timeout / Crash</text>
+  <text class="desc" x="285" y="3225" text-anchor="middle">作用：发现 Worker 可能失联</text>
+  <path class="edgeDashed" d="M575 1809 C440 1809 440 3206 480 3206"/>
+
+  <rect class="nodeRed" x="90" y="3295" width="390" height="112" rx="14"/>
+  <text class="label" x="285" y="3333" text-anchor="middle">LeaseExpired + Fencing</text>
+  <text class="desc" x="285" y="3370" text-anchor="middle">作用：旧 Worker 失去写入资格</text>
+  <path class="edge" d="M285 3262 V3295"/>
+
+  <rect class="nodeBlue" x="90" y="3440" width="390" height="112" rx="14"/>
+  <text class="label" x="285" y="3478" text-anchor="middle">Rebuild from Events</text>
+  <text class="desc" x="285" y="3515" text-anchor="middle">作用：用事件/Checkpoint 重建 Run 状态</text>
+  <path class="edge" d="M285 3407 V3440"/>
+
+  <rect class="nodeGreen" x="90" y="3585" width="390" height="112" rx="14"/>
+  <text class="label" x="285" y="3623" text-anchor="middle">Safe Retry / Requeue</text>
+  <text class="desc" x="285" y="3660" text-anchor="middle">作用：仅对只读或幂等动作安全重试</text>
+  <path class="edge" d="M285 3552 V3585"/>
+  <path class="edgeDashed" d="M480 3641 C540 3641 540 1530 575 1530"/>
+
+  <rect class="nodeAmber" x="1330" y="3585" width="390" height="112" rx="14"/>
+  <text class="label" x="1525" y="3623" text-anchor="middle">OutcomeUnknown / Human Review</text>
+  <text class="desc" x="1525" y="3660" text-anchor="middle">作用：外部副作用未知时禁止盲目重放</text>
+  <path class="edgeAmber" d="M480 3351 C800 3351 1030 3641 1330 3641"/>
+  <text class="edgeText" x="870" y="3590" text-anchor="middle">外部写入结果不确定</text>
+
+  <!-- legend -->
+  <rect class="node" x="575" y="3620" width="650" height="102" rx="14" opacity="0.9"/>
+  <text class="small" x="605" y="3655">颜色：蓝=状态/恢复，绿=允许/完成，黄=检查/审批，红=阻断/未知，紫=持久化</text>
+  <text class="small" x="605" y="3688">核心原则：事件是事实来源；Checkpoint 只是加速；旧租约不能写入；每个 Run 只有一个当前执行流程。</text>
+</svg>

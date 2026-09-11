@@ -51,6 +51,12 @@ class LocalSupervisor:
         # bounds supervisor recovery when a scheduling operation wedges.
         self.lease_ttl_seconds = max(1.0, float(lease_ttl_seconds))
         self._active: dict[str, tuple[asyncio.Task, RunWorker]] = {}
+        # Keep every worker task alive in the supervisor's lifecycle registry,
+        # including tasks removed from ``_active`` during lease recovery.  A
+        # stale worker can be cancelled while its provider call is still
+        # unwinding; dropping it from ``_active`` made ``stop()`` close the
+        # shared RunStore before that worker finished its final durable write.
+        self._worker_tasks: set[asyncio.Task] = set()
         self._loop_task: asyncio.Task | None = None
         self._stopping = False
         self._lease_manager = LeaseManager(store)
@@ -127,6 +133,8 @@ class LocalSupervisor:
                 except Exception:  # noqa: BLE001 - one run cannot stop siblings
                     continue
                 task = asyncio.create_task(worker.execute(lease), name=f"cc-harness-worker-{record.run_id}")
+                self._worker_tasks.add(task)
+                task.add_done_callback(self._worker_tasks.discard)
                 self._active[record.run_id] = (task, worker)
         queued = await self.store.list_runs({RunStatus.QUEUED.value})
         return SupervisorStats(tuple(sorted(self._active)), len(queued))
@@ -159,7 +167,11 @@ class LocalSupervisor:
             # epoch and appends the durable recovery event.
             self._active.pop(run_id, None)
             task.cancel()
-            with contextlib.suppress(asyncio.CancelledError, TimeoutError):
+            # The worker may have failed while cancellation was in flight.
+            # Its durable RunFailed event is the recovery record; an exception
+            # escaping this wait must never tear down the supervisor loop or
+            # starve unrelated queued runs.
+            with contextlib.suppress(asyncio.CancelledError, TimeoutError, Exception):
                 await asyncio.wait_for(asyncio.shield(task), timeout=1.0)
             with contextlib.suppress(Exception):
                 await self._lease_manager.reclaim_expired(
@@ -397,13 +409,19 @@ class LocalSupervisor:
             with contextlib.suppress(asyncio.CancelledError):
                 await self._loop_task
             self._loop_task = None
-        tasks = [task for task, _worker in self._active.values()]
+        # Include recovered/orphaned workers, not only the currently active
+        # scheduling slots.  Lease recovery intentionally removes a wedged
+        # task from ``_active`` so a replacement can be claimed; it must still
+        # be awaited before the shared store and provider clients are closed.
+        tasks = set(self._worker_tasks)
+        tasks.update(task for task, _worker in self._active.values())
         if not drain:
             for task in tasks:
                 task.cancel()
         if tasks:
             await asyncio.gather(*tasks, return_exceptions=True)
         self._active.clear()
+        self._worker_tasks.clear()
 
     async def _run_loop(self) -> None:
         while not self._stopping:

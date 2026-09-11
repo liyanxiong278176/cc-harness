@@ -19,12 +19,6 @@ def test_formal_gate_requires_only_official_readiness_contract(
     monkeypatch.setattr(
         terminal_preflight, "require_terminal_host", lambda _root: {"ready": True}
     )
-    network_checks: list[Path] = []
-    monkeypatch.setattr(
-        terminal_preflight,
-        "require_formal_verifier_network",
-        lambda root: network_checks.append(root),
-    )
     monkeypatch.setattr(
         terminal_preflight,
         "_identity",
@@ -37,7 +31,37 @@ def test_formal_gate_requires_only_official_readiness_contract(
     )
     terminal_preflight.require_formal_gates(tmp_path, task_limit=5)
     terminal_preflight.require_formal_gates(tmp_path)
-    assert network_checks == [tmp_path, tmp_path]
+
+
+def test_formal_gate_can_opt_into_network_diagnostic(
+    tmp_path: Path, monkeypatch
+) -> None:
+    gate = tmp_path / "gates"
+    monkeypatch.setattr(terminal_preflight, "gate_root", lambda _root: gate)
+    monkeypatch.setattr(
+        terminal_preflight, "require_terminal_host", lambda _root: {"ready": True}
+    )
+    monkeypatch.setattr(
+        terminal_preflight,
+        "_identity",
+        lambda _wheel: {"wheel_sha256": "sha:test"},
+    )
+    _write_json(gate / "check" / "summary.json", {"status": "ready"})
+    _write_json(
+        gate / "check" / "manifest.json",
+        {"adapter_run_identity": {"wheel_sha256": "sha:test"}},
+    )
+    observed: list[Path] = []
+    monkeypatch.setattr(
+        terminal_preflight,
+        "require_formal_verifier_network",
+        lambda root: observed.append(root),
+    )
+    monkeypatch.setenv(terminal_preflight.FORMAL_NETWORK_PROBE_ENV, "1")
+
+    terminal_preflight.require_formal_gates(tmp_path, task_limit=5)
+
+    assert observed == [tmp_path]
 
 
 def test_formal_gate_can_validate_an_existing_runs_frozen_wheel(
@@ -50,9 +74,6 @@ def test_formal_gate_can_validate_an_existing_runs_frozen_wheel(
     monkeypatch.setattr(terminal_preflight, "gate_root", lambda _root: gate)
     monkeypatch.setattr(
         terminal_preflight, "require_terminal_host", lambda _root: {"ready": True}
-    )
-    monkeypatch.setattr(
-        terminal_preflight, "require_formal_verifier_network", lambda _root: None
     )
     observed: list[Path] = []
 

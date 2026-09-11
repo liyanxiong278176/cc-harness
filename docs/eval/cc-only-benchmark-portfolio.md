@@ -120,6 +120,22 @@ the same catalog entry; no completed task is replayed. Copy the printed root int
 
 ```cmd
 scripts\run_eval_terminal_bench_2_1.cmd --output-root eval\result\cc-only\terminal-bench-2.1\deepseek-v4-flash\full-new-YYMMDDHHMMSS --confirm-live
+
+When the DeepSeek API is restricted to its idle period, attach the foreground
+idle-window controller to the same immutable root instead of starting another
+run:
+
+```text
+scripts\run_eval_terminal_bench_2_1_idle.cmd \
+  --output-root /mnt/d/agent_learning/cc-harness/eval/result/cc-only/terminal-bench-2.1/deepseek-v4-flash/full-new-YYMMDDHHMMSS \
+  --initial-status /home/lyx/.local/state/cc-harness/terminal-bench-supervisor/evaluation/<initial-id>/status.json
+```
+
+The controller allows Saturday/Sunday all day and, on weekdays, 00:00-09:00,
+12:00-14:00, and 18:00-24:00 (local machine time). It stops only the
+Terminal-Bench systemd worker at a boundary and resumes the same output root
+with its frozen catalog and attempts at the next allowed window. It never
+creates a fresh scored run or treats an incomplete root as complete.
 ```
 
 The formal Harbor command does not pass timeout multipliers, resource overrides, extra Compose

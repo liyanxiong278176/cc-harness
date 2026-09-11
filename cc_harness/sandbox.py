@@ -17,6 +17,7 @@ import os
 import socket
 import time
 import uuid
+from collections.abc import Mapping
 from datetime import timedelta
 from pathlib import Path
 
@@ -91,6 +92,35 @@ except ImportError:  # 无 [sandbox] extra(CI / 基础安装)
 
 class SandboxUnavailableError(RuntimeError):
     """The sandbox could not execute a command after bounded retries."""
+
+
+def _sandbox_resource_metadata(execution: object | None = None) -> dict[str, object]:
+    """Normalize optional OpenSandbox resource fields without coupling to SDK versions."""
+
+    reported: dict[str, object] = {}
+    if execution is not None:
+        for name in ("resource", "resources", "metrics", "usage"):
+            value = getattr(execution, name, None)
+            if isinstance(value, Mapping):
+                for key in (
+                    "cpu_ticks",
+                    "cpu_seconds",
+                    "memory_bytes",
+                    "rss_bytes",
+                    "peak_rss_bytes",
+                    "io_bytes",
+                    "network_bytes",
+                ):
+                    if key in value and isinstance(value[key], (int, float)):
+                        reported[key] = value[key]
+                if reported:
+                    break
+    return {
+        "source": "opensandbox",
+        "reported": bool(reported),
+        **reported,
+        "oom_killed": False,
+    }
 
 
 def _resolve_egress_target(target: str) -> set[ipaddress.IPv4Address | ipaddress.IPv6Address]:
@@ -422,7 +452,11 @@ class SandboxExecutor:
                     f"[Tool Error] sandbox timeout after {self.cfg.timeout_s}s; "
                     "the sandbox was destroyed"
                 ),
-                metadata={"exit_code": None, "timed_out": True},
+                metadata={
+                    "exit_code": None,
+                    "timed_out": True,
+                    "resource": _sandbox_resource_metadata(),
+                },
             )
         except SandboxUnavailableError as e:
             # Drop the session handle before surfacing the unknown outcome.
@@ -442,7 +476,12 @@ class SandboxExecutor:
             return ToolResult.error(
                 display=f"sandbox run failed: {e}",
                 llm=f"[Tool Error] sandbox: {type(e).__name__}: {e}",
-                metadata={"exit_code": None, "timed_out": False, "exception": type(e).__name__},
+                metadata={
+                    "exit_code": None,
+                    "timed_out": False,
+                    "exception": type(e).__name__,
+                    "resource": _sandbox_resource_metadata(),
+                },
             )
         stdout = "".join(log.text for log in (execution.logs.stdout or []))
         stderr = "".join(log.text for log in (execution.logs.stderr or []))
@@ -456,6 +495,7 @@ class SandboxExecutor:
                     "timed_out": False,
                     "stdout": stdout,
                     "stderr": stderr,
+                    "resource": _sandbox_resource_metadata(execution),
                 },
             )
         return ToolResult.success(
@@ -465,6 +505,7 @@ class SandboxExecutor:
                 "timed_out": False,
                 "stdout": stdout,
                 "stderr": stderr,
+                "resource": _sandbox_resource_metadata(execution),
             },
         )
 

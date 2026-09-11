@@ -18,6 +18,24 @@ The formal path fails closed if an overlay changes `PATH`, mounts `/tests`,
 replaces `apt-get`, `curl`, `uv`, `uvx`, Python, or uses timeout/resource/host
 overrides. Each scored attempt records `official-protocol.json`.
 
+The formal path does not add a synthetic canary or a separate verifier-network
+soak before Harbor. Those checks are available as explicit diagnostics only;
+otherwise a transient failure in an unrelated probe could block an otherwise
+valid official task. The launcher and Harbor child now receive the same
+explicit `DOCKER_HOST=unix:///var/run/docker.sock` (when no host is supplied)
+and an empty `DOCKER_CONTEXT`, so a stale `desktop-linux` context cannot make
+the launcher probe and Harbor's own Docker preflight disagree.
+
+The local Durable Runtime completion synthesizer remains strict for normal
+user runs: it needs successful verification-shaped evidence before it can mark
+the run completed. In the isolated official benchmark path it may instead
+commit a candidate from successful tool observations when no action is still
+pending. This is necessary for official tasks whose verifier is the first
+authoritative test (for example, repository-recovery tasks where the agent may
+not run a command containing `test`). The benchmark-only exception requires
+both `CC_HARNESS_TERMINAL_BENCH=1` and the explicit trusted-task provenance;
+Harbor's unchanged `/tests/test.sh` and reward remain the final oracle.
+
 ## Invalidated diagnostic run
 
 The earlier Hard result root used an offline verifier overlay that replaced

@@ -15,6 +15,7 @@ TERMINAL_EXECUTION_BACKEND = "wsl2-ubuntu-native-docker.v1"
 EXPECTED_DISTRIBUTION = "Ubuntu"
 EXPECTED_PROJECT_ROOT = Path("/mnt/d/agent_learning/cc-harness")
 EXPECTED_DOCKER_ROOT = Path("/var/lib/docker")
+_DOCKER_DEFAULT_HOST = "unix:///var/run/docker.sock"
 _NATIVE_FILESYSTEMS = {"ext2", "ext3", "ext4", "xfs", "btrfs"}
 
 
@@ -168,6 +169,15 @@ def _run_text(command: Sequence[str]) -> str | None:
 
 
 def _run(command: Sequence[str], *, timeout: int) -> subprocess.CompletedProcess[str] | None:
+    environment = None
+    # ``terminal_bench_wsl_supervisor`` runs under a persistent user systemd
+    # manager, so a stale desktop context can survive after the launcher has
+    # selected the native socket.  Normalize Docker CLI calls in this host
+    # probe exactly as the Harbor adapter does.
+    if command and Path(str(command[0])).name == "docker":
+        environment = os.environ.copy()
+        environment["DOCKER_HOST"] = environment.get("DOCKER_HOST") or _DOCKER_DEFAULT_HOST
+        environment["DOCKER_CONTEXT"] = ""
     try:
         return subprocess.run(
             list(command),
@@ -177,6 +187,7 @@ def _run(command: Sequence[str], *, timeout: int) -> subprocess.CompletedProcess
             errors="replace",
             check=False,
             timeout=timeout,
+            env=environment,
         )
     except (OSError, subprocess.TimeoutExpired):
         return None

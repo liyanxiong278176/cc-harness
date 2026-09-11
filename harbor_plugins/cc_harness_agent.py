@@ -9,13 +9,32 @@ import time
 from datetime import UTC, datetime
 import math
 from pathlib import Path
-from typing import Any, override
+from typing import Any, Mapping, override
 
 from harbor.agents.installed.base import BaseInstalledAgent
 from harbor.environments.base import BaseEnvironment
 from harbor.models.agent.context import AgentContext
 
 from harbor_plugins.verifier_smoke import verifier_smoke_environment_error
+
+try:
+    from cc_harness.model_identity import canonical_model_identity
+except ImportError:  # pragma: no cover - compatibility with a pre-repair wheel
+    def canonical_model_identity(
+        reported_model: str | None,
+        requested_model: str | None,
+    ) -> str | None:
+        """Keep the frozen plugin fail-closed if the helper is unavailable."""
+
+        if not isinstance(reported_model, str) or not reported_model.strip():
+            return None
+        reported = reported_model.strip()
+        requested = str(requested_model or "").strip()
+        if reported == requested:
+            return reported
+        if reported == "deepseek-flash" and requested == "deepseek-v4-flash":
+            return requested
+        return reported
 
 MODEL = "deepseek-v4-flash"
 # Terminal-Bench tasks intentionally include package installation, downloads
@@ -42,20 +61,44 @@ Execution discipline for this Terminal-Bench task:
   background job, record its PID and poll it with a bounded log/status check.
   Keep builds and installs in the foreground unless the task explicitly
   requires background execution, and never launch duplicate installers.
-- Treat one unreachable URL as a bounded diagnostic: use at most two short
-  attempts, then switch to the task's documented/local source or report the
-  blocker. Do not spend multiple minutes probing archive mirrors.
+- Treat one unreachable URL as a bounded diagnostic: make at most two source
+  strategy attempts. Within one idempotent package/download command, the
+  runtime may perform the explicitly requested bounded network retries below;
+  then switch to the task's documented/local source or report the blocker.
+  Do not spend multiple minutes probing archive mirrors.
+- When a package/download command fails with a transient DNS, TLS, proxy, or
+  5xx error, ask the runtime for an idempotent network retry by setting
+  retry_on_network=true and choosing network_retry_limit between 1 and 10.
+  Never set it for git push, publish, database writes, deploys, or arbitrary
+  shell commands; the runtime will refuse non-idempotent retries.
 - Keep all changes inside the task workspace and run the official checks before
   reporting completion. Treat every explicit output path as a completion
   contract: create it early, validate its format, and do not finish while it is
   missing. For a service, probe the requested local endpoint/process after the
-  final change. Once the artifacts and decisive checks pass, stop immediately
-  and leave a concise final summary instead of doing optional extra work.
+  final change. Re-run the decisive verification command after the last
+  mutation, and inspect schema/format/size when the task specifies an output
+  artifact. Before completion, ensure no action is failed or outcome_unknown,
+  no approval is pending, and every required child task is accepted. Once the
+  artifacts and decisive checks pass, stop immediately and leave a concise
+  final summary instead of doing optional extra work. Do not stop on prose
+  alone: emit a <cc-harness-complete> JSON block only after the checks pass,
+  listing the acceptance criteria and the observation digest for each decisive
+  check (never include hidden prompts or credentials).
 """
 COST_CONTRACT = "provider-reported-only-v1"
 _WHEEL_VERSION = re.compile(r"^cc_harness-([0-9]+\.[0-9]+\.[0-9]+)-")
 _TIKTOKEN_CACHE_DIR = "/opt/cc-harness/tiktoken-cache"
 _TIKTOKEN_CACHE_KEY = "9b5ad71b2ce5302211f9c61530b329a4922fc6a4"
+_SAFE_PROVIDER_METADATA_KEYS = {
+    "id",
+    "model",
+    "object",
+    "created",
+    "system_fingerprint",
+    "service_tier",
+    "request_id",
+    "response_id",
+}
 
 
 def _idle_budget_for_task(task_id: str | None) -> int:
@@ -167,6 +210,116 @@ class CCHarnessHarborAgent(BaseInstalledAgent):
                 environment,
                 command=(
                     "set -eu; "
+                    # Official task verifiers are intentionally unchanged, but
+                    # some minimal Ubuntu images bootstrap curl themselves.
+                    # A transient archive 5xx during that bootstrap otherwise
+                    # prevents the verifier from executing at all.  Configure
+                    # the real apt client (not a command wrapper) with bounded
+                    # retries and a conservative HTTP transport, then warm the
+                    # ordinary curl/trust-store packages before Harbor mounts
+                    # /tests.  If the primary Ubuntu archive keeps returning a
+                    # 5xx, retry once against security.ubuntu.com, which serves
+                    # the same noble suites.  This changes neither /tests nor
+                    # the official verifier and never installs the private
+                    # verifier runtime.  Terminal-Bench supplies frozen uv and
+                    # wheel artifacts, so an HTTPS-capable wget plus an existing
+                    # CA store is sufficient when a Debian CDN publishes a
+                    # stale curl .deb (a 404 must not invalidate the task).
+                    "if command -v apt-get >/dev/null 2>&1; then "
+                    "mkdir -p /etc/apt/apt.conf.d; "
+                    "printf '%s\\n' "
+                    "'Acquire::Retries \"5\";' "
+                    # A few pinned official task images (notably the
+                    # Debian bullseye/qemu image) ship with an expired
+                    # security-suite Release file.  The package signatures
+                    # are still verified; disabling only the time-validity
+                    # check lets the official image refresh its package
+                    # index instead of turning agent setup into an
+                    # environment_not_ready result.
+                    "'Acquire::Check-Valid-Until \"false\";' "
+                    "'Acquire::http::Timeout \"30\";' "
+                    "'Acquire::https::Timeout \"30\";' "
+                    "'Acquire::http::Pipeline-Depth \"0\";' "
+                    "> /etc/apt/apt.conf.d/99-cc-harness-network; "
+                    "network_tool_ready=0; "
+                    "if command -v curl >/dev/null 2>&1 && "
+                    "[ -s /etc/ssl/certs/ca-certificates.crt ]; then "
+                    "network_tool_ready=1; "
+                    "elif command -v wget >/dev/null 2>&1 && "
+                    "[ -s /etc/ssl/certs/ca-certificates.crt ]; then "
+                    "network_tool_ready=1; "
+                    "fi; "
+                    "if [ \"$network_tool_ready\" -ne 1 ]; then "
+                    "install_ok=0; "
+                    "for source in /etc/apt/sources.list "
+                    "/etc/apt/sources.list.d/*.list "
+                    "/etc/apt/sources.list.d/*.sources; do "
+                    "[ -f \"$source\" ] || continue; "
+                    "sed -i "
+                    "-e 's|http://archive.ubuntu.com/ubuntu|https://archive.ubuntu.com/ubuntu|g' "
+                    "-e 's|http://security.ubuntu.com/ubuntu|https://security.ubuntu.com/ubuntu|g' "
+                    "-e 's|http://deb.debian.org/debian-security|https://deb.debian.org/debian-security|g' "
+                    "-e 's|http://deb.debian.org/debian|https://deb.debian.org/debian|g' "
+                    "\"$source\" || true; "
+                    "done; "
+                    "apt_tls_opts=; "
+                    "if [ ! -s /etc/ssl/certs/ca-certificates.crt ]; then "
+                    "apt_tls_opts=\"-o Acquire::https::Verify-Peer=false "
+                    "-o Acquire::https::Verify-Host=false\"; fi; "
+                    "for mirror_round in 1 2; do "
+                    "if [ \"$mirror_round\" -eq 2 ]; then "
+                    "for source in /etc/apt/sources.list "
+                    "/etc/apt/sources.list.d/*.list "
+                    "/etc/apt/sources.list.d/*.sources; do "
+                    "[ -f \"$source\" ] || continue; "
+                        "sed -i "
+                        "-e 's|http://archive.ubuntu.com/ubuntu|https://security.ubuntu.com/ubuntu|g' "
+                        "-e 's|https://archive.ubuntu.com/ubuntu|https://security.ubuntu.com/ubuntu|g' "
+                        "-e 's|http://deb.debian.org/debian-security|https://deb.debian.org/debian-security|g' "
+                        "-e 's|http://deb.debian.org/debian|https://deb.debian.org/debian|g' "
+                        "\"$source\" || true; "
+                    "done; fi; "
+                    "update_ok=0; "
+                    "for retry in 1 2 3; do "
+                    "if DEBIAN_FRONTEND=noninteractive apt-get "
+                    "$apt_tls_opts -o Acquire::Check-Valid-Until=false -o Acquire::Retries=5 -o Acquire::http::Timeout=30 "
+                    "-o Acquire::https::Timeout=30 update; then "
+                    "update_ok=1; break; fi; sleep \"$retry\"; done; "
+                    "[ \"$update_ok\" -eq 1 ] || continue; "
+                    "for retry in 1 2 3; do "
+                    "if DEBIAN_FRONTEND=noninteractive apt-get "
+                    "$apt_tls_opts -o Acquire::Check-Valid-Until=false -o Acquire::Retries=5 -o Acquire::http::Timeout=30 "
+                    "-o Acquire::https::Timeout=30 --fix-missing install -y --no-install-recommends "
+                    "curl ca-certificates; then install_ok=1; break; fi; "
+                    # Debian mirrors can briefly publish a new Packages index
+                    # before every referenced .deb is available on the CDN.
+                    # Refresh the index between bounded install attempts so a
+                    # transient 404 is not misclassified as a broken task
+                    # environment.
+                    "if [ \"$retry\" -lt 3 ]; then DEBIAN_FRONTEND=noninteractive apt-get "
+                    "$apt_tls_opts -o Acquire::Check-Valid-Until=false -o Acquire::Retries=5 -o Acquire::http::Timeout=30 "
+                    "-o Acquire::https::Timeout=30 update >/dev/null 2>&1 || true; fi; "
+                    "sleep \"$retry\"; done; "
+                    # A stale Debian package index can reference a .deb that
+                    # has already rotated out of the CDN.  If wget and the CA
+                    # store were already present, the frozen runtime can still
+                    # proceed safely without curl; do not turn that optional
+                    # convenience package into an environment_not_ready result.
+                    "if [ \"$install_ok\" -ne 1 ] && command -v wget >/dev/null 2>&1 && "
+                    "[ -s /etc/ssl/certs/ca-certificates.crt ]; then install_ok=1; fi; "
+                    "[ \"$install_ok\" -eq 1 ] && break; "
+                    "done; "
+                    "[ \"$install_ok\" -eq 1 ] || exit 1; "
+                    "update-ca-certificates >/dev/null 2>&1 || true; "
+                    "fi; "
+                    "elif command -v apk >/dev/null 2>&1; then "
+                    "if ! command -v curl >/dev/null 2>&1 || "
+                    "[ ! -s /etc/ssl/certs/ca-certificates.crt ]; then "
+                    "apk_ok=0; for retry in 1 2 3; do "
+                    "if apk add --no-cache ca-certificates curl; then apk_ok=1; break; fi; "
+                    "sleep \"$retry\"; done; [ \"$apk_ok\" -eq 1 ] || exit 1; "
+                    "update-ca-certificates >/dev/null 2>&1 || true; fi; "
+                    "fi; "
                     "test -x /root/.local/bin/cc-harness; "
                     "test -x /opt/cc-harness/agent-runtime/python/bin/python; "
                     "test -d /opt/cc-harness/agent-site; "
@@ -515,6 +668,10 @@ class CCHarnessHarborAgent(BaseInstalledAgent):
         context.cost_usd = usage["provider_cost_usd"]
         context.metadata = {
             "resolved_model": MODEL,
+            "provider": usage["provider"],
+            "model": usage["model"],
+            "providers": usage["providers"],
+            "models": usage["models"],
             "model_calls": usage["model_calls"],
             "tool_calls": usage["tool_calls"],
             "run_command_timeout_s": RUN_COMMAND_TIMEOUT_S,
@@ -534,6 +691,11 @@ class CCHarnessHarborAgent(BaseInstalledAgent):
             "api_cost_status": usage["api_cost_status"],
             "api_cost_observed": usage["api_cost_observed"],
             "api_cost_complete": usage["api_cost_complete"],
+            "cache_hit_ratio": usage["cache_hit_ratio"],
+            "provider_metadata": usage["provider_metadata"],
+            "stop_reasons": usage["stop_reasons"],
+            "runtime_status": usage["runtime_status"],
+            "runtime_error": usage["runtime_error"],
             "cost_contract": COST_CONTRACT,
         }
 
@@ -568,14 +730,60 @@ def _parse_document(stdout: str) -> dict[str, Any]:
         raise ValueError(f"cc-harness output is not valid JSONL: {exc}") from exc
     if not documents or not isinstance(documents[-1], dict):
         raise ValueError("cc-harness output contains no result object")
-    result = documents[-1]
+    result = dict(documents[-1])
     if result.get("schema_version") != "cc-harness.print-result.v1":
         raise ValueError("cc-harness result schema is missing")
-    if result.get("error"):
-        raise ValueError(f"cc-harness reported an error: {result['error']}")
+    reported_model = result.get("resolved_model")
+    canonical_model = canonical_model_identity(reported_model, MODEL)
+    if canonical_model != reported_model and canonical_model == MODEL:
+        # Preserve the provider's raw model in usage/provider metadata; only
+        # normalize the top-level identity used by the official parity gate.
+        result["resolved_model"] = canonical_model
     if result.get("resolved_model") != MODEL:
         raise ValueError("cc-harness resolved model does not match the parity contract")
+    # A durable run can reach a verifier-usable workspace and still terminate
+    # at a runtime lifecycle boundary (for example ``stalled`` after the last
+    # tool observation).  Preserve that envelope so Harbor's official
+    # verifier can grade the workspace.  Only fatal protocol/provider errors
+    # are raised here; treating every runtime diagnostic as a malformed agent
+    # result was the reason valid verifier rewards were previously lost.
+    if result.get("error") and not _recoverable_runtime_error(result):
+        raise ValueError(f"cc-harness reported an error: {result['error']}")
+    outcome = result.get("outcome")
+    if not result.get("runtime_status"):
+        if isinstance(outcome, dict) and outcome.get("outcome"):
+            result["runtime_status"] = str(outcome["outcome"])
+        elif result.get("error"):
+            result["runtime_status"] = _runtime_status_from_error(str(result["error"]))
     return result
+
+
+_RECOVERABLE_RUNTIME_STATUSES = {
+    "stalled",
+    "blocked",
+    "failed_recoverable",
+}
+
+
+def _runtime_status_from_error(error: str) -> str | None:
+    normalized = str(error or "").casefold().replace("-", "_")
+    for status in _RECOVERABLE_RUNTIME_STATUSES:
+        if status in normalized:
+            return status
+    return None
+
+
+def _recoverable_runtime_error(result: Mapping[str, Any]) -> bool:
+    """Whether a result error is a runtime boundary, not a fatal agent error."""
+
+    outcome = result.get("outcome")
+    status = result.get("runtime_status")
+    if not status and isinstance(outcome, Mapping):
+        status = outcome.get("outcome")
+    status_value = str(status or "").casefold().replace("-", "_")
+    if status_value in _RECOVERABLE_RUNTIME_STATUSES:
+        return True
+    return _runtime_status_from_error(str(result.get("error") or "")) is not None
 
 
 def _usage_from_document(result: dict[str, Any]) -> dict[str, Any]:
@@ -587,7 +795,14 @@ def _usage_from_document(result: dict[str, Any]) -> dict[str, Any]:
     cache_creation = _count(usage, "cache_creation_input_tokens")
     cache_read = _count(usage, "cache_read_input_tokens")
     if uncached + cache_creation + cache_read != input_tokens:
-        raise ValueError("cc-harness cache token breakdown does not sum to input_tokens")
+        # Older gateways report only prompt_tokens.  Treat that entire prompt
+        # as an uncached miss rather than dropping the result at the Harbor
+        # adapter boundary; a partially reported cache breakdown remains an
+        # explicit, auditable fact (and never becomes a cost estimate).
+        if uncached == 0 and cache_creation == 0 and cache_read == 0:
+            uncached = input_tokens
+        else:
+            raise ValueError("cc-harness cache token breakdown does not sum to input_tokens")
     output_tokens = _count(usage, "output_tokens")
     model_calls = _count(usage, "model_calls")
     tool_calls = _count(usage, "tool_calls")
@@ -640,6 +855,26 @@ def _usage_from_document(result: dict[str, Any]) -> dict[str, Any]:
         if provider_cost_usd is not None
         else None
     )
+    providers = _bounded_string_list(usage.get("providers"))
+    models = _bounded_string_list(usage.get("models"))
+    provider = _bounded_identity(usage.get("provider"))
+    model = _bounded_identity(usage.get("model") or result.get("resolved_model"))
+    if provider and provider not in providers:
+        providers.insert(0, provider)
+    if model and model not in models:
+        models.insert(0, model)
+    if provider is None and providers:
+        provider = providers[0]
+    if model is None and models:
+        model = models[0]
+    provider_metadata = _bounded_provider_metadata(usage.get("provider_metadata"))
+    stop_reasons = _bounded_stop_reasons(usage.get("stop_reasons"))
+    runtime_status = _bounded_identity(
+        usage.get("runtime_status")
+        or result.get("runtime_status")
+        or ((result.get("outcome") or {}).get("outcome") if isinstance(result.get("outcome"), dict) else None)
+    )
+    runtime_error = _bounded_identity(usage.get("runtime_error") or result.get("error"))
     return {
         "input_tokens": input_tokens,
         "uncached_input_tokens": uncached,
@@ -658,6 +893,15 @@ def _usage_from_document(result: dict[str, Any]) -> dict[str, Any]:
         "api_cost_observed": api_cost_observed,
         "api_cost_complete": api_cost_complete,
         "provider_cost_usd": provider_cost_usd,
+        "provider": provider,
+        "model": model,
+        "providers": providers,
+        "models": models,
+        "cache_hit_ratio": cache_read / input_tokens if input_tokens > 0 else None,
+        "provider_metadata": provider_metadata,
+        "stop_reasons": stop_reasons,
+        "runtime_status": runtime_status,
+        "runtime_error": runtime_error,
     }
 
 
@@ -781,6 +1025,13 @@ def _atif_trajectory(
                 "api_reported_cost_currency": usage["api_reported_cost_currency"],
                 "api_cost_source": "provider",
                 "api_cost_status": usage["api_cost_status"],
+                "provider": usage["provider"],
+                "model": usage["model"],
+                "providers": usage["providers"],
+                "models": usage["models"],
+                "cache_hit_ratio": usage["cache_hit_ratio"],
+                "provider_metadata": usage["provider_metadata"],
+                "stop_reasons": usage["stop_reasons"],
                 "cost_contract": COST_CONTRACT,
             },
         ),
@@ -799,6 +1050,60 @@ def _count(usage: dict[str, Any], field: str) -> int:
     if isinstance(value, bool) or not isinstance(value, int) or value < 0:
         raise ValueError(f"cc-harness usage has invalid {field}")
     return value
+
+
+def _bounded_identity(value: Any) -> str | None:
+    if value is None:
+        return None
+    normalized = str(value).strip()[:512]
+    return normalized or None
+
+
+def _bounded_string_list(value: Any) -> list[str]:
+    if isinstance(value, str):
+        values = [value]
+    elif isinstance(value, (list, tuple)):
+        values = value
+    else:
+        values = []
+    result: list[str] = []
+    for item in values:
+        normalized = _bounded_identity(item)
+        if normalized and normalized not in result:
+            result.append(normalized)
+        if len(result) >= 32:
+            break
+    return result
+
+
+def _bounded_provider_metadata(value: Any) -> dict[str, Any]:
+    if not isinstance(value, Mapping):
+        return {}
+    result: dict[str, Any] = {}
+    for key in _SAFE_PROVIDER_METADATA_KEYS:
+        raw = value.get(key)
+        if isinstance(raw, str):
+            result[key] = raw[:512]
+        elif isinstance(raw, (int, float, bool)):
+            result[key] = raw
+    return result
+
+
+def _bounded_stop_reasons(value: Any) -> dict[str, int]:
+    if not isinstance(value, Mapping):
+        return {}
+    result: dict[str, int] = {}
+    for raw_reason, raw_count in value.items():
+        reason = str(raw_reason).strip()[:128]
+        if not reason:
+            continue
+        try:
+            count = int(raw_count)
+        except (TypeError, ValueError):
+            continue
+        if count > 0:
+            result[reason] = result.get(reason, 0) + min(count, 1_000_000)
+    return result
 
 
 def _bounded_iterations(raw: str | None) -> int:

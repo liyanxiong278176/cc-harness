@@ -8,12 +8,16 @@ from cc_harness.durable_runtime import DurableRuntimeClient
 from cc_harness.entrypoint import build_parser
 
 
-def test_runtime_selector_keeps_legacy_compatibility_explicit(monkeypatch) -> None:
+def test_runtime_selector_exposes_only_durable_runtime(monkeypatch) -> None:
     monkeypatch.delenv("CC_HARNESS_RUNTIME", raising=False)
     parser = build_parser()
 
     assert parser.parse_args([]).runtime == "durable"
-    assert parser.parse_args(["--runtime", "legacy"]).runtime == "legacy"
+    # The production contract intentionally has one resumable runtime path;
+    # accepting a legacy selector would silently route work around the
+    # durable event/checkpoint/audit guarantees.
+    with pytest.raises(SystemExit):
+        parser.parse_args(["--runtime", "legacy"])
     assert parser.parse_args(["--runtime", "durable"]).runtime == "durable"
 
 

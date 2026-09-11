@@ -85,6 +85,8 @@ def _benchmark_command(arguments: list[str]) -> list[str]:
         "terminal-bench-2.1",
         "--profile",
         "full",
+        "--trials-per-task",
+        "5",
         "--confirm-live",
         *arguments,
     ]
@@ -249,13 +251,7 @@ def _rotate_stale_new_run_log(run_root: Path, arguments: list[str]) -> None:
 
 
 def _worker_environment_arguments() -> list[str]:
-    names = {
-        "PATH",
-        "PYTHONPATH",
-        "WSL_DISTRO_NAME",
-        "DOCKER_HOST",
-        "LANG",
-        "LC_ALL",
+    proxy_names = {
         "HTTP_PROXY",
         "HTTPS_PROXY",
         "ALL_PROXY",
@@ -265,6 +261,20 @@ def _worker_environment_arguments() -> list[str]:
         "all_proxy",
         "no_proxy",
     }
+    names = {
+        "PATH",
+        "PYTHONPATH",
+        "WSL_DISTRO_NAME",
+        "DOCKER_HOST",
+        "DOCKER_CONFIG",
+        "LANG",
+        "LC_ALL",
+        "XDG_CACHE_HOME",
+        "TMPDIR",
+        "UV_PROJECT_ENVIRONMENT",
+        "UV_CACHE_DIR",
+        *proxy_names,
+    }
     names.update(
         name
         for name in os.environ
@@ -272,14 +282,27 @@ def _worker_environment_arguments() -> list[str]:
         or name
         in {
             "CC_HARNESS_ALLOW_OBSERVABILITY_RESUME",
+            "CC_HARNESS_ALLOW_RESUME_RUNTIME_REPAIR",
             "CC_HARNESS_ALLOW_RESUME_ARTIFACT_REFRESH",
         }
     )
-    return [
+    arguments = [
         f"--setenv={name}={os.environ[name]}"
         for name in sorted(names)
-        if os.environ.get(name)
+        if name in os.environ and (os.environ[name] or name not in proxy_names)
     ]
+    # A user systemd manager may have retained proxy variables from an older
+    # shell even though the official direct/public transport deliberately
+    # unsets them.  Send explicit clears so the detached worker cannot revive
+    # a stale proxy in Harbor or Docker task containers.
+    if os.environ.get("CC_HARNESS_TERMINAL_NETWORK_TRANSPORT") == "direct-public.v1":
+        arguments.extend(f"--setenv={name}=" for name in sorted(proxy_names))
+    # Always clear the context, including when the parent shell did not set
+    # it.  A persistent user systemd manager may otherwise retain
+    # ``desktop-linux`` and make Harbor resolve a different Docker endpoint
+    # than the launcher's native WSL socket.
+    arguments.append("--setenv=DOCKER_CONTEXT=")
+    return arguments
 
 
 def _start_systemd_worker(

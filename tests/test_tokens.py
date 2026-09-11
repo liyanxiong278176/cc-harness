@@ -21,6 +21,22 @@ def test_usage_record_normalizes_deepseek_cache_fields_and_direct_cost_only():
     assert usage.reported_cost_currency == "USD"
 
 
+def test_usage_record_fills_missing_total_from_prompt_and_completion():
+    usage = UsageRecord.from_api(
+        {"prompt_tokens": 12, "completion_tokens": 4}
+    )
+    assert usage is not None
+    assert usage.total_tokens == 16
+
+
+def test_usage_record_rejects_negative_provider_cost():
+    usage = UsageRecord.from_api(
+        {"prompt_tokens": 1, "completion_tokens": 1, "cost": -0.5}
+    )
+    assert usage is not None
+    assert usage.reported_cost is None
+
+
 def test_session_cost_is_unknown_if_any_observed_api_call_lacks_provider_cost():
     stats = SessionTokenStats()
     stats.add(TurnTokenStats(api_reported=True, api_reported_cost=0.1, api_reported_cost_currency="USD"))
@@ -280,6 +296,18 @@ def test_session_token_stats_add_accumulates():
     assert s.api_total_tokens == 165
     assert s.iters_total == 3
     assert s.turns_with_usage == 2
+
+
+def test_session_token_stats_keeps_bounded_per_call_envelopes():
+    invocation = {
+        "invocation_id": "turn-1",
+        "input_tokens": 100,
+        "output_tokens": 4,
+        "cost_status": "unavailable",
+    }
+    stats = SessionTokenStats()
+    stats.add(TurnTokenStats(api_reported=True, api_invocations=[invocation]))
+    assert stats.api_invocations == [invocation]
 
 
 def test_session_token_stats_add_turns_without_usage():

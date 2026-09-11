@@ -15,6 +15,7 @@ from cc_harness.loop_control import (
     ToolErrorKind,
     ToolScheduler,
     WorkingState,
+    artifact_validation_issues,
     classify_tool_error,
     completion_contract_from_instruction,
 )
@@ -51,12 +52,33 @@ async def test_completion_verifier_requires_path_and_post_mutation_test(tmp_path
     assert (await verifier.verify(state)).passed is True
 
 
+@pytest.mark.asyncio
+async def test_completion_verifier_rejects_model_only_final_message(tmp_path: Path) -> None:
+    verifier = CompletionVerifier()
+    report = await verifier.verify(WorkingState.new(tmp_path))
+    assert report.passed is False
+    assert any("final message alone" in issue for issue in report.issues)
+
+
 def test_completion_contract_extracts_outputs_but_not_inputs() -> None:
     contract = completion_contract_from_instruction(
         "Read /app/input.json.\nWrite the final answer to /app/output.json."
     )
     assert contract.required_paths == ("/app/output.json",)
     assert contract.require_service_health_check is False
+
+
+def test_completion_contract_validates_json_outputs_and_declared_digest(tmp_path: Path) -> None:
+    contract = completion_contract_from_instruction(
+        "Save JSON output to /app/result.json (sha256:"
+        + "a" * 64
+        + ")."
+    )
+    assert contract.required_artifacts[0].format == "json"
+    assert contract.required_artifacts[0].sha256 == "sha256:" + "a" * 64
+    target = tmp_path / "result.json"
+    target.write_text('{"ok": true}', encoding="utf-8")
+    assert not any("valid JSON" in issue for issue in artifact_validation_issues(tmp_path, contract.required_artifacts))
 
 
 @pytest.mark.asyncio
@@ -89,9 +111,27 @@ def test_stall_controller_detects_identical_trajectory() -> None:
     assert controller.observe("same", action_signature="action").stalled is False
     decision = controller.observe("same", action_signature="action")
     assert decision.stalled is True
+    assert decision.replan_required is True
+    assert decision.replan_id == "replan-1"
     assert "different action" in decision.instruction
     assert controller.should_block("action") is True
     assert controller.should_block("different") is False
+    assert controller.replan_count == 1
+    next_decision = controller.observe("new", action_signature="different")
+    assert next_decision.stalled is False
+
+
+def test_stall_controller_does_not_emit_duplicate_replan_for_blocked_signature() -> None:
+    controller = StallController(repeat_threshold=2)
+    controller.observe("same", action_signature="action")
+    first = controller.observe("same", action_signature="action")
+    assert first.replan_required is True
+    # A caller that observes before checking should still receive the same
+    # directive, not increment the replan counter indefinitely.
+    second = controller.observe("same", action_signature="action")
+    assert second.replan_required is False
+    assert second.replan_id == first.replan_id
+    assert controller.replan_count == 1
 
 
 def test_scheduler_only_parallelizes_proven_read_only_native_tools() -> None:

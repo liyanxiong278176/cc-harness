@@ -12,6 +12,7 @@ import os
 import sys
 from importlib.metadata import PackageNotFoundError, version
 from pathlib import Path
+from typing import Mapping
 
 from prompt_toolkit import PromptSession
 from rich.console import Console
@@ -414,6 +415,12 @@ async def _write_durable_print_result(client, run_id: str, *, error: str | None)
             "models": telemetry["models"],
             "invocation_count": telemetry["invocation_count"],
             "invocation_statuses": telemetry["statuses"],
+            "provider": telemetry["provider"],
+            "model": telemetry["model"],
+            "cache_hit_ratio": telemetry["cache_hit_ratio"],
+            "provider_metadata": telemetry["provider_metadata"],
+            "invocations": telemetry["invocations"],
+            "stop_reasons": telemetry["stop_reasons"],
         }
         trajectory: list[dict] = []
         final = ""
@@ -479,6 +486,15 @@ async def _write_durable_print_result(client, run_id: str, *, error: str | None)
         resolved = (
             (client._llm.resolved_model or requested) if client._llm is not None else None
         )
+        runtime_status = None
+        if isinstance(outcome, Mapping):
+            runtime_status = outcome.get("outcome")
+        if runtime_status is None and error:
+            normalized_error = str(error).casefold().replace("-", "_")
+            for candidate in ("stalled", "blocked", "failed_recoverable"):
+                if candidate in normalized_error:
+                    runtime_status = candidate
+                    break
         return {
             "schema_version": "cc-harness.print-result.v1",
             "type": "result",
@@ -488,6 +504,7 @@ async def _write_durable_print_result(client, run_id: str, *, error: str | None)
             "error": error,
             "run_id": run_id,
             "runtime": "durable",
+            "runtime_status": runtime_status,
             "outcome": outcome,
             "trajectory": trajectory,
             "usage": usage,
@@ -503,7 +520,29 @@ async def _write_durable_print_result(client, run_id: str, *, error: str | None)
         buffer.flush()
     else:
         sys.stdout.write(encoded.decode("utf-8"))
-    return 1 if error else 0
+    # Harbor needs to receive the workspace even when the durable worker ends
+    # at a recoverable lifecycle boundary.  The JSON envelope still carries
+    # the error and runtime status for attribution; only fatal protocol,
+    # provider, or approval errors keep the non-zero process status that
+    # signals an agent failure to the caller.
+    return 0 if not error or _recoverable_durable_error(error) else 1
+
+
+def _recoverable_durable_error(error: str | None) -> bool:
+    """Return True for runtime statuses that the official verifier can grade."""
+
+    normalized = str(error or "").casefold().replace("-", "_")
+    return any(
+        marker in normalized
+        for marker in (
+            "status stalled",
+            "status blocked",
+            "status failed_recoverable",
+            "run stalled",
+            "run blocked",
+            "run failed_recoverable",
+        )
+    )
 
 
 async def _run_print(
@@ -599,6 +638,21 @@ def _write_print_json(
     error: str | None,
     events: list[dict],
 ) -> None:
+    providers = list(getattr(stats, "api_providers", []) or [])
+    models = list(getattr(stats, "api_models", []) or [])
+    # Legacy/non-durable sessions may not have populated identity arrays yet;
+    # use the configured client as a safe compatibility fallback (base_url is
+    # reduced to its host so credentials/query strings can never leak).
+    if not providers:
+        base_url = getattr(runtime.llm, "base_url", None)
+        if base_url:
+            provider = str(base_url).split("//", 1)[-1].split("/", 1)[0]
+            if provider:
+                providers = [provider]
+    if not models:
+        model = getattr(runtime.llm, "resolved_model", None) or getattr(runtime.llm, "model", None)
+        if model:
+            models = [str(model)]
     payload = {
         "schema_version": "cc-harness.print-result.v1",
         "type": "result",
@@ -606,6 +660,7 @@ def _write_print_json(
         "requested_model": runtime.llm.model,
         "resolved_model": runtime.llm.resolved_model,
         "error": error,
+        "runtime": "interactive",
         "trajectory": events,
         "usage": {
             "input_tokens": int(getattr(stats, "api_prompt_tokens", 0) or 0),
@@ -632,6 +687,22 @@ def _write_print_json(
             "api_cost_status": _api_cost_status(stats),
             "api_cost_observed": bool(getattr(stats, "api_cost_observed", False)),
             "api_cost_complete": bool(getattr(stats, "api_cost_complete", False)),
+            "cache_hit_ratio": (
+                int(getattr(stats, "api_cache_read_prompt_tokens", 0) or 0)
+                / int(getattr(stats, "api_prompt_tokens", 0) or 1)
+                if int(getattr(stats, "api_prompt_tokens", 0) or 0) > 0
+                else None
+            ),
+            "provider": providers[0] if providers else None,
+            "model": models[0] if models else None,
+            "providers": providers,
+            "models": models,
+            "provider_metadata": list(getattr(stats, "api_provider_metadata", []) or []),
+            "invocations": [
+                dict(item)
+                for item in (getattr(stats, "api_invocations", []) or [])[:512]
+            ],
+            "stop_reasons": dict(getattr(stats, "api_stop_reasons", {}) or {}),
         },
     }
     encoded = (json.dumps(payload, ensure_ascii=False, allow_nan=False) + "\n").encode("utf-8")

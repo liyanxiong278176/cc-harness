@@ -6,6 +6,7 @@ import uuid
 import aiosqlite
 import pytest
 
+import cc_harness.run_store as run_store_module
 from cc_harness.run_events import EventActor, RunEvent
 from cc_harness.run_model import GoalContract, Run, RunStatus, RuntimeContract
 from cc_harness.run_store import LeaseFenceError, RunStore, SequenceConflict
@@ -335,3 +336,63 @@ async def test_distinct_store_connections_serialize_concurrent_writers(tmp_path)
     finally:
         await first.close()
         await second.close()
+
+
+@pytest.mark.asyncio
+async def test_store_uses_wal_and_serializes_read_transactions(tmp_path) -> None:
+    store = await opened_store(tmp_path)
+    try:
+        await append_created(store)
+        async with aiosqlite.connect(store.db_path) as db:
+            cursor = await db.execute("PRAGMA journal_mode")
+            assert (await cursor.fetchone())[0].lower() == "wal"
+        # synchronous is connection-local; inspect the configured runtime
+        # connection rather than a fresh SQLite client with its FULL default.
+        cursor = await store._db.execute("PRAGMA synchronous")
+        assert int((await cursor.fetchone())[0]) == 1
+
+        pages = await asyncio.gather(
+            *(store.read(RUN_ID, after=0, limit=1) for _ in range(16))
+        )
+        assert all(page.events[0].sequence == 1 for page in pages)
+    finally:
+        await store.close()
+
+
+@pytest.mark.asyncio
+async def test_cancelled_begin_rolls_back_before_next_operation(tmp_path, monkeypatch) -> None:
+    """A cancellation after SQLite accepts BEGIN must not poison the connection."""
+
+    store = await opened_store(tmp_path)
+    begun = asyncio.Event()
+    original_begin = run_store_module.begin_immediate
+
+    async def begin_then_pause(connection, **kwargs):
+        await original_begin(connection, **kwargs)
+        begun.set()
+        await asyncio.Future()
+
+    monkeypatch.setattr(run_store_module, "begin_immediate", begin_then_pause)
+    task = asyncio.create_task(
+        store.append(
+            event(
+                1,
+                "RunCreated",
+                {"goal": GOAL.to_dict(), "runtime_contract": CONTRACT.to_dict()},
+            ),
+            expected_sequence=0,
+        )
+    )
+    await asyncio.wait_for(begun.wait(), timeout=2)
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    # The same connection remains usable and no nested BEGIN is raised.
+    assert len(await store.list_runs()) == 1
+    monkeypatch.setattr(run_store_module, "begin_immediate", original_begin)
+    try:
+        await append_created(store)
+        assert (await store.read(RUN_ID)).events[0].event_type == "RunCreated"
+    finally:
+        await store.close()

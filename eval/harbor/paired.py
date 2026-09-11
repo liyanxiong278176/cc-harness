@@ -363,6 +363,8 @@ def build_harbor_command(
     wheel_path: Path,
     env_file: Path,
     jobs_dir: Path,
+    n_attempts: int = 1,
+    n_concurrent: int = 1,
     uv_bootstrap_path: Path | None = None,
     verifier_bootstrap_path: Path | None = None,
     tiktoken_bootstrap_path: Path | None = None,
@@ -378,6 +380,10 @@ def build_harbor_command(
     extra_docker_compose_paths: Sequence[Path] | None = None,
     allowed_agent_hosts: Sequence[str] | None = None,
 ) -> list[str]:
+    if not isinstance(n_attempts, int) or n_attempts < 1:
+        raise ValueError("n_attempts must be a positive integer")
+    if not isinstance(n_concurrent, int) or n_concurrent < 1:
+        raise ValueError("n_concurrent must be a positive integer")
     command = [
         uvx,
         "--from",
@@ -421,9 +427,9 @@ def build_harbor_command(
             "--env-file",
             str(env_file),
             "--n-attempts",
-            "1",
+            str(n_attempts),
             "--n-concurrent",
-            "1",
+            str(n_concurrent),
             "--jobs-dir",
             str(jobs_dir),
             "--quiet",

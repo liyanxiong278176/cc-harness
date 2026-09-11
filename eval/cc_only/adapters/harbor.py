@@ -21,6 +21,12 @@ from typing import Any
 from dotenv import dotenv_values
 
 from cc_harness.executor import _process_activity_snapshot
+from cc_harness.run_outcomes import (
+    FailureClass,
+    FailureEvidence,
+    classify_reason,
+    diagnose_root_cause,
+)
 from eval.harbor.paired import HARBOR_VERSION, build_harbor_command
 from eval.launch import HarnessKind
 from eval.launch.runner import _terminate_process_tree
@@ -50,6 +56,7 @@ from ..tiktoken_bootstrap import (
     tiktoken_bootstrap_identity,
 )
 from ..verifier_runtime import agent_runtime_overlay, ensure_verifier_runtime
+from eval.terminal_bench.infra_guard import build_default_guard_manager
 
 SWEBENCH_DATASET = "swe-bench/swe-bench-verified@sha256:b934b0cc3dc800fe945eaf9f1623329db97ee5e27c24c5563b3a16c6e2854c17"
 TERMINAL_BENCH_20_DATASET = "terminal-bench@2.0"
@@ -63,7 +70,12 @@ _TERMINAL_MIN_FREE_BYTES = 80 * 1024**3
 _TERMINAL_MAX_ITERATIONS = 80
 _DOCKER_HEALTHCHECK_ATTEMPTS = 3
 _DOCKER_HEALTHCHECK_BACKOFFS = (1.0, 2.0)
-_DOCKER_HEALTHCHECK_TIMEOUT_SECONDS = 10
+# Docker Desktop/native-daemon restarts can make ``docker info`` take longer
+# than the old 10-second probe even though the daemon is healthy.  Harbor's
+# own task preflight remains authoritative; this bounded probe only prevents
+# launching a process when the local endpoint is clearly unavailable.
+_DOCKER_HEALTHCHECK_TIMEOUT_SECONDS = 30
+_DOCKER_DEFAULT_HOST = "unix:///var/run/docker.sock"
 _HARBOR_HOST_IMPORT_TIMEOUT_SECONDS = 60
 _OFFICIAL_TERMINAL_FORBIDDEN_OPTIONS = (
     "--timeout-multiplier",
@@ -291,6 +303,81 @@ class _HarborAdapter:
     async def execute(self, context: TrialContext) -> TrialOutcome:
         evidence_jobs = context.attempt_root / "jobs"
         jobs = evidence_jobs
+        guard_manager = None
+        if self.slug == "terminal-bench-2.1":
+            guard_manager = build_default_guard_manager(
+                project_root=context.project_root,
+                attempt_root=context.attempt_root,
+                task_id=context.task.task_id,
+                official_dataset=self.dataset,
+                harbor_version=HARBOR_VERSION,
+            )
+            precheck = guard_manager.pre_check()
+            guard_manager.write_evidence("guard-precheck.json", precheck)
+            if precheck.get("blocking"):
+                # A failed guard is a pre-model infrastructure outcome.  The
+                # official Harbor verifier has not run and must not be scored.
+                return TrialOutcome(
+                    status=TrialStatus.INVALID,
+                    invalid_reason="Terminal-Bench infrastructure guard blocked task startup",
+                    protocol={
+                        "exception_is_infrastructure": True,
+                        "environment_not_ready": True,
+                        "guard_precheck": precheck,
+                        "official_error_counted_as_zero": False,
+                    },
+                    official_result=_terminal_official_result(
+                        None,
+                        source="harbor.verifier_result.not_started",
+                        verifier_executed=False,
+                    ),
+                    runtime_diagnostic={
+                        "status": "environment_not_ready",
+                        "error": "Terminal-Bench infrastructure guard blocked task startup",
+                        "model_phase_started": False,
+                        "reconciled": False,
+                        "failure_class": "verifier_infrastructure",
+                        "failure_evidence": _terminal_failure_evidence(
+                            "verifier_infrastructure",
+                            "Terminal-Bench infrastructure guard blocked task startup",
+                            model_phase_started=False,
+                            verifier_executed=False,
+                            source="harbor.guard",
+                        ),
+                    },
+                )
+            prevent = guard_manager.prevent()
+            guard_manager.write_evidence("guard-prevent.json", prevent)
+            if prevent.get("blocking"):
+                return TrialOutcome(
+                    status=TrialStatus.INVALID,
+                    invalid_reason="Terminal-Bench infrastructure guard prevention failed",
+                    protocol={
+                        "exception_is_infrastructure": True,
+                        "environment_not_ready": True,
+                        "guard_prevent": prevent,
+                        "official_error_counted_as_zero": False,
+                    },
+                    official_result=_terminal_official_result(
+                        None,
+                        source="harbor.verifier_result.not_started",
+                        verifier_executed=False,
+                    ),
+                    runtime_diagnostic={
+                        "status": "environment_not_ready",
+                        "error": "Terminal-Bench infrastructure guard prevention failed",
+                        "model_phase_started": False,
+                        "reconciled": False,
+                        "failure_class": "verifier_infrastructure",
+                        "failure_evidence": _terminal_failure_evidence(
+                            "verifier_infrastructure",
+                            "Terminal-Bench infrastructure guard prevention failed",
+                            model_phase_started=False,
+                            verifier_executed=False,
+                            source="harbor.guard",
+                        ),
+                    },
+                )
         if self.slug.startswith("terminal-bench"):
             runtime_root = os.environ.get("CC_HARNESS_TERMINAL_RUNTIME_ROOT")
             if not runtime_root:
@@ -336,6 +423,66 @@ class _HarborAdapter:
             + "\n",
             encoding="utf-8",
         )
+        # If the previous launcher crashed after Harbor had already persisted
+        # a complete repeated-trial job, recover that immutable official
+        # evidence instead of starting Harbor (and the model) a second time.
+        # This is especially important for a post-processing defect: replaying
+        # the task would spend another five model calls and would violate the
+        # one-run checkpoint contract even though all verifier rewards exist.
+        if self.slug == "terminal-bench-2.1" and self.trials_per_task > 1:
+            persisted = _find_completed_harbor_job(
+                evidence_jobs,
+                expected_trials=self.trials_per_task,
+            )
+            if persisted is not None:
+                persisted_root, persisted_job, persisted_trials, retained_count = persisted
+                recovered = _terminal_repeated_trial_outcome(
+                    context,
+                    job_root=persisted_root,
+                    job=persisted_job,
+                    trial_roots=persisted_trials,
+                    stats=persisted_job.get("stats") or {},
+                    retained_job_count=retained_count,
+                )
+                recovery_protocol = dict(recovered.protocol)
+                recovery_protocol.update(
+                    {
+                        "checkpoint_recovered": True,
+                        "recovery_source": "persisted-complete-harbor-job",
+                        "model_replayed": False,
+                        "harbor_resume_selection": "persisted-complete-job",
+                    }
+                )
+                try:
+                    (context.attempt_root / "checkpoint-recovery.json").write_text(
+                        json.dumps(
+                            {
+                                "status": recovered.status.value,
+                                "source_job": persisted_root.relative_to(
+                                    context.attempt_root
+                                ).as_posix(),
+                                "trial_count": len(persisted_trials),
+                                "model_replayed": False,
+                            },
+                            ensure_ascii=False,
+                            indent=2,
+                        )
+                        + "\n",
+                        encoding="utf-8",
+                    )
+                except OSError:
+                    pass
+                return TrialOutcome(
+                    status=recovered.status,
+                    metrics=recovered.metrics,
+                    usage=recovered.usage,
+                    invalid_reason=recovered.invalid_reason,
+                    failure_reason=recovered.failure_reason,
+                    critical_failure=recovered.critical_failure,
+                    protocol=recovery_protocol,
+                    official_result=recovered.official_result,
+                    runtime_diagnostic=recovered.runtime_diagnostic,
+                )
         docker_before = _docker_snapshot()
         (context.attempt_root / "docker-before.json").write_text(
             json.dumps(docker_before, ensure_ascii=False, indent=2) + "\n",
@@ -362,6 +509,25 @@ class _HarborAdapter:
                     "transient_infrastructure": True,
                     "docker_healthcheck": docker_health,
                     "official_error_counted_as_zero": False,
+                },
+                official_result=_terminal_official_result(
+                    None,
+                    source="harbor.verifier_result.not_started",
+                    verifier_executed=False,
+                ),
+                runtime_diagnostic={
+                    "status": "environment_not_ready",
+                    "error": diagnostic,
+                    "model_phase_started": False,
+                    "reconciled": False,
+                    "failure_class": "verifier_infrastructure",
+                    "failure_evidence": _terminal_failure_evidence(
+                        "verifier_infrastructure",
+                        diagnostic,
+                        model_phase_started=False,
+                        verifier_executed=False,
+                        source="harbor.docker_health",
+                    ),
                 },
             )
         configured = {
@@ -410,6 +576,8 @@ class _HarborAdapter:
             ),
             env_file=env_file,
             jobs_dir=jobs,
+            n_attempts=(self.trials_per_task if self.slug == "terminal-bench-2.1" else 1),
+            n_concurrent=1,
             agent_env=(terminal_agent_env if self.slug.startswith("terminal-bench") else None),
             extra_docker_compose_paths=(
                 (terminal_overlay,) if terminal_overlay is not None else None
@@ -425,8 +593,8 @@ class _HarborAdapter:
                         "official_task_and_verifier_unchanged": True,
                         "custom_agent_overlay": str(terminal_overlay),
                         "custom_agent_overlay_scope": "agent-runtime-only",
-                        "n_attempts": 1,
-                        "leaderboard_deviation": "single trial instead of five",
+                        "n_attempts": context.trials_per_task,
+                        "leaderboard_compatible": context.trials_per_task >= 5,
                     },
                     ensure_ascii=False,
                     indent=2,
@@ -444,6 +612,16 @@ class _HarborAdapter:
             ):
                 environment.pop(secret_name, None)
         environment.update(launch_values)
+        if self.slug.startswith("terminal-bench"):
+            # The durable WSL worker is launched by a user systemd manager.
+            # Explicitly clear a stale DOCKER_CONTEXT there so this probe and
+            # Harbor's DockerEnvironment.preflight resolve the same native
+            # socket.  Preserve an explicitly configured host, defaulting to
+            # the official local Unix socket used by terminal_bench_wsl_env.sh.
+            environment["DOCKER_HOST"] = (
+                environment.get("DOCKER_HOST") or _DOCKER_DEFAULT_HOST
+            )
+            environment["DOCKER_CONTEXT"] = ""
         environment["PYTHONUTF8"] = "1"
         existing_pythonpath = environment.get("PYTHONPATH")
         environment["PYTHONPATH"] = os.pathsep.join(
@@ -512,6 +690,25 @@ class _HarborAdapter:
                     "transient_infrastructure": False,
                     "official_error_counted_as_zero": False,
                 },
+                official_result=_terminal_official_result(
+                    None,
+                    source="harbor.verifier_result.not_started",
+                    verifier_executed=False,
+                ),
+                runtime_diagnostic={
+                    "status": "watchdog_timeout",
+                    "error": "Harbor exceeded the external emergency watchdog",
+                    "model_phase_started": True,
+                    "reconciled": False,
+                    "failure_class": "verifier_infrastructure",
+                    "failure_evidence": _terminal_failure_evidence(
+                        "verifier_infrastructure",
+                        "Harbor exceeded the external emergency watchdog",
+                        model_phase_started=True,
+                        verifier_executed=False,
+                        source="harbor.watchdog",
+                    ),
+                },
             )
         except asyncio.CancelledError:
             await _terminate_process_tree(process)
@@ -545,6 +742,25 @@ class _HarborAdapter:
                     "environment_not_ready": _environment_not_ready_text(diagnostic),
                     "official_error_counted_as_zero": False,
                 },
+                official_result=_terminal_official_result(
+                    None,
+                    source="harbor.verifier_result.not_started",
+                    verifier_executed=False,
+                ),
+                runtime_diagnostic={
+                    "status": "launcher_failure",
+                    "error": diagnostic,
+                    "model_phase_started": False,
+                    "reconciled": False,
+                    "failure_class": "verifier_infrastructure",
+                    "failure_evidence": _terminal_failure_evidence(
+                        "verifier_infrastructure",
+                        diagnostic or "Harbor produced no auditable job",
+                        model_phase_started=False,
+                        verifier_executed=False,
+                        source="harbor.launcher",
+                    ),
+                },
             )
         # A resumed Harbor task can retain a completed/interrupted job and
         # append a fresh job under the same jobs directory.  Multiple jobs are
@@ -562,17 +778,30 @@ class _HarborAdapter:
         ]
         retained_job_count = len(all_job_roots)
         job = json.loads((job_roots[0] / "result.json").read_text(encoding="utf-8"))
+        # ``stats`` is needed by the repeated-trial normalizer below.  Load it
+        # before branching on the number of persisted Harbor trials; the
+        # previous ordering referenced the local before assignment whenever a
+        # five-trial leaderboard job completed successfully.
+        stats = job.get("stats") or {}
         trial_roots = sorted(
             path
             for path in job_roots[0].iterdir()
             if path.is_dir() and (path / "result.json").is_file()
         )
+        if self.slug == "terminal-bench-2.1" and len(trial_roots) > 1:
+            return _terminal_repeated_trial_outcome(
+                context,
+                job_root=job_roots[0],
+                job=job,
+                trial_roots=trial_roots,
+                stats=stats,
+                retained_job_count=retained_job_count,
+            )
         trial_result = (
             json.loads((trial_roots[0] / "result.json").read_text(encoding="utf-8"))
             if len(trial_roots) == 1
             else {}
         )
-        stats = job.get("stats") or {}
         if int(stats.get("n_errored_trials") or 0):
             serialized = _harbor_failure_diagnostic(job_roots[0], job, trial_result)
             _write_failure_diagnostic(context.attempt_root, serialized)
@@ -589,15 +818,26 @@ class _HarborAdapter:
             )
             if terminal_grade is not None:
                 status, reward = terminal_grade
-                usage = _harbor_usage(stats, trial_result)
+                usage = _harbor_usage(stats, trial_result, job_root=job_roots[0])
                 verifier_diagnostic = _verifier_failure_diagnostic(job_roots[0])
-                failure_class = _terminal_failure_class(
-                    trial_result, verifier_diagnostic=verifier_diagnostic
+                failure_class = (
+                    _terminal_failure_class(
+                        trial_result,
+                        verifier_diagnostic=verifier_diagnostic,
+                        job_root=job_roots[0],
+                    )
+                    if reward <= 0
+                    else None
                 )
                 status = (
                     _terminal_official_zero_reward_status(failure_class)
                     if reward <= 0
                     else status
+                )
+                exception_message = (
+                    str(exception_info.get("exception_message") or "")
+                    if isinstance(exception_info, Mapping)
+                    else None
                 )
                 return TrialOutcome(
                     status=status,
@@ -641,8 +881,53 @@ class _HarborAdapter:
                             else False
                         ),
                         "failure_diagnostic": verifier_diagnostic[-32_000:],
+                        "failure_evidence": (
+                            _terminal_failure_evidence(
+                                failure_class,
+                                str(
+                                    exception_message
+                                    or "official Harbor grader rejected the solution"
+                                ),
+                                model_phase_started=bool(usage.get("model_phase_started")),
+                                verifier_executed=(
+                                    failure_class
+                                    not in {
+                                        "verifier_infrastructure",
+                                        "mixed",
+                                        "provider_transport",
+                                    }
+                                ),
+                                source="harbor.failure",
+                            )
+                            if failure_class
+                            else None
+                        ),
                         "official_error_counted_as_zero": False,
                     },
+                    official_result=_terminal_official_result(
+                        reward,
+                        verifier_executed=(
+                            failure_class
+                            not in {"verifier_infrastructure", "mixed", "provider_transport"}
+                        ),
+                        source=(
+                            "harbor.verifier_result"
+                            if failure_class
+                            not in {"verifier_infrastructure", "mixed", "provider_transport"}
+                            else "harbor.verifier_result.observed_without_execution"
+                        ),
+                    ),
+                    runtime_diagnostic=_terminal_runtime_diagnostic(
+                        trial_result,
+                        usage=usage,
+                        status=status,
+                        error=exception_message,
+                        failure_class=failure_class,
+                        verifier_executed=(
+                            failure_class
+                            not in {"verifier_infrastructure", "mixed", "provider_transport"}
+                        ),
+                    ),
                 )
             reason = (
                 "Harbor trial errored before a deterministic grade"
@@ -650,22 +935,24 @@ class _HarborAdapter:
             )
             verifier_diagnostic = _verifier_failure_diagnostic(job_roots[0])
             failure_class = _terminal_failure_class(
-                trial_result, verifier_diagnostic=verifier_diagnostic
+                trial_result,
+                verifier_diagnostic=verifier_diagnostic,
+                job_root=job_roots[0],
             )
             terminal_official = self.slug == "terminal-bench-2.1"
-            terminal_status = (
-                _terminal_official_zero_reward_status(failure_class)
-                if terminal_official
-                else TrialStatus.INVALID
+            # No deterministic verifier reward means there is no official
+            # task grade.  Keep this as an invalid infrastructure/runtime
+            # record instead of manufacturing reward=0.
+            terminal_status = TrialStatus.INVALID
+            usage = _harbor_usage(stats, trial_result, job_root=job_roots[0])
+            exception_message = (
+                str(exception_info.get("exception_message") or "")
+                if isinstance(exception_info, Mapping)
+                else None
             )
-            usage = _harbor_usage(stats, trial_result)
             return TrialOutcome(
                 status=terminal_status,
-                metrics=(
-                    {"reward": 0.0, "errored_trial": 1}
-                    if terminal_official and terminal_status is TrialStatus.FAIL
-                    else {}
-                ),
+                metrics={"errored_trial": 1},
                 failure_reason=(
                     reason if terminal_official and terminal_status is TrialStatus.FAIL else None
                 ),
@@ -687,16 +974,36 @@ class _HarborAdapter:
                     "exception_is_infrastructure": terminal_status is TrialStatus.INVALID,
                     "transient_infrastructure": _transient_text(serialized),
                     "environment_not_ready": _environment_not_ready_text(serialized),
+                    "failure_evidence": _terminal_failure_evidence(
+                        failure_class,
+                        str(exception_message or reason),
+                        model_phase_started=bool(usage.get("model_phase_started")),
+                        verifier_executed=False,
+                        source="harbor.failure",
+                    ),
                     "official_error_counted_as_zero": (
-                        terminal_official and terminal_status is TrialStatus.FAIL
+                        False
                     ),
                 },
+                official_result=_terminal_official_result(
+                    None,
+                    source="harbor.verifier_result.missing",
+                    verifier_executed=False,
+                ),
+                runtime_diagnostic=_terminal_runtime_diagnostic(
+                    trial_result,
+                    usage=usage,
+                    status=terminal_status,
+                    error=exception_message,
+                    failure_class=failure_class,
+                    verifier_executed=False,
+                ),
             )
         reward = _reward(stats)
         if reward is None:
             serialized = _harbor_failure_diagnostic(job_roots[0], job, trial_result)
             _write_failure_diagnostic(context.attempt_root, serialized)
-            usage = _harbor_usage(stats, trial_result)
+            usage = _harbor_usage(stats, trial_result, job_root=job_roots[0])
             return TrialOutcome(
                 # Without a deterministic reward there is no official
                 # assertion to grade. Keep it as infrastructure evidence for
@@ -712,21 +1019,45 @@ class _HarborAdapter:
                     "failure_diagnostic": serialized[-32_000:],
                     "transient_infrastructure": _transient_text(serialized),
                     "environment_not_ready": _environment_not_ready_text(serialized),
+                    "failure_class": "verifier_infrastructure",
+                    "failure_evidence": _terminal_failure_evidence(
+                        "verifier_infrastructure",
+                        "Harbor result does not contain a deterministic reward",
+                        model_phase_started=bool(usage.get("model_phase_started")),
+                        verifier_executed=False,
+                        source="harbor.result",
+                    ),
                     "model_phase_started": bool(usage.get("model_phase_started")),
                     "official_error_counted_as_zero": False,
                 },
+                official_result=_terminal_official_result(
+                    None,
+                    source="harbor.verifier_result.missing",
+                    verifier_executed=False,
+                ),
+                runtime_diagnostic=_terminal_runtime_diagnostic(
+                    trial_result,
+                    usage=usage,
+                    status=TrialStatus.INVALID,
+                    failure_class="verifier_infrastructure",
+                    verifier_executed=False,
+                ),
             )
         verifier_diagnostic = (
             _verifier_failure_diagnostic(job_roots[0]) if reward <= 0 else ""
         )
         failure_class = (
-            _terminal_failure_class(trial_result, verifier_diagnostic=verifier_diagnostic)
+            _terminal_failure_class(
+                trial_result,
+                verifier_diagnostic=verifier_diagnostic,
+                job_root=job_roots[0],
+            )
             if reward <= 0 and self.slug == "terminal-bench-2.1"
             else None
         )
         if verifier_diagnostic:
             _write_failure_diagnostic(context.attempt_root, verifier_diagnostic)
-        usage = _harbor_usage(stats, trial_result)
+        usage = _harbor_usage(stats, trial_result, job_root=job_roots[0])
         status = (
             TrialStatus.PASS
             if reward > 0
@@ -764,7 +1095,48 @@ class _HarborAdapter:
                     else False
                 ),
                 "failure_diagnostic": verifier_diagnostic[-32_000:],
+                "failure_evidence": (
+                    _terminal_failure_evidence(
+                        failure_class,
+                        "official Harbor grader rejected the solution",
+                        model_phase_started=bool(usage.get("model_phase_started")),
+                        verifier_executed=(
+                            failure_class
+                            not in {
+                                "verifier_infrastructure",
+                                "mixed",
+                                "provider_transport",
+                            }
+                        ),
+                        source="harbor.failure",
+                    )
+                    if failure_class
+                    else None
+                ),
             },
+            official_result=_terminal_official_result(
+                reward,
+                verifier_executed=(
+                    failure_class
+                    not in {"verifier_infrastructure", "mixed", "provider_transport"}
+                ),
+                source=(
+                    "harbor.verifier_result"
+                    if failure_class
+                    not in {"verifier_infrastructure", "mixed", "provider_transport"}
+                    else "harbor.verifier_result.observed_without_execution"
+                ),
+            ),
+                runtime_diagnostic=_terminal_runtime_diagnostic(
+                    trial_result,
+                    usage=usage,
+                    status=status,
+                    failure_class=failure_class,
+                    verifier_executed=(
+                        failure_class
+                        not in {"verifier_infrastructure", "mixed", "provider_transport"}
+                    ),
+                ),
         )
 
     def summarize(self, outcomes: Sequence[Mapping[str, Any]]) -> Mapping[str, Any]:
@@ -809,7 +1181,7 @@ class SweBenchVerifiedAdapter(_HarborAdapter):
 class TerminalBenchAdapter(_HarborAdapter):
     slug = "terminal-bench-2.1"
     title = "Terminal-Bench 2.1"
-    protocol_version = "terminal-bench-2.1-official-single-trial.v1"
+    protocol_version = "terminal-bench-2.1-official-repeated-trials.v2"
     dataset = TERMINAL_BENCH_21_DATASET
     max_automatic_attempts = 1
     # This is separate from the one official model attempt.  Only a
@@ -817,9 +1189,19 @@ class TerminalBenchAdapter(_HarborAdapter):
     # checkpoint-reused infrastructure retries.
     max_infrastructure_attempts = 10
     adaptations = (
-        "Each task runs once, while leaderboard submissions require at least five trials per task.",
+        "The formal run executes the requested number of independent Harbor trials per task; leaderboard submissions require at least five.",
         "Pre-model transient launcher failures may retry up to ten times on the same checkpoint; model-bearing failures are never replayed automatically.",
     )
+
+    def __init__(
+        self,
+        wheel_path: Path | None = None,
+        trials_per_task: int = 1,
+    ) -> None:
+        super().__init__(wheel_path=wheel_path)
+        if not isinstance(trials_per_task, int) or trials_per_task < 1:
+            raise ValueError("trials_per_task must be a positive integer")
+        self.trials_per_task = trials_per_task
 
     def check(
         self,
@@ -883,7 +1265,7 @@ class TerminalBenchAdapter(_HarborAdapter):
                     "--agent",
                     "harbor_plugins.cc_harness_agent:CCHarnessHarborAgent",
                     "--n-attempts",
-                    "1",
+                    str(self.trials_per_task),
                     "--extra-docker-compose",
                     str(overlay),
                 ]
@@ -892,6 +1274,8 @@ class TerminalBenchAdapter(_HarborAdapter):
                     "status": "pass",
                     "official_task_and_verifier_unchanged": True,
                     "custom_agent_overlay_scope": "agent-runtime-only",
+                    "n_attempts": self.trials_per_task,
+                    "leaderboard_compatible": self.trials_per_task >= 5,
                     "forbidden_command_replacements": [],
                 }
             agent_runtime_ready = True
@@ -904,7 +1288,9 @@ class TerminalBenchAdapter(_HarborAdapter):
             {
                 "official_dataset": TERMINAL_BENCH_21_DATASET,
                 "official_success_rule": "reward > 0",
-                "official_denominator": 89,
+                "official_denominator": len(tasks) * self.trials_per_task,
+                "official_task_count": len(tasks),
+                "trials_per_task": self.trials_per_task,
                 "docker_daemon_ready": docker_ready,
                 "docker_healthcheck": docker_health,
                 "docker_storage_path": str(storage_path) if storage_path else None,
@@ -1004,28 +1390,57 @@ class TerminalBenchAdapter(_HarborAdapter):
         )
 
     def summarize(self, outcomes: Sequence[Mapping[str, Any]]) -> Mapping[str, Any]:
-        rewards = [
+        task_rewards = [
             float((outcome.get("metrics") or {}).get("reward") or 0)
             for outcome in outcomes
         ]
-        successes = sum(reward > 0 for reward in rewards)
-        by_category: dict[str, dict[str, int | float]] = {}
+        trial_rewards_by_task: list[list[float]] = []
         for outcome in outcomes:
+            raw_rewards = (outcome.get("metrics") or {}).get("trial_rewards")
+            if isinstance(raw_rewards, Sequence) and not isinstance(
+                raw_rewards, (str, bytes, bytearray)
+            ) and raw_rewards:
+                trial_rewards_by_task.append(
+                    [
+                        float(value)
+                        for value in raw_rewards
+                        if isinstance(value, (int, float))
+                    ]
+                )
+            else:
+                trial_rewards_by_task.append(
+                    [float((outcome.get("metrics") or {}).get("reward") or 0)]
+                )
+        trial_rewards = [
+            reward for rewards in trial_rewards_by_task for reward in rewards
+        ]
+        task_successes = sum(reward > 0 for reward in task_rewards)
+        trial_successes = sum(reward > 0 for reward in trial_rewards)
+        task_count = max(0, int(getattr(self, "_summary_task_count", 89)))
+        expected_denominator = task_count * self.trials_per_task
+        denominator = max(expected_denominator, len(trial_rewards))
+        by_category: dict[str, dict[str, int | float]] = {}
+        for outcome, trial_rewards_for_task in zip(outcomes, trial_rewards_by_task):
             group = str(outcome.get("group") or "uncategorized")
             bucket = by_category.setdefault(group, {"trials": 0, "successes": 0})
-            bucket["trials"] = int(bucket["trials"]) + 1
-            reward = float((outcome.get("metrics") or {}).get("reward") or 0)
-            bucket["successes"] = int(bucket["successes"]) + int(reward > 0)
+            bucket["trials"] = int(bucket["trials"]) + len(trial_rewards_for_task)
+            bucket["successes"] = int(bucket["successes"]) + sum(
+                reward > 0 for reward in trial_rewards_for_task
+            )
         for bucket in by_category.values():
             bucket["accuracy"] = int(bucket["successes"]) / int(bucket["trials"])
         return {
             "official_success_rule": "reward > 0",
-            "official_denominator": 89,
-            "successful_tasks": successes,
-            "single_pass_accuracy": successes / 89,
+            "official_denominator": denominator,
+            "official_task_count": task_count,
+            "official_trial_count": len(trial_rewards),
+            "successful_tasks": task_successes,
+            "successful_trials": trial_successes,
+            "single_pass_accuracy": task_successes / task_count if task_count else None,
+            "leaderboard_accuracy": trial_successes / denominator if denominator else None,
             "terminal_results": len(outcomes),
-            "leaderboard_compatible": False,
-            "trials_per_task": 1,
+            "leaderboard_compatible": self.trials_per_task >= 5,
+            "trials_per_task": self.trials_per_task,
             "by_category": by_category,
         }
 
@@ -1040,6 +1455,7 @@ class TerminalBenchAdapter(_HarborAdapter):
         return {
             "dataset": self.dataset,
             "harbor_version": HARBOR_VERSION,
+            "trials_per_task": self.trials_per_task,
             "wheel_sha256": _sha256(wheel) if wheel.is_file() else None,
             "harbor_plugin_sha256": terminal_plugin_digest(project_root),
             "linux_uv_bootstrap": (
@@ -1060,7 +1476,6 @@ class TerminalBenchAdapter(_HarborAdapter):
             "mode": "coding",
             "thinking": "provider-default",
             "concurrency": 1,
-            "trials_per_task": 1,
             "long_term_memory": False,
             "timeout_multiplier": None,
             "agent_timeout_multiplier": None,
@@ -1136,7 +1551,18 @@ class TerminalBenchAdapter(_HarborAdapter):
         return frozen
 
     def after_attempt(self, context: TrialContext, outcome: TrialOutcome) -> None:
-        del outcome
+        if self.slug == "terminal-bench-2.1":
+            manager = build_default_guard_manager(
+                project_root=context.project_root,
+                attempt_root=context.attempt_root,
+                task_id=context.task.task_id,
+                official_dataset=self.dataset,
+                harbor_version=HARBOR_VERSION,
+            )
+            if outcome.status is TrialStatus.INVALID:
+                reason = outcome.invalid_reason or outcome.failure_reason or ""
+                manager.write_evidence("guard-recover.json", manager.recover(reason))
+            manager.write_evidence("guard-post-cleanup.json", manager.post_cleanup())
         before_path = context.attempt_root / "docker-before.json"
         if not before_path.is_file():
             return
@@ -1219,21 +1645,535 @@ def _reward(stats: Mapping[str, Any]) -> float | None:
     return None
 
 
+def _find_completed_harbor_job(
+    jobs: Path,
+    *,
+    expected_trials: int,
+) -> tuple[Path, dict[str, Any], list[Path], int] | None:
+    """Find a fully persisted Harbor job that can be graded without replay.
+
+    A launcher can fail while converting Harbor's already-complete result into
+    a cc-only outcome.  The evidence copy under ``attempt_root/jobs`` then
+    contains every official trial, so replaying Harbor would create duplicate
+    model calls.  Only accept a job with a finished trial set and a numeric
+    verifier reward for every trial; partial jobs remain eligible for normal
+    Harbor resume behaviour.
+    """
+
+    if expected_trials <= 0 or not jobs.is_dir():
+        return None
+    candidates: list[tuple[int, str, Path, dict[str, Any], list[Path]]] = []
+    try:
+        result_paths = [
+            path
+            for path in jobs.rglob("result.json")
+            if path.parent.parent == jobs
+        ]
+    except OSError:
+        return None
+    for result_path in result_paths:
+        job_root = result_path.parent
+        try:
+            payload = json.loads(result_path.read_text(encoding="utf-8"))
+        except (OSError, TypeError, ValueError, json.JSONDecodeError):
+            continue
+        if not isinstance(payload, Mapping):
+            continue
+        job = dict(payload)
+        stats = job.get("stats") or {}
+        if not isinstance(stats, Mapping):
+            stats = {}
+        declared_total = max(
+            0,
+            _nonnegative_int(job.get("n_total_trials"))
+            or _nonnegative_int(stats.get("n_total_trials")),
+        )
+        if declared_total and declared_total < expected_trials:
+            continue
+        try:
+            trial_roots = sorted(
+                path
+                for path in job_root.iterdir()
+                if path.is_dir() and (path / "result.json").is_file()
+            )
+        except OSError:
+            continue
+        if len(trial_roots) < expected_trials:
+            continue
+        complete_rewards = True
+        for trial_root in trial_roots:
+            try:
+                trial_payload = json.loads(
+                    (trial_root / "result.json").read_text(encoding="utf-8")
+                )
+            except (OSError, TypeError, ValueError, json.JSONDecodeError):
+                complete_rewards = False
+                break
+            if not isinstance(trial_payload, Mapping) or _verifier_reward(trial_payload) is None:
+                complete_rewards = False
+                break
+        if not complete_rewards:
+            continue
+        # A complete result must not advertise pending/running/cancelled or
+        # errored trials.  Missing counters are tolerated for older Harbor
+        # versions; numeric non-zero counters are never silently ignored.
+        if any(
+            _nonnegative_int(stats.get(name)) > 0
+            for name in (
+                "n_pending_trials",
+                "n_running_trials",
+                "n_cancelled_trials",
+                "n_errored_trials",
+            )
+        ):
+            continue
+        try:
+            mtime_ns = result_path.stat().st_mtime_ns
+        except OSError:
+            mtime_ns = 0
+        candidates.append((mtime_ns, str(job_root), job_root, job, trial_roots))
+    if not candidates:
+        return None
+    _, _, job_root, job, trial_roots = max(candidates, key=lambda item: (item[0], item[1]))
+    return job_root, job, trial_roots, len(result_paths)
+
+
+def _terminal_repeated_trial_outcome(
+    context: TrialContext,
+    *,
+    job_root: Path,
+    job: Mapping[str, Any],
+    trial_roots: Sequence[Path],
+    stats: Mapping[str, Any],
+    retained_job_count: int,
+) -> TrialOutcome:
+    """Normalize one Harbor job containing the leaderboard trial set.
+
+    The outer cc-only runner keeps one durable checkpoint per catalog task,
+    while Harbor owns the five independent attempts inside that task job.  We
+    retain every per-trial reward and diagnostic in the task result instead of
+    collapsing the job to its mean.  If a trial has no deterministic verifier
+    reward, the whole task remains infrastructure-pending so the runner can
+    pause without silently treating an environment error as a model score.
+    """
+
+    trial_payloads: list[dict[str, Any]] = []
+    trial_details: list[dict[str, Any]] = []
+    rewards: list[float] = []
+    invalid_details: list[dict[str, Any]] = []
+    failure_classes: list[str] = []
+    for index, trial_root in enumerate(trial_roots, 1):
+        try:
+            payload = json.loads((trial_root / "result.json").read_text(encoding="utf-8"))
+        except (OSError, TypeError, ValueError, json.JSONDecodeError) as exc:
+            payload = {}
+            invalid_details.append(
+                {
+                    "trial": index,
+                    "status": "invalid",
+                    "error": f"unable to read Harbor trial result: {type(exc).__name__}",
+                }
+            )
+        if not isinstance(payload, Mapping):
+            payload = {}
+        trial_payloads.append(dict(payload))
+        reward = _verifier_reward(payload)
+        exception_info = payload.get("exception_info") or {}
+        exception_type = (
+            str(exception_info.get("exception_type"))
+            if isinstance(exception_info, Mapping) and exception_info.get("exception_type")
+            else None
+        )
+        if reward is None:
+            invalid_details.append(
+                {
+                    "trial": index,
+                    "status": "invalid",
+                    "exception_type": exception_type,
+                    "error": "official verifier did not produce a deterministic reward",
+                }
+            )
+            trial_details.append(
+                {
+                    "trial": index,
+                    "status": "invalid",
+                    "reward": None,
+                    "exception_type": exception_type,
+                }
+            )
+            continue
+        reward = float(reward)
+        rewards.append(reward)
+        status = "pass" if reward > 0 else "fail"
+        failure_class = None
+        if reward <= 0:
+            diagnostic = _verifier_failure_diagnostic(trial_root)
+            failure_class = _terminal_failure_class(
+                payload,
+                verifier_diagnostic=diagnostic,
+                job_root=trial_root,
+            )
+            if failure_class:
+                failure_classes.append(failure_class)
+        trial_details.append(
+            {
+                "trial": index,
+                "status": status,
+                "reward": reward,
+                "exception_type": exception_type,
+                "failure_class": failure_class,
+            }
+        )
+
+    expected_trials = max(
+        0,
+        _nonnegative_int(job.get("n_total_trials"))
+        or _nonnegative_int(stats.get("n_total_trials")),
+    )
+    if expected_trials and len(trial_roots) < expected_trials:
+        for index in range(len(trial_roots) + 1, expected_trials + 1):
+            invalid_details.append(
+                {
+                    "trial": index,
+                    "status": "invalid",
+                    "error": "Harbor did not persist a trial result",
+                }
+            )
+
+    last_trial = trial_payloads[-1] if trial_payloads else {}
+    usage = _harbor_usage(stats, last_trial, job_root=job_root)
+    trial_count = max(expected_trials, len(trial_roots), len(trial_details))
+    metrics: dict[str, Any] = {
+        "reward": (sum(rewards) / len(rewards)) if rewards else 0.0,
+        "trial_rewards": rewards,
+        "trial_count": trial_count,
+        "trial_pass_count": sum(reward > 0 for reward in rewards),
+        "trial_fail_count": sum(reward <= 0 for reward in rewards),
+        "trial_invalid_count": len(invalid_details),
+        "errored_trial": _nonnegative_int(stats.get("n_errored_trials")),
+    }
+    protocol: dict[str, Any] = {
+        "dataset": TERMINAL_BENCH_21_DATASET,
+        "harbor_version": HARBOR_VERSION,
+        "harbor_job": job_root.relative_to(context.attempt_root).as_posix(),
+        "harbor_job_count": retained_job_count,
+        "harbor_resume_selection": "newest-top-level-job",
+        "n_attempts": trial_count,
+        "trial_details": trial_details[:32],
+        "failure_classes": sorted(set(failure_classes)),
+        "official_error_counted_as_zero": False,
+        "model_phase_started": bool(usage.get("model_phase_started")),
+    }
+    if invalid_details:
+        diagnostic = "; ".join(
+            str(item.get("error") or "invalid trial") for item in invalid_details[:8]
+        )
+        protocol.update(
+            {
+                "exception_is_infrastructure": True,
+                "verifier_infrastructure": True,
+                "transient_infrastructure": transient_infrastructure_text(diagnostic),
+                "environment_not_ready": _environment_not_ready_text(diagnostic),
+                "failure_class": "verifier_infrastructure",
+                "failure_evidence": _terminal_failure_evidence(
+                    "verifier_infrastructure",
+                    diagnostic,
+                    model_phase_started=bool(usage.get("model_phase_started")),
+                    verifier_executed=False,
+                    source="harbor.repeated-trials",
+                ),
+            }
+        )
+        result = {
+            "status": "invalid",
+            "trial_details": trial_details,
+            "invalid_details": invalid_details[:32],
+        }
+        try:
+            (context.attempt_root / "repeated-trial-diagnostic.json").write_text(
+                json.dumps(result, ensure_ascii=False, indent=2) + "\n",
+                encoding="utf-8",
+            )
+        except OSError:
+            pass
+        return TrialOutcome(
+            status=TrialStatus.INVALID,
+            metrics=metrics,
+            invalid_reason=(
+                "one or more Harbor trials did not produce a deterministic official reward"
+            ),
+            usage=usage,
+            protocol=protocol,
+            official_result=_terminal_official_result(
+                None,
+                source="harbor.verifier_result.missing",
+                verifier_executed=False,
+            ),
+            runtime_diagnostic=_terminal_runtime_diagnostic(
+                last_trial,
+                usage=usage,
+                status=TrialStatus.INVALID,
+                failure_class="verifier_infrastructure",
+                verifier_executed=False,
+            ),
+        )
+
+    aggregate_reward = sum(rewards) / len(rewards) if rewards else 0.0
+    aggregate_status = TrialStatus.PASS if any(reward > 0 for reward in rewards) else TrialStatus.FAIL
+    aggregate_failure_class = (
+        "task_fail" if aggregate_status is TrialStatus.FAIL and failure_classes else None
+    )
+    protocol["failure_class"] = aggregate_failure_class
+    protocol["verifier_infrastructure"] = False
+    protocol["failure_evidence"] = (
+        _terminal_failure_evidence(
+            aggregate_failure_class,
+            "one or more official Harbor trials received reward 0",
+            model_phase_started=bool(usage.get("model_phase_started")),
+            verifier_executed=True,
+            source="harbor.repeated-trials",
+        )
+        if aggregate_failure_class
+        else None
+    )
+    metrics["reward"] = aggregate_reward
+    return TrialOutcome(
+        status=aggregate_status,
+        metrics=metrics,
+        failure_reason=(
+            "one or more official Harbor trials received reward 0"
+            if aggregate_status is TrialStatus.FAIL
+            else None
+        ),
+        usage=usage,
+        protocol=protocol,
+        official_result=_terminal_official_result(
+            aggregate_reward,
+            verifier_executed=True,
+            source="harbor.verifier_result",
+        ),
+        runtime_diagnostic=_terminal_runtime_diagnostic(
+            last_trial,
+            usage=usage,
+            status=aggregate_status,
+            failure_class=aggregate_failure_class,
+            verifier_executed=True,
+        ),
+    )
+
+
+def _embedded_cc_result(value: Any) -> dict[str, Any] | None:
+    """Recover a cc-harness result envelope embedded in Harbor diagnostics.
+
+    Harbor wraps a non-zero agent exit in ``exception_info`` and, depending on
+    the version, may only retain the agent's JSONL on disk.  The result line is
+    still authoritative usage/runtime evidence, so scan both mappings and
+    text without accepting arbitrary JSON as a cc-harness envelope.
+    """
+
+    if isinstance(value, Mapping):
+        if value.get("schema_version") == "cc-harness.print-result.v1":
+            return dict(value)
+        for child in value.values():
+            found = _embedded_cc_result(child)
+            if found is not None:
+                return found
+        return None
+    if isinstance(value, bytes):
+        value = value.decode("utf-8", errors="replace")
+    if not isinstance(value, str) or not value:
+        return None
+
+    decoder = json.JSONDecoder()
+    # Fast path for a complete JSONL line or exception message.
+    try:
+        parsed = json.loads(value)
+    except (TypeError, ValueError, json.JSONDecodeError):
+        parsed = None
+    if isinstance(parsed, Mapping):
+        found = _embedded_cc_result(parsed)
+        if found is not None:
+            return found
+
+    marker = re.compile(
+        r"\\?\"schema_version\\?\"\s*:\s*\\?\"cc-harness\.print-result\.v1\\?\""
+    )
+    for match in marker.finditer(value):
+        # A result object starts shortly before its schema marker.  Trying
+        # each nearby opening brace is cheap (diagnostics are capped) and
+        # handles nested exception text without a fragile regex parser.
+        start_floor = max(0, match.start() - 8192)
+        starts = [index for index in range(start_floor, match.start()) if value[index] == "{"]
+        for start in reversed(starts):
+            try:
+                parsed, _end = decoder.raw_decode(value[start:])
+            except (TypeError, ValueError, json.JSONDecodeError):
+                continue
+            if isinstance(parsed, Mapping) and parsed.get("schema_version") == "cc-harness.print-result.v1":
+                return dict(parsed)
+        # Some exception serializers escape quotes.  Decode a bounded slice
+        # once and retry the normal mapping path rather than unescaping the
+        # entire diagnostic (which could change evidence text).
+        escaped = value[max(0, match.start() - 8192) : min(len(value), match.end() + 131072)]
+        try:
+            unescaped = bytes(escaped, "utf-8").decode("unicode_escape")
+        except UnicodeDecodeError:
+            unescaped = escaped.replace('\\"', '"')
+        if unescaped != value:
+            found = _embedded_cc_result(unescaped)
+            if found is not None:
+                return found
+    return None
+
+
+def _find_embedded_cc_result(
+    job_root: Path | None,
+    trial_result: Mapping[str, Any] | None,
+) -> dict[str, Any] | None:
+    """Find the newest valid cc-harness envelope in trial JSON or JSONL logs."""
+
+    # Harbor truncates long exception messages.  The truncated prefix often
+    # still contains a syntactically valid ``{schema_version, type, text}``
+    # object, but it has lost the usage/runtime fields that make the envelope
+    # useful for attribution.  Keep that object only as a fallback and prefer
+    # a richer result from the agent JSONL when one exists.
+    fallback = _embedded_cc_result(trial_result or {})
+
+    def quality(value: Mapping[str, Any]) -> int:
+        score = 0
+        usage = value.get("usage")
+        if isinstance(usage, Mapping):
+            score += 2
+            if any(
+                usage.get(name) not in (None, 0, "")
+                for name in (
+                    "input_tokens",
+                    "output_tokens",
+                    "model_calls",
+                    "tool_calls",
+                    "cache_read_input_tokens",
+                )
+            ):
+                score += 2
+        if value.get("runtime_status") or value.get("outcome") or value.get("error"):
+            score += 1
+        return score
+
+    fallback_quality = quality(fallback) if fallback is not None else -1
+    if job_root is None or not job_root.exists():
+        return fallback
+    candidates: list[Path] = []
+    try:
+        candidates = sorted(
+            (path for path in job_root.rglob("cc-harness.jsonl") if path.is_file()),
+            key=lambda path: (path.stat().st_mtime_ns, str(path)),
+            reverse=True,
+        )
+    except OSError:
+        candidates = []
+    best = fallback
+    best_quality = fallback_quality
+    for path in candidates:
+        try:
+            # The final result is normally the last line; scanning backwards
+            # avoids loading a long tool transcript into the evaluator.
+            lines = _read_tail(path, maximum_bytes=256 * 1024).splitlines()
+        except OSError:
+            continue
+        for line in reversed(lines):
+            found = _embedded_cc_result(line)
+            if found is not None:
+                found_quality = quality(found)
+                if found_quality > best_quality:
+                    best = found
+                    best_quality = found_quality
+                # A result with usage and a terminal runtime field is the
+                # complete envelope we are looking for; no older line can
+                # improve it without loading the whole transcript.
+                if found_quality >= 5:
+                    return found
+    return best
+
+
+def _embedded_runtime_status(value: Mapping[str, Any] | None) -> str | None:
+    """Normalize a durable runtime status from an embedded result envelope."""
+
+    if not isinstance(value, Mapping):
+        return None
+    status = value.get("runtime_status")
+    if status is None and isinstance(value.get("outcome"), Mapping):
+        status = value["outcome"].get("outcome")
+    if status is None:
+        error = str(value.get("error") or "").casefold().replace("-", "_")
+        for candidate in ("stalled", "blocked", "failed_recoverable"):
+            if candidate in error:
+                return candidate
+        return None
+    return str(status)
+
+
 def _harbor_usage(
-    stats: Mapping[str, Any], trial_result: Mapping[str, Any] | None = None
+    stats: Mapping[str, Any],
+    trial_result: Mapping[str, Any] | None = None,
+    *,
+    job_root: Path | None = None,
 ) -> dict[str, Any]:
-    input_tokens = int(stats.get("n_input_tokens") or 0)
-    cached_tokens = int(stats.get("n_cache_tokens") or 0)
-    output_tokens = int(stats.get("n_output_tokens") or 0)
+    embedded = _find_embedded_cc_result(job_root, trial_result)
+    embedded_usage = (
+        embedded.get("usage") if isinstance(embedded, Mapping) else None
+    )
+    if not isinstance(embedded_usage, Mapping):
+        embedded_usage = {}
     metadata = ((trial_result or {}).get("agent_result") or {}).get("metadata") or {}
-    model_calls = _nonnegative_int(metadata.get("model_calls"))
-    tool_calls = _nonnegative_int(metadata.get("tool_calls"))
+    if not isinstance(metadata, Mapping):
+        metadata = {}
+
+    def counter(*values: Any) -> int:
+        for value in values:
+            try:
+                parsed = int(value or 0)
+            except (TypeError, ValueError):
+                continue
+            if parsed > 0:
+                return parsed
+        return 0
+
+    # Harbor's aggregate stats are retained when present.  The embedded
+    # envelope fills the exact zero/missing fields left behind by a raised
+    # agent process, including cache-read and output counters.
+    input_tokens = counter(stats.get("n_input_tokens"), embedded_usage.get("input_tokens"))
+    cached_tokens = counter(
+        stats.get("n_cache_tokens"),
+        embedded_usage.get("cache_read_input_tokens"),
+        embedded_usage.get("cached_tokens"),
+    )
+    output_tokens = counter(stats.get("n_output_tokens"), embedded_usage.get("output_tokens"))
+    cache_creation_tokens = counter(
+        embedded_usage.get("cache_creation_input_tokens"),
+        embedded_usage.get("cache_write_tokens"),
+    )
+    if input_tokens:
+        cached_tokens = min(cached_tokens, input_tokens)
+        cache_creation_tokens = min(cache_creation_tokens, max(0, input_tokens - cached_tokens))
+    model_calls = counter(metadata.get("model_calls"), embedded_usage.get("model_calls"))
+    tool_calls = counter(metadata.get("tool_calls"), embedded_usage.get("tool_calls"))
     if model_calls == 0 or tool_calls == 0:
-        exception = (trial_result or {}).get("exception_info") or {}
-        serialized = json.dumps(exception, ensure_ascii=False)
+        serialized = json.dumps(trial_result or {}, ensure_ascii=False)
         model_calls = model_calls or _embedded_usage_count(serialized, "model_calls")
         tool_calls = tool_calls or _embedded_usage_count(serialized, "tool_calls")
-    raw_cost = metadata.get("api_reported_cost")
+
+    def first_value(*sources: Mapping[str, Any], names: Sequence[str]) -> Any:
+        for source in sources:
+            for name in names:
+                if name in source and source.get(name) is not None:
+                    return source.get(name)
+        return None
+
+    raw_cost = first_value(
+        metadata,
+        embedded_usage,
+        names=("api_reported_cost", "reported_cost", "cost"),
+    )
     try:
         api_reported_cost = float(raw_cost) if raw_cost is not None else None
     except (TypeError, ValueError):
@@ -1242,29 +2182,26 @@ def _harbor_usage(
         not math.isfinite(api_reported_cost) or api_reported_cost < 0
     ):
         api_reported_cost = None
-    raw_currency = metadata.get("api_reported_cost_currency")
+    raw_currency = first_value(
+        metadata,
+        embedded_usage,
+        names=("api_reported_cost_currency", "reported_cost_currency", "cost_currency", "currency"),
+    )
     api_reported_cost_currency = (
         str(raw_currency).strip().upper() if raw_currency is not None else None
     )
-    raw_status = metadata.get("api_cost_status")
-    api_cost_status = (
-        str(raw_status).strip().lower() if raw_status is not None else None
-    )
+    raw_status = first_value(metadata, embedded_usage, names=("api_cost_status", "cost_status"))
+    api_cost_status = str(raw_status).strip().lower() if raw_status is not None else None
     if api_cost_status is None and api_reported_cost is not None:
         api_cost_status = "reported"
-    # Some Harbor adapters expose token usage before they populate their
-    # optional model-call counter. Treat that usage as evidence that a
-    # provider call happened; otherwise a missing direct price could be
-    # incorrectly reported as ``unavailable`` instead of ``incomplete``.
     api_cost_observed = (
         bool(metadata.get("api_cost_observed"))
+        or bool(embedded_usage.get("api_cost_observed"))
         or model_calls > 0
         or input_tokens > 0
         or output_tokens > 0
     )
-    api_cost_complete = (
-        api_cost_status == "reported" and api_reported_cost is not None
-    )
+    api_cost_complete = api_cost_status == "reported" and api_reported_cost is not None
     if not api_cost_complete:
         api_cost_status = "incomplete" if api_cost_observed else "unavailable"
     provider_cost_microusd = (
@@ -1272,15 +2209,57 @@ def _harbor_usage(
         if api_cost_complete and api_reported_cost_currency in (None, "USD")
         else None
     )
+    provider = _bounded_identity(first_value(
+        embedded_usage,
+        metadata,
+        names=("provider", "provider_name"),
+    ))
+    model = _bounded_identity(first_value(
+        embedded_usage,
+        metadata,
+        names=("model", "resolved_model", "provider_model"),
+    ))
+    providers = _string_list(
+        first_value(embedded_usage, metadata, names=("providers", "provider_names"))
+    )
+    models = _string_list(
+        first_value(embedded_usage, metadata, names=("models", "model_names"))
+    )
+    # Older cc-harness envelopes expose identities as arrays because a
+    # resumed run may cross a gateway/model alias.  Keep the first stable
+    # identity in the scalar compatibility fields while retaining all values.
+    if provider is None and providers:
+        provider = providers[0]
+    if model is None and models:
+        model = models[0]
+    if provider and provider not in providers:
+        providers.insert(0, provider)
+    if model and model not in models:
+        models.insert(0, model)
+    provider_metadata_value: Any = {}
+    if isinstance(embedded, Mapping) and isinstance(embedded.get("provider_metadata"), Mapping):
+        provider_metadata_value = embedded.get("provider_metadata")
+    elif isinstance(embedded_usage.get("provider_metadata"), Mapping):
+        provider_metadata_value = embedded_usage.get("provider_metadata")
+    provider_metadata = _bounded_provider_metadata(provider_metadata_value)
+    stop_reasons_value: Any = {}
+    if isinstance(embedded_usage.get("stop_reasons"), Mapping):
+        stop_reasons_value = embedded_usage.get("stop_reasons")
+    elif isinstance(embedded, Mapping) and isinstance(embedded.get("stop_reasons"), Mapping):
+        stop_reasons_value = embedded.get("stop_reasons")
+    stop_reasons = _bounded_stop_reasons(stop_reasons_value)
+    runtime_status = _embedded_runtime_status(embedded)
+    runtime_error = embedded.get("error") if isinstance(embedded, Mapping) else None
     return {
         "input_tokens": input_tokens,
-        "uncached_input_tokens": max(0, input_tokens - cached_tokens),
-        "cache_creation_input_tokens": 0,
+        "uncached_input_tokens": max(
+            0, input_tokens - cached_tokens - cache_creation_tokens
+        ),
+        "cache_creation_input_tokens": cache_creation_tokens,
         "cache_read_input_tokens": cached_tokens,
         "output_tokens": output_tokens,
         # ``stats.cost_usd`` is not an auditable provider fact by itself; it
-        # may be a framework fallback.  Use only the explicit direct-cost
-        # fields emitted by the cc-harness result envelope.
+        # may be a framework fallback.  Use only explicit direct-cost fields.
         "cost_microusd": provider_cost_microusd,
         "api_reported_cost": api_reported_cost if api_cost_complete else None,
         "api_reported_cost_currency": api_reported_cost_currency,
@@ -1289,13 +2268,105 @@ def _harbor_usage(
         "api_cost_observed": api_cost_observed,
         "api_cost_complete": api_cost_complete,
         "model_calls": model_calls,
-        # Token counters are evidence that the model phase began, not an
-        # inferred number of calls.  The runner uses this boolean solely to
-        # prevent replaying a paid attempt when Harbor omitted its call count.
         "model_phase_started": bool(model_calls or input_tokens or output_tokens),
         "tool_calls": tool_calls,
-        "wall_time_ms": 0,
+        "provider": provider,
+        "model": model,
+        "provider_metadata": provider_metadata,
+        "providers": providers,
+        "models": models,
+        "cache_hit_ratio": (
+            cached_tokens / input_tokens if input_tokens > 0 else None
+        ),
+        "stop_reasons": stop_reasons,
+        "invocation_count": counter(
+            embedded_usage.get("invocation_count"),
+            embedded_usage.get("model_calls"),
+            metadata.get("invocation_count"),
+        ),
+        "invocation_statuses": (
+            dict(embedded_usage.get("invocation_statuses"))
+            if isinstance(embedded_usage.get("invocation_statuses"), Mapping)
+            else {}
+        ),
+        "runtime_status": str(runtime_status) if runtime_status else None,
+        "runtime_error": str(runtime_error) if runtime_error else None,
+        "wall_time_ms": counter(
+            metadata.get("wall_time_ms"), embedded_usage.get("wall_time_ms")
+        ),
     }
+
+
+_SAFE_PROVIDER_METADATA_KEYS = {
+    "id",
+    "model",
+    "object",
+    "created",
+    "system_fingerprint",
+    "service_tier",
+    "request_id",
+    "response_id",
+}
+
+
+def _bounded_provider_metadata(value: Any) -> dict[str, Any]:
+    """Retain only small, non-secret response identifiers from a provider."""
+
+    if not isinstance(value, Mapping):
+        return {}
+    result: dict[str, Any] = {}
+    for key in _SAFE_PROVIDER_METADATA_KEYS:
+        raw = value.get(key)
+        if isinstance(raw, str):
+            result[key] = raw[:512]
+        elif isinstance(raw, (int, float, bool)):
+            result[key] = raw
+    return result
+
+
+def _bounded_stop_reasons(value: Any) -> dict[str, int]:
+    """Normalize provider stop-reason counters without trusting arbitrary data."""
+
+    if not isinstance(value, Mapping):
+        return {}
+    result: dict[str, int] = {}
+    for raw_reason, raw_count in value.items():
+        reason = str(raw_reason).strip()[:128]
+        if not reason:
+            continue
+        try:
+            count = int(raw_count)
+        except (TypeError, ValueError):
+            continue
+        if count > 0:
+            result[reason] = result.get(reason, 0) + min(count, 1_000_000)
+    return result
+
+
+def _bounded_identity(value: Any) -> str | None:
+    if value is None:
+        return None
+    normalized = str(value).strip()[:512]
+    return normalized or None
+
+
+def _string_list(value: Any) -> list[str]:
+    """Return a de-duplicated list of non-empty string identities."""
+
+    if isinstance(value, str):
+        values = [value]
+    elif isinstance(value, Sequence) and not isinstance(value, (bytes, bytearray)):
+        values = [str(item) for item in value]
+    else:
+        values = []
+    result: list[str] = []
+    for item in values:
+        normalized = str(item).strip()[:512]
+        if normalized and normalized not in result:
+            result.append(normalized)
+        if len(result) >= 32:
+            break
+    return result
 
 
 def _usage_telemetry_incomplete(usage: Mapping[str, Any]) -> bool:
@@ -1368,29 +2439,229 @@ def _verifier_failure_diagnostic(job_root: Path) -> str:
 
 
 def _terminal_failure_class(
-    trial_result: Mapping[str, Any], *, verifier_diagnostic: str
+    trial_result: Mapping[str, Any],
+    *,
+    verifier_diagnostic: str,
+    job_root: Path | None = None,
 ) -> str:
     """Attribute a zero reward without changing the official reward/status."""
 
     exception = trial_result.get("exception_info") or {}
+    exception_text = " ".join(
+        str(exception.get(name) or "")
+        for name in ("exception_type", "exception_message", "stdout", "stderr")
+    ) if isinstance(exception, Mapping) else str(exception)
+    # Harbor may truncate the exception that contains the agent envelope.
+    # Prefer the complete JSONL envelope when available so a verifier outage
+    # after model activity is attributed as ``mixed`` rather than silently
+    # reported as verifier-only infrastructure failure.
+    embedded = _find_embedded_cc_result(job_root, trial_result)
+    embedded_usage = (
+        embedded.get("usage") if isinstance(embedded, Mapping) else {}
+    )
+    model_phase_started = bool(
+        isinstance(embedded_usage, Mapping)
+        and (
+            _nonnegative_int(embedded_usage.get("model_calls"))
+            or _nonnegative_int(embedded_usage.get("input_tokens"))
+            or _nonnegative_int(embedded_usage.get("output_tokens"))
+        )
+    )
     agent_error = bool(
         isinstance(exception, Mapping)
         and (exception.get("exception_type") or exception.get("exception_message"))
     )
+    combined_diagnostic = f"{exception_text}\n{verifier_diagnostic}"
     verifier_infrastructure = verifier_bootstrap_failure_text(verifier_diagnostic)
+    # Docker address-pool exhaustion and host OOM are environment failures,
+    # even when Harbor serializes them as a generic agent exception.  Keep the
+    # evidence out of task-failure reporting and let the runner retry it before
+    # any model request (the embedded counters fence post-model retries).
+    environment_outage = transient_infrastructure_text(combined_diagnostic) and any(
+        marker in combined_diagnostic.casefold()
+        for marker in (
+            "address pool",
+            "fully subnetted",
+            "cannot allocate memory",
+            "errno 12",
+            "out of memory",
+            "no space left on device",
+            "docker daemon",
+        )
+    )
+    if environment_outage:
+        return "mixed" if model_phase_started else "verifier_infrastructure"
     if verifier_infrastructure and agent_error:
         return "mixed"
     if verifier_infrastructure:
         return "verifier_infrastructure"
     if agent_error:
-        exception_text = " ".join(
-            str(exception.get(name) or "")
-            for name in ("exception_type", "exception_message")
-        )
         if transient_infrastructure_text(exception_text):
             return "provider_transport"
         return "agent_runtime"
     return "task_failure"
+
+
+def _terminal_official_result(
+    reward: float | None,
+    *,
+    source: str = "harbor.verifier_result",
+    verifier_executed: bool | None = None,
+) -> dict[str, Any]:
+    """Build the immutable official-grade ledger for a Terminal trial."""
+
+    executed = reward is not None if verifier_executed is None else bool(verifier_executed)
+    scored = reward is not None and executed
+    return {
+        "source": source,
+        "reward": reward,
+        # A numeric zero retained from Harbor is useful raw evidence, but it
+        # is not an official task grade when the verifier never reached an
+        # assertion (for example Docker/network bootstrap failure).
+        "status": (
+            ("pass" if reward > 0 else "fail") if scored else "unknown"
+        ),
+        "verifier_executed": executed,
+        "scored": scored,
+    }
+
+
+def _terminal_failure_evidence(
+    failure_class: str,
+    reason: str,
+    *,
+    model_phase_started: bool,
+    verifier_executed: bool,
+    source: str,
+    retryable: bool | None = None,
+    evidence_refs: Sequence[str] = (),
+    root_cause: str | None = None,
+) -> dict[str, Any]:
+    """Build the same evidence envelope for early Harbor return paths."""
+
+    canonical = {
+        "verifier_infrastructure": FailureClass.VERIFIER_INFRASTRUCTURE.value,
+        "environment_not_ready": FailureClass.ENVIRONMENT_NOT_READY.value,
+        "provider_transport": FailureClass.PROVIDER_TRANSPORT.value,
+        "task_failure": FailureClass.TASK_FAILURE.value,
+        "agent_runtime": FailureClass.RUNTIME.value,
+        "mixed": "mixed",
+    }.get(str(failure_class), str(failure_class))
+    if retryable is None:
+        retryable = canonical in {
+            FailureClass.ENVIRONMENT_NOT_READY.value,
+            FailureClass.PROVIDER_TRANSPORT.value,
+            FailureClass.OUTCOME_UNKNOWN.value,
+        }
+    diagnosis = root_cause or diagnose_root_cause(
+        f"{failure_class}: {reason}", phase=source
+    )
+    return FailureEvidence(
+        primary_class=canonical,
+        reason=str(reason or failure_class),
+        source=source,
+        model_phase_started=bool(model_phase_started),
+        verifier_executed=bool(verifier_executed),
+        retryable=bool(retryable),
+        evidence_refs=tuple(str(item) for item in evidence_refs),
+        details={"root_cause": diagnosis},
+    ).to_dict()
+
+
+def _terminal_runtime_diagnostic(
+    trial_result: Mapping[str, Any] | None,
+    *,
+    usage: Mapping[str, Any],
+    status: TrialStatus,
+    error: str | None = None,
+    failure_class: str | None = None,
+    verifier_executed: bool | None = None,
+) -> dict[str, Any]:
+    """Build a runtime-only ledger, never used to override the official grade."""
+
+    exception = (trial_result or {}).get("exception_info") or {}
+    exception_type = (
+        str(exception.get("exception_type"))
+        if isinstance(exception, Mapping) and exception.get("exception_type")
+        else None
+    )
+    runtime_status = usage.get("runtime_status")
+    if not runtime_status:
+        embedded = _embedded_cc_result(trial_result or {})
+        if isinstance(embedded, Mapping):
+            runtime_status = embedded.get("runtime_status")
+            if not runtime_status and isinstance(embedded.get("outcome"), Mapping):
+                runtime_status = embedded["outcome"].get("outcome")
+    reason = str(
+        error
+        or usage.get("runtime_error")
+        or (exception.get("exception_message") if isinstance(exception, Mapping) else "")
+        or runtime_status
+        or status.value
+    )
+    has_runtime_failure = bool(
+        status is not TrialStatus.PASS
+        or error
+        or exception_type
+        or usage.get("runtime_error")
+        or usage.get("runtime_status")
+    )
+    root_cause = (
+        diagnose_root_cause(reason, phase="harbor.runtime")
+        if has_runtime_failure
+        else None
+    )
+    model_phase_started = bool(usage.get("model_phase_started"))
+    resolved_failure = str(failure_class or usage.get("failure_class") or "").strip() or None
+    if resolved_failure is None and status not in {TrialStatus.PASS}:
+        resolved_failure = classify_reason(reason, event_type="HarborRuntime").value
+    evidence = None
+    if resolved_failure is not None:
+        evidence_class = {
+            "verifier_infrastructure": FailureClass.VERIFIER_INFRASTRUCTURE.value,
+            "environment_not_ready": FailureClass.ENVIRONMENT_NOT_READY.value,
+            "provider_transport": FailureClass.PROVIDER_TRANSPORT.value,
+            "task_failure": FailureClass.TASK_FAILURE.value,
+            "agent_runtime": FailureClass.RUNTIME.value,
+            "mixed": "mixed",
+        }.get(resolved_failure, resolved_failure)
+        evidence = FailureEvidence(
+            primary_class=evidence_class,
+            reason=reason,
+            source="harbor.runtime",
+            model_phase_started=model_phase_started,
+            verifier_executed=(
+                bool(verifier_executed)
+                if verifier_executed is not None
+                else bool(status in {TrialStatus.PASS, TrialStatus.FAIL})
+            ),
+            retryable=resolved_failure
+            in {
+                FailureClass.ENVIRONMENT_NOT_READY.value,
+                FailureClass.PROVIDER_TRANSPORT.value,
+                FailureClass.OUTCOME_UNKNOWN.value,
+            },
+            details={
+                "runtime_status": str(runtime_status or status.value),
+                "root_cause": root_cause,
+            },
+        ).to_dict()
+    diagnostic = {
+        "status": str(runtime_status or status.value),
+        "error": error or usage.get("runtime_error"),
+        "exception_type": exception_type,
+        "model_phase_started": model_phase_started,
+        "reconciled": bool(error or exception_type) and status in {
+            TrialStatus.PASS,
+            TrialStatus.FAIL,
+        },
+        "root_cause": root_cause,
+    }
+    if resolved_failure is not None:
+        diagnostic["failure_class"] = resolved_failure
+    if evidence is not None:
+        diagnostic["failure_evidence"] = evidence
+    return diagnostic
 
 
 def _terminal_official_zero_reward_status(failure_class: str | None) -> TrialStatus:
@@ -1612,6 +2883,11 @@ def _docker_healthcheck(
     if docker is None:
         result["last_error"] = "docker executable is unavailable"
         return result
+    probe_environment = _docker_client_environment()
+    result["docker_host"] = probe_environment["DOCKER_HOST"]
+    # An empty Docker context means the CLI uses DOCKER_HOST/default rather
+    # than inheriting a desktop-linux context from the user manager.
+    result["docker_context"] = "default"
     bounded_attempts = max(1, int(attempts))
     for attempt in range(1, bounded_attempts + 1):
         result["attempts"] = attempt
@@ -1624,11 +2900,19 @@ def _docker_healthcheck(
                 errors="replace",
                 check=False,
                 timeout=_DOCKER_HEALTHCHECK_TIMEOUT_SECONDS,
+                env=probe_environment,
             )
             diagnostic = (completed.stderr or completed.stdout or "").strip()
             if completed.returncode == 0:
                 result["ready"] = True
                 result["docker_root"] = (completed.stdout or "").strip()
+                if result["docker_root"] != "/var/lib/docker":
+                    result["ready"] = False
+                    result["last_error"] = (
+                        "Docker daemon is not using the native WSL root "
+                        f"/var/lib/docker (got {result['docker_root'] or 'empty'})"
+                    )
+                    continue
                 result["last_error"] = None
                 return result
             result["last_error"] = diagnostic or f"docker info exited {completed.returncode}"
@@ -1639,6 +2923,24 @@ def _docker_healthcheck(
             if delay > 0:
                 time.sleep(delay)
     return result
+
+
+def _docker_client_environment(
+    base: Mapping[str, str] | None = None,
+) -> dict[str, str]:
+    """Return the explicit Docker environment shared by probe and Harbor.
+
+    The WSL supervisor is a long-lived user-systemd process.  Without an
+    explicit empty ``DOCKER_CONTEXT``, it can retain a desktop context from a
+    previous shell while the launcher has already selected the native Unix
+    socket.  Clearing the context makes Docker's endpoint deterministic and
+    keeps the read-only probe consistent with Harbor's own preflight.
+    """
+
+    environment = dict(base or os.environ)
+    environment["DOCKER_HOST"] = environment.get("DOCKER_HOST") or _DOCKER_DEFAULT_HOST
+    environment["DOCKER_CONTEXT"] = ""
+    return environment
 
 
 def _cleanup_owned_harbor_resources(

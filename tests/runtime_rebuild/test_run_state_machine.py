@@ -12,6 +12,7 @@ from cc_harness.run_model import (
     RunStateMachine,
     RunStatus,
 )
+from cc_harness.run_outcomes import FailureClass, OutcomeKind, RunOutcome
 
 
 def completion() -> CompletionCandidate:
@@ -78,3 +79,12 @@ def test_unknown_or_terminal_transitions_are_rejected() -> None:
         machine.transition(RunStatus.COMPLETED, "RunResumed")
     with pytest.raises(InvalidRunTransition):
         machine.transition(RunStatus.CANCELLED, "RunQueued")
+
+
+def test_outcome_vocabulary_maps_lifecycle_without_model_prose() -> None:
+    assert RunOutcome.from_status(RunStatus.COMPLETED).outcome is OutcomeKind.PASS
+    blocked = RunOutcome.from_status(RunStatus.BLOCKED, reason="docker daemon is not ready")
+    assert blocked is not None
+    assert blocked.primary_class is FailureClass.ENVIRONMENT_NOT_READY
+    assert blocked.retryable is True
+    assert RunOutcome.from_status(RunStatus.RUNNING) is None

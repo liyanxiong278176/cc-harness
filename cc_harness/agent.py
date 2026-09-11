@@ -69,7 +69,17 @@ from cc_harness.security import (
     sanitize_untrusted_output,
 )
 from cc_harness.tokens import TokenCounter, TurnTokenStats, UsageRecord
-from cc_harness.tools import RUN_COMMAND_SPEC, confirm_tool, run_command
+from cc_harness.tools import (
+    BACKGROUND_STATUS_SPEC,
+    BACKGROUND_STOP_SPEC,
+    SERVICE_STATUS_SPEC,
+    RUN_COMMAND_SPEC,
+    confirm_tool,
+    process_status,
+    process_stop,
+    service_status,
+    run_command,
+)
 
 if TYPE_CHECKING:
     from cc_harness.project.models import TodoTask
@@ -109,6 +119,18 @@ NATIVE_TOOLS: dict[str, dict] = {
     "run_command": {
         "spec": RUN_COMMAND_SPEC,
         "handler": run_command,
+    },
+    "process_status": {
+        "spec": BACKGROUND_STATUS_SPEC,
+        "handler": process_status,
+    },
+    "service_status": {
+        "spec": SERVICE_STATUS_SPEC,
+        "handler": service_status,
+    },
+    "process_stop": {
+        "spec": BACKGROUND_STOP_SPEC,
+        "handler": process_stop,
     },
     **NATIVE_FILE_TOOLS,
 }
@@ -606,9 +628,11 @@ async def run_turn(
             native_name = str(native_function.get("name") or "")
             native_effect = (
                 "read"
-                if native_name in {"Read", "Glob", "Grep", "memory_recall"}
+                if native_name in {"Read", "Glob", "Grep", "memory_recall", "process_status", "service_status"}
                 else "write"
                 if native_name in {"Write", "memory_save"}
+                else "external_write"
+                if native_name in {"process_stop"}
                 else "unknown"
             )
             native_function["x-cc-harness-capability"] = {
@@ -667,6 +691,9 @@ async def run_turn(
         tool_capability_metadata[name] = metadata
 
     iter_usages: list[UsageRecord] = []   # per-iter API-reported usage
+    iter_provider_metadata: list[dict] = []
+    iter_stop_reasons: dict[str, int] = {}
+    iter_invocations: list[dict] = []
 
     memory_recall_calls = 0
 
@@ -742,6 +769,7 @@ async def run_turn(
                 is_error=True,
                 result_text=result.llm_text,
                 error_kind=ToolErrorKind.EXECUTION,
+                result_metadata=result.metadata,
             )
             _append_journal(
                 kind="tool_blocked",
@@ -755,6 +783,12 @@ async def run_turn(
                 "name": p.name,
                 "args": args,
                 "iteration": iter_count,
+                "replan_required": True,
+                "replan_id": (
+                    f"replan-{_stall_controller.replan_count}"
+                    if _stall_controller is not None
+                    else None
+                ),
                 "ts": time.time(),
             })
             return result
@@ -779,6 +813,20 @@ async def run_turn(
                 decision = _loop_cfg.recovery_policy.decide(
                     result.llm_text, attempt=attempt,
                 ) if result.is_error else None
+
+            # ``run_command`` owns the explicit network retry budget.  Do not
+            # multiply it with the generic loop retry policy (which would turn
+            # a requested ten-retry download into thirty subprocess calls).
+            network_retry = (
+                result.metadata.get("network_retry")
+                if isinstance(getattr(result, "metadata", None), dict)
+                else None
+            )
+            if decision is not None and isinstance(network_retry, dict) and network_retry.get(
+                "requested"
+            ):
+                final_kind = decision.kind
+                decision = None
 
             if (
                 _loop_cfg.enabled
@@ -809,12 +857,21 @@ async def run_turn(
             if decision is not None:
                 final_kind = decision.kind
                 if _loop_cfg.enabled and _loop_cfg.error_recovery:
+                    # Keep the executor's structured evidence when adding the
+                    # recovery hint.  Re-wrapping a ToolResult without its
+                    # metadata used to discard pid/readiness/resource/network
+                    # telemetry exactly on the failure path where operators
+                    # need it most.
+                    preserved_metadata = dict(
+                        getattr(result, "metadata", {}) or {}
+                    )
                     result = ToolResult.error(
                         display=result.display_text,
                         llm=(
                             f"{result.llm_text}\n"
                             f"[Recovery: {decision.kind.value}] {decision.instruction}"
                         ),
+                        metadata=preserved_metadata,
                     )
             break
 
@@ -824,6 +881,7 @@ async def run_turn(
             is_error=result.is_error,
             result_text=result.llm_text,
             error_kind=final_kind,
+            result_metadata=result.metadata,
         )
         if _loop_cfg.enabled and _loop_cfg.stall_detection and _stall_controller is not None:
             stall = _stall_controller.observe(
@@ -835,9 +893,21 @@ async def run_turn(
                     "type": "loop_stall",
                     "repeated": stall.repeated,
                     "instruction": stall.instruction,
+                    "replan_required": stall.replan_required,
+                    "replan_id": stall.replan_id,
+                    "blocked_action": stall.blocked_action,
                     "iteration": iter_count,
                     "ts": time.time(),
                 })
+                if stall.replan_required:
+                    await _safe_emit({
+                        "type": "loop_replan_required",
+                        "replan_id": stall.replan_id,
+                        "reason": "repeated action produced no new observation",
+                        "blocked_action": stall.blocked_action,
+                        "iteration": iter_count,
+                        "ts": time.time(),
+                    })
         _append_journal(
             kind="tool_finished",
             action_id=action_id,
@@ -848,6 +918,11 @@ async def run_turn(
                 "attempts": attempt,
                 "error_kind": final_kind.value if final_kind else None,
                 "result_hash": fingerprint,
+                "replan_count": (
+                    _stall_controller.replan_count
+                    if _stall_controller is not None
+                    else 0
+                ),
             },
         )
         await _safe_emit({
@@ -1020,16 +1095,27 @@ async def run_turn(
             tool_call_log=tool_call_log,
             compaction=last_compaction,
             prompt_metadata=prompt_metadata,
+            api_provider_metadata=list(iter_provider_metadata),
+            api_providers=(
+                [
+                    str(getattr(llm, "base_url", "")).split("//", 1)[-1].split("/", 1)[0]
+                ]
+                if getattr(llm, "base_url", None)
+                else []
+            ),
+            api_models=([str(getattr(llm, "resolved_model", None) or getattr(llm, "model", ""))] if getattr(llm, "model", None) else []),
+            api_stop_reasons=dict(iter_stop_reasons),
+            api_invocations=[dict(item) for item in iter_invocations[:512]],
         )
 
     async def _stream_one_turn(
         model_messages: list[dict],
         *,
         tools_override: list[dict] | None = None,
-    ) -> tuple[str, list, str | None, UsageRecord | None, str]:
+    ) -> tuple[str, list, str | None, UsageRecord | None, str, dict]:
         """Stream one LLM turn.
 
-        Returns ``(content, pending, finish_reason, usage, reasoning_content)``.
+        Returns ``(content, pending, finish_reason, usage, reasoning_content, provider_metadata)``.
         ``reasoning_content`` is kept separate from visible content because
         thinking-mode providers (notably DeepSeek-compatible endpoints) require
         the exact reasoning field when an assistant tool call is replayed.
@@ -1043,6 +1129,7 @@ async def run_turn(
         finish_reason: str | None = None
         usage: UsageRecord | None = None
         reasoning_content = ""
+        provider_metadata: dict = {}
         stream = llm.chat(
             model_messages,
             tool_specs if tools_override is None else tools_override,
@@ -1064,6 +1151,9 @@ async def run_turn(
                     finish_reason = ev.finish_reason
                     pending = ev.pending
                     usage = ev.usage
+                    provider_metadata = dict(getattr(ev, "provider_metadata", None) or {})
+                    if finish_reason:
+                        iter_stop_reasons[str(finish_reason)] = iter_stop_reasons.get(str(finish_reason), 0) + 1
                     # Test doubles and older adapters do not expose the
                     # optional provider field; protocol adaptation must remain
                     # backward-compatible with those streams.
@@ -1075,7 +1165,9 @@ async def run_turn(
             close_stream = getattr(stream, "aclose", None)
             if close_stream is not None:
                 await close_stream()
-        return "".join(content_parts), pending, finish_reason, usage, reasoning_content
+        if provider_metadata and provider_metadata not in iter_provider_metadata and len(iter_provider_metadata) < 32:
+            iter_provider_metadata.append(dict(provider_metadata))
+        return "".join(content_parts), pending, finish_reason, usage, reasoning_content, provider_metadata
 
     async def _constrained_finalizer(
         finding,
@@ -1110,7 +1202,7 @@ async def run_turn(
                 },
             ]
             try:
-                candidate, pending, _finish, usage, _reasoning_content = await _stream_one_turn(
+                candidate, pending, _finish, usage, _reasoning_content, provider_metadata = await _stream_one_turn(
                     finalizer_messages,
                     tools_override=[],
                 )
@@ -1121,6 +1213,8 @@ async def run_turn(
                 usage = None
             if usage is not None:
                 iter_usages.append(usage)
+            if provider_metadata and provider_metadata not in iter_provider_metadata and len(iter_provider_metadata) < 32:
+                iter_provider_metadata.append(dict(provider_metadata))
             if pending:
                 candidate = ""
             candidate = _redact(candidate, "result") if candidate else ""
@@ -1280,10 +1374,37 @@ async def run_turn(
 
         # 1. Stream one LLM turn (buffered — see _stream_one_turn).
         try:
-            content, pending, finish_reason, iter_usage, reasoning_content = await _stream_one_turn(
-                _context_projection.messages,
-                tools_override=[] if _deadline_finalization_only else None,
-            )
+            stream_kwargs = {
+                "tools_override": [] if _deadline_finalization_only else None,
+            }
+            if _task_deadline_epoch > 0:
+                # A provider stream is itself a foreground action.  Without a
+                # deadline around it, a stalled proxy can consume the entire
+                # task budget while the command watchdog remains healthy.
+                provider_budget = max(1.0, _task_deadline_epoch - time.time())
+                content, pending, finish_reason, iter_usage, reasoning_content, _provider_metadata = await asyncio.wait_for(
+                    _stream_one_turn(_context_projection.messages, **stream_kwargs),
+                    timeout=provider_budget,
+                )
+            else:
+                content, pending, finish_reason, iter_usage, reasoning_content, _provider_metadata = await _stream_one_turn(
+                    _context_projection.messages,
+                    **stream_kwargs,
+                )
+        except asyncio.TimeoutError:
+            remaining = max(0.0, _task_deadline_epoch - time.time()) if _task_deadline_epoch else 0.0
+            message = f"LLM stream exceeded the task deadline ({remaining:.1f}s remaining)"
+            print_error(console, message)
+            await _safe_emit({
+                "type": "deadline_exhausted",
+                "phase": "provider_stream",
+                "remaining_seconds": round(remaining, 3),
+                "iteration": iter_count,
+                "ts": time.time(),
+            })
+            _err_stats = _stats()
+            _err_stats.error = "deadline_exhausted"
+            return _err_stats
         except Exception as e:
             print_error(console, f"LLM stream failed: {e}")
             await _safe_emit({
@@ -1301,6 +1422,34 @@ async def run_turn(
 
         if iter_usage is not None:
             iter_usages.append(iter_usage)
+            base_url = str(getattr(llm, "base_url", None) or "")
+            provider = base_url.split("//", 1)[-1].split("/", 1)[0] if base_url else None
+            model = str(getattr(llm, "resolved_model", None) or getattr(llm, "model", "")) or None
+            iter_invocations.append(
+                {
+                    "invocation_id": f"turn-{iter_count}",
+                    "status": "succeeded",
+                    "provider": provider,
+                    "model": model,
+                    "input_tokens": iter_usage.prompt_tokens,
+                    "uncached_input_tokens": iter_usage.uncached_prompt_tokens,
+                    "cache_creation_input_tokens": iter_usage.cache_creation_prompt_tokens,
+                    "cache_read_input_tokens": iter_usage.cache_read_prompt_tokens,
+                    "output_tokens": iter_usage.completion_tokens,
+                    "cache_hit_ratio": (
+                        iter_usage.cache_read_prompt_tokens / iter_usage.prompt_tokens
+                        if iter_usage.prompt_tokens > 0
+                        else None
+                    ),
+                    "reported_cost": iter_usage.reported_cost,
+                    "reported_cost_currency": iter_usage.reported_cost_currency,
+                    "cost_status": (
+                        "reported" if iter_usage.reported_cost is not None else "unavailable"
+                    ),
+                    "stop_reason": finish_reason,
+                    "provider_metadata": dict(_provider_metadata or {}),
+                }
+            )
 
         # 2. Compute routing
         has_tool_calls = (finish_reason == "tool_calls") and bool(pending)

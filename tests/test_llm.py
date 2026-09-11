@@ -13,6 +13,7 @@ from cc_harness.llm import (
     accumulate_delta,
     normalize_thinking_mode,
 )
+from cc_harness.model_identity import canonical_model_identity
 
 
 def test_normalize_thinking_mode_aliases_and_rejects_unknown_values():
@@ -21,6 +22,18 @@ def test_normalize_thinking_mode_aliases_and_rejects_unknown_values():
     assert normalize_thinking_mode("OFF") == "disabled"
     with pytest.raises(ValueError, match="thinking mode"):
         normalize_thinking_mode("sometimes")
+
+
+def test_model_identity_accepts_only_the_known_deepseek_deployment_alias():
+    assert canonical_model_identity("deepseek-v4-flash", "deepseek-v4-flash") == (
+        "deepseek-v4-flash"
+    )
+    assert canonical_model_identity("deepseek-flash", "deepseek-v4-flash") == (
+        "deepseek-v4-flash"
+    )
+    # An unrelated deployment must remain visible so the parity contract can
+    # reject it instead of silently treating it as equivalent.
+    assert canonical_model_identity("deepseek-chat", "deepseek-v4-flash") == "deepseek-chat"
 
 
 def test_thinking_replay_error_requires_the_provider_protocol_message():
@@ -77,8 +90,10 @@ class _FakeChoice:
         self.finish_reason = finish_reason
 
 class _FakeChunk:
-    def __init__(self, delta, finish_reason=None):
+    def __init__(self, delta, finish_reason=None, **metadata):
         self.choices = [_FakeChoice(delta, finish_reason)]
+        for key, value in metadata.items():
+            setattr(self, key, value)
 
 def _tc(index, id_, name, arguments):
     """Build a fake tool_call delta. Use SimpleNamespace (NOT MagicMock) because
@@ -173,6 +188,65 @@ async def test_chat_captures_usage_on_final_chunk():
     assert final.usage.prompt_tokens == 100
     assert final.usage.completion_tokens == 50
     assert final.usage.total_tokens == 150
+
+
+@pytest.mark.asyncio
+async def test_chat_preserves_bounded_provider_response_metadata():
+    chunks = [
+        _FakeChunk(
+            _FakeChoiceDelta(content="ok"),
+            finish_reason="stop",
+            id="resp-1",
+            model="gateway-model",
+            object="chat.completion.chunk",
+            created=123,
+            request_id="req-1",
+            authorization="should-not-be-copied",
+        )
+    ]
+    client = _make_client(chunks)
+    final = [
+        event
+        async for event in client.chat(messages=[{"role": "user", "content": "hi"}], tools=[])
+        if event.kind == "done"
+    ][-1]
+    assert final.provider_metadata == {
+        "id": "resp-1",
+        "model": "gateway-model",
+        "object": "chat.completion.chunk",
+        "created": 123,
+        "request_id": "req-1",
+    }
+    assert "authorization" not in final.provider_metadata
+
+
+@pytest.mark.asyncio
+async def test_chat_canonicalizes_known_provider_model_alias_for_parity():
+    chunks = [
+        _FakeChunk(
+            _FakeChoiceDelta(content="ok"),
+            finish_reason="stop",
+            model="deepseek-flash",
+        )
+    ]
+    client = LLMClient(
+        api_key="sk-test",
+        model="deepseek-v4-flash",
+        base_url=None,
+    )
+    mock = MagicMock()
+    mock.chat.completions.create = AsyncMock(return_value=aiter(chunks))
+    client._client = mock
+
+    final = [
+        event
+        async for event in client.chat(messages=[{"role": "user", "content": "hi"}], tools=[])
+        if event.kind == "done"
+    ][-1]
+
+    assert client.resolved_model == "deepseek-v4-flash"
+    # The raw provider observation remains available for audit.
+    assert final.provider_metadata["model"] == "deepseek-flash"
 
 
 @pytest.mark.asyncio

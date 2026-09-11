@@ -14,6 +14,7 @@ from cc_harness.run_model import (
     RunStatus,
     RuntimeContract,
 )
+from cc_harness.run_outcomes import FailureClass, OutcomeKind
 from cc_harness.run_projection import ProjectionBuilder, RunProjection
 
 
@@ -153,6 +154,9 @@ def test_projection_rebuilds_run_todo_plan_working_and_child_views() -> None:
     assert projection.children[0].status == "accepted"
     assert projection.children[0].diff_digest == "sha256:diff"
     assert projection.evidence[0].digest == "sha256:test"
+    assert projection.outcome is not None
+    assert projection.outcome.outcome is OutcomeKind.PASS
+    assert projection.is_successful is True
 
 
 def test_projection_indexes_committed_tool_observation_artifact() -> None:
@@ -202,6 +206,30 @@ def test_snapshot_incremental_replay_has_same_digest_as_full_replay() -> None:
     resumed = builder.rebuild(events[8:], snapshot=snapshot)
     assert resumed.digest == full.digest
     assert RunProjection.from_dict(resumed.to_dict()).digest == full.digest
+
+
+def test_projection_retains_runtime_failure_classification() -> None:
+    events = projection_events()[:5]
+    events.extend(
+        [
+            make_event(6, "RunBlocked", {"reason": "docker daemon is not ready"}),
+            make_event(
+                7,
+                "RunOutcomeRecorded",
+                {
+                    "outcome": "blocked",
+                    "primary_class": "environment_not_ready",
+                    "retryable": True,
+                    "details": {"reason": "docker daemon is not ready"},
+                },
+            ),
+        ]
+    )
+    projection = ProjectionBuilder().rebuild(events)
+    assert projection.outcome is not None
+    assert projection.outcome.outcome is OutcomeKind.BLOCKED
+    assert projection.outcome.primary_class is FailureClass.ENVIRONMENT_NOT_READY
+    assert projection.is_successful is False
 
 
 def test_reducer_does_not_mutate_event_payloads() -> None:

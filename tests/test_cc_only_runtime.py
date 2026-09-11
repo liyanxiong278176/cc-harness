@@ -23,6 +23,8 @@ from eval.cc_only.adapters.harbor import (
     _cleanup_owned_harbor_resources,
     _docker_healthcheck,
     _docker_snapshot,
+    _embedded_cc_result,
+    _find_embedded_cc_result,
     _harbor_failure_diagnostic,
     _harbor_usage,
     _terminal_bench_errored_grade,
@@ -294,6 +296,7 @@ def test_terminal_bench_retries_network_evidence_even_when_harbor_flag_is_false(
 def test_terminal_bench_docker_healthcheck_retries_until_ready(monkeypatch) -> None:
     calls = 0
     sleeps: list[float] = []
+    environments: list[dict[str, str] | None] = []
 
     class Completed:
         def __init__(self, returncode: int, stdout: str = "", stderr: str = "") -> None:
@@ -301,9 +304,10 @@ def test_terminal_bench_docker_healthcheck_retries_until_ready(monkeypatch) -> N
             self.stdout = stdout
             self.stderr = stderr
 
-    def fake_run(_command, **_kwargs):
+    def fake_run(_command, **kwargs):
         nonlocal calls
         calls += 1
+        environments.append(kwargs.get("env"))
         if calls == 1:
             return Completed(1, stderr="Cannot connect to the Docker daemon")
         return Completed(0, stdout="/var/lib/docker\n")
@@ -318,6 +322,27 @@ def test_terminal_bench_docker_healthcheck_retries_until_ready(monkeypatch) -> N
     assert result["attempts"] == 2
     assert calls == 2
     assert sleeps == [0.25]
+    assert environments[0]["DOCKER_HOST"] == "unix:///var/run/docker.sock"
+    assert environments[0]["DOCKER_CONTEXT"] == ""
+
+
+def test_terminal_bench_docker_healthcheck_rejects_non_native_root(monkeypatch) -> None:
+    class Completed:
+        returncode = 0
+        stdout = "/var/lib/docker-desktop\n"
+        stderr = ""
+
+    monkeypatch.setattr("eval.cc_only.adapters.harbor.shutil.which", lambda _: "docker")
+    monkeypatch.setattr(
+        "eval.cc_only.adapters.harbor.subprocess.run",
+        lambda *_args, **_kwargs: Completed(),
+    )
+    monkeypatch.setattr("eval.cc_only.adapters.harbor.time.sleep", lambda _seconds: None)
+
+    result = _docker_healthcheck(attempts=1, backoffs=())
+
+    assert result["ready"] is False
+    assert "native WSL root" in result["last_error"]
 
 
 def test_terminal_bench_preserves_agent_and_tool_call_telemetry() -> None:
@@ -398,6 +423,120 @@ def test_terminal_bench_recovers_telemetry_from_rate_limit_error_text() -> None:
 
     assert usage["model_calls"] == 11
     assert usage["tool_calls"] == 13
+
+
+def test_terminal_bench_recovers_complete_print_envelope_from_exception_text() -> None:
+    envelope = {
+        "schema_version": "cc-harness.print-result.v1",
+        "resolved_model": "deepseek-v4-flash",
+        "runtime_status": "stalled",
+        "error": "durable run ended with status stalled",
+        "usage": {
+            "input_tokens": 100,
+            "uncached_input_tokens": 20,
+            "cache_read_input_tokens": 80,
+            "output_tokens": 4,
+            "model_calls": 2,
+            "tool_calls": 3,
+            "providers": ["api.deepseek.com"],
+            "models": ["deepseek-v4-flash"],
+        },
+    }
+    usage = _harbor_usage(
+        {},
+        {"exception_info": {"exception_message": json.dumps(envelope)}},
+    )
+
+    assert usage["input_tokens"] == 100
+    assert usage["cache_read_input_tokens"] == 80
+    assert usage["output_tokens"] == 4
+    assert usage["model_calls"] == 2
+    assert usage["tool_calls"] == 3
+    assert usage["provider"] == "api.deepseek.com"
+    assert usage["model"] == "deepseek-v4-flash"
+    assert usage["providers"] == ["api.deepseek.com"]
+    assert usage["models"] == ["deepseek-v4-flash"]
+    assert usage["runtime_status"] == "stalled"
+    assert usage["provider_metadata"] == {}
+
+
+def test_terminal_bench_prefers_rich_jsonl_over_truncated_harbor_exception(tmp_path: Path) -> None:
+    job_root = tmp_path / "job"
+    log_root = job_root / "task" / "agent"
+    log_root.mkdir(parents=True)
+    rich = {
+        "schema_version": "cc-harness.print-result.v1",
+        "type": "result",
+        "text": "done",
+        "error": "durable run ended with status stalled",
+        "usage": {
+            "input_tokens": 123,
+            "cache_read_input_tokens": 100,
+            "output_tokens": 7,
+            "model_calls": 4,
+            "tool_calls": 5,
+            "providers": ["api.deepseek.com"],
+            "models": ["deepseek-v4-flash"],
+        },
+    }
+    (log_root / "cc-harness.jsonl").write_text(
+        json.dumps(rich) + "\n", encoding="utf-8"
+    )
+    truncated = {
+        "exception_info": {
+            "exception_message": (
+                'stdout: {"schema_version":"cc-harness.print-result.v1",'
+                '"type":"result","text":"truncated"}'
+            )
+        }
+    }
+
+    found = _find_embedded_cc_result(job_root, truncated)
+    assert found is not None
+    assert found["usage"]["input_tokens"] == 123
+    usage = _harbor_usage({}, truncated, job_root=job_root)
+    assert usage["input_tokens"] == 123
+    assert usage["runtime_status"] == "stalled"
+
+
+def test_terminal_bench_usage_sanitizes_provider_metadata_and_reports_cache_ratio() -> None:
+    envelope = {
+        "schema_version": "cc-harness.print-result.v1",
+        "usage": {
+            "input_tokens": 100,
+            "cache_read_input_tokens": 25,
+            "output_tokens": 3,
+            "model_calls": 1,
+            "provider_metadata": {
+                "id": "resp-1",
+                "request_id": "req-1",
+                "authorization": "must-not-leak",
+                "huge": "x" * 10_000,
+            },
+            "stop_reasons": {"stop": 1, "bad": "not-a-count"},
+        },
+    }
+    usage = _harbor_usage({}, envelope)
+    assert usage["cache_hit_ratio"] == pytest.approx(0.25)
+    assert usage["provider_metadata"] == {"id": "resp-1", "request_id": "req-1"}
+    assert usage["stop_reasons"] == {"stop": 1}
+
+
+def test_terminal_bench_address_pool_and_oom_are_retryable_pre_model_outages() -> None:
+    for reason in (
+        "all predefined address pools are fully subnetted",
+        "Cannot allocate memory (errno 12)",
+    ):
+        outcome = TrialOutcome(
+            status=TrialStatus.INVALID,
+            invalid_reason=reason,
+            protocol={
+                "exception_is_infrastructure": True,
+                "environment_not_ready": True,
+                "transient_infrastructure": True,
+            },
+        )
+        assert _classify_terminal_infrastructure(outcome) == "transient"
 
 
 def test_terminal_bench_cleanup_stops_only_new_owned_running_containers(monkeypatch) -> None:
@@ -581,6 +720,52 @@ def test_resume_artifact_refresh_requires_explicit_opt_in(monkeypatch) -> None:
     assert _observability_resume_compatible(previous, current) is False
 
     monkeypatch.setenv("CC_HARNESS_ALLOW_RESUME_ARTIFACT_REFRESH", "1")
+    assert _observability_resume_compatible(previous, current) is True
+
+
+def test_resume_accepts_native_docker_daemon_restart_drift(monkeypatch) -> None:
+    native_checks = {
+        "linux": True,
+        "wsl2": True,
+        "docker_binary_native": True,
+        "docker_context_default": True,
+        "docker_daemon_ready": True,
+        "docker_server_linux": True,
+        "docker_root_native": True,
+        "docker_socket_native": True,
+        "docker_storage_ext": True,
+    }
+
+    def backend(name: str, version: str, host: str | None) -> dict[str, object]:
+        return {
+            "checks": native_checks,
+            "docker_name": name,
+            "docker_server_version": version,
+            "docker_host": host,
+            "docker_storage": {
+                "filesystem": "ext4",
+                "source": "/dev/sde[/var/lib/docker]",
+                "target": "/var/lib/docker",
+            },
+        }
+
+    previous = {
+        "benchmark": "terminal-bench-2.1",
+        "adapter_run_identity": {
+            "git_dirty_digest": "old-dirty",
+            "dataset": "pinned",
+            "execution_backend": backend("ASUS", "29.1.3", "unix:///var/run/docker.sock"),
+        },
+    }
+    current = {
+        "benchmark": "terminal-bench-2.1",
+        "adapter_run_identity": {
+            "git_dirty_digest": "new-dirty",
+            "dataset": "pinned",
+            "execution_backend": backend("docker-desktop", "29.2.0", None),
+        },
+    }
+    monkeypatch.setenv("CC_HARNESS_ALLOW_OBSERVABILITY_RESUME", "1")
     assert _observability_resume_compatible(previous, current) is True
 
 
@@ -1508,7 +1693,7 @@ def test_check_only_task_limit_uses_isolated_subset_contract(tmp_path: Path) -> 
     assert manifest["task_limit"] == 1
 
 
-def test_terminal_infrastructure_exhaustion_defers_task_without_stopping_batch(
+def test_terminal_infrastructure_exhaustion_pauses_batch(
     tmp_path: Path,
 ) -> None:
     class Adapter:
@@ -1572,13 +1757,17 @@ def test_terminal_infrastructure_exhaustion_defers_task_without_stopping_batch(
         assert not (evidence.parent / "result.json").exists()
     retained = list((output / trial["attempts"][0]["path"] / "infrastructure-results").glob("infrastructure-*.json"))
     assert len(retained) == 1
-    assert state["trials"]["terminal-bench/healthy-fixture"]["status"] == "pass"
-    assert adapter.executed[-1] == "terminal-bench/healthy-fixture"
+    assert state["trials"]["terminal-bench/healthy-fixture"]["status"] == "pending"
+    assert adapter.executed == [
+        "terminal-bench/infrastructure-fixture",
+        "terminal-bench/infrastructure-fixture",
+    ]
     first_summary = read_json(output / "summary.json")
     assert first_summary["status"] == "incomplete"
-    assert first_summary["counts"] == {"pass": 1, "fail": 0, "invalid": 0, "pending": 1}
+    assert first_summary["counts"] == {"pass": 0, "fail": 0, "invalid": 0, "pending": 2}
     assert first_summary["pending_tasks"] == [
-        "terminal-bench/infrastructure-fixture"
+        "terminal-bench/infrastructure-fixture",
+        "terminal-bench/healthy-fixture"
     ]
     assert first_summary["infrastructure_events"][-1]["reason"] == (
         "terminal_infrastructure_deferred"
@@ -1591,7 +1780,10 @@ def test_terminal_infrastructure_exhaustion_defers_task_without_stopping_batch(
     resumed_trial = resumed_state["trials"]["terminal-bench/infrastructure-fixture"]
     assert resumed_trial["status"] == "pass"
     assert resumed_state["retry_generation"] == 1
-    assert adapter.executed == ["terminal-bench/infrastructure-fixture"]
+    assert adapter.executed == [
+        "terminal-bench/infrastructure-fixture",
+        "terminal-bench/healthy-fixture",
+    ]
     final_summary = read_json(output / "summary.json")
     assert final_summary["status"] == "complete"
     assert final_summary["counts"] == {"pass": 2, "fail": 0, "invalid": 0, "pending": 0}

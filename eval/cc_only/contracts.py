@@ -64,8 +64,29 @@ class TrialOutcome:
     failure_reason: str | None = None
     critical_failure: bool = False
     protocol: Mapping[str, Any] = field(default_factory=dict)
+    # Official benchmark grading and the runtime's own lifecycle diagnostics
+    # are deliberately separate ledgers.  A runtime can stall after Harbor
+    # has already persisted an official verifier reward; collapsing the two
+    # would turn valid grades into infrastructure failures (or vice versa).
+    official_result: Mapping[str, Any] = field(default_factory=dict)
+    runtime_diagnostic: Mapping[str, Any] = field(default_factory=dict)
 
     def as_dict(self) -> dict[str, Any]:
+        protocol = dict(self.protocol)
+        runtime_diagnostic = dict(self.runtime_diagnostic)
+        # Keep the stable ``failure_class`` compatibility field untouched,
+        # while promoting the non-scoring root-cause label into the protocol
+        # envelope so reports can group deadline/network/service/persistence
+        # failures without parsing free-form diagnostics.
+        if "failure_root_cause" not in protocol and protocol.get("failure_class"):
+            root_cause = runtime_diagnostic.get("root_cause")
+            evidence = protocol.get("failure_evidence")
+            if not root_cause and isinstance(evidence, Mapping):
+                details = evidence.get("details")
+                if isinstance(details, Mapping):
+                    root_cause = details.get("root_cause")
+            if root_cause:
+                protocol["failure_root_cause"] = str(root_cause)
         return {
             "schema_version": "eval.cc-only-trial-outcome.v1",
             "status": self.status.value,
@@ -74,7 +95,9 @@ class TrialOutcome:
             "invalid_reason": self.invalid_reason,
             "failure_reason": self.failure_reason,
             "critical_failure": self.critical_failure,
-            "protocol": dict(self.protocol),
+            "protocol": protocol,
+            "official_result": dict(self.official_result),
+            "runtime_diagnostic": runtime_diagnostic,
         }
 
 
@@ -97,6 +120,10 @@ class TrialContext:
     qa_limit: int | None = None
     cache_only: bool = False
     cache_refresh: bool = False
+    # Number of official Harbor trials requested for this task.  Adapters may
+    # use this to pass ``--n-attempts`` without changing the task/verifier
+    # contract; the default preserves the historical single-trial behavior.
+    trials_per_task: int = 1
 
 
 class BenchmarkAdapter(Protocol):

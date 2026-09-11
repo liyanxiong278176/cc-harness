@@ -8,9 +8,17 @@ import hashlib
 import json
 import shutil
 import subprocess
+import sys
 import urllib.request
 from datetime import datetime
 from pathlib import Path
+
+# Keep the command usable when invoked directly from ``scripts/`` on Windows
+# (the WSL launchers already set PYTHONPATH, but a direct Python invocation
+# should not depend on that environment detail).
+_PROJECT_ROOT = Path(__file__).resolve().parents[1]
+if str(_PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(_PROJECT_ROOT))
 
 from eval.cc_only import EvalProfile, run_benchmark
 from eval.cc_only.adapters import (
@@ -60,11 +68,15 @@ def main() -> int:
         raise SystemExit("balanced AgentDojo selections require --profile portfolio")
     if args.balanced and args.balanced_80:
         raise SystemExit("choose either --balanced (500 trials) or --balanced-80")
+    if args.trials_per_task != 1 and args.benchmark != "terminal-bench-2.1":
+        raise SystemExit("--trials-per-task is currently supported only for terminal-bench-2.1")
     adapter = (
         AgentDojoBalanced500Adapter()
         if args.balanced
         else AgentDojoBalancedAdapter()
         if args.balanced_80
+        else TerminalBenchAdapter(trials_per_task=args.trials_per_task)
+        if args.benchmark == "terminal-bench-2.1"
         else ADAPTERS[args.benchmark]()
     )
     if args.oracle_preflight or args.synthetic_canary:
@@ -209,6 +221,8 @@ def main() -> int:
         print(f"task_ids={len(args.task_ids)}")
     if args.task_manifest:
         print(f"task_manifest={args.task_manifest}")
+    if args.benchmark == "terminal-bench-2.1":
+        print(f"trials_per_task={args.trials_per_task}")
     if args.rerun_sample:
         print(f"rerun_sample={args.rerun_sample}")
     if args.balanced:
@@ -247,6 +261,7 @@ def main() -> int:
                 rerun_sample=args.rerun_sample,
                 task_ids=args.task_ids,
                 task_manifest=args.task_manifest,
+                trials_per_task=args.trials_per_task,
                 progress=_progress,
             )
         )
@@ -594,6 +609,15 @@ def _parser() -> argparse.ArgumentParser:
         "--task-limit",
         type=int,
         help="run only the first N catalog tasks in an isolated result root",
+    )
+    parser.add_argument(
+        "--trials-per-task",
+        type=int,
+        default=1,
+        help=(
+            "number of independent Harbor trials per Terminal-Bench task "
+            "(use 5 for the official leaderboard-compatible run)"
+        ),
     )
     parser.add_argument(
         "--task-id",

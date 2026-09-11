@@ -88,6 +88,57 @@ async def test_supervisor_reclaims_expired_lease_from_still_active_task(tmp_path
 
 
 @pytest.mark.asyncio
+async def test_supervisor_stop_awaits_worker_removed_during_lease_recovery(tmp_path) -> None:
+    """A recovered worker remains in the shutdown barrier until it unwinds."""
+
+    project = tmp_path / "project"
+    project.mkdir()
+    store = RunStore(project, data_root=tmp_path / "data")
+    await store.open()
+    cancellation_seen = asyncio.Event()
+
+    class UncooperativeWorker(RunWorker):
+        async def execute(self, lease):
+            del lease
+            try:
+                await asyncio.Event().wait()
+            except asyncio.CancelledError:
+                cancellation_seen.set()
+                # Force the bounded lease-recovery wait to leave this task
+                # unwinding in the background.  A second cancellation from
+                # supervisor.stop() must still finish it.
+                await asyncio.sleep(2)
+                raise
+
+    try:
+        handle = await RunCoordinator(store).submit(RunRequest("stale shutdown", ("segment",)))
+
+        def factory(_run_id):
+            return UncooperativeWorker(
+                store,
+                ReActKernel(EmptyModel()),
+                worker_id="uncooperative",
+                lease_manager=LeaseManager(store, ttl_seconds=1.0),
+            )
+
+        supervisor = LocalSupervisor(store, factory, max_workers=1, poll_interval=0.01)
+        await supervisor.tick()
+        await asyncio.sleep(1.1)
+        await supervisor.tick()
+
+        assert cancellation_seen.is_set()
+        # Recovery may immediately claim a fresh epoch for the same run; the
+        # important invariant is that the cancelled predecessor is still in
+        # the shutdown registry in addition to the current scheduling slot.
+        assert supervisor._worker_tasks
+        assert len(supervisor._worker_tasks) > len(supervisor._active)
+        await supervisor.stop(drain=False)
+        assert not supervisor._worker_tasks
+    finally:
+        await store.close()
+
+
+@pytest.mark.asyncio
 async def test_supervisor_tick_error_does_not_stop_recovery_loop(tmp_path, monkeypatch) -> None:
     project = tmp_path / "project"
     project.mkdir()

@@ -220,6 +220,61 @@ async def test_executor_background_process_returns_handle_and_kill(tmp_path: Pat
     assert events[-1]["event"] == "background_finish"
 
 
+@pytest.mark.asyncio
+async def test_executor_background_without_progress_file_keeps_exit_manifest(tmp_path: Path):
+    """A caller may omit a progress sink; manifest liveness must still work."""
+
+    command = "Start-Sleep -Milliseconds 100" if sys.platform == "win32" else "sleep 0.1"
+    executor = NativeExecutor(project_root=tmp_path, timeout_s=2)
+    try:
+        result = await executor.run({"command": command, "background": True}, cwd=tmp_path)
+        assert not result.is_error
+        pid = int(result.metadata["pid"])
+        status = None
+        for _ in range(30):
+            await asyncio.sleep(0.1)
+            status = executor.background_status(pid)
+            if status is not None and status["state"] == "exited":
+                break
+        assert status is not None
+        assert status["state"] == "exited"
+        assert status["exit_code"] == 0
+    finally:
+        await executor.kill()
+
+
+@pytest.mark.asyncio
+async def test_executor_background_readiness_is_bounded_and_persisted(tmp_path: Path):
+    command = "Start-Sleep -Seconds 5" if sys.platform == "win32" else "sleep 5"
+    executor = NativeExecutor(project_root=tmp_path, timeout_s=2)
+    try:
+        result = await executor.run(
+            {
+                "command": command,
+                "background": True,
+                "readiness_command": "exit 0",
+                "readiness_timeout_s": 1,
+            },
+            cwd=tmp_path,
+        )
+        assert not result.is_error
+        assert result.metadata["state"] == "running"
+        assert result.metadata["readiness"]["status"] == "ready"
+        manifest = Path(result.metadata["manifest"])
+        payload = json.loads(manifest.read_text(encoding="utf-8"))
+        assert payload["schema_version"] == "cc-harness.background-process.v1"
+        assert payload["readiness"]["status"] == "ready"
+        # A new executor can inspect the same project-scoped handle without
+        # inheriting Python process state.
+        attached = NativeExecutor(project_root=tmp_path)
+        attached_status = attached.background_status(int(result.metadata["pid"]))
+        assert attached_status is not None
+        assert attached_status["state"] == "running"
+        assert attached_status["readiness"]["status"] == "ready"
+    finally:
+        await executor.kill()
+
+
 @pytest.mark.skipif(sys.platform == "win32", reason="POSIX process-group semantics")
 @pytest.mark.asyncio
 async def test_executor_timeout_kills_shell_descendants(tmp_path: Path):
@@ -235,6 +290,9 @@ async def test_executor_runs_simple_command(tmp_path: Path):
     ex = NativeExecutor(project_root=tmp_path)
     res = await ex.run({"command": "echo hello"}, cwd=tmp_path)
     assert "hello" in res.llm_text
+    resource = res.metadata["resource"]
+    assert {"rss_bytes", "peak_rss_bytes", "disk_free_bytes", "oom_killed"}.issubset(resource)
+    assert resource["oom_killed"] is False
 
 
 def test_windows_shell_profile_is_explicit_powershell():

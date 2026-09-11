@@ -10,6 +10,7 @@ from typing import Any, Literal
 
 from openai import AsyncOpenAI
 
+from cc_harness.model_identity import canonical_model_identity
 from cc_harness.tokens import UsageRecord
 
 
@@ -175,7 +176,30 @@ class StreamEvent:
     pending: list[PendingToolCall] = field(default_factory=list)
     content: str = ""
     reasoning_content: str = ""
+    refusal: str | None = None
     usage: UsageRecord | None = None
+    # Small, provider-owned response facts retained for audit/replay
+    # diagnostics.  The values are never sent back to a provider as prompt
+    # fields; they travel with the durable assistant event instead.
+    provider_metadata: dict[str, Any] = field(default_factory=dict)
+
+
+def _provider_chunk_metadata(chunk: Any) -> dict[str, Any]:
+    """Extract bounded, JSON-safe response metadata without serializing a SDK object."""
+
+    metadata: dict[str, Any] = {}
+    for name in ("id", "model", "object", "created", "system_fingerprint", "service_tier"):
+        value = getattr(chunk, name, None)
+        if isinstance(value, (str, int, float, bool)):
+            metadata[name] = value[:512] if isinstance(value, str) else value
+    # OpenAI-compatible gateways occasionally expose a response/request id in
+    # a private header-like field.  Keep only scalar identifiers and never
+    # copy authorization headers or the full raw response.
+    for name in ("request_id", "response_id"):
+        value = getattr(chunk, name, None)
+        if isinstance(value, str) and value:
+            metadata[name] = value[:512]
+    return metadata
 
 
 # --- Delta accumulator ---
@@ -336,6 +360,8 @@ class LLMClient:
         reasoning_parts: list[str] = []
         finish_reason: str | None = None
         usage: UsageRecord | None = None
+        provider_metadata: dict[str, Any] = {}
+        refusal: str | None = None
 
         try:
             stream = await self._client.chat.completions.create(**kwargs)
@@ -387,9 +413,20 @@ class LLMClient:
                 self.reasoning_effort_supported = True
 
         async for chunk in stream:
+            provider_metadata.update(_provider_chunk_metadata(chunk))
             reported_model = getattr(chunk, "model", None)
             if isinstance(reported_model, str) and reported_model:
-                self.resolved_model = reported_model
+                # OpenAI-compatible gateways may expose a deployment alias
+                # after the first request (DeepSeek currently reports
+                # ``deepseek-flash`` for the pinned ``deepseek-v4-flash``
+                # request).  Keep the raw value in provider_metadata for
+                # audit, while using the narrow canonical identity for the
+                # durable parity contract.  Unknown drift remains unchanged
+                # and is still rejected by the official adapter.
+                self.resolved_model = canonical_model_identity(
+                    reported_model,
+                    self.model,
+                )
             chunk_usage = getattr(chunk, "usage", None)
             if chunk_usage is not None:
                 usage = UsageRecord.from_api(chunk_usage)
@@ -401,6 +438,10 @@ class LLMClient:
             if delta.content:
                 content_parts.append(delta.content)
                 yield StreamEvent(kind="content", text=delta.content)
+
+            delta_refusal = getattr(delta, "refusal", None)
+            if delta_refusal:
+                refusal = str(delta_refusal)
 
             # DeepSeek reasoning models (e.g. deepseek-v4-flash) emit
             # delta.reasoning_content separately from delta.content. Capture it
@@ -446,5 +487,7 @@ class LLMClient:
             pending=pending,
             content=content_str,
             reasoning_content="".join(reasoning_parts),
+            refusal=refusal,
             usage=usage,
+            provider_metadata=provider_metadata,
         )

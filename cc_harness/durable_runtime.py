@@ -35,9 +35,15 @@ from .run_store import RunNotFound, RunStore, RunStoreError
 from .run_telemetry import aggregate_model_usage
 from .supervisor import LocalSupervisor
 from .tools import (
+    BACKGROUND_STATUS_SPEC,
+    BACKGROUND_STOP_SPEC,
+    SERVICE_STATUS_SPEC,
     RUN_COMMAND_SPEC,
     init_session_executor,
     prewarm_session_executor,
+    process_status,
+    process_stop,
+    service_status,
     run_command,
     shutdown_session_executor,
 )
@@ -244,6 +250,8 @@ class DurableModelAdapter(ModelAdapter):
         finish_reason = "model_stop"
         usage = None
         reasoning_content = ""
+        refusal: str | None = None
+        provider_metadata: dict[str, Any] = {}
         thinking_mode = getattr(self.llm, "thinking_mode", "auto")
         reasoning_content_required = bool(
             getattr(self.llm, "reasoning_content_required", False)
@@ -266,7 +274,9 @@ class DurableModelAdapter(ModelAdapter):
                     if event.content:
                         content = [event.content]
                     reasoning_content = event.reasoning_content
+                    refusal = event.refusal
                     usage = event.usage
+                    provider_metadata = dict(event.provider_metadata or {})
         finally:
             close_stream = getattr(stream, "aclose", None)
             if close_stream is not None:
@@ -325,6 +335,13 @@ class DurableModelAdapter(ModelAdapter):
         if usage is not None:
             usage_payload["reported_cost"] = usage.reported_cost
             usage_payload["reported_cost_currency"] = usage.reported_cost_currency
+            usage_payload["cache_hit_ratio"] = (
+                usage.cache_read_prompt_tokens / usage.prompt_tokens
+                if usage.prompt_tokens > 0
+                else None
+            )
+        if provider_metadata:
+            usage_payload["provider_metadata"] = provider_metadata
         # Provider/model identity is stored with the usage event, not inferred
         # later from mutable process configuration.  This is especially
         # important when a resumed run changes the requested model.
@@ -373,6 +390,8 @@ class DurableModelAdapter(ModelAdapter):
             stop_reason=finish_reason,
             usage=usage_payload,
             reasoning_content=reasoning_content,
+            refusal=refusal,
+            provider_metadata=provider_metadata,
         )
 
 
@@ -428,15 +447,26 @@ class DurableRuntimeClient:
         # operations (for example ``git push``) without being a live user's
         # request.  Keep the provenance explicit and auditable; never infer it
         # from the objective text.
-        if (
+        official_benchmark = (
             os.getenv("CC_HARNESS_TRUSTED_BENCHMARK_TASK", "") == "1"
             and os.getenv("CC_HARNESS_TERMINAL_BENCH", "") == "1"
-        ):
+        )
+        if official_benchmark:
             goal_provenance = "official_benchmark"
         elif confirm_high_risk:
             goal_provenance = "user_confirmed"
         else:
             goal_provenance = "user"
+        if official_benchmark and acceptance_criteria == ("request addressed",):
+            # The benchmark adapter supplies the frozen task statement as the
+            # objective but no user-authored criteria.  Give the durable goal
+            # an explicit, provider-neutral contract so the model sees that
+            # artifacts and decisive verification are required; the official
+            # Harbor verifier remains the final task oracle.
+            acceptance_criteria = (
+                "official task statement satisfied",
+                "required artifacts present and decisive verification recorded",
+            )
         return (
             await self.coordinator.submit(
                 RunRequest(
@@ -986,8 +1016,17 @@ class DurableRuntimeClient:
         }
         handler_deps: dict[str, Mapping[str, Any]] = {}
         handlers["run_command"] = run_command
+        handlers["process_status"] = process_status
+        handlers["process_stop"] = process_stop
+        handlers["service_status"] = service_status
         specs: list[dict[str, Any]] = []
-        for name, entry in (("run_command", {"spec": RUN_COMMAND_SPEC}), *NATIVE_FILE_TOOLS.items()):
+        for name, entry in (
+            ("run_command", {"spec": RUN_COMMAND_SPEC}),
+            ("process_status", {"spec": BACKGROUND_STATUS_SPEC}),
+            ("process_stop", {"spec": BACKGROUND_STOP_SPEC}),
+            ("service_status", {"spec": SERVICE_STATUS_SPEC}),
+            *NATIVE_FILE_TOOLS.items(),
+        ):
             spec = json.loads(json.dumps(entry["spec"], ensure_ascii=False))
             function = spec.setdefault("function", {})
             contract = contracts.get(name)
@@ -1133,6 +1172,9 @@ class DurableRuntimeClient:
         if self.tool_bundles is not None:
             native_names = {
                 "run_command",
+                "process_status",
+                "process_stop",
+                "service_status",
                 "ContinueToolResult",
                 "RecallRunContext",
                 "dispatch_subagent",

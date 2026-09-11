@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 import os
 import re
 import time
@@ -16,7 +17,9 @@ from collections.abc import Iterable, Sequence
 from dataclasses import asdict, dataclass, field
 from enum import Enum
 from pathlib import Path
-from typing import Any
+from typing import Any, Mapping
+
+from .run_model import GoalContract
 
 
 class ToolErrorKind(str, Enum):
@@ -60,10 +63,13 @@ _SERVICE_HEALTH_COMMAND_RE = re.compile(
     r"(?:grpcurl|nc\s+-z|netcat\s+-z|systemctl\s+is-active|service\s+\S+\s+status)",
     re.IGNORECASE,
 )
-_EXPLICIT_ARTIFACT_RE = re.compile(r"(?<![\w.-])(/app/[A-Za-z0-9_./-]+)")
+_EXPLICIT_ARTIFACT_RE = re.compile(
+    r"(?<![\w.-])(/(?:app|tmp|workspace)/[A-Za-z0-9_./-]+)"
+)
 _ARTIFACT_DIRECTIVE_RE = re.compile(
     r"\b(?:create|write|save|store|produce|generate|output|place|put|"
-    r"创建|写入|保存|生成|输出|放到|存储)\b",
+    r"required|must\s+(?:exist|contain|be)|deliver(?:able|ed)|artifact|"
+    r"创建|写入|保存|生成|输出|放到|存储|必须(?:存在|包含)|产物|交付)\b",
     re.IGNORECASE,
 )
 _SERVICE_REQUEST_RE = re.compile(
@@ -146,15 +152,325 @@ class RecoveryPolicy:
 
 
 @dataclass(frozen=True)
+class ArtifactRequirement:
+    """A concrete deliverable required by a task contract.
+
+    ``path`` is always resolved under the run workspace.  ``kind`` and
+    ``min_bytes`` let the runtime distinguish a real artifact from an empty
+    placeholder, while the optional digest gives callers a deterministic
+    integrity check when a task supplies one.
+    """
+
+    path: str
+    kind: str = "file"
+    min_bytes: int = 1
+    sha256: str | None = None
+    format: str | None = None
+
+    def __post_init__(self) -> None:
+        if not str(self.path).strip():
+            raise ValueError("artifact requirement path is required")
+        if self.kind not in {"file", "directory", "any"}:
+            raise ValueError("artifact requirement kind must be file, directory, or any")
+        if self.min_bytes < 0:
+            raise ValueError("artifact requirement min_bytes must be non-negative")
+        if self.sha256 is not None:
+            value = str(self.sha256)
+            if not re.fullmatch(r"(?:sha256:)?[0-9a-f]{64}", value):
+                raise ValueError("artifact requirement sha256 must be a 64-character hex digest")
+        if self.format is not None and self.format not in {"json", "text", "binary"}:
+            raise ValueError("artifact requirement format must be json, text, or binary")
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "path": self.path,
+            "kind": self.kind,
+            "min_bytes": self.min_bytes,
+            "sha256": self.sha256,
+            "format": self.format,
+        }
+
+    @classmethod
+    def from_dict(cls, value: Mapping[str, Any]) -> "ArtifactRequirement":
+        if not isinstance(value, Mapping):
+            raise ValueError("artifact requirement must be an object")
+        return cls(
+            path=str(value.get("path") or ""),
+            kind=str(value.get("kind") or "file"),
+            min_bytes=max(0, int(value.get("min_bytes", 1))),
+            sha256=(str(value["sha256"]) if value.get("sha256") else None),
+            format=(str(value["format"]) if value.get("format") else None),
+        )
+
+
+@dataclass(frozen=True)
 class CompletionContract:
     required_paths: tuple[str, ...] = ()
+    required_artifacts: tuple[ArtifactRequirement, ...] = ()
+    verification_commands: tuple[str, ...] = ()
+    service_health_commands: tuple[str, ...] = ()
     require_verification_after_code_changes: bool = True
     require_session_todos_complete: bool = True
     require_service_health_check: bool = False
     max_rechecks: int = 2
+    environment_retry_limit: int = 10
+    deadline_seconds: float | None = None
+    # Empty for ordinary user sessions.  Trusted task adapters may explicitly
+    # allow task-image roots such as /tmp for deliverables that live outside
+    # the mounted workspace.
+    allowed_external_roots: tuple[str, ...] = ()
+
+    def __post_init__(self) -> None:
+        if self.max_rechecks < 0:
+            raise ValueError("max_rechecks must be non-negative")
+        if self.environment_retry_limit < 0:
+            raise ValueError("environment_retry_limit must be non-negative")
+        if self.deadline_seconds is not None and (
+            not math.isfinite(float(self.deadline_seconds)) or self.deadline_seconds <= 0
+        ):
+            raise ValueError("deadline_seconds must be a positive finite number")
+        for raw_root in self.allowed_external_roots:
+            normalized = str(raw_root).replace("\\", "/").rstrip("/")
+            if not normalized.startswith("/") or normalized in {"", "/", "/app"}:
+                raise ValueError("allowed_external_roots must contain safe absolute POSIX roots")
+        paths = set(self.required_paths)
+        artifact_paths = {item.path for item in self.required_artifacts}
+        if not artifact_paths.issubset(paths):
+            raise ValueError("required_artifacts must be included in required_paths")
 
 
-def completion_contract_from_instruction(instruction: str) -> CompletionContract:
+@dataclass(frozen=True)
+class TaskContract:
+    """Structured task contract shared by planning, execution and completion.
+
+    GoalContract remains the durable source of truth.  This value object is a
+    runtime view that adds executable obligations (artifacts, verification and
+    service probes) without relying on the model to restate them in prose.
+    """
+
+    objective: str
+    acceptance_criteria: tuple[str, ...]
+    constraints: tuple[str, ...] = ()
+    allowed_scope: tuple[str, ...] = ()
+    excluded_scope: tuple[str, ...] = ()
+    completion: CompletionContract = field(default_factory=CompletionContract)
+
+    @classmethod
+    def from_goal(
+        cls,
+        goal: GoalContract,
+        *,
+        completion: CompletionContract | None = None,
+    ) -> "TaskContract":
+        if not isinstance(goal, GoalContract):
+            raise TypeError("task contract requires a GoalContract")
+        selected = completion or CompletionContract()
+        return cls(
+            objective=goal.objective,
+            acceptance_criteria=tuple(goal.acceptance_criteria),
+            constraints=tuple(goal.constraints),
+            allowed_scope=tuple(goal.allowed_scope),
+            excluded_scope=tuple(goal.excluded_scope),
+            completion=selected,
+        )
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "objective": self.objective,
+            "acceptance_criteria": list(self.acceptance_criteria),
+            "constraints": list(self.constraints),
+            "allowed_scope": list(self.allowed_scope),
+            "excluded_scope": list(self.excluded_scope),
+            "completion": {
+                "required_paths": list(self.completion.required_paths),
+                "required_artifacts": [
+                    item.to_dict() for item in self.completion.required_artifacts
+                ],
+                "verification_commands": list(self.completion.verification_commands),
+                "service_health_commands": list(self.completion.service_health_commands),
+                "require_verification_after_code_changes": (
+                    self.completion.require_verification_after_code_changes
+                ),
+                "require_session_todos_complete": self.completion.require_session_todos_complete,
+                "require_service_health_check": self.completion.require_service_health_check,
+                "max_rechecks": self.completion.max_rechecks,
+                "environment_retry_limit": self.completion.environment_retry_limit,
+                "deadline_seconds": self.completion.deadline_seconds,
+                "allowed_external_roots": list(self.completion.allowed_external_roots),
+            },
+        }
+
+    @classmethod
+    def from_dict(cls, value: Mapping[str, Any]) -> "TaskContract":
+        if not isinstance(value, Mapping):
+            raise ValueError("task contract must be an object")
+        raw_completion = value.get("completion")
+        completion_data = raw_completion if isinstance(raw_completion, Mapping) else {}
+        required_paths = tuple(str(item) for item in completion_data.get("required_paths") or ())
+        artifacts = tuple(
+            ArtifactRequirement.from_dict(item)
+            for item in completion_data.get("required_artifacts") or ()
+        )
+        completion = CompletionContract(
+            required_paths=required_paths,
+            required_artifacts=artifacts,
+            verification_commands=tuple(
+                str(item) for item in completion_data.get("verification_commands") or ()
+            ),
+            service_health_commands=tuple(
+                str(item) for item in completion_data.get("service_health_commands") or ()
+            ),
+            require_verification_after_code_changes=bool(
+                completion_data.get("require_verification_after_code_changes", True)
+            ),
+            require_session_todos_complete=bool(
+                completion_data.get("require_session_todos_complete", True)
+            ),
+            require_service_health_check=bool(
+                completion_data.get("require_service_health_check", False)
+            ),
+            max_rechecks=max(0, int(completion_data.get("max_rechecks", 2))),
+            environment_retry_limit=max(0, int(completion_data.get("environment_retry_limit", 10))),
+            deadline_seconds=(
+                float(completion_data["deadline_seconds"])
+                if completion_data.get("deadline_seconds") is not None
+                else None
+            ),
+            allowed_external_roots=tuple(
+                str(item).replace("\\", "/").rstrip("/")
+                for item in completion_data.get("allowed_external_roots") or ()
+            ),
+        )
+        return cls(
+            objective=str(value.get("objective") or ""),
+            acceptance_criteria=tuple(str(item) for item in value.get("acceptance_criteria") or ()),
+            constraints=tuple(str(item) for item in value.get("constraints") or ()),
+            allowed_scope=tuple(str(item) for item in value.get("allowed_scope") or ()),
+            excluded_scope=tuple(str(item) for item in value.get("excluded_scope") or ()),
+            completion=completion,
+        )
+
+
+def artifact_validation_issues(
+    project_root: Path,
+    requirements: Iterable[ArtifactRequirement],
+    *,
+    allowed_external_roots: Iterable[str] = (),
+) -> tuple[str, ...]:
+    """Validate required deliverables without consulting model output.
+
+    The function is intentionally synchronous and side-effect free so the
+    worker, interactive loop, and post-run auditors share exactly the same
+    artifact contract.  ``/app`` is the canonical task-image root and maps to
+    the durable project root; other absolute paths are rejected as out of
+    scope unless an explicit trusted root was supplied.
+    """
+
+    root = Path(project_root).resolve()
+    external_roots = tuple(allowed_external_roots)
+    issues: list[str] = []
+    for requirement in requirements:
+        target = _resolve_under_root(
+            root,
+            requirement.path,
+            allowed_external_roots=external_roots,
+        )
+        if target is None:
+            issues.append(f"required artifact is outside workspace: {requirement.path}")
+            continue
+        if not target.exists():
+            issues.append(f"required artifact is missing: {requirement.path}")
+            continue
+        if requirement.kind == "file" and not target.is_file():
+            issues.append(f"required artifact is not a file: {requirement.path}")
+            continue
+        if requirement.kind == "directory" and not target.is_dir():
+            issues.append(f"required artifact is not a directory: {requirement.path}")
+            continue
+        if target.is_file():
+            try:
+                if target.stat().st_size < requirement.min_bytes:
+                    issues.append(
+                        f"required artifact is empty or too small: {requirement.path}"
+                    )
+                if requirement.sha256:
+                    digest = hashlib.sha256()
+                    with target.open("rb") as stream:
+                        for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+                            digest.update(chunk)
+                    actual = "sha256:" + digest.hexdigest()
+                    expected = requirement.sha256
+                    if not expected.startswith("sha256:"):
+                        expected = "sha256:" + expected
+                    if actual != expected:
+                        issues.append(f"required artifact digest mismatch: {requirement.path}")
+                if requirement.format == "json":
+                    if target.stat().st_size > 4 * 1024 * 1024:
+                        issues.append(f"required JSON artifact is too large to validate: {requirement.path}")
+                    else:
+                        try:
+                            json.loads(target.read_text(encoding="utf-8"))
+                        except (OSError, UnicodeDecodeError, json.JSONDecodeError, ValueError):
+                            issues.append(f"required artifact is not valid JSON: {requirement.path}")
+            except OSError:
+                issues.append(f"required artifact cannot be read: {requirement.path}")
+    return tuple(issues)
+
+
+def _normalise_command(value: str) -> str:
+    """Normalize a command before hashing it into durable loop state."""
+
+    text = str(value or "").strip().strip("`")
+    text = re.sub(r"^[-*>`\s]+", "", text)
+    return re.sub(r"\s+", " ", text).strip()
+
+
+def _instruction_commands(instruction: str, pattern: re.Pattern[str]) -> tuple[str, ...]:
+    """Extract executable snippets, preferring commands in backticks."""
+
+    found: list[str] = []
+    candidates = re.findall(r"`([^`\n]+)`", instruction) + instruction.splitlines()
+    command_start = re.compile(
+        r"\b(?:python(?:3)?\s+-m\s+pytest|pytest|npm\s+(?:run\s+)?test|"
+        r"pnpm\s+(?:run\s+)?test|yarn\s+test|cargo\s+test|go\s+test|"
+        r"dotnet\s+test|mvn(?:w)?\s+test|gradle(?:w?)\s+test|"
+        r"curl|wget|grpcurl|(?:nc|netcat)\s+-z|systemctl\s+is-active|"
+        r"service\s+\S+\s+status)\b",
+        re.IGNORECASE,
+    )
+    service_start = re.compile(
+        r"\b(?:curl|wget|grpcurl|(?:nc|netcat)\s+-z|systemctl\s+is-active|"
+        r"service\s+\S+\s+status)\b",
+        re.IGNORECASE,
+    )
+    for raw in candidates:
+        line = _normalise_command(raw)
+        start = (service_start if pattern is _SERVICE_HEALTH_COMMAND_RE else command_start).search(line)
+        command = line[start.start():] if start else line
+        # Prose often lists a command followed by another instruction on the
+        # same line.  Keep the executable prefix only; fenced snippets remain
+        # untouched except for terminal punctuation.
+        for separator in (
+            " and then ", " then ", " and probe ", " and verify ",
+            " and check ", "；", "。",
+        ):
+            if separator in command.casefold():
+                index = command.casefold().index(separator)
+                command = command[:index]
+                break
+        command = command.strip("`'\".,;:)]}")
+        if not command or not pattern.search(command):
+            continue
+        if command not in found:
+            found.append(command)
+    return tuple(found)
+
+
+def completion_contract_from_instruction(
+    instruction: str,
+    *,
+    trusted_public_instruction: bool = False,
+) -> CompletionContract:
     """Derive only explicit, user-visible completion obligations.
 
     The extractor deliberately ignores arbitrary paths mentioned as inputs. A
@@ -164,6 +480,8 @@ def completion_contract_from_instruction(instruction: str) -> CompletionContract
     """
 
     required: list[str] = []
+    artifact_formats: dict[str, str | None] = {}
+    artifact_digests: dict[str, str | None] = {}
     for line in instruction.splitlines():
         if not _ARTIFACT_DIRECTIVE_RE.search(line):
             continue
@@ -171,9 +489,33 @@ def completion_contract_from_instruction(instruction: str) -> CompletionContract
             path = match.group(1).rstrip(".,:;)]}'\"")
             if path not in required:
                 required.append(path)
+            lowered = line.casefold()
+            artifact_formats.setdefault(
+                path,
+                "json" if path.casefold().endswith(".json") and "json" in lowered else None,
+            )
+            digest_match = re.search(r"\bsha256:[0-9a-f]{64}\b", line, re.IGNORECASE)
+            if digest_match:
+                artifact_digests[path] = digest_match.group(0).lower()
+    verification_commands = _instruction_commands(instruction, _TEST_COMMAND_RE)
+    service_health_commands = _instruction_commands(instruction, _SERVICE_HEALTH_COMMAND_RE)
+    # Only the official adapter may authorize paths outside the mounted
+    # workspace.  Interactive user text remains workspace-only by default.
+    allowed_external_roots = ("/tmp", "/workspace") if trusted_public_instruction else ()
     return CompletionContract(
         required_paths=tuple(required),
+        required_artifacts=tuple(
+            ArtifactRequirement(
+                path=path,
+                sha256=artifact_digests.get(path),
+                format=artifact_formats.get(path),
+            )
+            for path in required
+        ),
+        verification_commands=verification_commands,
+        service_health_commands=service_health_commands,
         require_service_health_check=bool(_SERVICE_REQUEST_RE.search(instruction)),
+        allowed_external_roots=allowed_external_roots,
     )
 
 
@@ -185,6 +527,12 @@ class WorkingState:
     modified_paths: set[str] = field(default_factory=set)
     read_paths: set[str] = field(default_factory=set)
     last_mutation_sequence: int = 0
+    # A final sentence is not evidence.  Keep durable counters for the last
+    # successful observation so the interactive verifier can reject a
+    # model-only completion even when the task did not spell out a file or
+    # test command.
+    last_successful_sequence: int = 0
+    last_decisive_sequence: int = 0
     last_verification_sequence: int = 0
     last_verification_ok: bool | None = None
     last_service_health_sequence: int = 0
@@ -193,6 +541,10 @@ class WorkingState:
     last_error_kind: str | None = None
     unresolved_errors: list[dict[str, Any]] = field(default_factory=list)
     result_fingerprints: list[str] = field(default_factory=list)
+    # Histories are bounded and digest-only so completion survives a restart
+    # without persisting command contents or other sensitive arguments.
+    verification_history: list[dict[str, Any]] = field(default_factory=list)
+    service_health_history: list[dict[str, Any]] = field(default_factory=list)
 
     @classmethod
     def new(cls, project_root: Path) -> WorkingState:
@@ -207,6 +559,7 @@ class WorkingState:
         is_error: bool,
         result_text: str,
         error_kind: ToolErrorKind | None = None,
+        result_metadata: Mapping[str, Any] | None = None,
     ) -> str:
         self.sequence += 1
         self.last_tool_name = tool_name
@@ -218,12 +571,58 @@ class WorkingState:
         elif path:
             self.read_paths.add(path)
 
+        if not is_error:
+            self.last_successful_sequence = self.sequence
+            if (
+                _is_mutating_call(tool_name, args)
+                or _is_verification_call(tool_name, args)
+                or _is_service_health_call(tool_name, args)
+            ):
+                self.last_decisive_sequence = self.sequence
+
+        metadata = dict(result_metadata or {})
         if _is_verification_call(tool_name, args):
             self.last_verification_sequence = self.sequence
             self.last_verification_ok = not is_error
+            self.verification_history.append(
+                {
+                    "sequence": self.sequence,
+                    "tool": tool_name,
+                    "command_digest": _text_digest(
+                        _normalise_command(str(args.get("command") or ""))
+                    ),
+                    "ok": not is_error,
+                    "result_hash": _text_digest(result_text),
+                }
+            )
+            self.verification_history = self.verification_history[-64:]
         if _is_service_health_call(tool_name, args):
             self.last_service_health_sequence = self.sequence
-            self.last_service_health_ok = not is_error
+            readiness = metadata.get("readiness")
+            health_status = str(metadata.get("health_status") or "")
+            if isinstance(readiness, Mapping) and readiness.get("requested"):
+                health_ok = readiness.get("status") == "ready"
+            elif health_status:
+                health_ok = health_status == "healthy"
+            else:
+                health_ok = not is_error
+            self.last_service_health_ok = bool(health_ok)
+            self.service_health_history.append(
+                {
+                    "sequence": self.sequence,
+                    "tool": tool_name,
+                    "command_digest": _text_digest(
+                        _normalise_command(str(args.get("command") or ""))
+                    ),
+                    "ok": bool(health_ok),
+                    "result_hash": _text_digest(result_text),
+                    "readiness_status": (
+                        readiness.get("status") if isinstance(readiness, Mapping) else None
+                    ),
+                    "health_status": health_status or None,
+                }
+            )
+            self.service_health_history = self.service_health_history[-64:]
 
         kind = error_kind or (classify_tool_error(result_text) if is_error else None)
         self.last_error_kind = kind.value if kind else None
@@ -252,6 +651,8 @@ class WorkingState:
             "modified_paths": sorted(self.modified_paths),
             "read_paths": sorted(self.read_paths),
             "last_mutation_sequence": self.last_mutation_sequence,
+            "last_successful_sequence": self.last_successful_sequence,
+            "last_decisive_sequence": self.last_decisive_sequence,
             "last_verification_sequence": self.last_verification_sequence,
             "last_verification_ok": self.last_verification_ok,
             "last_service_health_sequence": self.last_service_health_sequence,
@@ -260,6 +661,8 @@ class WorkingState:
             "last_error_kind": self.last_error_kind,
             "unresolved_errors": list(self.unresolved_errors),
             "result_fingerprints": list(self.result_fingerprints),
+            "verification_history": list(self.verification_history),
+            "service_health_history": list(self.service_health_history),
         }
 
     @classmethod
@@ -277,6 +680,8 @@ class WorkingState:
             modified_paths=set(data.get("modified_paths") or []),
             read_paths=set(data.get("read_paths") or []),
             last_mutation_sequence=int(data.get("last_mutation_sequence", 0)),
+            last_successful_sequence=int(data.get("last_successful_sequence", 0)),
+            last_decisive_sequence=int(data.get("last_decisive_sequence", 0)),
             last_verification_sequence=int(data.get("last_verification_sequence", 0)),
             last_verification_ok=data.get("last_verification_ok"),
             last_service_health_sequence=int(data.get("last_service_health_sequence", 0)),
@@ -285,6 +690,8 @@ class WorkingState:
             last_error_kind=data.get("last_error_kind"),
             unresolved_errors=list(data.get("unresolved_errors") or []),
             result_fingerprints=list(data.get("result_fingerprints") or [])[-20:],
+            verification_history=list(data.get("verification_history") or [])[-64:],
+            service_health_history=list(data.get("service_health_history") or [])[-64:],
         )
 
 
@@ -314,10 +721,43 @@ class CompletionVerifier:
         session_id: str = "",
     ) -> CompletionReport:
         issues: list[str] = []
+        if state.last_successful_sequence <= 0:
+            issues.append(
+                "completion requires at least one successful tool observation; "
+                "a model final message alone is not evidence"
+            )
+        artifact_paths = {item.path for item in self.contract.required_artifacts}
         for raw_path in self.contract.required_paths:
-            target = _resolve_under_root(state.project_root, raw_path)
+            if raw_path in artifact_paths:
+                continue
+            target = _resolve_under_root(
+                state.project_root,
+                raw_path,
+                allowed_external_roots=self.contract.allowed_external_roots,
+            )
             if target is None or not target.exists():
                 issues.append(f"required path is missing: {raw_path}")
+        issues.extend(
+            artifact_validation_issues(
+                state.project_root,
+                self.contract.required_artifacts,
+                allowed_external_roots=self.contract.allowed_external_roots,
+            )
+        )
+
+        if self.contract.verification_commands:
+            verified_digests = {
+                str(item.get("command_digest"))
+                for item in state.verification_history
+                if bool(item.get("ok"))
+            }
+            for command in self.contract.verification_commands:
+                digest = _text_digest(_normalise_command(command))
+                if digest not in verified_digests:
+                    issues.append(
+                        "required verification command was not successfully executed: "
+                        + command
+                    )
 
         if (
             self.contract.require_verification_after_code_changes
@@ -342,6 +782,21 @@ class CompletionVerifier:
             ]
             if incomplete:
                 issues.append("session TODOs are incomplete: " + ", ".join(sorted(incomplete)))
+        if self.contract.service_health_commands:
+            healthy_digests = {
+                str(item.get("command_digest"))
+                for item in state.service_health_history
+                if bool(item.get("ok"))
+            }
+            for command in self.contract.service_health_commands:
+                digest = _text_digest(_normalise_command(command))
+                if digest not in healthy_digests and not any(
+                    bool(item.get("ok")) and item.get("tool") == "service_status"
+                    for item in state.service_health_history
+                ):
+                    issues.append(
+                        "required service health command was not successful: " + command
+                    )
         if self.contract.require_service_health_check and state.last_service_health_ok is not True:
             issues.append(
                 "service task has no successful local health check; probe its requested endpoint "
@@ -355,6 +810,9 @@ class StallDecision:
     stalled: bool
     repeated: int = 0
     instruction: str = ""
+    replan_required: bool = False
+    replan_id: str | None = None
+    blocked_action: str = ""
 
 
 @dataclass
@@ -366,9 +824,34 @@ class StallController:
     _blocked_action: str = ""
 
     def should_block(self, action_signature: str) -> bool:
-        return bool(self._blocked_action and action_signature == self._blocked_action)
+        if not self._blocked_action:
+            return False
+        if action_signature == self._blocked_action:
+            return True
+        # A genuinely different action acknowledges the replan directive and
+        # opens a fresh trajectory.  Without this reset the old controller
+        # permanently blocked future calls after the first stall.
+        self.reset_after_replan()
+        return False
+
+    @property
+    def replan_count(self) -> int:
+        return self._replans
+
+    @property
+    def blocked_action(self) -> str:
+        return self._blocked_action
+
+    def reset_after_replan(self) -> None:
+        """Clear the blocked signature while retaining the audit counter."""
+
+        self._blocked_action = ""
+        self._repeat_count = 0
+        self._last_fingerprint = ""
 
     def observe(self, fingerprint: str, *, action_signature: str = "") -> StallDecision:
+        if self._blocked_action and action_signature != self._blocked_action:
+            self.reset_after_replan()
         if fingerprint == self._last_fingerprint:
             self._repeat_count += 1
         else:
@@ -376,6 +859,20 @@ class StallController:
             self._repeat_count = 1
         if self._repeat_count < self.repeat_threshold:
             return StallDecision(False, self._repeat_count)
+        # Emit one durable replan directive per blocked signature.  Repeated
+        # calls are then rejected by ``should_block`` until the model chooses
+        # a different action, preventing a hot loop and making the recovery
+        # boundary visible to the caller.
+        if self._blocked_action == action_signature and action_signature:
+            return StallDecision(
+                True,
+                self._repeat_count,
+                "No progress detected from repeated identical action and observation. "
+                "Do not repeat it; state a new hypothesis and choose a different action.",
+                replan_required=False,
+                replan_id=f"replan-{self._replans}",
+                blocked_action=action_signature,
+            )
         self._replans += 1
         self._blocked_action = action_signature
         return StallDecision(
@@ -383,6 +880,9 @@ class StallController:
             self._repeat_count,
             "No progress detected from repeated identical action and observation. "
             "Do not repeat it; state a new hypothesis and choose a different action.",
+            replan_required=True,
+            replan_id=f"replan-{self._replans}",
+            blocked_action=action_signature,
         )
 
 
@@ -559,11 +1059,17 @@ def _is_verification_call(tool_name: str, args: dict[str, Any]) -> bool:
 
 
 def _is_service_health_call(tool_name: str, args: dict[str, Any]) -> bool:
+    if tool_name == "service_status":
+        return True
     command = args.get("command")
     return (
         tool_name == "run_command"
         and isinstance(command, str)
-        and bool(_SERVICE_HEALTH_COMMAND_RE.search(command))
+        and bool(
+            _SERVICE_HEALTH_COMMAND_RE.search(command)
+            or str(args.get("readiness_command") or "").strip()
+            or str(args.get("health_command") or "").strip()
+        )
     )
 
 
@@ -575,8 +1081,42 @@ def _tool_path(args: dict[str, Any]) -> str:
     return ""
 
 
-def _resolve_under_root(root: Path, raw_path: str) -> Path | None:
+def _resolve_under_root(
+    root: Path,
+    raw_path: str,
+    *,
+    allowed_external_roots: Iterable[str] = (),
+) -> Path | None:
     target = Path(raw_path)
+    # Harbor and other task runners expose the workspace as ``/app`` even
+    # when the durable worker is running from a host checkout.  Keep that
+    # mapping explicit; arbitrary absolute paths remain outside the contract.
+    normalized = str(raw_path).replace("\\", "/")
+    if normalized == "/app" or normalized.startswith("/app/"):
+        target = root / normalized.removeprefix("/app/").removeprefix("/app")
+    elif target.is_absolute():
+        allowed = tuple(
+            str(item).replace("\\", "/").rstrip("/")
+            for item in allowed_external_roots
+            if str(item).strip()
+        )
+        matched_root = next(
+            (
+                candidate
+                for candidate in allowed
+                if normalized == candidate or normalized.startswith(candidate + "/")
+            ),
+            None,
+        )
+        if matched_root is None:
+            return None
+        target = Path(normalized)
+        try:
+            resolved_external = target.resolve(strict=False)
+            resolved_external.relative_to(Path(matched_root).resolve(strict=False))
+        except (OSError, ValueError):
+            return None
+        return resolved_external
     if not target.is_absolute():
         target = root / target
     try:

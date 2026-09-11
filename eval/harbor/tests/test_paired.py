@@ -89,6 +89,24 @@ def test_builds_explicit_terminal_bench_budgets_and_agent_environment(tmp_path: 
     assert "MAX_ITERATIONS=80" in command
 
 
+def test_builds_repeated_terminal_trials_serially(tmp_path: Path) -> None:
+    command = build_harbor_command(
+        uvx="uvx",
+        project_root=tmp_path,
+        dataset="terminal-bench/terminal-bench-2-1@sha256:dataset",
+        task_name="terminal-bench/compile-compcert",
+        harness=HarnessKind.CC_HARNESS,
+        wheel_path=tmp_path / "cc_harness-0.1.0-py3-none-any.whl",
+        env_file=tmp_path / ".env",
+        jobs_dir=tmp_path / "jobs",
+        n_attempts=5,
+        n_concurrent=1,
+    )
+
+    assert command[command.index("--n-attempts") + 1] == "5"
+    assert command[command.index("--n-concurrent") + 1] == "1"
+
+
 def test_state_is_resumable_only_with_identical_config(tmp_path: Path) -> None:
     schedule = build_balanced_schedule(("task-one",), repetitions=1, random_seed=7)
     state_path = tmp_path / "state.json"

@@ -117,6 +117,21 @@ class ToolContractRegistry:
                     "run_command", EffectClass.UNKNOWN, retryable=False,
                     requires_approval=True, cancel_supported=True,
                 ),
+                ToolRecoveryContract(
+                    "process_status", EffectClass.READ_ONLY, retryable=True,
+                    max_retries=2, idempotent=True, parallelizable=False,
+                    requires_approval=False, child_allowed=True,
+                ),
+                ToolRecoveryContract(
+                    "service_status", EffectClass.READ_ONLY, retryable=True,
+                    max_retries=2, idempotent=True, parallelizable=False,
+                    requires_approval=False, child_allowed=True,
+                ),
+                ToolRecoveryContract(
+                    "process_stop", EffectClass.EXTERNAL_SIDE_EFFECT,
+                    retryable=False, requires_approval=True,
+                    cancel_supported=True, child_allowed=False,
+                ),
             ]
         )
 

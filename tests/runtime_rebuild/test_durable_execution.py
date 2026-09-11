@@ -203,7 +203,7 @@ def test_provider_messages_reorder_parallel_tool_results_and_drop_incomplete_cal
 
 
 def test_assistant_message_preserves_explicit_empty_reasoning_content():
-    from cc_harness.interaction_history import assistant_message
+    from cc_harness.interaction_history import assistant_message, canonical_message
 
     omitted = assistant_message("plain")
     assert "reasoning_content" not in omitted
@@ -221,6 +221,41 @@ def test_assistant_message_preserves_explicit_empty_reasoning_content():
         reasoning_content_required=True,
     )
     assert accepted[0]["reasoning_content"] == ""
+
+
+def test_durable_message_round_trip_preserves_provider_fields_and_tool_pairing():
+    from cc_harness.interaction_history import MESSAGE_SCHEMA_VERSION, canonical_message
+
+    message = canonical_message(
+        {
+            "role": "assistant",
+            "content": None,
+            "reasoning_content": "trace",
+            "refusal": None,
+            "tool_calls": [
+                {
+                    "id": "call-1",
+                    "type": "function",
+                    "function": {"name": "Read", "arguments": '{"path":"a"}'},
+                    "provider_extension": {"index": 0},
+                }
+            ],
+            "_provider_metadata": {"response_id": "resp-1"},
+        }
+    )
+
+    assert message["_message_schema"] == MESSAGE_SCHEMA_VERSION
+    assert message["reasoning_content"] == "trace"
+    assert message["refusal"] is None
+    assert message["tool_calls"][0]["function"]["arguments"] == '{"path":"a"}'
+    assert message["tool_calls"][0]["provider_extension"] == {"index": 0}
+
+
+def test_durable_message_rejects_invalid_tool_pairing_shape():
+    from cc_harness.interaction_history import canonical_message
+
+    with pytest.raises(ValueError, match="tool_call_id"):
+        canonical_message({"role": "tool", "content": "orphan"})
 
 
 @pytest.mark.asyncio

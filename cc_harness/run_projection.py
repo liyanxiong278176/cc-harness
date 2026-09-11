@@ -21,6 +21,7 @@ from .run_model import (
     RuntimeContract,
     digest_json,
 )
+from .run_outcomes import RunOutcome, outcome_for_status
 
 
 class ProjectionError(ValueError):
@@ -268,6 +269,10 @@ class RunProjection:
     sequence: int = 0
     last_event_id: str | None = None
     status: RunStatus = RunStatus.DRAFT
+    # Runtime-owned terminal classification.  This is separate from the
+    # lifecycle enum so an external verifier can distinguish “workspace ready
+    # for grading” from a model/process failure without parsing prose.
+    outcome: RunOutcome | None = None
     goal: GoalContract | None = None
     runtime_contract: RuntimeContract | None = None
     runtime_contract_digest: str | None = None
@@ -296,6 +301,7 @@ class RunProjection:
             "sequence": self.sequence,
             "last_event_id": self.last_event_id,
             "status": self.status.value,
+            "outcome": self.outcome.to_dict() if self.outcome is not None else None,
             "goal": self.goal.to_dict() if self.goal else None,
             "runtime_contract": self.runtime_contract.to_dict() if self.runtime_contract else None,
             "runtime_contract_digest": self.runtime_contract_digest,
@@ -324,6 +330,7 @@ class RunProjection:
             sequence=int(data.get("sequence", 0)),
             last_event_id=data.get("last_event_id"),
             status=RunStatus(str(data.get("status", RunStatus.DRAFT.value))),
+            outcome=(RunOutcome.from_dict(data["outcome"]) if data.get("outcome") else None),
             goal=GoalContract.from_dict(goal_data) if goal_data else None,
             runtime_contract=(
                 RuntimeContract.from_dict(runtime_contract_data) if runtime_contract_data else None
@@ -351,6 +358,23 @@ class RunProjection:
     @property
     def digest(self) -> str:
         return digest_json(self.to_dict())
+
+    @property
+    def is_terminal(self) -> bool:
+        return self.status in {
+            RunStatus.COMPLETED,
+            RunStatus.CANCELLED,
+            RunStatus.FAILED_RECOVERABLE,
+            RunStatus.FAILED_TERMINAL,
+            RunStatus.BLOCKED,
+            RunStatus.STALLED,
+        }
+
+    @property
+    def is_successful(self) -> bool:
+        return self.status is RunStatus.COMPLETED or (
+            self.outcome is not None and self.outcome.is_success
+        )
 
 
 def _action_to_dict(action: ActionAttempt) -> dict[str, Any]:
@@ -403,6 +427,7 @@ class _MutableProjection:
     sequence: int = 0
     last_event_id: str | None = None
     status: RunStatus = RunStatus.DRAFT
+    outcome: RunOutcome | None = None
     goal: GoalContract | None = None
     runtime_contract: RuntimeContract | None = None
     runtime_contract_digest: str | None = None
@@ -428,6 +453,7 @@ class _MutableProjection:
             sequence=projection.sequence,
             last_event_id=projection.last_event_id,
             status=projection.status,
+            outcome=projection.outcome,
             goal=projection.goal,
             runtime_contract=projection.runtime_contract,
             runtime_contract_digest=projection.runtime_contract_digest,
@@ -453,6 +479,7 @@ class _MutableProjection:
             sequence=self.sequence,
             last_event_id=self.last_event_id,
             status=self.status,
+            outcome=self.outcome,
             goal=self.goal,
             runtime_contract=self.runtime_contract,
             runtime_contract_digest=self.runtime_contract_digest,
@@ -572,6 +599,11 @@ class ProjectionBuilder:
                 if isinstance(payload.get("new_runtime_contract"), Mapping)
                 else None
             )
+        elif event.event_type == "RunOutcomeRecorded":
+            try:
+                state.outcome = RunOutcome.from_dict(payload)
+            except (TypeError, ValueError) as exc:
+                raise ProjectionError("invalid run outcome payload") from exc
         elif event.event_type == "PlanDiscoveryStarted":
             state.discovery_status = "awaiting"
             state.mutation_gate = "read_only"
@@ -655,6 +687,14 @@ class ProjectionBuilder:
             )
         state.sequence = event.sequence
         state.last_event_id = event.event_id
+        # A legacy stream may not contain the derived RunOutcomeRecorded
+        # event.  Derive a conservative fallback so old runs still expose one
+        # stable outcome vocabulary; a later explicit event always wins.
+        if state.outcome is None:
+            reason = str(payload.get("reason") or "") if isinstance(payload, Mapping) else ""
+            derived = outcome_for_status(state.status, reason=reason)
+            if derived is not None:
+                state.outcome = derived
 
     @staticmethod
     def _apply_observation(event: RunEvent, state: _MutableProjection) -> None:
@@ -750,6 +790,19 @@ class ProjectionBuilder:
             result_artifact=event.payload.get("result_artifact"),
             error_kind=event.payload.get("error_kind"),
         )
+        if resolved is ActionStatus.SUCCEEDED:
+            # A reconciliation that proves the effect completed also resolves
+            # the error recorded for the uncertain action.  Without this,
+            # retrying/reconciling an idempotent action could leave a stale
+            # ``unresolved_errors`` entry that permanently blocks completion.
+            state.working_state = replace(
+                state.working_state,
+                unresolved_errors=tuple(
+                    item
+                    for item in state.working_state.unresolved_errors
+                    if str(item.get("action_id")) != action_id
+                ),
+            )
     def _apply_approval(self, event: RunEvent, state: _MutableProjection) -> None:
         payload = event.payload
         approval_id = str(payload.get("approval_id", ""))
@@ -877,6 +930,16 @@ class ProjectionBuilder:
                     "kind": payload.get("error_kind", "unknown"),
                 }
             )
+        else:
+            # A later successful attempt for the same logical action resolves
+            # an earlier failed/cancelled/unknown attempt.  Keep unrelated
+            # errors intact so the completion gate still fails closed.
+            action_id = str(payload.get("action_id") or "")
+            unresolved = [
+                item
+                for item in unresolved
+                if str(item.get("action_id")) != action_id
+            ]
         state.working_state = replace(
             state.working_state,
             modified_paths=tuple(sorted(modified)),

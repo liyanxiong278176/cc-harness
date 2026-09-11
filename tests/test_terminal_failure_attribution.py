@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+import json
+from pathlib import Path
+
 from eval.cc_only.adapters.harbor import (
     _terminal_failure_class,
     _terminal_official_zero_reward_status,
@@ -46,6 +49,40 @@ def test_agent_and_verifier_failures_are_reported_as_mixed() -> None:
     output = "curl: (28) Failed to download CPython before tests started"
 
     assert _terminal_failure_class(trial, verifier_diagnostic=output) == "mixed"
+
+
+def test_failure_attribution_reads_rich_jsonl_after_harbor_truncates_exception(
+    tmp_path: Path,
+) -> None:
+    """Model activity in the durable envelope must survive Harbor truncation."""
+
+    job_root = tmp_path / "job"
+    agent_root = job_root / "task" / "agent"
+    agent_root.mkdir(parents=True)
+    envelope = {
+        "schema_version": "cc-harness.print-result.v1",
+        "runtime_status": "stalled",
+        "usage": {"input_tokens": 1200, "model_calls": 3},
+    }
+    (agent_root / "cc-harness.jsonl").write_text(
+        json.dumps(envelope) + "\n", encoding="utf-8"
+    )
+    trial = {
+        "exception_info": {
+            "exception_type": "NonZeroAgentExitCodeError",
+            # Harbor's serialized exception no longer contains the envelope.
+            "exception_message": "durable run ended with status stalled",
+        }
+    }
+
+    assert (
+        _terminal_failure_class(
+            trial,
+            verifier_diagnostic="all predefined address pools are fully subnetted",
+            job_root=job_root,
+        )
+        == "mixed"
+    )
 
 
 def test_agent_exception_without_verifier_bootstrap_failure_is_runtime_failure() -> None:

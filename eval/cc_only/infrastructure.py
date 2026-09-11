@@ -80,6 +80,20 @@ _TRANSIENT_MARKERS = (
     "docker daemon",
     "failed_recoverable",
     "provider proxy stream failure",
+    # Docker's finite bridge-address allocator and host resource pressure.
+    # These failures happen before Harbor can create a task container and are
+    # therefore safe to retry without replaying a model attempt.
+    "all predefined address pools are fully subnetted",
+    "all predefined address pools have been fully subnetted",
+    "address pools are fully subnetted",
+    "address pools have been fully subnetted",
+    "could not find an available, non-overlapping ipv4 address pool",
+    "no available, non-overlapping ipv4 address pool",
+    "cannot allocate memory",
+    "errno 12",
+    "out of memory",
+    "out-of-memory",
+    "no space left on device",
 )
 
 
