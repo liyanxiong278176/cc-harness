@@ -336,6 +336,120 @@ async def test_run_command_hard_mode_no_fallback(monkeypatch, tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_run_command_falls_back_to_native_before_dispatch(monkeypatch, tmp_path):
+    """A startup outage can replay once because the sandbox never saw command."""
+    from cc_harness import tools
+    from cc_harness.config import ExecutorBackend, ExecutorConfig
+    from cc_harness.sandbox import SandboxUnavailableError
+
+    cfg = ExecutorConfig(backend=ExecutorBackend.SANDBOX)
+    sandbox = MagicMock()
+    sandbox.project_root = tmp_path
+    sandbox.kill = AsyncMock()
+    sandbox.run = AsyncMock(side_effect=SandboxUnavailableError("server is down"))
+    tools._session_executor = sandbox
+    tools._session_executor_config = cfg
+    tools.configure_session_native_fallback(True, capability_profile="standard")
+
+    result = await tools.run_command({"command": "echo fallback"}, cwd=str(tmp_path))
+
+    assert result.is_error is False
+    assert "fallback" in result.llm_text
+    assert isinstance(tools.get_session_executor(), tools.NativeExecutor)
+    assert sandbox.run.await_count == 1
+    audit = tmp_path / ".cc-harness" / "logs" / "sandbox.jsonl"
+    assert "native_fallback_activated" in audit.read_text(encoding="utf-8")
+
+
+@pytest.mark.asyncio
+async def test_run_command_does_not_replay_after_sandbox_dispatch(monkeypatch, tmp_path):
+    """An unknown command outcome switches future calls but never duplicates it."""
+    from cc_harness import tools
+    from cc_harness.config import ExecutorBackend, ExecutorConfig
+    from cc_harness.sandbox import SandboxUnavailableError
+
+    cfg = ExecutorConfig(backend=ExecutorBackend.SANDBOX)
+    sandbox = MagicMock()
+    sandbox.project_root = tmp_path
+    sandbox.kill = AsyncMock()
+    sandbox.run = AsyncMock(
+        side_effect=SandboxUnavailableError(
+            "connection lost after dispatch",
+            retry_safe=False,
+            stage="command_transport",
+        )
+    )
+    tools._session_executor = sandbox
+    tools._session_executor_config = cfg
+    tools.configure_session_native_fallback(True, capability_profile="standard")
+
+    result = await tools.run_command({"command": "touch should-not-replay"}, cwd=str(tmp_path))
+
+    assert result.is_error is True
+    assert "not replayed" in result.llm_text
+    assert result.metadata["outcome_unknown"] is True
+    assert isinstance(tools.get_session_executor(), tools.NativeExecutor)
+    assert sandbox.run.await_count == 1
+
+
+@pytest.mark.asyncio
+async def test_hardened_profile_keeps_fail_closed(monkeypatch, tmp_path):
+    """Security/evaluation profiles cannot bypass the sandbox contract."""
+    from cc_harness import tools
+    from cc_harness.config import ExecutorBackend, ExecutorConfig
+    from cc_harness.sandbox import SandboxUnavailableError
+
+    cfg = ExecutorConfig(backend=ExecutorBackend.SANDBOX)
+    sandbox = MagicMock()
+    sandbox.project_root = tmp_path
+    sandbox.run = AsyncMock(side_effect=SandboxUnavailableError("server is down"))
+    tools._session_executor = sandbox
+    tools._session_executor_config = cfg
+    tools.configure_session_native_fallback(True, capability_profile="hardened-safety")
+
+    result = await tools.run_command({"command": "echo blocked"}, cwd=str(tmp_path))
+
+    assert result.is_error is True
+    assert "fallback is disabled" in result.llm_text
+    assert tools.get_session_executor() is sandbox
+
+
+def test_init_session_executor_clears_previous_fallback_state(monkeypatch, tmp_path):
+    """A new project must not inherit another project's degraded status."""
+    from cc_harness import tools
+    from cc_harness.config import ExecutorBackend, ExecutorConfig
+
+    old_root = tmp_path / "old"
+    new_root = tmp_path / "new"
+    old_root.mkdir()
+    new_root.mkdir()
+    tools._session_fallback_reason = "old sandbox outage"
+    tools._session_allow_native_fallback = True
+    tools._session_fallback_profile = "standard"
+
+    tools.init_session_executor(
+        ExecutorConfig(backend=ExecutorBackend.NATIVE),
+        new_root,
+    )
+
+    status = tools.session_executor_status()
+    assert status["fallback_reason"] is None
+    assert status["native_fallback_active"] is False
+    assert status["native_fallback_enabled"] is False
+    tools.reset_session_executor()
+
+
+def test_official_agent_runtime_marker_disables_native_fallback(monkeypatch):
+    """The Harbor agent-runtime marker keeps evaluation isolation fail-closed."""
+    from cc_harness import tools
+
+    monkeypatch.setenv("CC_HARNESS_TERMINAL_AGENT_RUNTIME", "1")
+    tools.configure_session_native_fallback(True, capability_profile="standard")
+
+    assert tools.session_executor_status()["native_fallback_enabled"] is False
+
+
+@pytest.mark.asyncio
 async def test_shutdown_session_executor_kills_and_clears(monkeypatch):
     """shutdown 调 executor.kill + shutdown_owned,清空单例(fail-soft)。"""
     from cc_harness import tools

@@ -203,7 +203,7 @@ def test_provider_messages_reorder_parallel_tool_results_and_drop_incomplete_cal
 
 
 def test_assistant_message_preserves_explicit_empty_reasoning_content():
-    from cc_harness.interaction_history import assistant_message, canonical_message
+    from cc_harness.interaction_history import assistant_message
 
     omitted = assistant_message("plain")
     assert "reasoning_content" not in omitted

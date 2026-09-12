@@ -21,6 +21,8 @@ dependencies = [
   "Pillow>=10.0",
   "aiosqlite>=0.20",
   "sqlite-vec>=0.1.9",
+  "fastapi>=0.115",
+  "uvicorn[standard]>=0.30",
 ]
 
 [project.optional-dependencies]
@@ -35,6 +37,7 @@ build-backend = "hatchling.build"
 
 [tool.hatch.build.targets.wheel]
 packages = ["cc_harness"]
+include = ["cc_harness/web_assets/**"]
 
 [project.scripts]
 cc-harness = "cc_harness.entrypoint:main"

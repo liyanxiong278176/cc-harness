@@ -85,3 +85,26 @@ def test_directory_symlink_is_masked_without_following_it(tmp_path):
     assert [(target.relative_path, target.is_dir) for target in targets] == [
         (Path("linked"), True),
     ]
+
+
+def test_cc_harness_generated_eval_artifacts_are_masked_as_opaque_roots(tmp_path):
+    """Do not walk every historical attempt in a cc-harness checkout.
+
+    The aggregate output roots are sensitive runtime state, but expanding
+    thousands of nested ``.cc-harness`` directories is both unnecessary and
+    prone to Windows MAX_PATH failures.  One empty overlay per aggregate root
+    preserves the protection contract while keeping sandbox startup bounded.
+    """
+    (tmp_path / "cc_harness").mkdir()
+    (tmp_path / "pyproject.toml").write_text("[project]\nname='fixture'\n", encoding="utf-8")
+    nested = tmp_path / "eval" / "result" / "cc-only" / "run" / "workspace" / ".cc-harness"
+    nested.mkdir(parents=True)
+    (nested / "secret.json").write_text("secret", encoding="utf-8")
+    (tmp_path / "eval" / "cc-only" / "nested" / ".env").parent.mkdir(parents=True)
+    (tmp_path / "eval" / "cc-only" / "nested" / ".env").write_text("TOKEN=x", encoding="utf-8")
+
+    targets = discover_mask_targets(tmp_path)
+    assert [(item.relative_path.as_posix(), item.is_dir) for item in targets] == [
+        ("eval/cc-only", True),
+        ("eval/result/cc-only", True),
+    ]

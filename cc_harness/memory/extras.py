@@ -67,7 +67,7 @@ async def build_memory_extras(
     decider_llm = None
     try:
         from cc_harness.memory.store import MemoryStore
-        from cc_harness.memory.embedding import EmbeddingClient
+        from cc_harness.memory.embedding import EmbeddingClient, LocalEmbeddingClient
         from cc_harness.memory.decider import LLMDecider
         from cc_harness.memory.retriever import MemoryRetriever
         from cc_harness.memory.service import MemoryService
@@ -82,19 +82,43 @@ async def build_memory_extras(
         print(f"[memory] import failed: {e}; running without memory tools")
         return [], None
     try:
-        emb_base = env.get("EMBEDDING_BASE_URL") or env["OPENAI_BASE_URL"]
-        emb_key = env.get("EMBEDDING_API_KEY") or env["OPENAI_API_KEY"]
-        emb_model = env.get("EMBEDDING_MODEL", "BAAI/bge-m3")
-        emb_dim = int(env.get("EMBEDDING_DIM", "1024"))
+        provider = str(
+            env.get("MEMORY_EMBEDDING_PROVIDER")
+            or getattr(memory_config, "embedding_provider", "remote")
+            or "remote"
+        ).strip().lower()
+        emb_base = env.get("EMBEDDING_BASE_URL") or getattr(
+            memory_config, "embedding_base_url", ""
+        )
+        emb_key = env.get("EMBEDDING_API_KEY") or getattr(
+            memory_config, "embedding_api_key", ""
+        )
+        emb_model = env.get("EMBEDDING_MODEL") or getattr(
+            memory_config, "embedding_model", ""
+        ) or "BAAI/bge-m3"
+        emb_dim = int(
+            env.get("EMBEDDING_DIM")
+            or getattr(memory_config, "embedding_dim", 1024)
+        )
 
         store = MemoryStore(
             db_path=db_path, embedding_dim=emb_dim, project_scope=project_scope
         )
         await store.init_schema()
-        embedder = EmbeddingClient(
-            base_url=emb_base, api_key=emb_key, model=emb_model, dim=emb_dim,
-            timeout_s=(memory_config.embed_timeout_s if memory_config else 10.0),
-        )
+        if provider == "local" or str(emb_base).lower().startswith("local://"):
+            # Local embeddings deliberately bypass HTTP and therefore never
+            # consume a separate embedding-provider quota.
+            embedder = LocalEmbeddingClient(dim=emb_dim)
+        else:
+            if not emb_base or not emb_key:
+                raise ValueError(
+                    "remote memory embeddings require EMBEDDING_BASE_URL and "
+                    "EMBEDDING_API_KEY (or set MEMORY_EMBEDDING_PROVIDER=local)"
+                )
+            embedder = EmbeddingClient(
+                base_url=emb_base, api_key=emb_key, model=emb_model, dim=emb_dim,
+                timeout_s=(memory_config.embed_timeout_s if memory_config else 10.0),
+            )
         decider_llm = LLMClient(
             api_key=env["OPENAI_API_KEY"], model=env["OPENAI_MODEL"], base_url=env["OPENAI_BASE_URL"],
         )

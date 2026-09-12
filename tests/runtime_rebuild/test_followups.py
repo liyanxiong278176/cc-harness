@@ -2,10 +2,13 @@ import pytest
 
 from cc_harness.coordinator import RunCoordinator, RunRequest
 from cc_harness.followups import FollowUpService
+from cc_harness.lease import LeaseManager
+from cc_harness.run_events import EventActor
 from cc_harness.run_store import RunStore
 from cc_harness.run_kernel import ModelSegment, ReActKernel
 from cc_harness.supervisor import LocalSupervisor
 from cc_harness.worker import RunWorker
+from cc_harness.run_model import RunStatus
 
 
 class EmptyModel:
@@ -57,6 +60,43 @@ async def test_supervisor_releases_follow_up_after_predecessor_cancel(tmp_path) 
         await supervisor.tick()
         follow_up = await coordinator.inspect(queued.follow_up_run_id)
         assert follow_up.status.value in {"queued", "running"}
+        assert (await store.load_projection(predecessor.run_id)).queue[0].status == "started"
+    finally:
+        if supervisor is not None:
+            await supervisor.stop()
+        await store.close()
+
+
+@pytest.mark.asyncio
+async def test_supervisor_releases_follow_up_after_predecessor_stalled(tmp_path) -> None:
+    """A committed no-action answer is a safe, incomplete chat boundary."""
+
+    project = tmp_path / "project"
+    project.mkdir()
+    store = RunStore(project, data_root=tmp_path / "data")
+    await store.open()
+    supervisor = None
+    try:
+        coordinator = RunCoordinator(store)
+        predecessor = await coordinator.submit(RunRequest("first task", ("done",)))
+        lease_manager = LeaseManager(store)
+        lease = await lease_manager.claim(predecessor.run_id, "stalled-worker")
+        await coordinator._append(
+            predecessor.run_id,
+            "RunStalled",
+            {"reason": "no verifiable progress"},
+            EventActor("worker", "stalled-worker"),
+        )
+        await lease_manager.release(lease)
+        queued = await coordinator.send(predecessor.run_id, "continue the conversation")
+
+        def factory(_run_id):
+            return RunWorker(store, ReActKernel(EmptyModel()), worker_id="follow-up-worker")
+
+        supervisor = LocalSupervisor(store, factory, max_workers=1, poll_interval=0.01)
+        await supervisor.tick()
+        follow_up = await coordinator.inspect(queued.follow_up_run_id)
+        assert follow_up.status in {RunStatus.QUEUED, RunStatus.RUNNING}
         assert (await store.load_projection(predecessor.run_id)).queue[0].status == "started"
     finally:
         if supervisor is not None:

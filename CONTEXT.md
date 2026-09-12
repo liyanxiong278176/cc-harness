@@ -1,6 +1,6 @@
 # cc-harness
 
-cc-harness 是在用户当前终端中运行的编码代理。其交互语言强调由应用接管当前终端表面的会话，而不是独立窗口或 Web 图形界面。
+cc-harness 是在用户本机运行的编码代理。默认交互面是绑定回环地址的本地 WebUI；TUI 保留为兼容入口。WebUI 与 TUI 只负责呈现和输入，Agent、Durable Runtime、上下文、记忆、安全与会话事实保持单一实现。
 
 ## Language
 
@@ -44,7 +44,7 @@ treatment 与必要的隔离 judge 均使用经服务端身份验证的 `deepsee
 不同 benchmark、样本及 treatment 分组使用互不共享的 workspace、运行目录、会话、记忆库、摘要、ref 与节点清单；每组完成后将其状态封存为只读审计证据并从后续活动运行中卸载，下一组启动前必须验证活动状态为空且不存在跨任务命中。隔离或清理失败使运行无效，评测不得读取或改写用户日常全局记忆。_Avoid_: 复用上一题的 CC_HARNESS_HOME、让 treatment 继承其他任务状态、为防污染删除审计证据、清理失败后继续运行
 
 **产品对标边界（Product Parity Boundary）**:
-cc-harness 对标 Claude Code 的终端 coding-agent 内核及 headless/SDK 能力；Web、Desktop、Mobile、Slack、Chrome 与完整企业平台不属于当前对标范围。_Avoid_: 完整复制 Claude 平台、只对齐终端外观
+cc-harness 对标 Claude Code/DeepSeek Harness 的本地 coding-agent 内核、WebUI 和 headless/SDK 能力；云端协作、Desktop/Mobile 原生壳、Slack、Chrome 与完整企业平台不属于当前对标范围。_Avoid_: 完整复制云平台、只对齐界面外观、让 WebUI 旁路 Runtime
 
 **可信内核阶段（Trusted Core Phase）**:
 第一阶段优先完成原生文件与搜索工具、不可绕过的 hard-deny 与 sandbox、模型和成本追踪、headless JSON 协议及持续 coding benchmark，再建设 Skills、Hooks 与增强型 Subagents；UI 仅修复阻塞真实使用或验证的问题。_Avoid_: 用像素级界面对齐代替底层能力、在核心契约未成立前继续扩大 UI 表面积
@@ -67,23 +67,23 @@ cc-harness 对标 Claude Code 的终端 coding-agent 内核及 headless/SDK 能�
 **可回滚发布（Rollbackable Release）**:
 发布包经过签名并区分 stable/canary 通道，支持版本固定、原子升级和一键回滚，升级失败时保留旧程序、harness profile 与用户数据；运行中的任务不被无提示切换版本。_Avoid_: 强制静默升级、覆盖唯一可运行版本、回滚时降级用户数据库、长任务中途改变 harness
 
-**终端内会话（In-Terminal Session）**:
-在调用命令的当前终端内持续呈现对话、工具活动和输入区。默认 fullscreen renderer 使用 alternate screen 接管当前终端表面；classic renderer 作为兼容路径把历史写入原生 scrollback；两者退出后都恢复调用者的 shell。
-_Avoid_: 另开终端窗口、桌面 GUI、Web UI、退出后破坏原终端状态
+**本地会话面（Local Session Surface）**:
+用户在本机浏览器或调用命令的当前终端中持续呈现对话、工具活动、审批、状态和输入区。默认 WebUI 绑定回环地址并由 `cc-harness` 启动；TUI 的 fullscreen/classic renderer 作为兼容路径。关闭浏览器或断开客户端不等于终止 Durable Run，显式终止才会停止运行树。
+_Avoid_: 让客户端成为运行权威、另开不受控的远程服务、关闭 WebUI 静默删除运行、由 WebUI 复制一套 Agent 逻辑
 
 **一等本地平台（First-Class Local Platform）**:
 Windows、Linux 与 macOS 都必须通过核心工具、路径安全、会话恢复和 CLI 发布门；Windows 支持原生 PowerShell、PTY 与文件语义，不以 WSL 作为运行前提。_Avoid_: 把 Windows 当作尽力兼容、仅在单一开发机验证、用 WSL 结果代表原生 Windows
 
 **`cc-harness` 命令**:
-用户在任意项目目录启动原位终端会话的正式命令；`python main.py` 仅作为源码开发与兼容入口。
+用户在任意项目目录启动本地 WebUI 会话的正式命令，打印访问地址并默认打开浏览器；`--tui` 显式启动兼容终端会话，`python main.py` 仅作为源码开发与兼容入口。
 _Avoid_: 将 `main.py` 视为正式用户入口
 
 **启动面板（Startup Panel）**:
-每次开始原位终端会话时显示的品牌与环境摘要；其字符栅格、分区、边框、间距和状态层级以 Claude Code 经典终端界面为视觉基准，但名称、版本、像素图标、提示和更新内容必须属于 cc-harness。
-_Avoid_: Web 首页、全屏仪表盘、复制 Claude 名称、图标或发布内容
+每次开始本地会话时显示的品牌与环境摘要；WebUI 使用侧栏品牌区，TUI 使用终端面板，名称、版本、吉祥物、提示和更新内容必须属于 cc-harness。
+_Avoid_: 复制 Claude/DeepSeek 名称、图标或发布内容、展示未接通的环境状态
 
 **月薪喵像素吉祥物（Yuexin Cat Pixel Mascot）**:
-启动面板左栏使用的彩色半块像素画；从用户提供的参考图提取米色头部、棕色轮廓、蓝色眼睛、白色身体与遮脸前爪，不重新分发原始位图。
+启动面板左栏使用的彩色半块像素画；用户已确认拥有参考图的使用权，因此 WebUI 发布包可随附该本地吉祥物资源。若权利状态改变，应替换为自有图形。
 _Avoid_: 泛化猫脸字符、Claude 像素图标、嵌入网络原图、无法在普通终端稳定对齐的图片协议
 
 **已接通能力（Wired Capability）**:

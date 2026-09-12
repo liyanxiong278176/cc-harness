@@ -77,11 +77,13 @@ def test_package_entrypoint_propagates_system_exit(monkeypatch) -> None:
         module.main()
 
 
-def test_package_entrypoint_defaults_to_fullscreen_legacy(monkeypatch) -> None:
+def test_package_entrypoint_defaults_to_webui_durable_runtime(monkeypatch) -> None:
     from cc_harness.entrypoint import build_parser
 
     monkeypatch.delenv("CC_HARNESS_RUNTIME", raising=False)
-    assert build_parser().parse_args([]).runtime == "legacy"
+    args = build_parser().parse_args([])
+    assert args.runtime == "durable"
+    assert args.tui is None
 
 
 def test_package_entrypoint_can_select_durable_runtime(monkeypatch) -> None:

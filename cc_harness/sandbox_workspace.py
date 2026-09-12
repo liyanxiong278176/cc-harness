@@ -37,6 +37,14 @@ class MaskTarget:
 def discover_mask_targets(project_root: Path) -> tuple[MaskTarget, ...]:
     """Find sensitive paths and links without following directory symlinks."""
     root = project_root.resolve()
+    # A cc-harness checkout can contain thousands of generated evaluation
+    # workspaces.  They are runtime artifacts, not the selected source tree;
+    # mask the aggregate output directory once instead of walking every
+    # nested attempt.  This keeps startup bounded and avoids Windows MAX_PATH
+    # failures while materialising one overlay per nested ``.cc-harness``.
+    is_cc_harness_checkout = (
+        (root / "cc_harness").is_dir() and (root / "pyproject.toml").is_file()
+    )
     targets: list[MaskTarget] = []
     for current, dirnames, filenames in os.walk(root, followlinks=False):
         current_path = Path(current)
@@ -44,6 +52,12 @@ def discover_mask_targets(project_root: Path) -> tuple[MaskTarget, ...]:
         for name in dirnames:
             path = current_path / name
             relative = path.relative_to(root)
+            if is_cc_harness_checkout and (
+                relative.parts[:2] == ("eval", "cc-only")
+                or relative.parts[:3] == ("eval", "result", "cc-only")
+            ):
+                targets.append(MaskTarget(relative, is_dir=True))
+                continue
             if name == ".git" and path.is_dir() and not path.is_symlink():
                 # Git object/pack trees are large and contain no credentials
                 # that this overlay protects.  Preserve the two config files

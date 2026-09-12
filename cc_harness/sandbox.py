@@ -3,7 +3,8 @@
 会话级 lazy create sandbox(首次 run 建,后续复用);commands.run 收
 stdout/stderr/exit → ToolResult(格式同 NativeExecutor)。
 通信错(create / commands.run 抛异常)经 _with_retry 尝试 3 次(重试前等待 1s/2s);
-全败抛 SandboxUnavailableError，调用方 fail closed，不降级到 native。
+外部端点未通过本地 attestation 或全败均抛 SandboxUnavailableError。调用方可在命令尚未发出时按显式 Runtime
+降级策略切换到 NativeExecutor；命令已经发出但结果未知时绝不自动重放。
 命令结果(exit≠0)是正常返回,不重试。
 """
 from __future__ import annotations
@@ -15,6 +16,7 @@ import json
 import logging
 import os
 import socket
+import tempfile
 import time
 import uuid
 from collections.abc import Mapping
@@ -91,7 +93,28 @@ except ImportError:  # 无 [sandbox] extra(CI / 基础安装)
 
 
 class SandboxUnavailableError(RuntimeError):
-    """The sandbox could not execute a command after bounded retries."""
+    """The sandbox could not execute a command after bounded retries.
+
+    ``retry_safe`` means that the command was not dispatched and may be
+    attempted once by a fallback executor.  ``fallback_safe`` is separate:
+    switching the executor for *future* commands can be safe even when the
+    current command has an unknown outcome.  Egress/security preflight errors
+    set ``fallback_safe=False`` so a native fallback cannot bypass the
+    sandbox's network or isolation contract.
+    """
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        retry_safe: bool = True,
+        fallback_safe: bool = True,
+        stage: str = "preflight",
+    ) -> None:
+        super().__init__(message)
+        self.retry_safe = bool(retry_safe)
+        self.fallback_safe = bool(fallback_safe)
+        self.stage = str(stage)
 
 
 def _sandbox_resource_metadata(execution: object | None = None) -> dict[str, object]:
@@ -128,15 +151,28 @@ def _resolve_egress_target(target: str) -> set[ipaddress.IPv4Address | ipaddress
     try:
         answers = socket.getaddrinfo(hostname, 443, type=socket.SOCK_STREAM)
     except socket.gaierror as exc:
-        raise SandboxUnavailableError(f"sandbox egress DNS preflight failed for {hostname}") from exc
+        raise SandboxUnavailableError(
+            f"sandbox egress DNS preflight failed for {hostname}",
+            retry_safe=False,
+            fallback_safe=False,
+            stage="egress_preflight",
+        ) from exc
     addresses = {ipaddress.ip_address(answer[4][0]) for answer in answers}
     if not addresses:
-        raise SandboxUnavailableError(f"sandbox egress DNS returned no addresses for {hostname}")
+        raise SandboxUnavailableError(
+            f"sandbox egress DNS returned no addresses for {hostname}",
+            retry_safe=False,
+            fallback_safe=False,
+            stage="egress_preflight",
+        )
     unsafe = sorted(str(address) for address in addresses if not address.is_global)
     if unsafe:
         raise SandboxUnavailableError(
             f"sandbox egress target {hostname} resolved to non-public address(es): "
-            + ", ".join(unsafe)
+            + ", ".join(unsafe),
+            retry_safe=False,
+            fallback_safe=False,
+            stage="egress_policy",
         )
     return addresses
 
@@ -207,7 +243,15 @@ async def _with_retry(coro_factory, attempts: int | None = None):
             last = e
             if i < retry_budget - 1:
                 await asyncio.sleep(2 ** i)
-    # 全败:包成 SandboxUnavailableError,让调用方按统一类型降级。
+    # 全败:包成 SandboxUnavailableError,让调用方按统一类型处理。保留
+    # security/preflight 标记，避免把 egress policy 错误误当成可降级故障。
+    if isinstance(last, SandboxUnavailableError):
+        raise SandboxUnavailableError(
+            str(last),
+            retry_safe=last.retry_safe,
+            fallback_safe=last.fallback_safe,
+            stage=last.stage,
+        ) from last
     raise SandboxUnavailableError(str(last)) from last
 
 
@@ -240,10 +284,12 @@ class SandboxExecutor:
         self.project_root = Path(project_root).resolve()
         self._sandbox = None     # lazy create,会话级复用
         self._mask_plan: WorkspaceMaskPlan | None = None
-        # Keep mask mounts below the project root.  Besides making the
-        # allowlist stable for externally managed servers, this lets startup
-        # prewarm the service without walking the entire repository first.
-        self._mask_parent = self.project_root / ".cc-harness" / "workspace-masks"
+        # Keep masks in a short per-user temp path. Windows bind-mount source
+        # paths otherwise exceed MAX_PATH when a repository contains nested
+        # generated worktrees. The parent is explicitly included in the
+        # OpenSandbox host-path attestation, so this does not widen the
+        # effective workspace mount.
+        self._mask_parent = Path(tempfile.gettempdir()) / "cch"
         self._credential_broker = CredentialBroker(cfg, self.project_root)
 
     def _network_policy(self) -> NetworkPolicy:
@@ -282,7 +328,7 @@ class SandboxExecutor:
         if reusable_root is None:
             self._mask_parent.mkdir(parents=True, exist_ok=True)
             reusable_root = self._mask_parent / (
-                f"session-{os.getpid()}-{uuid.uuid4().hex}"
+                f"s{os.getpid()}-{uuid.uuid4().hex[:12]}"
             )
         self._mask_plan = WorkspaceMaskPlan.create(targets, root=reusable_root)
 
@@ -329,7 +375,7 @@ class SandboxExecutor:
         # Lazy import keeps the base package importable without the optional
         # OpenSandbox dependency, while allowing tests to patch the module
         # seam before this method is called.
-        from cc_harness.sandbox_server import ensure_server
+        from cc_harness.sandbox_server import ServerAttestationError, ensure_server
 
         allowed_host_paths = [str(self.project_root)]
         if self._mask_plan is not None:
@@ -341,14 +387,29 @@ class SandboxExecutor:
             # a dynamic /tmp path in its configuration.
             self._mask_parent.mkdir(parents=True, exist_ok=True)
             allowed_host_paths.append(str(self._mask_parent))
-        state = await ensure_server(
-            host=self.cfg.server_host,
-            port=self.cfg.server_port,
-            allowed_host_paths=allowed_host_paths,
-            config_path=self.cfg.server_config_path,
-            pids_limit=self.cfg.pids_limit,
-            require_external_attestation=self.cfg.require_external_attestation,
-        )
+        try:
+            state = await ensure_server(
+                host=self.cfg.server_host,
+                port=self.cfg.server_port,
+                allowed_host_paths=allowed_host_paths,
+                config_path=self.cfg.server_config_path,
+                pids_limit=self.cfg.pids_limit,
+                require_external_attestation=self.cfg.require_external_attestation,
+            )
+        except ServerAttestationError as exc:
+            # A local standard session may continue when discovery found a
+            # stale/unattested endpoint.  Keep supplied-config mismatches
+            # fail-closed: those indicate a policy violation, not a transient
+            # Docker outage.  The Runtime decides whether the marked fallback
+            # is permitted for this session and never bypasses evaluation or
+            # hardened profiles.
+            fallback_safe = bool(getattr(exc, "fallback_safe", False))
+            raise SandboxUnavailableError(
+                str(exc),
+                retry_safe=fallback_safe,
+                fallback_safe=fallback_safe,
+                stage=str(getattr(exc, "stage", "server_attestation")),
+            ) from exc
         if state is None:
             raise SandboxUnavailableError(
                 "opensandbox-server 不可用(Docker 未装/未运行,或 server 起不来)"
@@ -410,7 +471,12 @@ class SandboxExecutor:
                 await self._credential_broker.provision(candidate)
             except CredentialBrokerError as exc:
                 await self._destroy_sandbox()
-                raise SandboxUnavailableError(str(exc)) from None
+                raise SandboxUnavailableError(
+                    str(exc),
+                    retry_safe=False,
+                    fallback_safe=False,
+                    stage="credential_provisioning",
+                ) from None
         return self._sandbox
 
     async def run(self, args: dict, *, cwd: Path) -> ToolResult:
@@ -437,9 +503,15 @@ class SandboxExecutor:
                     "state": "unsupported",
                 },
             )
+        command_started = False
         try:
             await self._refresh_workspace_masks()
             sb = await self._ensure_sandbox()    # 内含 retry,3 次后抛 SandboxUnavailableError
+            # Set this immediately before the SDK call.  Any transport error
+            # after this point is outcome-unknown and must never be replayed by
+            # a native fallback because the command may already have changed
+            # files or started a service in the container.
+            command_started = True
             execution = await asyncio.wait_for(
                 _with_retry(lambda: sb.commands.run(command)),
                 timeout=self.cfg.timeout_s,
@@ -459,6 +531,9 @@ class SandboxExecutor:
                 },
             )
         except SandboxUnavailableError as e:
+            if command_started:
+                e.retry_safe = False
+                e.stage = "command_transport"
             # Drop the session handle before surfacing the unknown outcome.
             # The server may have restarted or the container endpoint may be
             # stale; retaining it would make every later continuation reuse a

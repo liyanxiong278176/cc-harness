@@ -283,8 +283,10 @@ class SandboxConfig(BaseModel):
     vault: bool = False
     vault_credentials: list[SandboxVaultCredential] = []
     vault_bindings: list[SandboxVaultBinding] = []
-    # Compatibility field for old policy files. Runtime fallback is always hard;
-    # explicit host execution uses executor.backend=native instead.
+    # Compatibility field for old policy files. The effective fallback policy
+    # is selected by the Runtime entrypoint so hardened/evaluation sessions
+    # remain fail-closed; ordinary local sessions may arm an audited native
+    # fallback without changing this persisted compatibility value.
     fallback_on_error: str = "hard"
 
     model_config = {"extra": "ignore"}
@@ -343,7 +345,13 @@ class SandboxConfig(BaseModel):
 
 
 class ExecutorConfig(BaseModel):
-    """Execution backend config; sandbox is the fail-closed default."""
+    """Execution backend config; sandbox is the default backend.
+
+    Native fallback is deliberately a session/runtime decision rather than a
+    silent config mutation, so benchmark and hardened profiles can keep the
+    isolation contract while ordinary local work remains usable during a
+    Docker/OpenSandbox outage.
+    """
     enabled: bool = True          # compatibility only; false cannot select host execution
     backend: ExecutorBackend = ExecutorBackend.SANDBOX
     sandbox: SandboxConfig = SandboxConfig()
@@ -355,7 +363,8 @@ def load_executor_config(path: Path) -> ExecutorConfig:
     """Read executor config; missing configuration defaults to sandbox.
 
     ``CC_HARNESS_EXECUTOR_BACKEND=native`` is an explicit host-execution opt-in.
-    The legacy fallback setting is accepted but normalized to fail-closed.
+    The legacy fallback setting is accepted and normalized for compatibility;
+    the active Runtime decides whether an audited native fallback is allowed.
     """
     if not path.exists():
         cfg = ExecutorConfig()
@@ -366,8 +375,8 @@ def load_executor_config(path: Path) -> ExecutorConfig:
     fallback_env = os.getenv("CC_HARNESS_SANDBOX_FALLBACK", "").strip().lower()
     if fallback_env == "native" or cfg.sandbox.fallback_on_error == "native":
         log.warning(
-            "sandbox native fallback is retired; use executor.backend=native "
-            "for explicit host execution"
+            "sandbox native fallback requested; the active Runtime will honor "
+            "it only for non-hardened local sessions"
         )
     cfg.sandbox.fallback_on_error = "hard"
     backend_env = os.getenv("CC_HARNESS_EXECUTOR_BACKEND", "").strip().lower()
@@ -412,6 +421,12 @@ class ContextConfig(BaseModel):
     fail_closed: bool = True
     context_window_source: str = "legacy-default"
     context_window_verified: bool = False
+    # Provider tokenizers do not all agree with the local cl100k estimate used
+    # by the projection layer.  Durable Runtime uses this as a conservative
+    # preflight fraction of the advertised window; it never changes the
+    # provider-reported window shown to users.  A value of 0.8 leaves headroom
+    # for provider-specific message framing and tokenizer drift.
+    provider_safety_factor: float = 0.8
 
     model_config = {"extra": "ignore"}
 
@@ -435,6 +450,8 @@ class ContextConfig(BaseModel):
             raise ValueError("summary_retry_limit must be non-negative")
         if self.compaction_lease_ttl_seconds <= 0:
             raise ValueError("compaction_lease_ttl_seconds must be positive")
+        if not 0.5 <= self.provider_safety_factor <= 1:
+            raise ValueError("provider_safety_factor must be between 0.5 and 1")
         return self
 
 
@@ -449,7 +466,8 @@ def load_context_config(
 
     path 暂不读(policy.yaml 无 context 段);env 覆盖:CONTEXT_ENABLED / CONTEXT_WINDOW /
     CONTEXT_TIER1/2/3 / CONTEXT_PROTECT_TOKENS / CONTEXT_OUTPUT_RESERVE_TOKENS /
-    CONTEXT_TOOL_RESERVE_TOKENS / CONTEXT_COMPACTION_LEASE_TTL_SECONDS。
+    CONTEXT_TOOL_RESERVE_TOKENS / CONTEXT_COMPACTION_LEASE_TTL_SECONDS /
+    CONTEXT_PROVIDER_SAFETY_FACTOR。
     """
     env = os.environ if environ is None else environ
     enabled = env.get("CONTEXT_ENABLED")
@@ -459,6 +477,7 @@ def load_context_config(
     output_reserve = env.get("CONTEXT_OUTPUT_RESERVE_TOKENS")
     tool_reserve = env.get("CONTEXT_TOOL_RESERVE_TOKENS")
     lease_ttl = env.get("CONTEXT_COMPACTION_LEASE_TTL_SECONDS")
+    provider_safety = env.get("CONTEXT_PROVIDER_SAFETY_FACTOR")
     kw: dict = {}
     if enabled is not None and enabled.strip():
         kw["enabled"] = enabled.strip().lower() in ("1", "true", "yes", "on")
@@ -493,6 +512,8 @@ def load_context_config(
         kw["tool_schema_reserve_tokens"] = int(tool_reserve)
     if lease_ttl:
         kw["compaction_lease_ttl_seconds"] = float(lease_ttl)
+    if provider_safety:
+        kw["provider_safety_factor"] = float(provider_safety)
     return ContextConfig(**kw)
 
 
@@ -552,6 +573,7 @@ def load_memory_config(
         ("embedding_base_url", "EMBEDDING_BASE_URL", str),
         ("embedding_api_key", "EMBEDDING_API_KEY", str),
         ("embedding_model", "EMBEDDING_MODEL", str),
+        ("embedding_provider", "MEMORY_EMBEDDING_PROVIDER", str),
         ("embedding_dim", "EMBEDDING_DIM", int),
     ]:
         v = env.get(env_name)

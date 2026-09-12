@@ -138,6 +138,10 @@ def test_run_and_candidate_are_model_values() -> None:
 def test_predecessor_gate_matches_decided_matrix() -> None:
     assert predecessor_gate(RunStatus.COMPLETED) is PredecessorGateStatus.READY
     assert predecessor_gate(RunStatus.CANCELLED) is PredecessorGateStatus.INCOMPLETE
+    # A stalled predecessor has released its lease at a safe interaction
+    # boundary.  A normal follow-up must not wait forever for a completion
+    # candidate that requires another user turn.
+    assert predecessor_gate(RunStatus.STALLED) is PredecessorGateStatus.INCOMPLETE
     assert predecessor_gate(RunStatus.BLOCKED) is PredecessorGateStatus.WAITING
     assert predecessor_gate(RunStatus.BLOCKED, bypassed=True) is PredecessorGateStatus.BYPASSED
 

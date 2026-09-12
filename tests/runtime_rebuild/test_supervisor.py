@@ -111,7 +111,7 @@ async def test_supervisor_stop_awaits_worker_removed_during_lease_recovery(tmp_p
                 raise
 
     try:
-        handle = await RunCoordinator(store).submit(RunRequest("stale shutdown", ("segment",)))
+        await RunCoordinator(store).submit(RunRequest("stale shutdown", ("segment",)))
 
         def factory(_run_id):
             return UncooperativeWorker(

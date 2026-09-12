@@ -881,7 +881,11 @@ class RunStateMachine:
     }
 
     _SAME_STATE_ALLOWED: ClassVar[dict[str, set[RunStatus]]] = {
-        "GoalContractAccepted": {RunStatus.DRAFT, RunStatus.QUEUED, RunStatus.RUNNING},
+        # A goal-level safety review can pause a newly-created Run before its
+        # first worker claim.  An explicit client confirmation records the
+        # acceptance while the lifecycle is still ``blocked``; the following
+        # RunResumed event then moves it back to the durable queue.
+        "GoalContractAccepted": {RunStatus.DRAFT, RunStatus.QUEUED, RunStatus.RUNNING, RunStatus.BLOCKED},
         "GoalContractRevised": {RunStatus.DRAFT, RunStatus.QUEUED, RunStatus.RUNNING},
         "PlanCreated": {RunStatus.DRAFT, RunStatus.QUEUED, RunStatus.RUNNING},
         "PlanRevised": {RunStatus.QUEUED, RunStatus.RUNNING, RunStatus.BLOCKED},
@@ -1025,7 +1029,14 @@ def predecessor_gate(predecessor: RunStatus, *, bypassed: bool = False) -> Prede
         return PredecessorGateStatus.BYPASSED
     if predecessor is RunStatus.COMPLETED:
         return PredecessorGateStatus.READY
-    if predecessor is RunStatus.CANCELLED:
+    # A stalled run has already reached a safe interaction boundary: the
+    # worker released its lease after committing the assistant response and
+    # no action is in flight.  Treat a follow-up as an incomplete continuation
+    # instead of leaving it behind a predecessor that can never become
+    # ``completed`` without another user message.  The child still receives
+    # the explicit incomplete-predecessor constraint, so task completion
+    # remains evidence-gated.
+    if predecessor in {RunStatus.CANCELLED, RunStatus.STALLED}:
         return PredecessorGateStatus.INCOMPLETE
     return PredecessorGateStatus.WAITING
 

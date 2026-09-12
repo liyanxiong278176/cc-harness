@@ -1,9 +1,18 @@
 # cc-harness
 
-一个在当前终端中运行的 coding agent。默认使用唯一的 Durable Runtime：任务、
-子任务、工具动作、审批和 checkpoint 写入本地事件存储；TUI 只是控制面，关闭
-窗口不会取消已提交的运行，重新打开后可用自然语言“继续”恢复。
-项目不依赖 Textual。
+一个本地 coding agent。默认打开基于 React/Vite 的 WebUI，但执行始终只有一套
+Durable Runtime：任务、子任务、工具动作、审批和 checkpoint 写入本地事件存储。
+浏览器关闭不会取消已提交的运行；重新打开同一个地址即可查看状态并继续。需要纯
+终端时仍可显式使用 `--tui`，项目不依赖 Textual。
+
+## 使用 cc-harness 生成的项目
+
+下面是使用 cc-harness 驱动生成的 Campus Eats 校园外卖项目效果（示例项目不属于
+本仓库，不会随本仓库提交）：
+
+<p align="center">
+  <img src="img/campus-eats-result.png" alt="Campus Eats 校园外卖项目效果" width="960" />
+</p>
 
 ## 安装与启动
 
@@ -58,10 +67,15 @@ API key，并保存到 `~/.cc-harness/.env`。配置优先级为：进程环境�
 
 默认执行后端是 OpenSandbox。Durable supervisor 启动时会自动检查并启动（或复用）
 `opensandbox-server`，确认 HTTP `/health` 和安全配置后才接受任务；首次执行命令时
-才创建具体的沙箱容器。服务不可用会在模型调用前明确失败，不会偷偷改用宿主机执行。
-代码工作区会以可写挂载提供给沙箱中的命令工具，以便创建和修改项目文件；`.env`、
-`.ssh`、`.git/config` 等敏感路径会用空的只读遮罩覆盖，仍不会暴露给容器。
-首次安装需要可用的 Docker 和沙箱依赖：
+才创建具体的沙箱容器。普通本地会话在检测到 SDK、Docker、server 不可用，或本机外部端点
+缺少 attestation 时，会记录原因并自动切换到 `NativeExecutor`，因此仍可继续工作；切换会写入
+`.cc-harness/logs/sandbox.jsonl` 和 activation manifest，界面/审计可以看到这是降级
+执行。已发出的命令结果不确定时不会重放当前命令，只对后续命令使用本机执行。
+安全策略、`hardened-safety`、Terminal-Bench/评测进程仍保持 fail-closed，不会绕过沙箱
+伪造隔离成绩。代码工作区会以可写挂载提供给沙箱中的命令工具，以便创建和修改项目文件；
+`.env`、`.ssh`、`.git/config` 等敏感路径会用空的只读遮罩覆盖，仍不会暴露给容器。
+若要启用隔离执行，首次安装需要可用的 Docker 和沙箱依赖；没有这些依赖时普通本地
+会话仍会按上面的审计降级路径工作：
 
 ```powershell
 python -m pip install -e ".[sandbox]"
@@ -71,17 +85,22 @@ python -m pip install -e ".[sandbox]"
 `CC_HARNESS_SANDBOX_SERVER_CONFIG_PATH`，或在项目 `policy.yaml` 的
 `executor.sandbox.server_config_path` 中指定实际 TOML 路径，以便运行时校验 allowlist、
 `dns+nft` 出站策略和 Docker 安全限制。明确使用宿主机执行时才传 `--host-execution`；
-该模式不会启动 OpenSandbox。
+该模式不会启动 OpenSandbox。如需强制普通会话保持 fail-closed，可设置
+`CC_HARNESS_SANDBOX_FALLBACK=hard`；显式设置 `CC_HARNESS_SANDBOX_FALLBACK=native`
+可在没有 capability profile 的调用方中启用降级。
 
 ## 常用启动方式
 
 ```powershell
-cc-harness                         # 默认打开 Durable Runtime 控制面
+cc-harness                         # 启动本地 WebUI，打印并打开访问链接
+cc-harness --no-open               # 启动 WebUI，但不自动打开浏览器
+cc-harness --port 3080             # 默认端口被占用时自动顺延到下一个可用端口
+cc-harness --tui default           # 使用兼容的终端控制面
 cc-harness --runtime durable       # 显式选择唯一的 Durable Runtime（默认）
 cc-harness --command supervisor    # 仅启动后台 Durable supervisor
-cc-harness -c                      # 继续当前目录最近的会话
-cc-harness -r                      # 选择当前目录的历史会话
-cc-harness -r SESSION_ID           # 继续指定会话
+cc-harness --tui default -c        # 在终端继续当前目录最近的会话
+cc-harness --tui default -r        # 在终端选择当前目录的历史会话
+cc-harness --tui default -r SESSION_ID # 在终端继续指定会话
 cc-harness --cwd D:\work\project   # 指定工作目录
 cc-harness --add-dir D:\shared     # 增加允许访问的目录，可重复
 cc-harness -p "summarize this repo" # 非交互打印模式
@@ -93,7 +112,30 @@ cc-harness -p "summarize this repo" # 非交互打印模式
 "explain this error" | cc-harness
 ```
 
-## 交互
+## WebUI 交互
+
+- 启动后默认监听 `127.0.0.1:3080`；端口被占用时选择下一个空闲端口，并在终端打印
+  实际链接。只有显式传入 `--host` 才会监听非回环地址，v1 不发放访问 token。
+- 左侧会话按项目隔离，关闭浏览器只断开 SSE 连接，不会停止 Runtime；终端 `Ctrl+C`
+  才会关闭 WebUI 并优雅停止活动运行。
+- 必须先点击“选择项目文件夹”（无桌面环境可手动输入完整路径），未选择项目时输入
+  框不可用。所选目录是该项目 Runtime 的工作根，跨项目不会共享会话或文件范围。
+- 左下角“设置”填写 Base URL、模型名称和 API key；可先测试连接。API key 默认掩码，
+  只有点击“显示”才在本地页面展示完整值，不会进入事件、日志或提示词。设置保存在
+  `~/.cc-harness/webui.json`，新建 Runtime 时生效。
+- 底部右侧圆环来自最近一次真实模型请求的输入 token 与模型窗口；没有遥测时显示 `—`，
+  不推测百分比。点击圆环可查看对话、系统提示、工具、输出、摘要分类以及缓存读取、
+  窗口来源（分类是 Runtime 的本地 tokenizer 明细，费用仍以 provider 返回为准）。
+- 消息使用 Markdown 渲染，工具输出默认折叠；审批、停止、继续均调用现有 Durable
+  Coordinator。系统提示词、隐藏规则、完整推理和工具参数不会发送到浏览器。
+
+前端源代码位于 [`web/`](web/)，开发时可运行 `npm install`、`npm run dev`；发布构建
+可运行 `python scripts/build_webui.py`，它会把产物复制到 `cc_harness/web_assets/`，
+因此安装 Python wheel 后不需要 Node.js。
+启动链接和默认端口沿用 [DeepSeek Harness 的本地 WebUI 入口](https://github.com/deepseek-ai/deepseek-harness)
+的使用习惯，但 cc-harness 保持自己的界面与 Runtime 协议。
+
+## TUI 兼容交互
 
 - 启动页采用 Claude Code classic inline shell 的双栏结构，但使用 cc-harness 自有名称、版本、更新记录，以及从用户参考图提取的彩色遮脸月薪喵像素形象；窄于 80 列时自动改为上下布局。
 - `Enter` 提交；`Alt+Enter`、`Ctrl+J` 或行尾 `\` 插入换行。超过 800 字符或 2 行的粘贴会折叠为可展开标记，不会自动提交。
@@ -163,14 +205,22 @@ CC_HARNESS_TOOL_BUNDLES=core,web
 文件和不支持的二进制文件会被拒绝。`bypass-prompts` 仅跳过普通确认，不绕过
 路径边界、sandbox、敏感信息与 hard-deny 规则。
 
+WebUI 输入框左下角提供同样的三种权限策略：`请求批准`（默认，所有写入/外部动作在执行前暂停）、
+`帮我批准`（自动放行工作区内的 Write/Edit，仅对命令、网络和外部副作用请求批准）、
+`完全访问权限`（跳过普通审批）。选择会按当前项目保存，并在下一次新运行或当前运行结束后的继续操作中生效；
+正在执行的 Run 不会被中途切换权限。三种模式都继续受路径边界、敏感凭据和安全 hard-deny 规则保护。
+
 ## 架构
 
 ```text
 cc-harness / python main.py
   -> entrypoint.py
-  -> DurableRuntimeClient         # 唯一运行时：事件、审批、checkpoint、supervisor
-  -> detached Durable supervisor  # TUI 关闭后继续消费同一个本地 Run Store
-  -> durable REPL                 # 轻量控制面，不复制运行状态
+  -> WebUI (FastAPI + React/Vite, REST + replayable SSE)
+  -> DurableRuntimeClient          # 唯一运行时：事件、审批、checkpoint、supervisor
+  -> project-scoped Run Store      # 每个项目独立事件库与工作根
+
+cc-harness --tui
+  -> durable REPL                  # 兼容控制面，仍调用同一个 Runtime
 
 旧 SessionRuntime/FullscreenTerminalApp 代码只用于历史数据迁移与测试兼容，
 不再是可选择的运行时，也不会作为 Durable Run 的回退或子 agent 执行路径。

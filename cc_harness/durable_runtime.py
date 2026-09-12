@@ -34,21 +34,27 @@ from .run_model import ActionStatus, CompletionCandidate, EffectClass, RunStatus
 from .run_store import RunNotFound, RunStore, RunStoreError
 from .run_telemetry import aggregate_model_usage
 from .supervisor import LocalSupervisor
+from .permissions import normalize_permission_mode, requires_approval_for_mode
 from .tools import (
     BACKGROUND_STATUS_SPEC,
     BACKGROUND_STOP_SPEC,
     SERVICE_STATUS_SPEC,
     RUN_COMMAND_SPEC,
+    configure_session_native_fallback,
+    fallback_session_executor,
     init_session_executor,
     prewarm_session_executor,
     process_status,
     process_stop,
     service_status,
     run_command,
+    session_executor_status,
     shutdown_session_executor,
 )
+from .sandbox import SandboxUnavailableError
 from .l5 import sanitize
 from .tool_observation import CONTINUE_TOOL_RESULT_SPEC, ToolObservation, make_observation
+from .tokens import TokenCounter
 from .worker import ActionExecutionResult, RunWorker
 from .durable_subagents import (
     ACCEPT_CHILD_CANDIDATE_SPEC,
@@ -383,6 +389,20 @@ class DurableModelAdapter(ModelAdapter):
             ).encode("utf-8")
         ).hexdigest()[:20]
         usage_payload["prompt_metadata"] = prompt_meta
+        # Keep the same six-bucket breakdown used by the terminal renderer in
+        # the durable invocation envelope.  These are bounded local token
+        # counts for explaining context composition; provider-reported input
+        # tokens remain authoritative for billing and the context ring.
+        try:
+            usage_payload["context_categories"] = TokenCounter().categorize(
+                [dict(message) for message in messages],
+                [dict(tool) for tool in tools],
+            )
+        except Exception:
+            # A missing tokenizer must never turn a successful provider call
+            # into a failed runtime call.  The WebUI will show no categories
+            # when this optional explanatory telemetry is unavailable.
+            pass
         return ModelSegment(
             text=text,
             tool_calls=tuple(calls),
@@ -414,14 +434,56 @@ class DurableRuntimeClient:
         self._mcp: MCPClient | None = None
         self._capabilities: AgentCapabilityRuntime | None = None
         self._services: SharedCapabilityServices | None = None
+        # Approval mode is selected by the control plane (CLI/TUI/WebUI) and
+        # captured by every Worker created by this client. It is deliberately
+        # not global process state, so separate project clients remain isolated.
+        self.permission_mode = "default"
         self._policy = None
         self._capability_broker = ActionScopedCapabilityBroker()
         self._security_capability_metadata: dict[str, dict[str, Any]] = {}
         self._activation_manifest: ActivationManifest | None = None
         self._workspace_command_lock = asyncio.Lock()
         self._execution_started = False
+        # Redaction-safe execution status for WebUI/diagnostics.  Keep the
+        # requested and effective backends separate so a native fallback is
+        # visible instead of looking like a normal host session.
+        self._executor_status: dict[str, Any] = {
+            "requested_backend": None,
+            "backend": None,
+            "sandbox_available": None,
+            "degraded": False,
+            "fallback_reason": None,
+        }
         self.project_instructions = None
         self.tool_bundles = None
+
+    def executor_status(self) -> dict[str, Any]:
+        """Return the effective executor state without secrets or commands."""
+        status = dict(self._executor_status)
+        live = session_executor_status()
+        if (
+            status.get("requested_backend") == ExecutorBackend.SANDBOX.value
+            and live.get("native_fallback_active")
+        ):
+            status.update(
+                {
+                    "backend": ExecutorBackend.NATIVE.value,
+                    "sandbox_available": False,
+                    "degraded": True,
+                    "fallback_reason": live.get("fallback_reason"),
+                }
+            )
+        return status
+
+    def capability_status(self) -> dict[str, Any]:
+        """Return the persisted capability activation snapshot for the UI."""
+
+        path = self.cwd / ".cc-harness" / "activation" / "durable-runtime.json"
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, TypeError, ValueError, json.JSONDecodeError):
+            return {}
+        return payload if isinstance(payload, dict) else {}
 
     @classmethod
     async def create(
@@ -605,8 +667,15 @@ class DurableRuntimeClient:
         *,
         reason: str = "explicit Ctrl+C termination",
         grace_seconds: float = 1.0,
+        stop_supervisor: bool = True,
     ) -> None:
-        """Stop scheduling and durably request cancellation for the whole tree."""
+        """Stop scheduling and durably request cancellation for the whole tree.
+
+        ``stop_supervisor=False`` is used by the WebUI's per-session Stop
+        control so cancelling one session does not starve other sessions that
+        share the same project supervisor.  The CLI keeps the historical
+        default and stops its attached supervisor.
+        """
         run_ids = await self.run_tree(root_run_id)
         for run_id in reversed(run_ids):
             try:
@@ -626,7 +695,7 @@ class DurableRuntimeClient:
                     await self._on_child_cancelled(run_id, reason)
             except Exception:
                 continue
-        if self.supervisor is not None:
+        if stop_supervisor and self.supervisor is not None:
             await self.supervisor.stop(drain=False)
             self.supervisor = None
 
@@ -637,6 +706,7 @@ class DurableRuntimeClient:
         eligible = {
             RunStatus.CANCELLED,
             RunStatus.STALLED,
+            RunStatus.BLOCKED,
             RunStatus.FAILED_RECOVERABLE,
             RunStatus.WAITING_ON_PREDECESSOR,
         }
@@ -658,6 +728,7 @@ class DurableRuntimeClient:
         recoverable = {
             RunStatus.CANCELLED,
             RunStatus.STALLED,
+            RunStatus.BLOCKED,
             RunStatus.FAILED_RECOVERABLE,
             RunStatus.WAITING_ON_PREDECESSOR,
         }
@@ -681,10 +752,25 @@ class DurableRuntimeClient:
         reasoning_effort: str | None = None,
         capability_profile: str = "standard",
         host_execution: bool = False,
+        permission_mode: str | None = None,
+        config_overrides: Mapping[str, str] | None = None,
     ) -> LocalSupervisor:
         if self.supervisor is not None:
             return self.supervisor
-        config = load_layered_config(self.cwd)
+        # WebUI settings are kept in the control plane and passed explicitly
+        # for this supervisor.  ``load_layered_config`` remains the one
+        # precedence/validation implementation; the override map only
+        # supplies the three model fields for a newly created supervisor and
+        # never mutates process-wide environment variables.
+        environ = dict(os.environ)
+        if config_overrides:
+            environ.update({str(key): str(value) for key, value in config_overrides.items()})
+        self.permission_mode = normalize_permission_mode(
+            permission_mode
+            or environ.get("CC_HARNESS_PERMISSION_MODE")
+            or self.permission_mode
+        )
+        config = load_layered_config(self.cwd, environ=environ)
         self.tool_bundles = parse_tool_bundles(
             config.runtime_environment.get("CC_HARNESS_TOOL_BUNDLES")
         )
@@ -699,6 +785,10 @@ class DurableRuntimeClient:
             requested_model=config.openai_model,
         )
         self._activation_manifest.initialize("runtime", entrypoint="DurableRuntimeClient")
+        self._activation_manifest.initialize(
+            "runtime",
+            permission_mode=self.permission_mode,
+        )
         self._activation_manifest.add_artifact("runtime", activation_path)
         self._llm = LLMClient(
             api_key=config.openai_api_key,
@@ -716,40 +806,102 @@ class DurableRuntimeClient:
             connected_servers=len(self._mcp._sessions),
             tool_count=len(self._mcp._tools),
         )
+        capability_profile_obj = CapabilityProfile.named(capability_profile)
         self._services = SharedCapabilityServices.load(
             self.cwd,
             config,
-            profile=CapabilityProfile.named(capability_profile),
+            profile=capability_profile_obj,
             host_execution=host_execution,
+            auto_enable_memory=(
+                capability_profile_obj.long_term_memory
+                and capability_profile_obj.name == "standard"
+            ),
         )
         self._policy = self._services.policy
         executor_config = self._services.executor_config
+        requested_backend = executor_config.backend.value
+        self._executor_status = {
+            "requested_backend": requested_backend,
+            "backend": requested_backend,
+            "sandbox_available": requested_backend != ExecutorBackend.SANDBOX,
+            "degraded": False,
+            "fallback_reason": None,
+        }
         init_session_executor(executor_config, str(self.cwd))
+        configure_session_native_fallback(
+            executor_config.backend is ExecutorBackend.SANDBOX,
+            capability_profile=capability_profile,
+        )
         # Mark the session executor as owned before any eager preflight.  If
         # Docker/OpenSandbox is unavailable, client.close() must still clean
         # masks, an owned server process, and the executor singleton.
         self._execution_started = True
         if executor_config.backend is ExecutorBackend.SANDBOX:
+            server_state = None
             try:
                 server_state = await prewarm_session_executor()
+            except SandboxUnavailableError as exc:
+                switched = await fallback_session_executor(exc, retry_current=False)
+                if switched:
+                    # Keep the requested backend and the effective backend
+                    # distinct in the activation evidence.  The project is
+                    # usable, but callers can see that isolation was
+                    # temporarily unavailable and native execution was used.
+                    executor_config.backend = ExecutorBackend.NATIVE
+                    self._services.executor_config.backend = ExecutorBackend.NATIVE
+                    self._activation_manifest.degrade(
+                        "runtime",
+                        f"sandbox_unavailable_native_fallback:{type(exc).__name__}:{exc}",
+                    )
+                    self._activation_manifest.initialize(
+                        "runtime",
+                        sandbox_server_ready=False,
+                        sandbox_server_owned=False,
+                        requested_executor_backend=requested_backend,
+                        sandbox_fallback="native",
+                        sandbox_fallback_stage=getattr(exc, "stage", "preflight"),
+                        sandbox_fallback_reason=str(exc),
+                        executor_backend=ExecutorBackend.NATIVE.value,
+                    )
+                    self._executor_status = {
+                        "requested_backend": requested_backend,
+                        "backend": ExecutorBackend.NATIVE.value,
+                        "sandbox_available": False,
+                        "degraded": True,
+                        "fallback_reason": str(exc),
+                    }
+                else:
+                    self._activation_manifest.degrade(
+                        "runtime",
+                        f"sandbox_server_unavailable:{type(exc).__name__}:{exc}",
+                    )
+                    raise
             except Exception as exc:
                 self._activation_manifest.degrade(
                     "runtime",
                     f"sandbox_server_unavailable:{type(exc).__name__}:{exc}",
                 )
                 raise
-            self._activation_manifest.initialize(
-                "runtime",
-                sandbox_server_ready=True,
-                sandbox_server_owned=bool(getattr(server_state, "owned", False)),
-                sandbox_server_endpoint=(
-                    f"{executor_config.sandbox.server_host}:"
-                    f"{executor_config.sandbox.server_port}"
-                ),
-                sandbox_server_version=getattr(server_state, "server_version", None),
-                sandbox_server_config_digest=getattr(server_state, "config_digest", None),
-                sandbox_server_egress_mode=getattr(server_state, "egress_mode", None),
-            )
+            if executor_config.backend is ExecutorBackend.SANDBOX:
+                self._executor_status = {
+                    "requested_backend": requested_backend,
+                    "backend": ExecutorBackend.SANDBOX.value,
+                    "sandbox_available": True,
+                    "degraded": False,
+                    "fallback_reason": None,
+                }
+                self._activation_manifest.initialize(
+                    "runtime",
+                    sandbox_server_ready=True,
+                    sandbox_server_owned=bool(getattr(server_state, "owned", False)),
+                    sandbox_server_endpoint=(
+                        f"{executor_config.sandbox.server_host}:"
+                        f"{executor_config.sandbox.server_port}"
+                    ),
+                    sandbox_server_version=getattr(server_state, "server_version", None),
+                    sandbox_server_config_digest=getattr(server_state, "config_digest", None),
+                    sandbox_server_egress_mode=getattr(server_state, "egress_mode", None),
+                )
         self._activation_manifest.initialize(
             "safety",
             policy_path=str(self.cwd / "policy.yaml"),
@@ -775,6 +927,17 @@ class DurableRuntimeClient:
             output_reserve_tokens=self._capabilities.context_config.output_reserve_tokens,
             tool_schema_reserve_tokens=self._capabilities.context_config.tool_schema_reserve_tokens,
             fail_closed=self._capabilities.context_config.fail_closed,
+            # Record the effective factor (including the provider-specific
+            # DeepSeek floor and any high-water calibration), not merely the
+            # configured generic default.  The preflight window and the
+            # activation evidence must describe the same budget.
+            provider_safety_factor=float(
+                self._capabilities._provider_safety_factor()
+            ),
+            preflight_window=int(
+                self._capabilities.context_config.context_window
+                * self._capabilities._provider_safety_factor()
+            ),
             offload_enabled=self._capabilities.memory_config.offload_enabled,
         )
         if self._capabilities.memory_deps:
@@ -784,6 +947,9 @@ class DurableRuntimeClient:
                 pipeline_enabled=bool(self._capabilities.memory_config.pipeline_enabled),
                 layered_inject=bool(self._capabilities.memory_config.layered_inject),
                 capture_enabled=bool(self._capabilities.memory_config.capture_enabled),
+                embedding_provider=str(
+                    getattr(self._capabilities.memory_config, "embedding_provider", "remote")
+                ),
                 background_services=sorted(self._capabilities.background_services),
             )
         else:
@@ -794,7 +960,12 @@ class DurableRuntimeClient:
                 layered_inject=False,
                 capture_enabled=False,
                 unavailable=True,
+                degraded_reason=self._capabilities.memory_init_error,
             )
+            if self._capabilities.memory_init_error:
+                self._activation_manifest.degrade(
+                    "memory", self._capabilities.memory_init_error
+                )
         self._activation_manifest.initialize(
             "background_services",
             enabled_services=sorted(self._capabilities.background_services),
@@ -855,6 +1026,7 @@ class DurableRuntimeClient:
                 child_cancellation_callback=self._on_child_cancelled,
                 child_failure_callback=self._on_child_failed,
                 working_directory_resolver=self._resolve_run_root,
+                permission_mode=self.permission_mode,
             )
             worker_ref["worker"] = worker
             return worker
@@ -872,6 +1044,7 @@ class DurableRuntimeClient:
         *,
         reasoning_effort: str | None = None,
         host_execution: bool = False,
+        permission_mode: str | None = None,
     ) -> int:
         """Ensure a supervisor process owns execution independently of the TUI.
 
@@ -916,6 +1089,8 @@ class DurableRuntimeClient:
             command.extend(("--effort", reasoning_effort))
         if host_execution:
             command.append("--host-execution")
+        if permission_mode:
+            command.extend(("--permission-mode", normalize_permission_mode(permission_mode)))
         log_file = log_path.open("a", encoding="utf-8")
         popen_kwargs: dict[str, Any] = {
             "cwd": str(self.cwd),
@@ -1010,6 +1185,18 @@ class DurableRuntimeClient:
         *,
         extras: Sequence[Mapping[str, Any]] | None = None,
     ):
+        def apply_permission_mode(contract: ToolRecoveryContract) -> ToolRecoveryContract:
+            """Bind a provider/tool contract to this client's approval mode."""
+
+            required = requires_approval_for_mode(
+                contract.effect_class,
+                self.permission_mode,
+                declared=contract.requires_approval,
+            )
+            metadata = dict(contract.metadata)
+            metadata["permission_mode"] = self.permission_mode
+            return replace(contract, requires_approval=required, metadata=metadata)
+
         contracts = ToolContractRegistry.first_party()
         handlers: dict[str, Any] = {
             name: entry["handler"] for name, entry in NATIVE_FILE_TOOLS.items()
@@ -1030,12 +1217,8 @@ class DurableRuntimeClient:
             spec = json.loads(json.dumps(entry["spec"], ensure_ascii=False))
             function = spec.setdefault("function", {})
             contract = contracts.get(name)
-            if contract.effect_class is not EffectClass.READ_ONLY:
-                # Durable execution has no implicit interactive prompt.  Any
-                # mutation/external/unknown action therefore pauses through the
-                # event-sourced approval gate before dispatch.
-                contract = replace(contract, requires_approval=True)
-                contracts.register(contract)
+            contract = apply_permission_mode(contract)
+            contracts.register(contract)
             security_effect = {
                 EffectClass.READ_ONLY.value: "read",
                 EffectClass.WORKSPACE_MUTATION.value: "write",
@@ -1050,6 +1233,7 @@ class DurableRuntimeClient:
             self._security_capability_metadata[name] = {
                 "effect": security_effect,
                 "requires_user_intent": contract.requires_approval,
+                "permission_mode": self.permission_mode,
                 "source": "first_party_native_contract",
             }
             function["x-cc-harness-capability"] = {
@@ -1059,6 +1243,7 @@ class DurableRuntimeClient:
                     else contract.effect_class
                 ),
                 "requires_user_intent": contract.requires_approval,
+                "permission_mode": self.permission_mode,
                 "source": "first_party_native_contract",
             }
             specs.append(spec)
@@ -1097,6 +1282,7 @@ class DurableRuntimeClient:
             copied.setdefault("function", {})["x-cc-harness-capability"] = {
                 "effect": EffectClass.READ_ONLY.value,
                 "requires_user_intent": False,
+                "permission_mode": self.permission_mode,
                 "source": contract.metadata["source"],
             }
             specs.append(copied)
@@ -1109,6 +1295,7 @@ class DurableRuntimeClient:
             copied.setdefault("function", {})["x-cc-harness-capability"] = {
                 "effect": EffectClass.READ_ONLY.value,
                 "requires_user_intent": False,
+                "permission_mode": self.permission_mode,
                 "source": "durable-child-coordinator",
             }
             contracts.register(
@@ -1159,6 +1346,13 @@ class DurableRuntimeClient:
                     )
                 else:
                     contracts.register(contracts.get(name))
+                contract = apply_permission_mode(contracts.get(name))
+                contracts.register(contract)
+                capability_metadata = dict(function.get("x-cc-harness-capability") or {})
+                capability_metadata["requires_user_intent"] = contract.requires_approval
+                capability_metadata["permission_mode"] = self.permission_mode
+                function["x-cc-harness-capability"] = capability_metadata
+                self._security_capability_metadata[name] = capability_metadata
                 specs.append(spec)
         if self._mcp is not None:
             for spec in self._mcp._tools:
@@ -1166,7 +1360,11 @@ class DurableRuntimeClient:
                 function = copied.get("function") or {}
                 name = str(function.get("name") or "")
                 metadata = dict(function.get("x-cc-harness-capability") or {})
-                contracts.from_mcp_metadata(name, metadata)
+                contract = apply_permission_mode(contracts.from_mcp_metadata(name, metadata))
+                contracts.register(contract)
+                metadata["requires_user_intent"] = contract.requires_approval
+                metadata["permission_mode"] = self.permission_mode
+                function["x-cc-harness-capability"] = metadata
                 self._security_capability_metadata[name] = metadata
                 specs.append(copied)
         if self.tool_bundles is not None:

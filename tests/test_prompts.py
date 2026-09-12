@@ -150,6 +150,14 @@ def test_build_system_prompt_substitutes_cwd():
     assert "/test/cwd" in out
 
 
+def test_interaction_style_matches_webui_reply_contract():
+    out = build_system_prompt("/x", mode="coding")
+    assert "用户可见回复契约" in out
+    assert "使用用户当前语言" in out
+    assert "不要把事件名" in out
+    assert "隐藏推理" in out
+
+
 def test_coding_prompt_does_not_treat_stopping_a_failed_retry_as_completion():
     out = build_system_prompt("/x", mode="coding")
     assert "工具失败只是一条观察" in out

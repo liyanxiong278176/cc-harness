@@ -624,6 +624,11 @@ class ProjectionBuilder:
             "RunStalled",
         }:
             state.active_worker_id = None
+            # A resumed Run is active work again.  Do not leave the previous
+            # stalled/blocked/cancelled outcome attached to a queued
+            # projection; a fresh terminal boundary will record a new one.
+            if event.event_type == "RunResumed":
+                state.outcome = None
         elif event.event_type == "PlanCreated" or event.event_type == "PlanRevised":
             state.plan = PlanGraph.from_dict(payload["plan"])
         elif event.event_type == "ToolObservationCommitted":

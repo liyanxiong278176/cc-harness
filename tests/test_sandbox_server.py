@@ -1,5 +1,4 @@
 import subprocess
-import sys
 import tomllib
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -90,8 +89,11 @@ async def test_ensure_server_times_out_and_kills(monkeypatch):
 
 
 def _server_cli_path() -> Path:
-    exe = "opensandbox-server.exe" if sys.platform == "win32" else "opensandbox-server"
-    return Path(sys.executable).parent / exe
+    # Reuse production discovery: Windows console scripts live in the Python
+    # ``Scripts`` sibling, while POSIX virtualenvs place them beside python.
+    from cc_harness.sandbox_server import _server_cli
+
+    return _server_cli()
 
 
 def test_set_allowed_host_paths_toml_round_trip(tmp_path):

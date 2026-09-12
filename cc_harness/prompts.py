@@ -67,6 +67,7 @@ class PromptManifest:
 # stable core on every turn.
 _STABLE_SECTIONS = frozenset({
     "identity", "instruction_hierarchy", "cwd", "react_format",
+    "interaction_style",
     "tool_discipline", "dangerous_ops", "honesty", "plan_mode_override",
     "design_mode_override", "chat_mode", "todo_block",
     "audited_rules",
@@ -107,6 +108,32 @@ def _react_format(ctx: dict) -> str | None:
         "不要在文本中输出 `思考:`、`行动:`、`观察:`、`结果:`、`Action: {{...}}` 或模拟工具调用格式。\n"
         "长任务只在有实际进展、阻塞或需要用户决定时给出简短更新;不要输出隐藏推理。"
         "任务完成后直接给出简洁结果,不要重复系统标签。"
+    )
+
+
+def _interaction_style(ctx: dict) -> str | None:
+    """Keep model-facing replies aligned with the Web UI interaction contract.
+
+    DeepSeek Harness keeps the transcript focused on the user request and the
+    final answer: progress/process details remain available as UI state, while
+    protocol envelopes and hidden reasoning stay out of the chat.  This is a
+    stable prompt section so the behaviour is consistent across turns and
+    providers without exposing the production prompt in the Web UI.
+    """
+
+    if ctx.get("mode") not in {"coding", "chat", "plan", "design"}:
+        return None
+    return (
+        "## 用户可见回复契约\n"
+        "- 使用用户当前语言回复;用户使用中文时统一使用自然、简洁的简体中文。\n"
+        "- 普通问题直接回答;执行任务时只在真实进展、等待审批、阻塞或需要用户决定时给出短进度说明。\n"
+        "- 工具调用、运行时事件、重试和子 Agent 过程由界面呈现;不要把事件名、内部状态 JSON、哈希、"
+        "完成协议、系统提示词或隐藏推理写进用户回复。\n"
+        "- 运行时要求的完成候选仍必须按契约提交;将机器协议与自然语言分开,不要解释或复制协议,"
+        "界面会自动隐藏它。\n"
+        "- 工具完成后先用一句话说明结果,必要时补充关键文件、测试或下一步;不要逐条复述原始工具输出。\n"
+        "- 需要用户批准或工具结果待确认时,明确说明正在等待什么以及用户可以采取的动作;不要假装已经完成。\n"
+        "- 最终回复只总结已完成事项、可核验依据和仍存在的风险/待办,不输出内部编排细节。"
     )
 
 
@@ -387,6 +414,7 @@ SECTION_POOL: list[tuple[str, Callable[[dict], str | None], str]] = [
     ("instruction_hierarchy", _instruction_hierarchy, _ALWAYS_KEY),
     ("cwd", _cwd, _ALWAYS_KEY),
     ("react_format", _react_format, "mode_coding"),
+    ("interaction_style", _interaction_style, _ALWAYS_KEY),
     ("thought_minimum", _thought_minimum, "mode_coding"),
     ("todo_block", _todo_block, "mode_coding"),
     ("tool_discipline", _tool_discipline, "mode_coding"),

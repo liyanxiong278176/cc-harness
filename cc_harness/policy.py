@@ -53,7 +53,15 @@ _PATH_KEYS = {
     "source", "destination", "src", "dst", "old_path", "new_path",
 }
 _PATH_LIST_KEYS = {"paths", "files"}
-_SENSITIVE_DIR_NAMES = {".ssh", ".aws", ".azure", ".cc-harness", ".gnupg", ".kube"}
+_SENSITIVE_DIR_NAMES = {
+    ".ssh",
+    ".aws",
+    ".azure",
+    ".cc-harness",
+    ".cc-harness-data",
+    ".gnupg",
+    ".kube",
+}
 _SENSITIVE_FILE_NAMES = {
     ".env", ".git-credentials", ".netrc", ".npmrc", ".pypirc",
     "id_dsa", "id_ecdsa", "id_ed25519", "id_rsa",

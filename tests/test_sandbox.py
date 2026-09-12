@@ -602,3 +602,30 @@ async def test_ensure_server_unavailable_raises(tmp_path, monkeypatch):
         with pytest.raises(SandboxUnavailableError):
             await ex.run({"command": "echo"}, cwd=tmp_path)
         SDK.create.assert_not_called()   # ensure_server None 时不该 create
+
+
+@pytest.mark.asyncio
+async def test_external_unattested_endpoint_can_use_local_recovery(tmp_path, monkeypatch):
+    """Missing local attestation is recoverable only as a marked preflight error."""
+    from cc_harness import sandbox_server as ss
+    from cc_harness.sandbox import SandboxExecutor, SandboxUnavailableError
+    from cc_harness.config import SandboxConfig
+
+    async def unattested(*_args, **_kwargs):
+        raise ss.ServerAttestationError(
+            "external OpenSandbox server requires server_config_path attestation",
+            fallback_safe=True,
+            stage="external_attestation_missing",
+        )
+
+    monkeypatch.setattr(ss, "ensure_server", unattested)
+    with patch("cc_harness.sandbox.Sandbox") as SDK:
+        SDK.create = AsyncMock()
+        executor = SandboxExecutor(SandboxConfig(), project_root=tmp_path)
+        with pytest.raises(SandboxUnavailableError) as caught:
+            await executor.run({"command": "echo"}, cwd=tmp_path)
+
+    assert caught.value.fallback_safe is True
+    assert caught.value.retry_safe is True
+    assert caught.value.stage == "external_attestation_missing"
+    SDK.create.assert_not_called()

@@ -50,7 +50,11 @@ from cc_harness.render import (
     print_warn,
 )
 from cc_harness.tokens import SessionTokenStats, TokenCounter
-from cc_harness.tools import init_session_executor, shutdown_session_executor
+from cc_harness.tools import (
+    configure_session_native_fallback,
+    init_session_executor,
+    shutdown_session_executor,
+)
 
 log = logging.getLogger(__name__)
 
@@ -559,6 +563,10 @@ async def run_repl(
     # 命令 cold-start。kill-switch 在 config.enabled / config.backend(policy.yaml)。
     exec_cfg = load_executor_config(Path(cwd) / "policy.yaml")
     init_session_executor(exec_cfg, cwd)
+    configure_session_native_fallback(
+        exec_cfg.backend.value == "sandbox",
+        capability_profile=os.getenv("CC_HARNESS_CAPABILITY_PROFILE") or "standard",
+    )
 
     # Plan2: 构造 memory 工具(session 级单例)。失败优雅降级(无 EMBEDDING_* 或
     # sqlite-vec 缺 → helper 返 ([], None);此处兜底构造异常)。生产 db=logs/memory.db

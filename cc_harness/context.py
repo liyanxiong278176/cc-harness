@@ -60,7 +60,7 @@ _FALLBACK_CHARS = 200
 # compaction artifacts unsafe to reuse.  This invalidates stale projections on
 # resume instead of replaying an artifact that was produced with the old
 # last-user protect-boundary behavior.
-_COMPACTION_ALGORITHM_VERSION = "v5-authoritative-tail"
+_COMPACTION_ALGORITHM_VERSION = "v6-authoritative-tail-provider-budget"
 
 # 3-group fence regex for user ```` ``` ```` code blocks (no nested-fence support).
 _CODE_FENCE_RE = re.compile(r"```([^\n]*)\n(.*?)\n```", re.DOTALL)
@@ -961,6 +961,7 @@ def _compaction_key(
             config.tier2_threshold,
             config.tier3_threshold,
         ],
+        "context_window": config.context_window,
         "protect_zone_tokens": config.protect_zone_tokens,
         "summarize_max_output_tokens": config.summarize_max_output_tokens,
         "model": getattr(llm, "resolved_model", None) or getattr(llm, "model", None),

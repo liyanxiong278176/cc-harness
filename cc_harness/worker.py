@@ -45,6 +45,7 @@ from .run_model import (
 from .run_projection import RunProjection
 from .run_store import LeaseFenceError, RunStore, RunStoreError, SequenceConflict
 from .run_outcomes import outcome_for_event
+from .permissions import normalize_permission_mode, requires_approval_for_mode
 from .tool_observation import ToolObservation, make_observation
 
 
@@ -203,6 +204,7 @@ class RunWorker:
         child_cancellation_callback: ChildCancellationCallback | None = None,
         child_failure_callback: ChildFailureCallback | None = None,
         working_directory_resolver: WorkingDirectoryResolver | None = None,
+        permission_mode: str = "default",
     ) -> None:
         self.store = store
         self.kernel = kernel
@@ -228,9 +230,27 @@ class RunWorker:
         self.child_cancellation_callback = child_cancellation_callback
         self.child_failure_callback = child_failure_callback
         self.working_directory_resolver = working_directory_resolver
+        self.permission_mode = normalize_permission_mode(permission_mode)
         self.working_directory: Path = self.store.project_root
         self._active_node_id: str | None = None
         self._event_lock = asyncio.Lock()
+
+    def _requires_approval(self, request: ActionRequest) -> bool:
+        """Apply the selected mode to a model action and its durable contract.
+
+        The mode is evaluated in the worker as well as when contracts are
+        built. This second check matters for provider adapters that include an
+        explicit ``requires_approval`` flag in a tool call: bypass/auto-edit
+        must not accidentally fall back to a stale model-side flag, while the
+        conservative default still honors it.
+        """
+
+        contract = self.contracts.get(request.tool_name)
+        return requires_approval_for_mode(
+            contract.effect_class,
+            self.permission_mode,
+            declared=request.requires_approval or contract.requires_approval,
+        )
 
     async def claim(self, run_id: str) -> Lease:
         return await self.lease_manager.claim(run_id, self.worker_id)
@@ -318,6 +338,7 @@ class RunWorker:
                             )
                             return
                 context_manifest_artifact: str | None = None
+                context_build = None
                 messages = await self._messages_for_projection(
                     projection,
                     include_interactions=self.capability_runtime is None,
@@ -345,6 +366,17 @@ class RunWorker:
                             "segment": segment,
                             "round": len(projection.actions),
                             "compaction_tier": int(context_build.compaction.tier),
+                            "compaction": {
+                                "tier": context_build.compaction.tier.name.lower(),
+                                "before_tokens": context_build.compaction.before_tokens,
+                                "after_tokens": context_build.compaction.after_tokens,
+                                "ratio_before": context_build.compaction.ratio_before,
+                                "ratio_after": context_build.compaction.ratio_after,
+                                "summarized": context_build.compaction.summarized,
+                                "error": context_build.compaction.error,
+                            },
+                            "effective_context_window": context_build.effective_context_window,
+                            "provider_safety_factor": context_build.provider_safety_factor,
                             "manifest_artifact": context_build.manifest_artifact,
                             "coverage": dict(context_build.coverage),
                         },
@@ -359,10 +391,36 @@ class RunWorker:
                         run_id=lease.run_id,
                         projection_digest=context_build.projection_digest,
                     )
-                    context_overflow = (
+                    # Memory is a projection capability, so it may be used
+                    # even when the current lookup is empty or a persisted
+                    # snapshot is reused.  Record the attempt at the same
+                    # durable boundary as context activation; this keeps the
+                    # UI/activation manifest honest instead of reporting
+                    # ``triggered=false`` until a later save checkpoint.
+                    context_coverage = dict(context_build.coverage)
+                    if context_coverage.get("memory_enabled"):
+                        self._trigger_activation(
+                            "memory",
+                            run_id=lease.run_id,
+                            stage="context_projection",
+                            injected=bool(context_build.recalled),
+                            snapshot_reused=bool(
+                                context_coverage.get("memory_snapshot_reused")
+                            ),
+                            injection_mode=context_coverage.get(
+                                "memory_injection_mode", "disabled"
+                            ),
+                        )
+                    context_overflow = bool(
                         self.capability_runtime.context_config.enabled
-                        and context_build.compaction.after_tokens
-                        > self.capability_runtime.context_config.context_window
+                        and (
+                            context_build.compaction.ratio_after > 1.0
+                            or (
+                                context_build.effective_context_window is not None
+                                and context_build.compaction.after_tokens
+                                > context_build.effective_context_window
+                            )
+                        )
                     )
                     compaction_error = context_build.compaction.error
                     if context_overflow and not compaction_error:
@@ -380,6 +438,12 @@ class RunWorker:
                                 "tier": context_build.compaction.tier.name.lower(),
                                 "source_digest": context_build.source_digest,
                                 "error": compaction_error,
+                                "before_tokens": context_build.compaction.before_tokens,
+                                "after_tokens": context_build.compaction.after_tokens,
+                                "ratio_before": context_build.compaction.ratio_before,
+                                "ratio_after": context_build.compaction.ratio_after,
+                                "effective_context_window": context_build.effective_context_window,
+                                "provider_safety_factor": context_build.provider_safety_factor,
                             },
                             artifact_refs=(
                                 (context_build.compaction_artifact,)
@@ -445,6 +509,16 @@ class RunWorker:
                     invocation_error = f"{type(exc).__name__}: {exc}"[:600]
                     raise
                 finally:
+                    if self.capability_runtime is not None and context_build is not None:
+                        record_usage = getattr(
+                            self.capability_runtime, "record_provider_usage", None
+                        )
+                        if record_usage is not None:
+                            with contextlib.suppress(Exception):
+                                record_usage(
+                                    getattr(outcome, "usage", None),
+                                    local_input_tokens=context_build.compaction.after_tokens,
+                                )
                     # Persist a terminal invocation fact even when the
                     # provider stream fails before an assistant message can
                     # be committed.  Usage reports consume these facts.
@@ -493,8 +567,7 @@ class RunWorker:
                     outcome = replace(outcome, model_text=safe_text)
                 message_requests = outcome.action_requests
                 for request_index, request in enumerate(outcome.action_requests):
-                    contract = self.contracts.get(request.tool_name)
-                    if request.requires_approval or contract.requires_approval:
+                    if self._requires_approval(request):
                         # Provider protocols require one tool result for every
                         # persisted call. Calls behind this approval boundary
                         # are replanned after the approved result is committed.
@@ -564,8 +637,8 @@ class RunWorker:
                         )
                     break
                 for request in requests:
-                    contract = self.contracts.get(request.tool_name)
-                    if request.requires_approval or contract.requires_approval:
+                    if self._requires_approval(request):
+                        contract = self.contracts.get(request.tool_name)
                         await self._plan_action(current_lease, request, contract.effect_class, contract.digest)
                         await self._append(
                             current_lease,

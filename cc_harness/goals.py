@@ -7,6 +7,7 @@ is accepted or blocked before it is submitted to a worker.
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass
 from enum import Enum
 from typing import Iterable
@@ -49,32 +50,119 @@ _AMBIGUOUS_MARKERS = (
     "等等",
     "随便",
 )
-_HIGH_RISK_MARKERS = (
-    "delete",
-    "drop ",
-    "destroy",
-    "wipe",
-    "production",
-    "deploy",
-    "publish",
-    "push ",
-    "send ",
-    "payment",
-    "credential",
-    "password",
-    "token",
-    "密钥",
-    "生产",
-    "删除",
-    "部署",
-    "发布",
-    "付款",
-)
-
-
 def _contains_marker(text: str, markers: Iterable[str]) -> tuple[str, ...]:
     lowered = text.casefold()
     return tuple(marker for marker in markers if marker.casefold() in lowered)
+
+
+# A goal often *describes* a production-shaped feature, credentials, payments,
+# or destructive business states without asking the Runtime to perform an
+# external side effect.  The old substring list treated every noun as a live
+# operation, so a request such as "build a production campus food-delivery
+# app" was blocked before the first model call.  Keep this gate conservative:
+# only explicit imperative operations (or an un-simulated production payment
+# service) require a decision.  Tool-level policy and approvals remain the
+# enforcement point once the model starts working.
+_HIGH_RISK_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
+    (
+        "deployment",
+        re.compile(
+            r"\b(?:deploy|publish|push)\b[^.!?\n]{0,120}\b"
+            r"(?:production|prod|live|remote|server|webserver|origin|public)\b",
+            re.IGNORECASE,
+        ),
+    ),
+    (
+        "destructive_operation",
+        re.compile(
+            r"\b(?:delete|drop|destroy|wipe|erase)\b[^.!?\n]{0,80}\b"
+            r"(?:all|the|files?|directories?|database|data|repo(?:sitory)?|"
+            r"project|account|production|server)\b",
+            re.IGNORECASE,
+        ),
+    ),
+    (
+        "secret_exfiltration",
+        re.compile(
+            r"\b(?:reveal|expose|exfiltrate|print|log|share|send|upload)\b"
+            r"[^.!?\n]{0,80}\b(?:api[\s_-]?key|password|token|credential|secret)\b",
+            re.IGNORECASE,
+        ),
+    ),
+    (
+        "production_payment_service",
+        re.compile(
+            r"\bproduction\b[^.!?\n]{0,60}\b"
+            r"(?:payment|payments|billing|banking|charge)\b",
+            re.IGNORECASE,
+        ),
+    ),
+    (
+        "deployment_cn",
+        re.compile(
+            r"(?:部署|发布|推送|上线)\s*(?:到|至)?\s*"
+            r"(?:生产|线上|远程|服务器|公网|仓库|webserver)",
+            re.IGNORECASE,
+        ),
+    ),
+    (
+        "destructive_operation_cn",
+        re.compile(
+            r"(?:删除|销毁|清空|覆盖)\s*(?:全部|所有|生产|线上|数据库|"
+            r"数据|目录|文件|仓库|项目|账号)",
+            re.IGNORECASE,
+        ),
+    ),
+    (
+        "external_payment_cn",
+        re.compile(
+            r"(?:真实支付|线上支付|立即付款|转账给|向[^\n]{0,20}转账|"
+            r"发送[^\n]{0,20}(?:密钥|密码|令牌)|泄露[^\n]{0,20}(?:密钥|密码|令牌))",
+            re.IGNORECASE,
+        ),
+    ),
+)
+
+_NEGATION_PATTERN = re.compile(
+    r"(?:\b(?:not|don't|do not|never|without|no)\b|不要|禁止|不得|不应|无需|不需要)"
+    r"\s*$",
+    re.IGNORECASE,
+)
+_SIMULATION_PATTERN = re.compile(
+    r"(?:mock|fake|simulation|simulated|stub|test[- ]only|replaceable\s+adapter|"
+    r"模拟|仿真|虚拟|不需要真实|无需真实|不真实)",
+    re.IGNORECASE,
+)
+
+
+def _match_is_negated(text: str, match: re.Match[str]) -> bool:
+    """Avoid turning an explicit safety constraint into a risky request."""
+
+    prefix = text[max(0, match.start() - 24) : match.start()]
+    return bool(_NEGATION_PATTERN.search(prefix))
+
+
+def _match_is_simulated(text: str, match: re.Match[str]) -> bool:
+    """Treat mock/simulated integrations as implementation requirements."""
+
+    window = text[max(0, match.start() - 100) : min(len(text), match.end() + 100)]
+    return bool(_SIMULATION_PATTERN.search(window))
+
+
+def _contains_high_risk_operation(text: str) -> tuple[str, ...]:
+    hits: list[str] = []
+    for name, pattern in _HIGH_RISK_PATTERNS:
+        match = next(pattern.finditer(text), None)
+        if match is None or _match_is_negated(text, match):
+            continue
+        # A payment/secret phrase accompanied by mock/simulation language is
+        # a local implementation concern, not authorization to move money or
+        # disclose credentials.  The regular action/secret patterns still
+        # catch an explicit non-simulated operation elsewhere in the goal.
+        if name in {"production_payment_service", "external_payment_cn", "secret_exfiltration"} and _match_is_simulated(text, match):
+            continue
+        hits.append(name)
+    return tuple(hits)
 
 
 class GoalContractService:
@@ -130,7 +218,7 @@ class GoalContractService:
         # or a task phrase happens to match a generic goal marker. All
         # action-level controls remain enforced after this goal gate.
         ambiguous = () if trusted_provenance else _contains_marker(text, _AMBIGUOUS_MARKERS)
-        high_risk = () if trusted_provenance else _contains_marker(text, _HIGH_RISK_MARKERS)
+        high_risk = () if trusted_provenance else _contains_high_risk_operation(text)
         reasons: list[str] = []
         questions: list[str] = []
         if ambiguous:

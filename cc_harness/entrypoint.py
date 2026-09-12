@@ -23,7 +23,7 @@ from cc_harness.run_telemetry import aggregate_model_usage
 
 
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="cc-harness terminal coding agent")
+    parser = argparse.ArgumentParser(description="cc-harness local coding agent")
     parser.add_argument("prompt", nargs="?", help="Initial prompt")
     parser.add_argument(
         "-p",
@@ -80,7 +80,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--host-execution",
         action="store_true",
-        help="Explicitly run commands on the host instead of the fail-closed sandbox",
+        help="Explicitly force host execution (ordinary sessions otherwise auto-fallback only on sandbox infrastructure outages)",
     )
     parser.add_argument(
         "--bare",
@@ -127,7 +127,28 @@ def build_parser() -> argparse.ArgumentParser:
         default="text",
         help="Print-mode output format",
     )
-    parser.add_argument("--tui", choices=("fullscreen", "default"), default=None)
+    parser.add_argument(
+        "--tui",
+        choices=("fullscreen", "default"),
+        default=None,
+        help="Use the terminal control surface instead of the default local WebUI",
+    )
+    parser.add_argument(
+        "--host",
+        default="127.0.0.1",
+        help="WebUI bind host (loopback by default; remote access requires explicit opt-in)",
+    )
+    parser.add_argument(
+        "--port",
+        type=int,
+        default=3080,
+        help="WebUI port (uses the next free port when the requested port is occupied)",
+    )
+    parser.add_argument(
+        "--no-open",
+        action="store_true",
+        help="Start the WebUI without opening a browser",
+    )
     parser.add_argument("--lang", choices=("zh-CN", "en"), default=None)
     parser.add_argument("--repl", action="store_true", help=argparse.SUPPRESS)
     parser.add_argument(
@@ -174,6 +195,23 @@ async def _run_durable(args, cwd: Path) -> int:
     from cc_harness.durable_runtime import DurableRuntimeClient
     from cc_harness.repl import run_durable_repl
 
+    # The browser is the default control plane.  It owns no second execution
+    # engine: the WebUI module creates the same DurableRuntimeClient used by
+    # the TUI and exposes only its REST/SSE control surface.  Keeping this
+    # branch before client creation also means a user can start the UI before
+    # choosing a project folder, as required by the WebUI workflow.
+    if args.command is None and sys.stdin.isatty() and args.tui is None:
+        from cc_harness.webui import run_web_server
+
+        return await run_web_server(
+            initial_cwd=cwd,
+            data_root=args.data_root,
+            host=args.host,
+            port=args.port,
+            no_open=args.no_open,
+            initial_prompt=args.prompt,
+        )
+
     client = await DurableRuntimeClient.create(cwd, data_root=args.data_root)
     try:
         if args.print_mode:
@@ -192,6 +230,7 @@ async def _run_durable(args, cwd: Path) -> int:
             await client.run_supervisor_forever(
                 reasoning_effort=args.effort,
                 host_execution=args.host_execution,
+                permission_mode=args.permission_mode,
                 auto_approve=args.permission_mode == "bypass-prompts",
                 max_workers=max(1, args.max_workers),
             )
@@ -200,6 +239,7 @@ async def _run_durable(args, cwd: Path) -> int:
             client.start_detached_supervisor(
                 reasoning_effort=args.effort,
                 host_execution=args.host_execution,
+                permission_mode=args.permission_mode,
             )
             await run_durable_repl(
                 client,
@@ -287,6 +327,7 @@ async def _run_durable_print(client, args, objective: str) -> int:
             reasoning_effort=args.effort,
             capability_profile=args.capability_profile or "standard",
             host_execution=args.host_execution,
+            permission_mode=args.permission_mode,
         ),
         name="cc-harness-print-supervisor-start",
     )

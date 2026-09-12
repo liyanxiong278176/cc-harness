@@ -5,10 +5,11 @@ import asyncio
 import json
 import os
 import re
+import time
 from collections.abc import Awaitable, Callable
 from pathlib import Path
 
-from cc_harness.config import ExecutorConfig
+from cc_harness.config import ExecutorBackend, ExecutorConfig
 from cc_harness.executor import (
     Executor,
     NativeExecutor,
@@ -117,6 +118,14 @@ RUN_COMMAND_TIMEOUT_S = 30
 _session_executor: Executor | None = None
 # Retained so status surfaces can report the selected backend.
 _session_executor_config: ExecutorConfig | None = None
+# Native fallback is deliberately opt-in at the executor seam.  Runtime
+# entrypoints enable it for ordinary local work, while hardened/evaluation
+# profiles leave it disabled so a missing sandbox cannot produce a false
+# isolation result.
+_session_allow_native_fallback = False
+_session_fallback_profile: str | None = None
+_session_fallback_reason: str | None = None
+_session_fallback_lock = asyncio.Lock()
 
 
 class ExecutorNotInitializedError(RuntimeError):
@@ -130,9 +139,89 @@ def init_session_executor(config: ExecutorConfig, project_root: str | Path) -> N
     Store config for status and diagnostics.
     """
     global _session_executor, _session_executor_config
+    global _session_allow_native_fallback, _session_fallback_profile
+    global _session_fallback_reason
     _session_executor = build_executor(config, Path(project_root))
     _session_executor_config = config
+    # A process can attach a new project/session without passing through the
+    # full shutdown path (the WebUI keeps a manager-level client cache).  Do
+    # not let a previous project's fallback reason leak into the new status
+    # surface or make a fresh NativeExecutor look like a degraded fallback.
+    _session_allow_native_fallback = False
+    _session_fallback_profile = None
+    _session_fallback_reason = None
     _surface_shell_metadata(_session_executor)
+
+
+def configure_session_native_fallback(
+    enabled: bool,
+    *,
+    capability_profile: str | None = None,
+) -> None:
+    """Configure transparent local fallback for this executor session.
+
+    The fallback is only a recovery path for OpenSandbox infrastructure
+    outages.  It is disabled for hardened/security profiles, benchmark
+    processes, or an explicit ``CC_HARNESS_SANDBOX_FALLBACK=hard`` override.
+    ``CC_HARNESS_SANDBOX_FALLBACK=native`` is accepted as an explicit local
+    opt-in for callers that do not use a capability profile.
+    """
+
+    global _session_allow_native_fallback, _session_fallback_profile
+    profile = (capability_profile or "").strip().lower() or None
+    security_mode = os.getenv("CC_HARNESS_SECURITY_MODE", "").strip().lower()
+    restricted_profile = profile == "hardened-safety" or security_mode in {
+        "strict",
+        "hardened",
+        "security",
+    }
+    benchmark_process = any(
+        os.getenv(name, "").strip().lower() in {"1", "true", "yes", "on"}
+        for name in (
+            "CC_HARNESS_TERMINAL_BENCH",
+            "CC_HARNESS_EVAL",
+            # The official Harbor adapter always sets this marker.  Treat it
+            # as an isolation boundary even if a caller forgot the friendly
+            # benchmark alias above.
+            "CC_HARNESS_TERMINAL_AGENT_RUNTIME",
+        )
+    )
+    explicit_mode = os.getenv("CC_HARNESS_SANDBOX_FALLBACK", "").strip().lower()
+    if explicit_mode == "hard":
+        enabled = False
+    elif explicit_mode == "native":
+        enabled = True
+    if os.getenv("CC_HARNESS_DISABLE_NATIVE_FALLBACK", "").strip().lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }:
+        enabled = False
+    # Benchmark/evaluation runs must never silently switch to the host, even
+    # when an inherited shell happens to contain the native opt-in variable.
+    if benchmark_process:
+        enabled = False
+    _session_allow_native_fallback = bool(enabled) and not restricted_profile
+    _session_fallback_profile = profile
+
+
+def session_executor_status() -> dict[str, object]:
+    """Return redaction-safe backend/fallback status for UI and audit paths."""
+
+    config = _session_executor_config
+    backend = getattr(config, "backend", None)
+    return {
+        "initialized": _session_executor is not None,
+        "backend": backend.value if isinstance(backend, ExecutorBackend) else (
+            str(backend) if backend is not None else None
+        ),
+        "native_fallback_enabled": bool(_session_allow_native_fallback),
+        "native_fallback_active": isinstance(_session_executor, NativeExecutor)
+        and bool(_session_fallback_reason),
+        "fallback_profile": _session_fallback_profile,
+        "fallback_reason": _session_fallback_reason,
+    }
 
 
 def get_session_executor() -> Executor:
@@ -162,8 +251,13 @@ async def prewarm_session_executor():
 def reset_session_executor() -> None:
     """Clear session executor state for test and lifecycle isolation."""
     global _session_executor, _session_executor_config
+    global _session_allow_native_fallback, _session_fallback_profile
+    global _session_fallback_reason
     _session_executor = None
     _session_executor_config = None
+    _session_allow_native_fallback = False
+    _session_fallback_profile = None
+    _session_fallback_reason = None
 
 
 async def shutdown_session_executor() -> None:
@@ -172,8 +266,14 @@ async def shutdown_session_executor() -> None:
     全部 best-effort:任何异常吞掉(退出路径不能炸)。NativeExecutor 无 kill
     方法 → getattr 返回 None → 跳过。
     """
-    global _session_executor
+    global _session_executor, _session_executor_config
+    global _session_allow_native_fallback, _session_fallback_profile
+    global _session_fallback_reason
     if _session_executor is None:
+        _session_executor_config = None
+        _session_allow_native_fallback = False
+        _session_fallback_profile = None
+        _session_fallback_reason = None
         return
     kill = getattr(_session_executor, "kill", None)
     if kill is not None:
@@ -187,6 +287,88 @@ async def shutdown_session_executor() -> None:
     except Exception:
         pass
     _session_executor = None
+    _session_executor_config = None
+    _session_allow_native_fallback = False
+    _session_fallback_profile = None
+    _session_fallback_reason = None
+
+
+def _native_fallback_audit(project_root: Path, *, reason: str, stage: str, retry_current: bool) -> None:
+    """Persist a redaction-safe record whenever the host fallback is armed."""
+
+    entry = {
+        "ts": time.strftime("%Y-%m-%dT%H:%M:%S"),
+        "action": "native_fallback_activated",
+        "reason": reason,
+        "stage": stage,
+        "retry_current": bool(retry_current),
+        "profile": _session_fallback_profile,
+    }
+    path = project_root / ".cc-harness" / "logs" / "sandbox.jsonl"
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with path.open("a", encoding="utf-8") as handle:
+            handle.write(json.dumps(entry, ensure_ascii=False) + "\n")
+    except OSError:
+        # The fallback must not mask the original infrastructure diagnosis.
+        pass
+
+
+async def fallback_session_executor(
+    error: BaseException,
+    *,
+    retry_current: bool,
+) -> bool:
+    """Arm NativeExecutor after a sandbox infrastructure outage.
+
+    Returns ``True`` when native execution is active.  This function never
+    executes a command itself; callers may replay only when ``retry_current``
+    is true (the sandbox raised before dispatch).  A command-transport error
+    can therefore switch the *next* action to native without duplicating an
+    action whose outcome is unknown.
+    """
+
+    global _session_executor, _session_executor_config, _session_fallback_reason
+    if not isinstance(error, BaseException):
+        return False
+    if not bool(getattr(error, "fallback_safe", True)):
+        return False
+    async with _session_fallback_lock:
+        config = _session_executor_config
+        if config is None or config.backend is not ExecutorBackend.SANDBOX:
+            return isinstance(_session_executor, NativeExecutor) and bool(_session_fallback_reason)
+        if not _session_allow_native_fallback:
+            return False
+        current = _session_executor
+        project_root = getattr(current, "project_root", None)
+        if project_root is None:
+            return False
+        if isinstance(current, NativeExecutor):
+            return True
+        kill = getattr(current, "kill", None)
+        if kill is not None:
+            try:
+                await kill()
+            except Exception:
+                # Teardown is best effort; the old backend is discarded and
+                # no command is replayed until the new executor is ready.
+                pass
+        try:
+            from cc_harness.sandbox_server import shutdown_owned
+            await shutdown_owned()
+        except Exception:
+            pass
+        config.backend = ExecutorBackend.NATIVE
+        native = build_executor(config, Path(project_root))
+        _session_executor = native
+        _session_fallback_reason = str(error)
+        _native_fallback_audit(
+            Path(project_root),
+            reason=str(error),
+            stage=str(getattr(error, "stage", "preflight")),
+            retry_current=retry_current,
+        )
+        return True
 
 
 async def run_command(
@@ -305,11 +487,44 @@ async def run_command(
                 llm=f"[Tool Error] {exc}",
             )
         except SandboxUnavailableError as exc:
-            result = ToolResult.error(
-                display="sandbox unavailable; command was not executed",
-                llm=("[Tool Error] sandbox unavailable; command was not executed and host fallback "
-                     f"is disabled: {exc}"),
+            # Only a failure before dispatch may replay the current command.
+            # If the SDK transport failed after dispatch, arm native execution
+            # for the next action but preserve this action as outcome-unknown.
+            safe_to_retry = bool(getattr(exc, "retry_safe", False))
+            switched = await fallback_session_executor(
+                exc,
+                retry_current=safe_to_retry,
             )
+            if switched and safe_to_retry:
+                result = await get_session_executor().run(args, cwd=Path(cwd))
+            elif switched:
+                result = ToolResult.error(
+                    display="sandbox unavailable; current command outcome is unknown",
+                    llm=(
+                        "[Tool Error] sandbox transport failed after dispatch; the command was "
+                        "not replayed. Native execution is enabled for subsequent commands. "
+                        f"stage={getattr(exc, 'stage', 'command_transport')}: {exc}"
+                    ),
+                    metadata={
+                        "exit_code": None,
+                        "outcome_unknown": True,
+                        "sandbox_fallback": "native_for_next_action",
+                        "sandbox_stage": getattr(exc, "stage", "command_transport"),
+                    },
+                )
+            else:
+                result = ToolResult.error(
+                    display="sandbox unavailable; command was not executed",
+                    llm=(
+                        "[Tool Error] sandbox unavailable; command was not executed and "
+                        f"native fallback is disabled: {exc}"
+                    ),
+                    metadata={
+                        "exit_code": None,
+                        "outcome_unknown": False,
+                        "sandbox_stage": getattr(exc, "stage", "preflight"),
+                    },
+                )
         result_text = "\n".join(
             str(value or "")
             for value in (

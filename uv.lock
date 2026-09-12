@@ -422,6 +422,7 @@ source = { editable = "." }
 dependencies = [
     { name = "aiosqlite" },
     { name = "deepeval" },
+    { name = "fastapi" },
     { name = "jsonschema" },
     { name = "langfuse" },
     { name = "mcp", extra = ["cli"] },
@@ -438,6 +439,7 @@ dependencies = [
     { name = "rich" },
     { name = "sqlite-vec" },
     { name = "tiktoken" },
+    { name = "uvicorn", extra = ["standard"] },
 ]
 
 [package.optional-dependencies]
@@ -464,6 +466,7 @@ requires-dist = [
     { name = "agentdojo", marker = "extra == 'benchmarks'", specifier = "==0.1.35" },
     { name = "aiosqlite", specifier = ">=0.20" },
     { name = "deepeval", specifier = ">=0.21" },
+    { name = "fastapi", specifier = ">=0.115" },
     { name = "jsonschema", specifier = ">=4.21" },
     { name = "langfuse", specifier = ">=2.0,<3" },
     { name = "mcp", extras = ["cli"], specifier = ">=1.27,<2" },
@@ -487,6 +490,7 @@ requires-dist = [
     { name = "ruff", marker = "extra == 'dev'", specifier = "==0.16.1" },
     { name = "sqlite-vec", specifier = ">=0.1.9" },
     { name = "tiktoken", specifier = ">=0.7" },
+    { name = "uvicorn", extras = ["standard"], specifier = ">=0.30" },
 ]
 provides-extras = ["dev", "dlp", "sandbox", "benchmarks"]
 

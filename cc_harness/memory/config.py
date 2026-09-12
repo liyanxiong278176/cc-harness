@@ -58,6 +58,12 @@ class MemoryConfig(BaseModel):
     embedding_api_key: str = ""
     embedding_model: str = ""
     embedding_dim: int = 1024
+    # ``remote`` preserves the existing OpenAI-compatible embedding contract.
+    # ``local`` uses the deterministic, zero-network hash embedder and is the
+    # default selected by the interactive Durable Runtime when a project has
+    # no embedding settings.  Keeping the provider explicit makes activation
+    # evidence and cost reports honest (local embeddings have no API charge).
+    embedding_provider: str = "remote"
     pipeline_threshold: float = 0.55
     pipeline_recent_turns: int = 10
     pipeline_max_delta_tokens: int = 4000
@@ -123,6 +129,14 @@ class MemoryConfig(BaseModel):
         if v <= 0:
             raise ValueError(f"embedding_dim must be > 0, got {v}")
         return v
+
+    @field_validator("embedding_provider")
+    @classmethod
+    def _check_embedding_provider(cls, v: str) -> str:
+        normalized = str(v or "remote").strip().lower()
+        if normalized not in {"remote", "local"}:
+            raise ValueError("embedding_provider must be 'remote' or 'local'")
+        return normalized
 
     @field_validator("injection_token_budget", "retriever_top_k",
                      "pipeline_recent_turns", "pipeline_max_delta_tokens",
@@ -191,7 +205,7 @@ class MemoryConfig(BaseModel):
         return v
 
     def model_post_init(self, __context) -> None:
-        if self.enabled:
+        if self.enabled and self.embedding_provider != "local":
             missing = [n for n, v in [
                 ("embedding_base_url", self.embedding_base_url),
                 ("embedding_api_key", self.embedding_api_key),

@@ -1,7 +1,8 @@
 # @liyanxiong278176/cc-harness
 
 `cc-harness` 的 npm 安装入口。核心运行时仍然来自 Python 项目；此包只负责
-准备运行环境并转发命令行参数。
+准备运行环境并转发命令行参数。运行 `cc-harness` 默认会启动本地 WebUI，并打印
+访问地址；需要终端界面时显式传入 `--tui default`。
 
 ## 安装
 
@@ -44,9 +45,13 @@ npm uninstall -g @lyx/cc-harness
 cd /path/to/project
 cc-harness
 cc-harness --cwd /path/to/project
+# 不自动打开浏览器，或显式使用终端控制面
+cc-harness --no-open
+cc-harness --tui default
 ```
 
-所有参数都会原样传给 Python 核心，例如 `cc-harness --help`、`cc-harness -c`。
+所有参数都会原样传给 Python 核心，例如 `cc-harness --help`、
+`cc-harness --tui default -c`（终端兼容控制面）。
 
 ## 配置核心来源
 

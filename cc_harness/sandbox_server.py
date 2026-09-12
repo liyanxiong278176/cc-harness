@@ -17,6 +17,7 @@ import logging
 import os
 import re
 import signal
+import shutil
 import subprocess
 import sys
 import tomllib
@@ -42,7 +43,25 @@ class ServerState:
 
 
 class ServerAttestationError(RuntimeError):
-    """A reachable external server could not prove the required controls."""
+    """A reachable external server could not prove the required controls.
+
+    ``fallback_safe`` is intentionally true only for the two *discovery*
+    failures where the endpoint is either not an OpenSandbox health service or
+    has no operator-supplied attestation path.  A supplied configuration that
+    fails validation remains a security/configuration error and must not be
+    bypassed by native execution.
+    """
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        fallback_safe: bool = False,
+        stage: str = "server_attestation",
+    ) -> None:
+        super().__init__(message)
+        self.fallback_safe = bool(fallback_safe)
+        self.stage = str(stage)
 
 
 async def ping(host: str, port: int, timeout: float = 1.0) -> bool:
@@ -181,13 +200,34 @@ def _kill_proc_tree(proc) -> None:
 
 
 def _server_cli() -> Path:
-    """opensandbox-server console script 路径(venv 内 .exe / 类 unix 无后缀)。
+    """Locate the ``opensandbox-server`` console script on every Python layout.
 
-    真 server 入口是 console script(非 python -m opensandbox_server,该包无 __main__)。
-    install 时 pip 在 venv 的 Scripts/bin 下生成可执行入口,与 sys.executable 同目录。
+    ``pip`` puts console scripts beside ``python`` on POSIX, but in the
+    sibling ``Scripts`` directory on Windows (including a system install such
+    as ``D:\\python3.13\\Scripts``).  The previous implementation only
+    checked ``Path(sys.executable).parent`` and therefore raised WinError 2
+    after a successful ``pip install -e '.[sandbox]'``.  Keep the returned
+    value deterministic for tests, while also honoring a PATH-installed
+    executable (pipx/conda/launcher environments).
     """
     exe = "opensandbox-server.exe" if sys.platform == "win32" else "opensandbox-server"
-    return Path(sys.executable).parent / exe
+    python_dir = Path(sys.executable).resolve().parent
+    candidates = [
+        # Windows virtualenv/system Python convention.
+        python_dir / "Scripts" / exe,
+        # POSIX virtualenv convention and unusual flat installs.
+        python_dir / exe,
+    ]
+    for candidate in candidates:
+        if candidate.is_file():
+            return candidate
+    on_path = shutil.which(exe) or shutil.which("opensandbox-server")
+    if on_path:
+        return Path(on_path).resolve()
+    # Preserve a useful, deterministic path in the eventual error message.
+    # _fork_server converts a missing executable into a normal unavailable
+    # server result instead of leaking a platform-specific WinError.
+    return candidates[0]
 
 
 def _set_config_port(config_path: Path, port: int) -> None:
@@ -346,7 +386,9 @@ async def ensure_server(port: int, host: str = "127.0.0.1",
             if require_external_attestation:
                 if not trusted.owned and not config_path_provided:
                     raise ServerAttestationError(
-                        "external OpenSandbox server requires server_config_path attestation"
+                        "external OpenSandbox server requires server_config_path attestation",
+                        fallback_safe=True,
+                        stage="external_attestation_missing",
                     )
                 attested = attest_server_config(
                     config_path,
@@ -361,11 +403,17 @@ async def ensure_server(port: int, host: str = "127.0.0.1",
                 _TRUSTED_ENDPOINTS[endpoint] = trusted
             return trusted
         if not await health(host, port):
-            raise ServerAttestationError("reachable port is not an OpenSandbox health endpoint")
+            raise ServerAttestationError(
+                "reachable port is not an OpenSandbox health endpoint",
+                fallback_safe=True,
+                stage="external_health_mismatch",
+            )
         if require_external_attestation:
             if not config_path_provided:
                 raise ServerAttestationError(
-                    "external OpenSandbox server requires server_config_path attestation"
+                    "external OpenSandbox server requires server_config_path attestation",
+                    fallback_safe=True,
+                    stage="external_attestation_missing",
                 )
             state = attest_server_config(
                 config_path,
@@ -380,7 +428,15 @@ async def ensure_server(port: int, host: str = "127.0.0.1",
         return state
     if not _docker_available():
         return None
-    proc = await _fork_server(port, host, config_path, allowed_host_paths, pids_limit)
+    try:
+        proc = await _fork_server(port, host, config_path, allowed_host_paths, pids_limit)
+    except OSError as exc:
+        # A package can be installed while its console-script launcher is not
+        # discoverable (for example a system Python on Windows).  Treat that
+        # as an unavailable sandbox so the caller records a precise
+        # environment failure instead of leaking WinError/FileNotFoundError.
+        log.warning("unable to start opensandbox-server: %s", exc)
+        return None
     loop = asyncio.get_running_loop()
     deadline = loop.time() + ready_timeout
     while loop.time() < deadline:

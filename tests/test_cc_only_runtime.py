@@ -23,7 +23,6 @@ from eval.cc_only.adapters.harbor import (
     _cleanup_owned_harbor_resources,
     _docker_healthcheck,
     _docker_snapshot,
-    _embedded_cc_result,
     _find_embedded_cc_result,
     _harbor_failure_diagnostic,
     _harbor_usage,

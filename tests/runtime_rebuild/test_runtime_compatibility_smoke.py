@@ -49,3 +49,36 @@ async def test_durable_runtime_supervisor_smoke_initializes_activation_boundary(
         prewarm.assert_awaited_once_with()
     finally:
         await client.close()
+
+
+@pytest.mark.asyncio
+async def test_durable_runtime_uses_audited_native_fallback_when_sandbox_is_down(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    """Local standard work remains startable without Docker/OpenSandbox."""
+    monkeypatch.setenv("OPENAI_API_KEY", "provider-neutral-smoke-key")
+    monkeypatch.setenv("OPENAI_BASE_URL", "https://example.invalid/v1")
+    monkeypatch.setenv("OPENAI_MODEL", "provider-neutral-smoke-model")
+    from unittest.mock import AsyncMock
+    from cc_harness.sandbox import SandboxUnavailableError
+    from cc_harness import tools
+
+    prewarm = AsyncMock(side_effect=SandboxUnavailableError("docker is unavailable"))
+    monkeypatch.setattr("cc_harness.durable_runtime.prewarm_session_executor", prewarm)
+
+    client = await DurableRuntimeClient.create(tmp_path, data_root=tmp_path / "data")
+    try:
+        supervisor = await client.start_supervisor(worker_id="fallback", max_workers=1)
+
+        manifest_path = tmp_path / ".cc-harness" / "activation" / "durable-runtime.json"
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        runtime = manifest["capabilities"]["runtime"]
+        assert type(supervisor).__name__ == "LocalSupervisor"
+        assert runtime["degraded_reason"].startswith("sandbox_unavailable_native_fallback:")
+        assert runtime["details"]["sandbox_fallback"] == "native"
+        assert client._services.executor_config.backend.value == "native"
+        assert tools.session_executor_status()["native_fallback_active"] is True
+        prewarm.assert_awaited_once_with()
+    finally:
+        await client.close()

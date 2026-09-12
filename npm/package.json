@@ -1,7 +1,7 @@
 {
   "name": "@liyanxiong278176/cc-harness",
   "version": "0.1.1",
-  "description": "npm launcher for the cc-harness terminal coding agent",
+  "description": "npm launcher for the cc-harness local WebUI coding agent",
   "license": "MIT",
   "type": "commonjs",
   "bin": {

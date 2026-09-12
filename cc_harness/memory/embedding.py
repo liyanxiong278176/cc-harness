@@ -1,6 +1,9 @@
 """Async HTTP client for OpenAI-compatible embedding APIs."""
 from __future__ import annotations
 import asyncio
+import hashlib
+import math
+import re
 import httpx
 
 
@@ -18,6 +21,51 @@ class EmbeddingRateLimitError(EmbeddingError):
 
 class EmbeddingAPIError(EmbeddingError):
     """Other non-2xx HTTP responses."""
+
+
+class LocalEmbeddingClient:
+    """Deterministic, zero-network embedding fallback.
+
+    This is intentionally a lexical hash embedding rather than a pretend
+    semantic model.  It gives the existing sqlite-vec/FTS hybrid retriever a
+    useful local signal when users have not configured a paid embedding
+    provider, while keeping the limitation explicit in activation telemetry.
+    The same text and dimension always produce the same normalized vector, so
+    persisted memories remain searchable after a restart.
+    """
+
+    _TOKEN_RE = re.compile(r"\w+", re.UNICODE)
+
+    def __init__(self, dim: int = 1024) -> None:
+        if int(dim) <= 0:
+            raise ValueError("embedding dimension must be positive")
+        self.dim = int(dim)
+
+    async def aclose(self) -> None:
+        """Match :class:`EmbeddingClient`'s lifecycle contract (no-op)."""
+
+    async def embed(self, text: str) -> list[float]:
+        if not isinstance(text, str) or not text.strip():
+            raise EmbeddingError("text must be non-empty string")
+        tokens = self._TOKEN_RE.findall(text.casefold())
+        # Include a stable whole-text feature for punctuation/short Chinese
+        # inputs that may not yield a ``\w`` token on every Unicode build.
+        features = tokens or [text.casefold().strip()]
+        vector = [0.0] * self.dim
+        for position, token in enumerate(features):
+            digest = hashlib.sha256(
+                f"cc-harness-local-embedding-v1:{position}:{token}".encode("utf-8")
+            ).digest()
+            index = int.from_bytes(digest[:8], "big") % self.dim
+            sign = 1.0 if digest[8] & 1 else -1.0
+            # Repeated terms contribute more, but a bounded weight avoids a
+            # single long transcript dominating all other dimensions.
+            vector[index] += sign * (1.0 + min(position, 32) / 32.0)
+        norm = math.sqrt(sum(value * value for value in vector)) or 1.0
+        return [value / norm for value in vector]
+
+    async def embed_batch(self, texts: list[str]) -> list[list[float]]:
+        return [await self.embed(text) for text in texts]
 
 
 class EmbeddingClient:

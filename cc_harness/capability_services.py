@@ -135,6 +135,7 @@ class SharedCapabilityServices:
         additional_roots: Sequence[Path] = (),
         host_execution: bool = False,
         context_config: ContextConfig | None = None,
+        auto_enable_memory: bool = False,
     ) -> "SharedCapabilityServices":
         root = Path(cwd).resolve()
         policy_path = root / "policy.yaml"
@@ -159,6 +160,51 @@ class SharedCapabilityServices:
         l5_config = load_l5_config(policy_path)
         if host_execution:
             executor_config.backend = ExecutorBackend.NATIVE
+        memory_config = load_memory_config(
+            policy_path,
+            environ=config.runtime_environment,
+        )
+        # A normal interactive project should work without a second paid
+        # embedding account.  Opt in to a deterministic local backend only
+        # when the caller explicitly requests this convenience (the durable
+        # interactive entrypoint does); benchmark/eval profiles and direct
+        # library callers retain the historical opt-in behavior.  An explicit
+        # MEMORY_ENABLED=false always wins.
+        runtime_env = config.runtime_environment
+        explicit_memory_flag = str(runtime_env.get("MEMORY_ENABLED", "")).strip()
+        explicit_provider = str(
+            runtime_env.get("MEMORY_EMBEDDING_PROVIDER", "")
+        ).strip().lower()
+        if (
+            auto_enable_memory
+            and explicit_memory_flag == ""
+            and not memory_config.enabled
+        ):
+            memory_config = type(memory_config).model_validate(
+                {
+                    **memory_config.model_dump(),
+                    "enabled": True,
+                    "embedding_provider": "local",
+                    "embedding_base_url": "local://hash",
+                    "embedding_api_key": "local",
+                    "embedding_model": "hash-v1",
+                }
+            )
+        elif (
+            auto_enable_memory
+            and memory_config.enabled
+            and explicit_provider in {"", "local"}
+            and not memory_config.embedding_base_url
+        ):
+            memory_config = type(memory_config).model_validate(
+                {
+                    **memory_config.model_dump(),
+                    "embedding_provider": "local",
+                    "embedding_base_url": "local://hash",
+                    "embedding_api_key": "local",
+                    "embedding_model": "hash-v1",
+                }
+            )
         return cls(
             cwd=root,
             config=config,
@@ -168,10 +214,7 @@ class SharedCapabilityServices:
                 model=config.openai_model,
                 environ=config.runtime_environment,
             ),
-            memory_config=load_memory_config(
-                policy_path,
-                environ=config.runtime_environment,
-            ),
+            memory_config=memory_config,
             l2_config=l2_config,
             l2_client=l2_client,
             l2_model=os.getenv("JUDGE_MODEL") or config.openai_model,
@@ -195,6 +238,9 @@ class SharedCapabilityServices:
         pii_requested = bool(getattr(l5_config, "enabled", False) and getattr(l5_config, "pii_on", False))
         pii_dependency = _module_available("presidio_analyzer")
         memory_enabled = bool(getattr(self.memory_config, "enabled", False))
+        memory_provider = str(
+            getattr(self.memory_config, "embedding_provider", "remote")
+        )
         memory_dependency = _module_available("sqlite_vec")
         degraded: list[str] = []
         if sandbox_requested and not sandbox_sdk:
@@ -232,6 +278,18 @@ class SharedCapabilityServices:
             },
             "sandbox_requested": sandbox_requested,
             "memory_configured": memory_enabled,
+            "memory_provider": memory_provider,
+            # Sub-features cannot be active when the top-level memory switch
+            # is off.  Reporting the raw YAML flags here was misleading: a
+            # project with ``MEMORY_ENABLED=false`` could still appear to
+            # safety telemetry as capturing/injecting memory.  Keep the
+            # activation contract internally consistent and redaction-safe.
+            "memory_capture_enabled": bool(
+                memory_enabled and getattr(self.memory_config, "capture_enabled", False)
+            ),
+            "memory_layered_injection": bool(
+                memory_enabled and getattr(self.memory_config, "layered_inject", False)
+            ),
             "pii_requested": pii_requested,
         }
 

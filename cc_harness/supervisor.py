@@ -311,6 +311,13 @@ class LocalSupervisor:
                 RunStatus.COMPLETED,
                 RunStatus.CANCELLED,
                 RunStatus.FAILED_TERMINAL,
+                # A stalled predecessor has released its lease after a
+                # committed assistant turn.  Follow-ups are intentionally
+                # marked incomplete, but they are still safe to schedule;
+                # requiring an explicit bypass here stranded ordinary chat
+                # messages behind a run that can only progress after user
+                # input.
+                RunStatus.STALLED,
             }:
                 # An explicitly bypassed follow-up is a durable recovery
                 # boundary even when its predecessor stalled.  The bypass

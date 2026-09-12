@@ -36,7 +36,11 @@ from cc_harness.project_instructions import load_project_instructions
 from cc_harness.tool_bundles import parse_tool_bundles
 from cc_harness.repl import ReplState, _after_turn_memory, _after_turn_todo, _extract_final_text
 from cc_harness.session_store import SessionRecord, SessionStore
-from cc_harness.tools import init_session_executor, shutdown_session_executor
+from cc_harness.tools import (
+    configure_session_native_fallback,
+    init_session_executor,
+    shutdown_session_executor,
+)
 
 EventEmitter = Callable[[dict], Awaitable[None]]
 ConfirmHandler = Callable[[str, dict, str], Awaitable[str]]
@@ -311,6 +315,13 @@ class SessionRuntime:
             exec_cfg.backend = ExecutorBackend.NATIVE
             self.warnings.append(RuntimeWarning("host execution explicitly enabled"))
         init_session_executor(exec_cfg, str(self.cwd))
+        # Ordinary local sessions remain usable when Docker/OpenSandbox is
+        # unavailable.  The helper still refuses fallback for hardened,
+        # strict-security, and benchmark environments.
+        configure_session_native_fallback(
+            exec_cfg.backend is ExecutorBackend.SANDBOX,
+            capability_profile=self.capability_profile.name,
+        )
         safety_details = (
             self.shared_services.activation_details()
             if self.shared_services is not None

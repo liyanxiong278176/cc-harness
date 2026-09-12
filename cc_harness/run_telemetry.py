@@ -119,6 +119,7 @@ def aggregate_model_usage(events: Iterable[Any]) -> dict[str, Any]:
         "provider": None,
         "model": None,
         "cache_hit_ratio": None,
+        "context_categories": None,
     }
     if not source_events:
         return result
@@ -192,6 +193,26 @@ def aggregate_model_usage(events: Iterable[Any]) -> dict[str, Any]:
             "duration_ms": payload.get("duration_ms"),
             "provider_metadata": metadata,
         }
+        categories = usage.get("context_categories")
+        if isinstance(categories, Mapping):
+            # Counts are explanatory local telemetry, not billable usage. Keep
+            # only non-negative integers and a fixed set of known buckets so
+            # untrusted provider payloads cannot inflate the UI or leak data.
+            safe_categories = {}
+            for name in (
+                "user_input",
+                "tool_calls",
+                "llm_output",
+                "system_prompt",
+                "summary",
+                "tool_definitions",
+            ):
+                try:
+                    safe_categories[name] = max(0, int(categories.get(name, 0) or 0))
+                except (TypeError, ValueError):
+                    safe_categories[name] = 0
+            invocation["context_categories"] = safe_categories
+            result["context_categories"] = safe_categories
         if "error" in payload:
             invocation["error"] = str(payload.get("error") or "")[:1_000]
         # Keep the report bounded even if a very long run contains thousands

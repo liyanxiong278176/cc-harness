@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import uuid
+from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Any
 
@@ -250,6 +251,28 @@ class RunCoordinator:
             RunStatus.WAITING_ON_PREDECESSOR,
             RunStatus.CANCELLED,
         }:
+            # Goal-level review happens before a worker is claimed.  The
+            # WebUI's explicit Continue action is the human decision required
+            # by that gate, so persist the acceptance before re-queueing.  Do
+            # not infer approval from arbitrary goal text and do not mark
+            # environment/action failures as goal-approved.
+            if view.status is RunStatus.BLOCKED:
+                outcome = view.projection.outcome
+                details = outcome.details if outcome is not None else {}
+                blocked_reason = str(details.get("reason") or "") if isinstance(details, Mapping) else ""
+                if blocked_reason == "goal_requires_decision":
+                    goal = view.projection.goal
+                    if goal is None:
+                        raise ValueError("blocked run has no goal contract to confirm")
+                    await self._append(
+                        run_id,
+                        "GoalContractAccepted",
+                        {
+                            "goal": goal.to_dict(),
+                            "confirmation": "explicit client resume",
+                        },
+                        EventActor("client", "local-client"),
+                    )
             await self._append(run_id, "RunResumed", {"reason": reason}, EventActor("client", "local-client"))
         updated = await self.inspect(run_id)
         return ControlReceipt(run_id, updated.status, updated.sequence)
