@@ -367,6 +367,61 @@ class MemoryStore:
                 await self._db.rollback()
                 raise
 
+    async def search_conversation(
+        self,
+        query: str,
+        *,
+        limit: int = 5,
+        session_id: str | None = None,
+    ) -> list[dict[str, object]]:
+        """Lexically search durable L0 conversation turns.
+
+        L0 is deliberately cheap and deterministic: it is the final fallback
+        after L3 persona, L2 scenarios, and semantic L1 facts.  Parameters are
+        bound through SQLite (including the LIKE patterns), so arbitrary user
+        text cannot become SQL.
+        """
+
+        assert self._db is not None, "store.init_schema first"
+        terms = _FTS_TOKEN_RE.findall(str(query or "").casefold())
+        terms = list(dict.fromkeys(term for term in terms if term))
+        if not terms:
+            return []
+        limit = max(1, min(int(limit), 100))
+        clauses: list[str] = []
+        params: list[object] = []
+        for term in terms[:12]:
+            clauses.append("(LOWER(content) LIKE ? OR LOWER(keywords) LIKE ? OR LOWER(entities) LIKE ?)")
+            pattern = f"%{term}%"
+            params.extend((pattern, pattern, pattern))
+        where = " OR ".join(clauses)
+        if session_id is not None:
+            where = f"session_id = ? AND ({where})"
+            params.insert(0, session_id)
+        cursor = await self._db.execute(
+            "SELECT id, session_id, turn_idx, role, content, ts, dates, entities, keywords, "
+            "message_idx, content_digest FROM conversation "
+            f"WHERE {where} ORDER BY turn_idx DESC, id DESC LIMIT ?",
+            [*params, limit],
+        )
+        rows = await cursor.fetchall()
+        return [
+            {
+                "id": row[0],
+                "session_id": row[1],
+                "turn_idx": row[2],
+                "role": row[3],
+                "content": row[4],
+                "ts": row[5],
+                "dates": row[6],
+                "entities": row[7],
+                "keywords": row[8],
+                "message_idx": row[9],
+                "content_digest": row[10],
+            }
+            for row in rows
+        ]
+
     async def add(self, text: str, embedding: list[float], source: str,
                   session_id: str | None = None, layer: str = "L1",
                   *, version: int = 1, supersedes_id: str | None = None,

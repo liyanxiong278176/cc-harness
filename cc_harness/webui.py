@@ -911,7 +911,9 @@ class WebRuntimeManager:
                             "error": raw.get("error"),
                             "effective_context_window": payload.get("effective_context_window"),
                             "provider_safety_factor": payload.get("provider_safety_factor"),
-                            "applied": bool(
+                            "applied": bool(raw.get("applied"))
+                            if "applied" in raw
+                            else bool(
                                 str(raw.get("tier") or "none") != "none"
                                 or raw.get("summarized")
                             ),
@@ -936,7 +938,9 @@ class WebRuntimeManager:
                         "error": payload.get("error"),
                         "effective_context_window": payload.get("effective_context_window"),
                         "provider_safety_factor": payload.get("provider_safety_factor"),
-                        "applied": bool(tier != "none" or payload.get("summarized")),
+                        "applied": bool(payload.get("applied"))
+                        if "applied" in payload
+                        else bool(tier != "none" or payload.get("summarized")),
                     }
             compaction = latest_applied or latest_projection
         except Exception:

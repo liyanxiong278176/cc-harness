@@ -2,11 +2,190 @@
 
 from __future__ import annotations
 
+import asyncio
+import contextlib
+import os
+from contextlib import asynccontextmanager
+from dataclasses import dataclass
+from pathlib import Path
 import time
+from collections.abc import AsyncIterator, Iterable, Mapping
 
 from .run_events import EventActor, RunEvent
-from .run_model import Lease, RunStatus
-from .run_store import LeaseFenceError, RunStore
+from .run_kernel import ActionRequest
+from .run_model import EffectClass, Lease, ResourceLease, RunStatus, SupervisorLease
+from .run_store import (
+    LeaseFenceError,
+    ResourceLeaseConflict,
+    RunStore,
+    RunStoreError,
+)
+
+
+@dataclass(frozen=True)
+class ResourceSpec:
+    """Normalized resource requested by an action."""
+
+    resource_key: str
+    mode: str
+
+    def __post_init__(self) -> None:
+        if not self.resource_key:
+            raise ValueError("resource_key is required")
+        if self.mode not in {"shared", "exclusive"}:
+            raise ValueError("resource mode must be shared or exclusive")
+
+
+def _normalize_effect(effect: EffectClass | str) -> str:
+    return effect.value if isinstance(effect, EffectClass) else str(effect or "unknown").strip().lower()
+
+
+def _normalize_path(value: str, working_directory: Path) -> str:
+    """Canonicalize a user/tool path without requiring it to exist."""
+
+    raw = str(value).strip()
+    if not raw:
+        return ""
+    # A glob pattern identifies the directory whose contents it can touch.
+    wildcard = next((index for index, char in enumerate(raw) if char in "*?[]{}"), None)
+    if wildcard is not None:
+        raw = raw[:wildcard].rstrip("\\/") or "."
+    candidate = Path(raw)
+    if not candidate.is_absolute():
+        candidate = working_directory / candidate
+    try:
+        resolved = candidate.resolve(strict=False)
+    except OSError:
+        resolved = candidate.absolute()
+    normalized = resolved.as_posix().rstrip("/") or "."
+    # Windows paths are case-insensitive; lowercasing only on Windows keeps
+    # conflict checks deterministic while preserving Unix case sensitivity.
+    return os.path.normcase(normalized)
+
+
+def _explicit_resource_specs(
+    arguments: Mapping[str, object],
+    working_directory: Path,
+) -> tuple[ResourceSpec, ...]:
+    raw = arguments.get("resource_keys")
+    if raw is None:
+        return ()
+    values = raw if isinstance(raw, (list, tuple, set)) else (raw,)
+    specs: list[ResourceSpec] = []
+    for value in values:
+        if isinstance(value, Mapping):
+            key = str(value.get("key") or value.get("resource_key") or "").strip()
+            mode = str(value.get("mode") or "exclusive").strip().lower()
+        else:
+            key = str(value).strip()
+            mode = "exclusive"
+        if not key:
+            continue
+        if ":" not in key:
+            key = f"named:{key}"
+        specs.append(ResourceSpec(key, mode))
+    return tuple(specs)
+
+
+_PATH_ARGUMENT_KEYS = frozenset(
+    {
+        "path",
+        "paths",
+        "file",
+        "files",
+        "file_path",
+        "file_paths",
+        "filename",
+        "filenames",
+        "directory",
+        "directories",
+        "dir",
+        "dirs",
+        "cwd",
+    }
+)
+
+
+def resource_specs_for_action(
+    request: ActionRequest,
+    *,
+    effect: EffectClass | str,
+    working_directory: Path,
+    project_id: str,
+) -> tuple[ResourceSpec, ...]:
+    """Derive conservative locks from a tool contract and its arguments.
+
+    Explicit ``resource_keys`` win.  Native file tools lock their paths,
+    read-only lookups use shared workspace locks, and unknown/external actions
+    fall back to an exclusive workspace/project lock.  This lets independent
+    sessions share a project while preventing overlapping writes.
+    """
+
+    arguments = request.arguments
+    explicit = _explicit_resource_specs(arguments, working_directory)
+    if explicit:
+        return explicit
+    effect_value = _normalize_effect(effect)
+    paths: list[str] = []
+    for key, value in arguments.items():
+        if str(key).casefold() not in _PATH_ARGUMENT_KEYS:
+            continue
+        values = value if isinstance(value, (list, tuple, set)) else (value,)
+        for item in values:
+            normalized = _normalize_path(str(item), working_directory)
+            if normalized:
+                paths.append(f"path:{normalized}")
+    # Preserve order for useful diagnostics while deduplicating aliases.
+    paths = list(dict.fromkeys(paths))
+    if effect_value == EffectClass.READ_ONLY.value:
+        if paths:
+            return tuple(ResourceSpec(path, "shared") for path in paths)
+        return (ResourceSpec(f"workspace:{_normalize_path(str(working_directory), working_directory)}", "shared"),)
+    if effect_value == EffectClass.WORKSPACE_MUTATION.value:
+        if paths:
+            return tuple(ResourceSpec(path, "exclusive") for path in paths)
+        return (ResourceSpec(f"workspace:{_normalize_path(str(working_directory), working_directory)}", "exclusive"),)
+    if effect_value == EffectClass.EXTERNAL_SIDE_EFFECT.value:
+        return (ResourceSpec(f"project:{project_id}", "exclusive"),)
+    # ``run_command`` has an intentionally unknown contract because arbitrary
+    # shell commands may mutate the workspace.  Scope it to the worker's
+    # working tree so isolated worktrees can still proceed in parallel.
+    if request.tool_name == "run_command":
+        return (ResourceSpec(f"workspace:{_normalize_path(str(working_directory), working_directory)}", "exclusive"),)
+    return (ResourceSpec(f"project:{project_id}", "exclusive"),)
+
+
+class SupervisorLeaseManager:
+    """Small owner-scoped facade for the project scheduler lease."""
+
+    def __init__(self, store: RunStore, *, owner_id: str, ttl_seconds: float = 120.0) -> None:
+        self.store = store
+        self.owner_id = owner_id
+        self.ttl_seconds = max(1.0, float(ttl_seconds))
+        self.current: SupervisorLease | None = None
+
+    async def acquire(self) -> SupervisorLease:
+        self.current = await self.store.claim_supervisor_lease(
+            self.owner_id,
+            ttl_seconds=self.ttl_seconds,
+        )
+        return self.current
+
+    async def heartbeat(self) -> SupervisorLease:
+        if self.current is None:
+            return await self.acquire()
+        self.current = await self.store.heartbeat_supervisor_lease(
+            self.current,
+            ttl_seconds=self.ttl_seconds,
+        )
+        return self.current
+
+    async def release(self) -> bool:
+        if self.current is None:
+            return False
+        released = await self.store.release_supervisor_lease(self.current)
+        self.current = None
+        return released
 
 
 class LeaseManager:
@@ -112,4 +291,160 @@ class LeaseManager:
         return current
 
 
-__all__ = ["LeaseManager"]
+class ResourceLeaseManager:
+    """Action-scoped resource leases backed by the project RunStore.
+
+    Resource contention is expected coordination, not a run failure.  The
+    manager waits for an overlapping lease to expire or be released, while a
+    cancellation/fenced worker exits without acquiring a new resource.
+    """
+
+    def __init__(
+        self,
+        store: RunStore,
+        *,
+        ttl_seconds: float = 120.0,
+        poll_interval: float = 0.1,
+    ) -> None:
+        self.store = store
+        self.ttl_seconds = max(1.0, float(ttl_seconds))
+        self.poll_interval = max(0.01, float(poll_interval))
+
+    async def acquire_for_action(
+        self,
+        lease: Lease,
+        request: ActionRequest,
+        *,
+        effect: EffectClass | str,
+        working_directory: Path,
+        action_id: str | None = None,
+    ) -> tuple[ResourceLease, ...]:
+        specs = resource_specs_for_action(
+            request,
+            effect=effect,
+            working_directory=working_directory,
+            project_id=self.store.project_id,
+        )
+        while True:
+            try:
+                return await self._claim_once(
+                    lease,
+                    tuple((item.resource_key, item.mode) for item in specs),
+                    action_id=action_id or request.action_id,
+                )
+            except ResourceLeaseConflict:
+                # A resource conflict is not a task error.  Do not wait after
+                # the run has entered a cancellation/final state, though; a
+                # cancelled action must not acquire a fresh lock.
+                projection = await self.store.load_projection(lease.run_id)
+                if projection.status in {
+                    RunStatus.CANCEL_REQUESTED,
+                    RunStatus.CANCELLED,
+                    RunStatus.BLOCKED,
+                    RunStatus.STALLED,
+                    RunStatus.COMPLETED,
+                    RunStatus.FAILED_RECOVERABLE,
+                    RunStatus.FAILED_TERMINAL,
+                }:
+                    raise LeaseFenceError(
+                        f"run cannot wait for resource lease in {projection.status.value}"
+                    )
+                await asyncio.sleep(self.poll_interval)
+
+    async def _claim_once(
+        self,
+        lease: Lease,
+        resources: tuple[tuple[str, str], ...],
+        *,
+        action_id: str,
+    ) -> tuple[ResourceLease, ...]:
+        """Make a claim cancellation-safe across the SQLite commit boundary."""
+
+        claim_task = asyncio.create_task(
+            self.store.claim_resources(
+                lease.run_id,
+                lease.epoch,
+                resources,
+                ttl_seconds=self.ttl_seconds,
+                action_id=action_id,
+            ),
+            name=f"cc-harness-resource-claim-{lease.run_id}-{action_id}",
+        )
+        try:
+            return await asyncio.shield(claim_task)
+        except asyncio.CancelledError:
+            # Cancellation can arrive just after SQLite commits the rows but
+            # before the await resumes.  Drain the shielded task and release
+            # any rows it returned, otherwise a cancelled Worker could leave
+            # a lock until its TTL.
+            with contextlib.suppress(Exception):
+                claimed = await asyncio.shield(claim_task)
+                await self.store.release_resources(claimed)
+            raise
+
+    async def renew(self, leases: Iterable[ResourceLease]) -> tuple[ResourceLease, ...]:
+        return await self.store.renew_resources(leases, ttl_seconds=self.ttl_seconds)
+
+    async def release(self, leases: Iterable[ResourceLease]) -> int:
+        return await self.store.release_resources(leases)
+
+    @asynccontextmanager
+    async def hold_for_action(
+        self,
+        lease: Lease,
+        request: ActionRequest,
+        *,
+        effect: EffectClass | str,
+        working_directory: Path,
+        action_id: str | None = None,
+    ) -> AsyncIterator[tuple[ResourceLease, ...]]:
+        resources = await self.acquire_for_action(
+            lease,
+            request,
+            effect=effect,
+            working_directory=working_directory,
+            action_id=action_id,
+        )
+        heartbeat_task: asyncio.Task[None] | None = None
+        if resources:
+            heartbeat_task = asyncio.create_task(
+                self._heartbeat_loop(lease, resources),
+                name=f"cc-harness-resource-heartbeat-{lease.run_id}-{request.action_id}",
+            )
+        try:
+            yield resources
+        finally:
+            if heartbeat_task is not None:
+                heartbeat_task.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await heartbeat_task
+            with contextlib.suppress(LeaseFenceError, RunStoreError, Exception):
+                await self.release(resources)
+
+    async def _heartbeat_loop(
+        self,
+        lease: Lease,
+        resources: tuple[ResourceLease, ...],
+    ) -> None:
+        interval = max(0.25, min(10.0, self.ttl_seconds / 3.0))
+        while True:
+            await asyncio.sleep(interval)
+            try:
+                await self.renew(resources)
+                # Resource rows are renewed in place; the worker lease itself
+                # remains the fencing authority and is heartbeated separately
+                # by RunWorker.  Do not inspect the immutable Lease handle's
+                # original expiry here: RunWorker renews the same epoch in
+                # place, so a long action must keep its resource lock alive
+                # beyond the first TTL window.
+            except (LeaseFenceError, RunStoreError, Exception):
+                return
+
+
+__all__ = [
+    "LeaseManager",
+    "ResourceLeaseManager",
+    "ResourceSpec",
+    "SupervisorLeaseManager",
+    "resource_specs_for_action",
+]

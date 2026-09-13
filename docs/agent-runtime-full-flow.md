@@ -30,9 +30,9 @@ flowchart TD
     WAIT -.->|依赖完成或用户明确 bypass| QUEUE
 
     subgraph SCHEDULER["调度阶段 Scheduling：谁来执行 Run"]
-        SUP["LocalSupervisor<br/>作用：扫描队列、分配 Worker、维护并发和项目根串行"]
-        SGATE{"Scheduling Gate<br/>作用：检查项目锁、Child/Worktree 冲突和 PlanGraph readiness"]
-        LEASE["Claim Lease + lease_epoch<br/>作用：锁定 Worker，并用 fencing 拒绝旧 Worker 写入"]
+        SUP["LocalSupervisor<br/>作用：扫描队列、分配 Worker、维护并发"]
+        SGATE{"Scheduling Gate<br/>作用：检查 Supervisor 选主、Child/Worktree 冲突和 PlanGraph readiness"]
+        LEASE["SupervisorLease → RunLease<br/>作用：选主、锁定 Worker，并用 fencing 拒绝旧写入"]
         SUP --> SGATE
         SGATE --"未就绪"--> WAIT
         SGATE --"就绪"--> LEASE
@@ -165,8 +165,10 @@ flowchart TD
 | PlanGraph | 任务节点、依赖、文件所有权和执行顺序 |
 | Todo | PlanGraph 的进度投影 |
 | Supervisor | 调度 Run、分配 Worker、回收失效 Worker |
+| SupervisorLease | 项目级选主；只限制调度器，不限制同一项目的并行 Run |
 | Lease | Worker 的临时执行租约 |
 | Fencing / lease_epoch | 防止 Lease 过期的旧 Worker 继续写入 |
+| ResourceLease | 动作级文件、工作区和外部副作用冲突锁；共享读取可并行 |
 | Worker | 真正执行 Run Segment 的进程 |
 | Segment | 绑定一个 PlanNode 的连续模型—工具循环 |
 | Agent Kernel | 调用模型并把模型响应转换为结构化动作或完成候选 |

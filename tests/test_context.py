@@ -157,6 +157,19 @@ def test_find_protect_boundary_clamp_to_last_user():
     assert boundary == 0  # clamped to last_user_idx=0 → all protect
 
 
+def test_find_protect_boundary_allows_oversized_latest_tool():
+    """A tool result larger than the protect zone must remain compactable."""
+    _, _, find_protect_boundary, *_ = _import_context()
+    msgs = [
+        {"role": "system", "content": "policy"},
+        {"role": "tool", "content": "x" * 100},
+    ]
+    # The latest tool is larger than the 8-token protect budget.  Returning
+    # len(messages) makes the tool eligible while system messages remain
+    # skipped by the tier implementation itself.
+    assert find_protect_boundary(msgs, FakeCounter(), 8, preserve_last_user=False) == 2
+
+
 # ============================================================
 # apply_tier1_snip (8 tests)
 # ============================================================
@@ -171,6 +184,24 @@ def test_apply_tier1_snip_tool_head_tail():
     assert result_lines[0] == "L0"
     assert result_lines[1] == "L1"
     assert any("omitted" in ln for ln in result_lines)
+    assert result_lines[-1] == "L9"
+
+
+def test_apply_tier1_snip_json_wrapped_tool_output():
+    """Runtime tool observations wrap multiline output inside compact JSON."""
+    _, _, _, apply_tier1_snip, *_ = _import_context()
+    cfg = _cfg(snip_head_lines=2, snip_tail_lines=1)
+    wrapped = json.dumps(
+        {"status": "succeeded", "content": "\n".join(f"L{i}" for i in range(10))},
+        ensure_ascii=False,
+        sort_keys=True,
+    )
+    msgs = [{"role": "tool", "content": wrapped}]
+    assert apply_tier1_snip(msgs, 1, cfg) == 1
+    decoded = json.loads(msgs[0]["content"])
+    result_lines = decoded["content"].splitlines()
+    assert result_lines[:2] == ["L0", "L1"]
+    assert any("omitted" in line for line in result_lines)
     assert result_lines[-1] == "L9"
 
 
@@ -1074,8 +1105,13 @@ async def test_summary_keeps_offload_source_ref_visible_to_model(tmp_path):
     cfg = _cfg(
         context_window=2000,
         tier1_threshold=0.05,
-        tier2_threshold=0.2,
-        tier3_threshold=0.3,
+        # Keep this fixture in the summary tier.  The purpose of the test is
+        # to verify that the source pointer survives the authoritative summary
+        # rebuild; with a character-counting fake counter the original values
+        # selected SNIP and no transform was eligible for the one-line tool
+        # result.
+        tier2_threshold=0.1,
+        tier3_threshold=0.15,
         protect_zone_tokens=5,
     )
     projection = ContextProjection(source, artifact_dir=tmp_path)

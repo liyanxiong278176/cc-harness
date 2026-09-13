@@ -10,6 +10,7 @@ from cc_harness.prompts import (
     PromptComposer,
     SECTION_POOL,
     build_system_prompt,
+    frontend_design_requested,
 )
 
 
@@ -153,9 +154,34 @@ def test_build_system_prompt_substitutes_cwd():
 def test_interaction_style_matches_webui_reply_contract():
     out = build_system_prompt("/x", mode="coding")
     assert "用户可见回复契约" in out
-    assert "使用用户当前语言" in out
+    assert "默认所有面向用户的自然语言使用简体中文" in out
+    assert "不要直接照搬 provider" in out
+    assert "代码、shell 命令、文件路径" in out
     assert "不要把事件名" in out
     assert "隐藏推理" in out
+
+
+def test_frontend_design_guidance_is_opt_in():
+    plain = build_system_prompt("/x", mode="coding")
+    frontend = build_system_prompt(
+        "/x", mode="coding", extra_ctx={"frontend_design": True}
+    )
+
+    assert "前端设计与实现规范(frontend-design" not in plain
+    assert "前端设计与实现规范(frontend-design" in frontend
+    assert "入口 HTML 必须命名为 `index.html`" in frontend
+    assert '"Created By Deerflow"' in frontend
+    assert "https://deerflow.tech" in frontend
+
+
+def test_frontend_design_request_classifier_requires_an_implementation_signal():
+    assert frontend_design_requested("请实现一个 React 页面") is True
+    assert frontend_design_requested("请修改 src/App.tsx") is True
+    assert frontend_design_requested("build a production web project") is True
+    assert frontend_design_requested("前端是什么") is False
+    assert frontend_design_requested("修复后端 API 超时") is False
+    assert frontend_design_requested("build backend service") is False
+    assert frontend_design_requested("修复 web server 的超时") is False
 
 
 def test_coding_prompt_does_not_treat_stopping_a_failed_retry_as_completion():

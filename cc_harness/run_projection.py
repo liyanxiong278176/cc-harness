@@ -19,6 +19,7 @@ from .run_model import (
     RunStateMachine,
     RunStatus,
     RuntimeContract,
+    action_idempotency_key,
     digest_json,
 )
 from .run_outcomes import RunOutcome, outcome_for_status
@@ -383,6 +384,7 @@ def _action_to_dict(action: ActionAttempt) -> dict[str, Any]:
         "run_id": action.run_id,
         "tool_name": action.tool_name,
         "normalized_args_digest": action.normalized_args_digest,
+        "idempotency_key": action.idempotency_key,
         "effect_class": action.effect_class.value
         if isinstance(action.effect_class, EffectClass)
         else action.effect_class,
@@ -418,6 +420,14 @@ def _action_from_dict(data: Mapping[str, Any]) -> ActionAttempt:
         arguments_artifact=data.get("arguments_artifact"),
         result_artifact=data.get("result_artifact"),
         error_kind=data.get("error_kind"),
+        idempotency_key=str(
+            data.get("idempotency_key")
+            or action_idempotency_key(
+                str(data.get("tool_name", "")),
+                str(data.get("normalized_args_digest", "")),
+                str(data.get("effect_class", EffectClass.UNKNOWN.value)),
+            )
+        ),
     )
 
 
@@ -748,6 +758,14 @@ class ProjectionBuilder:
                 attempt=attempt,
                 lease_epoch=event.lease_epoch,
                 arguments_artifact=payload.get("arguments_artifact"),
+                idempotency_key=str(
+                    payload.get("idempotency_key")
+                    or action_idempotency_key(
+                        str(payload["tool_name"]),
+                        str(payload.get("normalized_args_digest", "")),
+                        str(payload["effect_class"]),
+                    )
+                ),
             )
             return
         if action is None:
@@ -808,6 +826,15 @@ class ProjectionBuilder:
                     if str(item.get("action_id")) != action_id
                 ),
             )
+            for item in event.payload.get("evidence") or ():
+                if not isinstance(item, Mapping):
+                    continue
+                try:
+                    evidence = EvidenceRef.from_dict(item)
+                except (TypeError, ValueError, KeyError):
+                    continue
+                if not any(existing.digest == evidence.digest for existing in state.evidence):
+                    state.evidence.append(evidence)
     def _apply_approval(self, event: RunEvent, state: _MutableProjection) -> None:
         payload = event.payload
         approval_id = str(payload.get("approval_id", ""))

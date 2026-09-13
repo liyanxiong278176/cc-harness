@@ -70,7 +70,7 @@ MEMORY_RECALL_SPEC = {
     "type": "function",
     "function": {
         "name": "memory_recall",
-        "description": "按语义查询长期记忆,返回 top-k 相似记忆。",
+        "description": "按需渐进查询长期记忆，按 L3→L2→L1→L0 返回首个有用层并附检索路径。",
         "parameters": {
             "type": "object",
             "properties": {
@@ -99,6 +99,8 @@ MEMORY_SAVE_SPEC = {
 
 
 def _format_recall_results(results) -> str:
+    if hasattr(results, "layers"):
+        return _format_layered_results(results)
     if not results:
         return "(没有匹配的长期记忆)"
     lines = [f"找到 {len(results)} 条相关记忆:"]
@@ -123,11 +125,26 @@ def _format_save_result(result) -> str:
     return "\n".join(parts)
 
 
-async def memory_recall_handler(args, *, cwd, retriever):
+async def memory_recall_handler(
+    args,
+    *,
+    cwd,
+    retriever,
+    layered_recall=None,
+    session_id: str | None = None,
+):
     query = (args.get("query") or "").strip()
     if not query:
         return ToolResult.error(display="query 不能为空", llm="[Tool Error] query 不能为空")
     try:
+        if layered_recall is not None:
+            result = await layered_recall(
+                query,
+                top_k=int(getattr(retriever, "top_k", 5)),
+                session_id=session_id,
+                progressive=True,
+            )
+            return ToolResult.success(_format_recall_results(result))
         # Phase 2+4: 多 query 重试 + hybrid 召回。
         # attempt=0 用原 query,1..N 用 _rewrite_query 改写。
         # 首次有结果立即返回(避免无谓重试);空结果才重试。
@@ -176,6 +193,29 @@ def _format_preserved_results(results) -> str:
     if errors:
         lines.append("  errors: " + "; ".join(errors))
     return "\n".join(lines)
+
+
+def _format_layered_results(result) -> str:
+    """Render a progressive L3→L0 result with an auditable layer trail."""
+
+    layers = tuple(getattr(result, "layers", ()) or ())
+    lines = [
+        "记忆检索路径: " + (" → ".join(layers) if layers else "无匹配"),
+    ]
+    persona = getattr(result, "persona", None)
+    if persona is not None and getattr(persona, "summary", ""):
+        lines.append(f"[L3] {persona.summary}")
+    for scenario in getattr(result, "scenarios", ()) or ():
+        if getattr(scenario, "summary", ""):
+            lines.append(f"[L2] {scenario.summary}")
+    for item in getattr(result, "atoms", ()) or ():
+        memory = item[0] if isinstance(item, tuple) and item else item
+        if getattr(memory, "text", ""):
+            lines.append(f"[L1] {memory.text} (源: {getattr(memory, 'source', 'memory')})")
+    for item in getattr(result, "conversation", ()) or ():
+        if isinstance(item, dict) and item.get("content"):
+            lines.append(f"[L0] {item.get('role', 'unknown')}: {item['content']}")
+    return "\n".join(lines) if len(lines) > 1 else "(没有匹配的长期记忆)"
 
 
 async def memory_save_handler(

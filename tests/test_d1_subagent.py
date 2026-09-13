@@ -172,6 +172,21 @@ def test_build_subagent_prompt_no_description_no_criteria():
     assert "acceptance_criteria:" not in p
 
 
+def test_build_subagent_frontend_prompt_includes_frontend_guidance_only_for_ui_work():
+    frontend = _build_subagent_system_prompt(
+        task_id="ui-1", title="实现 React 页面", description="补齐页面布局和交互",
+        criteria=["页面在窄屏下可用"], parent_id="p1", depth=1,
+    )
+    backend = _build_subagent_system_prompt(
+        task_id="api-1", title="修复订单 API", description="补充接口测试",
+        criteria=["pytest 通过"], parent_id="p1", depth=1,
+    )
+
+    assert "前端设计与实现规范(frontend-design" in frontend
+    assert "入口 HTML 必须命名为 `index.html`" in frontend
+    assert "前端设计与实现规范(frontend-design" not in backend
+
+
 def test_render_summary_includes_done_state_hint():
     """3 个 subagent 全 done → '父完成门: 全部 done'。"""
     results = [

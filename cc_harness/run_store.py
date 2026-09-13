@@ -4,19 +4,21 @@ from __future__ import annotations
 
 import asyncio
 import json
+import re
 import time
 from contextlib import asynccontextmanager, suppress
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Iterable
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, Mapping
+from uuid import uuid4
 
 import aiosqlite
 
-from .artifacts import ArtifactStore
+from .artifacts import ArtifactStore, GarbageCollectionReport
 from .fact_store import default_user_data_dir, project_identity
 from .run_events import EventActor, EventValidationError, RunEvent
-from .run_model import Lease, Run
+from .run_model import Lease, ResourceLease, Run, SupervisorLease
 from .run_projection import ProjectionBuilder, ProjectionError, RunProjection
 from .sqlite_utils import begin_immediate
 
@@ -35,6 +37,27 @@ class SequenceConflict(RunStoreError):
 
 class LeaseFenceError(RunStoreError):
     """Raised when an event comes from an old worker lease epoch."""
+
+
+class SupervisorLeaseConflict(RunStoreError):
+    """Raised when another live process owns project scheduler leadership."""
+
+
+class SupervisorLeaseFenceError(LeaseFenceError):
+    """Raised when a supervisor heartbeat/release comes from a stale epoch."""
+
+
+class ResourceLeaseConflict(RunStoreError):
+    """Raised when an action resource overlaps another live action lease."""
+
+    def __init__(self, run_id: str, conflicts: tuple[tuple[str, str, str], ...]) -> None:
+        self.run_id = run_id
+        self.conflicts = conflicts
+        rendered = ", ".join(
+            f"{resource_key} ({mode}, run={owner_run_id})"
+            for resource_key, mode, owner_run_id in conflicts
+        )
+        super().__init__(f"resource lease conflict for run {run_id}: {rendered}")
 
 
 class DuplicateEventError(RunStoreError):
@@ -161,6 +184,29 @@ class RunStore:
                 acquired_at REAL NOT NULL,
                 expires_at REAL NOT NULL
             );
+            CREATE TABLE IF NOT EXISTS project_supervisor_lease (
+                project_id TEXT PRIMARY KEY REFERENCES project_record(project_id),
+                owner_id TEXT NOT NULL,
+                epoch INTEGER NOT NULL,
+                acquired_at REAL NOT NULL,
+                heartbeat_at REAL NOT NULL,
+                expires_at REAL NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS run_resource_lease (
+                lease_id TEXT PRIMARY KEY,
+                project_id TEXT NOT NULL REFERENCES project_record(project_id),
+                run_id TEXT NOT NULL REFERENCES run_record(run_id),
+                action_id TEXT,
+                resource_key TEXT NOT NULL,
+                mode TEXT NOT NULL CHECK (mode IN ('shared', 'exclusive')),
+                lease_epoch INTEGER NOT NULL,
+                acquired_at REAL NOT NULL,
+                expires_at REAL NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS run_resource_lease_active_idx
+                ON run_resource_lease(project_id, expires_at);
+            CREATE INDEX IF NOT EXISTS run_resource_lease_run_idx
+                ON run_resource_lease(run_id, lease_epoch);
             CREATE TABLE IF NOT EXISTS run_approval (
                 approval_id TEXT PRIMARY KEY,
                 run_id TEXT NOT NULL REFERENCES run_record(run_id),
@@ -180,7 +226,7 @@ class RunStore:
                 status TEXT NOT NULL,
                 queued_sequence INTEGER NOT NULL
             );
-            CREATE TABLE IF NOT EXISTS action_attempt (
+                CREATE TABLE IF NOT EXISTS action_attempt (
                 run_id TEXT NOT NULL REFERENCES run_record(run_id),
                 action_id TEXT NOT NULL,
                 attempt INTEGER NOT NULL,
@@ -191,10 +237,10 @@ class RunStore:
                 lease_epoch INTEGER NOT NULL,
                 arguments_artifact TEXT,
                 result_artifact TEXT,
-                error_kind TEXT,
-                PRIMARY KEY (run_id, action_id, attempt)
-            );
-
+                    error_kind TEXT,
+                    idempotency_key TEXT NOT NULL DEFAULT '',
+                    PRIMARY KEY (run_id, action_id, attempt)
+             );
             CREATE TRIGGER IF NOT EXISTS run_event_no_update
             BEFORE UPDATE ON run_event BEGIN
                 SELECT RAISE(ABORT, 'run events are immutable');
@@ -219,6 +265,7 @@ class RunStore:
             for table, column, definition in (
                 ("run_record", "lease_epoch", "INTEGER NOT NULL DEFAULT 0"),
                 ("action_attempt", "arguments_artifact", "TEXT"),
+                ("action_attempt", "idempotency_key", "TEXT NOT NULL DEFAULT ''"),
             ):
                 cursor = await self._db.execute(f"PRAGMA table_info({table})")
                 columns = {str(row[1]) for row in await cursor.fetchall()}
@@ -226,6 +273,10 @@ class RunStore:
                     await self._db.execute(
                         f"ALTER TABLE {table} ADD COLUMN {column} {definition}"
                     )
+            await self._db.execute(
+                "CREATE INDEX IF NOT EXISTS action_attempt_idempotency_idx "
+                "ON action_attempt(run_id, idempotency_key)"
+            )
             now = time.time()
             await self._db.execute(
                 "INSERT OR IGNORE INTO project_record(project_id, canonical_root, created_at) VALUES (?, ?, ?)",
@@ -247,6 +298,79 @@ class RunStore:
                     await self._rollback_open_transaction(self._db)
                     await self._db.close()
                     self._db = None
+
+    async def referenced_artifact_digests(self) -> set[str]:
+        """Collect every content digest reachable from the durable runtime.
+
+        Object publication intentionally happens before the event commit.  If a
+        process dies in that gap the object is an orphan; garbage collection
+        must therefore derive roots from immutable event/snapshot payloads and
+        never from a best-effort in-memory list.
+        """
+
+        db = self._require_db()
+        digest_re = re.compile(r"^sha256:[0-9a-f]{64}$")
+        found: set[str] = set()
+
+        def collect(value: Any) -> None:
+            if isinstance(value, str):
+                if digest_re.fullmatch(value):
+                    found.add(value)
+                return
+            if isinstance(value, Mapping):
+                for item in value.values():
+                    collect(item)
+                return
+            if isinstance(value, (list, tuple, set)):
+                for item in value:
+                    collect(item)
+
+        async with self._write_lock:
+            async with self._transaction(db, write=False):
+                cursor = await db.execute(
+                    "SELECT payload_json, artifact_refs_json FROM run_event"
+                )
+                rows = await cursor.fetchall()
+                snapshot_cursor = await db.execute(
+                    "SELECT projection_json FROM run_snapshot"
+                )
+                snapshot_rows = await snapshot_cursor.fetchall()
+        for payload_json, refs_json in rows:
+            for raw in (payload_json, refs_json):
+                try:
+                    collect(json.loads(raw))
+                except (TypeError, ValueError, json.JSONDecodeError):
+                    continue
+        for (projection_json,) in snapshot_rows:
+            try:
+                collect(json.loads(projection_json))
+            except (TypeError, ValueError, json.JSONDecodeError):
+                continue
+        return found
+
+    async def collect_artifact_garbage(
+        self,
+        *,
+        now: float | None = None,
+        grace_period_seconds: float | None = None,
+    ) -> GarbageCollectionReport:
+        """Delete only old objects that are unreachable from durable state."""
+
+        referenced = await self.referenced_artifact_digests()
+        # Temp files are not addressable artifacts and can only be abandoned by
+        # an interrupted atomic publish; clean them independently.
+        self.artifacts.cleanup_temporary_files(
+            older_than_seconds=(
+                self.artifacts.grace_period_seconds
+                if grace_period_seconds is None
+                else max(0.0, float(grace_period_seconds))
+            )
+        )
+        return self.artifacts.collect_garbage(
+            referenced,
+            now=now,
+            grace_period_seconds=grace_period_seconds,
+        )
 
     @staticmethod
     async def _rollback_open_transaction(db: aiosqlite.Connection) -> None:
@@ -611,7 +735,421 @@ class RunStore:
                 cursor = await db.execute(
                     "DELETE FROM run_lease WHERE run_id = ? AND epoch = ?", (run_id, epoch)
                 )
+                # Resource leases are subordinate to the worker lease.  A
+                # terminal worker release must never leave a workspace lock
+                # behind for the next run; crash recovery also removes rows
+                # when the corresponding worker lease expires.
+                await db.execute(
+                    "DELETE FROM run_resource_lease WHERE run_id = ? AND lease_epoch = ?",
+                    (run_id, epoch),
+                )
         return cursor.rowcount == 1
+
+    async def claim_supervisor_lease(
+        self,
+        owner_id: str,
+        *,
+        ttl_seconds: float = 120.0,
+    ) -> SupervisorLease:
+        """Atomically acquire project scheduler leadership.
+
+        The project lease is a leader-election record only.  It does not
+        serialize Runs; the selected supervisor may dispatch as many runs as
+        ``LocalSupervisor.max_workers`` allows.  A takeover advances the
+        epoch, fencing heartbeats from a stale process.
+        """
+
+        owner = str(owner_id).strip()
+        if not owner:
+            raise RunStoreError("supervisor lease owner_id is required")
+        ttl = max(1.0, float(ttl_seconds))
+        db = self._require_db()
+        async with self._write_lock:
+            async with self._transaction(db, write=True):
+                now = time.time()
+                cursor = await db.execute(
+                    """SELECT owner_id, epoch, acquired_at, heartbeat_at, expires_at
+                       FROM project_supervisor_lease WHERE project_id = ?""",
+                    (self.project_id,),
+                )
+                row = await cursor.fetchone()
+                if row is not None and float(row[4]) > now and str(row[0]) != owner:
+                    raise SupervisorLeaseConflict(
+                        f"project {self.project_id} supervisor lease is owned by {row[0]}"
+                    )
+                if row is not None and str(row[0]) == owner and float(row[4]) > now:
+                    epoch = int(row[1])
+                    acquired_at = float(row[2])
+                else:
+                    epoch = (int(row[1]) + 1) if row is not None else 1
+                    acquired_at = now
+                expires_at = now + ttl
+                await db.execute(
+                    """INSERT INTO project_supervisor_lease
+                       (project_id, owner_id, epoch, acquired_at, heartbeat_at, expires_at)
+                       VALUES (?, ?, ?, ?, ?, ?)
+                       ON CONFLICT(project_id) DO UPDATE SET owner_id=excluded.owner_id,
+                       epoch=excluded.epoch, acquired_at=excluded.acquired_at,
+                       heartbeat_at=excluded.heartbeat_at, expires_at=excluded.expires_at""",
+                    (self.project_id, owner, epoch, acquired_at, now, expires_at),
+                )
+                return SupervisorLease(
+                    self.project_id,
+                    owner,
+                    epoch,
+                    acquired_at,
+                    expires_at,
+                    heartbeat_at=now,
+                )
+
+    async def current_supervisor_lease(self) -> SupervisorLease | None:
+        db = self._require_db()
+        async with self._write_lock:
+            async with self._transaction(db, write=False):
+                cursor = await db.execute(
+                    """SELECT project_id, owner_id, epoch, acquired_at, heartbeat_at, expires_at
+                       FROM project_supervisor_lease WHERE project_id = ?""",
+                    (self.project_id,),
+                )
+                row = await cursor.fetchone()
+                if row is None:
+                    return None
+                return SupervisorLease(
+                    str(row[0]),
+                    str(row[1]),
+                    int(row[2]),
+                    float(row[3]),
+                    float(row[5]),
+                    heartbeat_at=float(row[4]),
+                )
+
+    async def heartbeat_supervisor_lease(
+        self,
+        lease: SupervisorLease,
+        *,
+        ttl_seconds: float = 120.0,
+    ) -> SupervisorLease:
+        """Renew leadership only when owner and epoch are still current."""
+
+        if lease.project_id != self.project_id:
+            raise SupervisorLeaseFenceError("supervisor lease belongs to another project")
+        ttl = max(1.0, float(ttl_seconds))
+        db = self._require_db()
+        async with self._write_lock:
+            async with self._transaction(db, write=True):
+                now = time.time()
+                cursor = await db.execute(
+                    """SELECT owner_id, epoch, acquired_at, expires_at
+                       FROM project_supervisor_lease WHERE project_id = ?""",
+                    (self.project_id,),
+                )
+                row = await cursor.fetchone()
+                if (
+                    row is None
+                    or str(row[0]) != lease.owner_id
+                    or int(row[1]) != lease.epoch
+                    or float(row[3]) <= now
+                ):
+                    raise SupervisorLeaseFenceError("supervisor lease is no longer current")
+                expires_at = now + ttl
+                await db.execute(
+                    """UPDATE project_supervisor_lease
+                       SET heartbeat_at = ?, expires_at = ?
+                       WHERE project_id = ? AND owner_id = ? AND epoch = ?""",
+                    (now, expires_at, self.project_id, lease.owner_id, lease.epoch),
+                )
+                return SupervisorLease(
+                    self.project_id,
+                    lease.owner_id,
+                    lease.epoch,
+                    float(row[2]),
+                    expires_at,
+                    heartbeat_at=now,
+                )
+
+    async def release_supervisor_lease(self, lease: SupervisorLease) -> bool:
+        """Release leadership without allowing a stale owner to delete it."""
+
+        if lease.project_id != self.project_id:
+            return False
+        db = self._require_db()
+        async with self._write_lock:
+            async with self._transaction(db, write=True):
+                cursor = await db.execute(
+                    """DELETE FROM project_supervisor_lease
+                       WHERE project_id = ? AND owner_id = ? AND epoch = ?""",
+                    (self.project_id, lease.owner_id, lease.epoch),
+                )
+                return cursor.rowcount == 1
+
+    async def claim_resources(
+        self,
+        run_id: str,
+        lease_epoch: int,
+        resources: Iterable[tuple[str, str]],
+        *,
+        ttl_seconds: float = 120.0,
+        action_id: str | None = None,
+    ) -> tuple[ResourceLease, ...]:
+        """Atomically claim shared/exclusive resources for a worker action.
+
+        Rows are subordinate to the worker ``run_lease`` and are cleaned up
+        whenever that lease is released or expires.  Conflict detection is
+        done inside the same SQLite write transaction, so two processes cannot
+        both observe an available file and acquire it concurrently.
+        """
+
+        if lease_epoch < 1:
+            raise LeaseFenceError("resource lease requires a positive worker epoch")
+        requested: list[tuple[str, str]] = []
+        seen: dict[str, str] = {}
+        for raw_key, raw_mode in resources:
+            key = str(raw_key).strip()
+            mode = str(raw_mode).strip().lower()
+            if not key or mode not in {"shared", "exclusive"}:
+                raise RunStoreError("resource key and mode must be valid")
+            previous = seen.get(key)
+            if previous == "exclusive" or mode == previous:
+                continue
+            if previous == "shared" and mode == "exclusive":
+                seen[key] = mode
+                requested = [(item_key, item_mode) for item_key, item_mode in requested if item_key != key]
+                requested.append((key, mode))
+                continue
+            seen[key] = mode
+            requested.append((key, mode))
+        if not requested:
+            return ()
+        ttl = max(1.0, float(ttl_seconds))
+        db = self._require_db()
+        async with self._write_lock:
+            async with self._transaction(db, write=True):
+                now = time.time()
+                await self._ensure_run(run_id)
+                cursor = await db.execute(
+                    "SELECT epoch, expires_at FROM run_lease WHERE run_id = ?",
+                    (run_id,),
+                )
+                worker_row = await cursor.fetchone()
+                if (
+                    worker_row is None
+                    or int(worker_row[0]) != lease_epoch
+                    or float(worker_row[1]) <= now
+                ):
+                    raise LeaseFenceError("worker lease is not current for resource claim")
+                # A crash can leave a resource row behind until its own TTL.
+                # It is safe to remove it earlier when the owning worker lease
+                # is gone or fenced, which lets a replacement proceed promptly.
+                await db.execute(
+                    """DELETE FROM run_resource_lease
+                       WHERE project_id = ? AND
+                       (expires_at <= ? OR NOT EXISTS (
+                           SELECT 1 FROM run_lease AS worker_lease
+                           WHERE worker_lease.run_id = run_resource_lease.run_id
+                             AND worker_lease.epoch = run_resource_lease.lease_epoch
+                             AND worker_lease.expires_at > ?
+                       ))""",
+                    (self.project_id, now, now),
+                )
+                cursor = await db.execute(
+                    """SELECT resource_key, mode, run_id
+                       FROM run_resource_lease
+                       WHERE project_id = ? AND expires_at > ? AND run_id != ?""",
+                    (self.project_id, now, run_id),
+                )
+                active = tuple(
+                    (str(row[0]), str(row[1]), str(row[2]))
+                    for row in await cursor.fetchall()
+                )
+                conflicts = tuple(
+                    (existing_key, existing_mode, existing_run_id)
+                    for requested_key, requested_mode in requested
+                    for existing_key, existing_mode, existing_run_id in active
+                    if _resource_keys_overlap(requested_key, existing_key)
+                    and (requested_mode == "exclusive" or existing_mode == "exclusive")
+                )
+                if conflicts:
+                    raise ResourceLeaseConflict(run_id, conflicts)
+                expires_at = now + ttl
+                claimed: list[ResourceLease] = []
+                for resource_key, mode in requested:
+                    lease_id = uuid4().hex
+                    await db.execute(
+                        """INSERT INTO run_resource_lease
+                           (lease_id, project_id, run_id, action_id, resource_key, mode,
+                            lease_epoch, acquired_at, expires_at)
+                           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                        (
+                            lease_id,
+                            self.project_id,
+                            run_id,
+                            action_id,
+                            resource_key,
+                            mode,
+                            lease_epoch,
+                            now,
+                            expires_at,
+                        ),
+                    )
+                    claimed.append(
+                        ResourceLease(
+                            lease_id,
+                            self.project_id,
+                            run_id,
+                            resource_key,
+                            mode,
+                            lease_epoch,
+                            now,
+                            expires_at,
+                            action_id=action_id,
+                        )
+                    )
+                return tuple(claimed)
+
+    async def renew_resources(
+        self,
+        leases: Iterable[ResourceLease],
+        *,
+        ttl_seconds: float = 120.0,
+    ) -> tuple[ResourceLease, ...]:
+        """Renew resource rows while fencing stale worker epochs."""
+
+        current_leases = tuple(leases)
+        if not current_leases:
+            return ()
+        ttl = max(1.0, float(ttl_seconds))
+        db = self._require_db()
+        async with self._write_lock:
+            async with self._transaction(db, write=True):
+                now = time.time()
+                renewed: list[ResourceLease] = []
+                for resource in current_leases:
+                    if resource.project_id != self.project_id:
+                        raise LeaseFenceError("resource lease belongs to another project")
+                    cursor = await db.execute(
+                        """SELECT run_id, resource_key, mode, lease_epoch,
+                                  acquired_at, action_id
+                           FROM run_resource_lease WHERE lease_id = ?""",
+                        (resource.lease_id,),
+                    )
+                    row = await cursor.fetchone()
+                    worker_cursor = await db.execute(
+                        "SELECT epoch, expires_at FROM run_lease WHERE run_id = ?",
+                        (resource.run_id,),
+                    )
+                    worker_row = await worker_cursor.fetchone()
+                    if (
+                        row is None
+                        or str(row[0]) != resource.run_id
+                        or int(row[3]) != resource.lease_epoch
+                        or worker_row is None
+                        or int(worker_row[0]) != resource.lease_epoch
+                        or float(worker_row[1]) <= now
+                    ):
+                        raise LeaseFenceError("resource lease is no longer current")
+                    expires_at = now + ttl
+                    await db.execute(
+                        "UPDATE run_resource_lease SET expires_at = ? WHERE lease_id = ?",
+                        (expires_at, resource.lease_id),
+                    )
+                    renewed.append(
+                        ResourceLease(
+                            resource.lease_id,
+                            self.project_id,
+                            resource.run_id,
+                            str(row[1]),
+                            str(row[2]),
+                            resource.lease_epoch,
+                            float(row[4]),
+                            expires_at,
+                            action_id=(str(row[5]) if row[5] is not None else None),
+                        )
+                    )
+                return tuple(renewed)
+
+    async def release_resources(self, leases: Iterable[ResourceLease]) -> int:
+        """Release only the exact resource rows owned by the caller."""
+
+        current_leases = tuple(leases)
+        if not current_leases:
+            return 0
+        db = self._require_db()
+        async with self._write_lock:
+            async with self._transaction(db, write=True):
+                released = 0
+                for resource in current_leases:
+                    cursor = await db.execute(
+                        """DELETE FROM run_resource_lease
+                           WHERE lease_id = ? AND project_id = ? AND run_id = ?
+                             AND lease_epoch = ?""",
+                        (
+                            resource.lease_id,
+                            self.project_id,
+                            resource.run_id,
+                            resource.lease_epoch,
+                        ),
+                    )
+                    released += max(0, int(cursor.rowcount))
+                return released
+
+    async def release_resources_for_run(self, run_id: str, *, lease_epoch: int | None = None) -> int:
+        """Best-effort cleanup used by recovery and terminal transitions."""
+
+        db = self._require_db()
+        async with self._write_lock:
+            async with self._transaction(db, write=True):
+                if lease_epoch is None:
+                    cursor = await db.execute(
+                        "DELETE FROM run_resource_lease WHERE project_id = ? AND run_id = ?",
+                        (self.project_id, run_id),
+                    )
+                else:
+                    cursor = await db.execute(
+                        """DELETE FROM run_resource_lease
+                           WHERE project_id = ? AND run_id = ? AND lease_epoch = ?""",
+                        (self.project_id, run_id, lease_epoch),
+                    )
+                return max(0, int(cursor.rowcount))
+
+    async def list_resource_leases(
+        self,
+        run_id: str | None = None,
+        *,
+        include_expired: bool = False,
+    ) -> tuple[ResourceLease, ...]:
+        """Inspect resource ownership for diagnostics and tests."""
+
+        db = self._require_db()
+        async with self._write_lock:
+            async with self._transaction(db, write=False):
+                query = (
+                    "SELECT lease_id, project_id, run_id, resource_key, mode, "
+                    "lease_epoch, acquired_at, expires_at, action_id "
+                    "FROM run_resource_lease WHERE project_id = ?"
+                )
+                params: list[Any] = [self.project_id]
+                if run_id is not None:
+                    query += " AND run_id = ?"
+                    params.append(run_id)
+                if not include_expired:
+                    query += " AND expires_at > ?"
+                    params.append(time.time())
+                query += " ORDER BY acquired_at, lease_id"
+                cursor = await db.execute(query, tuple(params))
+                return tuple(
+                    ResourceLease(
+                        str(row[0]),
+                        str(row[1]),
+                        str(row[2]),
+                        str(row[3]),
+                        str(row[4]),
+                        int(row[5]),
+                        float(row[6]),
+                        float(row[7]),
+                        action_id=(str(row[8]) if row[8] is not None else None),
+                    )
+                    for row in await cursor.fetchall()
+                )
 
     async def _projection_tx(self, run_id: str, through_sequence: int | None = None) -> RunProjection:
         db = self._require_db()
@@ -657,8 +1195,9 @@ class RunStore:
             await db.execute(
                 """INSERT INTO action_attempt
                    (run_id, action_id, attempt, tool_name, status, effect_class,
-                    contract_digest, lease_epoch, arguments_artifact, result_artifact, error_kind)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                    contract_digest, lease_epoch, arguments_artifact, result_artifact,
+                    error_kind, idempotency_key)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 (
                     projection.run_id,
                     action.action_id,
@@ -671,6 +1210,7 @@ class RunStore:
                     action.arguments_artifact,
                     action.result_artifact,
                     action.error_kind,
+                    action.idempotency_key,
                 ),
             )
         await db.execute("DELETE FROM run_approval WHERE run_id = ?", (projection.run_id,))
@@ -716,6 +1256,14 @@ class RunStore:
                 "UPDATE run_record SET lease_epoch = ? WHERE run_id = ?",
                 (event.lease_epoch, event.run_id),
             )
+            # A fresh worker epoch starts with no resource ownership from a
+            # previously fenced worker.  The old rows are safe to remove here
+            # because the append is already advancing the authoritative run
+            # lease in the same SQLite transaction.
+            await db.execute(
+                "DELETE FROM run_resource_lease WHERE run_id = ?",
+                (event.run_id,),
+            )
             expires_at = float(event.payload.get("expires_at", time.time() + 60.0))
             await db.execute(
                 """INSERT INTO run_lease(run_id, worker_id, epoch, acquired_at, expires_at)
@@ -737,6 +1285,10 @@ class RunStore:
                 (float(event.payload.get("expires_at", time.time() + 60.0)), event.run_id, event.lease_epoch),
             )
         elif event.event_type in {"RunResumed", "RunBlocked", "RunStalled", "RunCancelled", "ApprovalRequested"}:
+            await db.execute(
+                "DELETE FROM run_resource_lease WHERE run_id = ?",
+                (event.run_id,),
+            )
             if event.event_type != "RunResumed":
                 await db.execute("DELETE FROM run_lease WHERE run_id = ?", (event.run_id,))
 
@@ -826,15 +1378,41 @@ class RunStore:
         return self._db
 
 
+def _resource_keys_overlap(left: str, right: str) -> bool:
+    """Return whether two normalized resource keys may touch one another."""
+
+    a = str(left).strip().rstrip("/") or "."
+    b = str(right).strip().rstrip("/") or "."
+    if a == b:
+        return True
+    a_kind, _, a_value = a.partition(":")
+    b_kind, _, b_value = b.partition(":")
+    if a_kind == "project" or b_kind == "project":
+        return True
+    hierarchical = {"path", "workspace"}
+    if a_kind not in hierarchical or b_kind not in hierarchical:
+        return False
+    a_value = a_value.rstrip("/") or "."
+    b_value = b_value.rstrip("/") or "."
+    return (
+        a_value == b_value
+        or a_value.startswith(f"{b_value}/")
+        or b_value.startswith(f"{a_value}/")
+    )
+
+
 __all__ = [
     "AppendEvent",
     "DuplicateEventError",
     "EventPage",
     "LeaseFenceError",
+    "ResourceLeaseConflict",
     "RunNotFound",
     "RunRecordView",
     "RunStore",
     "RunStoreError",
     "SequenceConflict",
+    "SupervisorLeaseConflict",
+    "SupervisorLeaseFenceError",
     "StoredEvent",
 ]

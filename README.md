@@ -226,6 +226,15 @@ cc-harness --tui
 不再是可选择的运行时，也不会作为 Durable Run 的回退或子 agent 执行路径。
 ```
 
+同一项目的并发由三层租约协调：`project_supervisor_lease` 只做 Supervisor
+选主，`run_lease` 栅栏化单个 Worker，`run_resource_lease` 在工具动作边界按
+文件、工作区或外部副作用做共享/独占冲突控制。因此同目录的独立会话可以
+同时运行，重叠写入会等待而不会阻塞无关 Run。详细约定见
+[`docs/runtime-leases.md`](docs/runtime-leases.md)。
+
+中断、超时、工具幂等/对账、artifact 回收及 L3 优先记忆的边界行为见
+[`docs/runtime-recovery-hardening.md`](docs/runtime-recovery-hardening.md)。
+
 提示词采用版本化稳定前缀 + 动态运行时后缀；外部规则已经过审核、适配并固定在
 本地 registry，生产运行时不会联网拉取提示词更新。TUI 的可观测信息只引用安全
 元数据（版本、不可逆 digest、token/cache 计数、压缩统计和错误事实），不会泄露

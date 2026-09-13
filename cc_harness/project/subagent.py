@@ -137,7 +137,11 @@ def _build_subagent_system_prompt(
       保持 subagent 同样受信任边界保护 — 防止 subagent 透过工具返回
       `<untrusted>` 块被 prompt-injection 劫持(纵深防御)。
     """
-    from cc_harness.prompts import SECTION_POOL  # 延迟 import(避免 cc_harness 启动期拽 subagent 链)
+    from cc_harness.prompts import (
+        SECTION_POOL,
+        frontend_design_guidance,
+        frontend_design_requested,
+    )  # 延迟 import(避免 cc_harness 启动期拽 subagent 链)
     # E2 T3.3 fix: SECTION_POOL was refactored from dict to list-of-tuples in
     # 738706b (T2.1). Look up by name instead of dict key.
     hierarchy = next(
@@ -157,6 +161,17 @@ def _build_subagent_system_prompt(
         f"- title: {title}",
         f"- parent_id: {parent_id}",
     ]
+    task_text = " ".join(
+        [
+            str(title or ""),
+            str(description or ""),
+            *(str(item) for item in (criteria or [])),
+        ]
+    )
+    if frontend_design_requested(task_text):
+        # Keep the subagent contract aligned with the parent turn, but only
+        # spend context when this particular child is implementing a UI.
+        parts.extend(["", frontend_design_guidance()])
     if description:
         parts.append(f"- description: {description}")
     if criteria:

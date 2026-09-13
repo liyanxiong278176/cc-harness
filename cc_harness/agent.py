@@ -45,6 +45,7 @@ from cc_harness.loop_control import (
 from cc_harness.mcp_client import ToolResult
 from cc_harness.native_tools import NATIVE_FILE_TOOLS
 from cc_harness.policy import Action, PolicyEngine
+from cc_harness.prompts import PROMPT_VERSION, frontend_design_requested
 from cc_harness.tool_bundles import bundle_digest, select_tool_specs
 from cc_harness.reflection.events import (  # E2 T2.2:反思事件工厂
     empty_turn_loop,
@@ -170,7 +171,7 @@ _LAYERED_MEMORY_BLOCK_RE = re.compile(
 
 
 def _render_layered_memory_block(recall) -> str:
-    """Render the automatic L2/L3 snapshot; L1 remains tool-driven."""
+    """Render the automatic L3 persona snapshot; lower layers stay tool-driven."""
     sections: list[str] = []
     if recall.persona:
         sections.append(f"## 用户画像\n{recall.persona.summary[:200]}")
@@ -254,9 +255,10 @@ async def run_turn(
     to match the current mode before the first LLM call. If `cwd` is None,
     the caller is responsible for having the right system prompt in place.
 
-    `memory_layer`(Q3 Task7)可选会话级分层记忆注入。首次 pre-turn 召回 L2/L3，
-    后续根据 version 指纹复用缓存；版本变化才替换。L1 不自动注入，由模型调用
-    memory_recall 按需取得。None 或缺 "recall" 键 = kill-switch；异常 fail-soft。
+    `memory_layer`(Q3 Task7)可选会话级分层记忆注入。首次 pre-turn 只注入 L3
+    persona 快照，后续根据 version 指纹复用缓存；版本变化才替换。L2/L1/L0
+    不自动注入，由模型调用 `memory_recall` 按 L3→L2→L1→L0 逐层取得。
+    None 或缺 "recall" 键 = kill-switch；异常 fail-soft。
 
     `offload_deps`(Q4 Task5)可选短期符号化卸载:after-tool-call hook,tool result
     token > threshold → 落 refs + 摘要 + Mermaid canvas,messages 历史只留 pointer。
@@ -391,6 +393,22 @@ async def run_turn(
         else:
             messages.insert(0, {"role": "system", "content": system_prompt})
     elif refresh_system_prompt and cwd is not None:
+        # Frontend design guidance is opt-in.  Detect only the latest user
+        # request so backend/Runtime/test turns do not inherit UI-specific
+        # instructions or spend context on them.
+        _latest_user_content = next(
+            (
+                item.get("content", "")
+                for item in reversed(messages)
+                if item.get("role") == "user"
+            ),
+            "",
+        )
+        _frontend_extra = (
+            {"frontend_design": True}
+            if frontend_design_requested(_latest_user_content)
+            else {}
+        )
         _prompt_capabilities = {
             "todo_available": True,
             "subagent_available": True,
@@ -425,6 +443,7 @@ async def run_turn(
             _refresh_system_prompt(
                 messages, cwd, mode,
                 extra_ctx={"qa_category": qa_context["q_type"], **_neg_extra, **_e1_extra,
+                           **_frontend_extra,
                            "e3_prior_messages": prior_messages},  # E3
                 resume_task=resume_task,
                 todo_hints=todo_hints,
@@ -435,7 +454,7 @@ async def run_turn(
         else:
             _refresh_system_prompt(
                 messages, cwd, mode,
-                extra_ctx={**_neg_extra, **_e1_extra,
+                extra_ctx={**_neg_extra, **_e1_extra, **_frontend_extra,
                            "e3_prior_messages": prior_messages},  # E3
                 resume_task=resume_task,
                 todo_hints=todo_hints,
@@ -444,9 +463,10 @@ async def run_turn(
                  project_instructions=project_instructions,
             )
 
-    # --- Q3 Task7: 会话级 L2/L3 快照注入 ---
-    # 首回合 recall；后续只比较轻量 version fingerprint。版本未变复用缓存，
-    # 版本变化才重新 recall 并替换旧块。L1 不自动注入，由模型按需调用 memory_recall。
+    # --- Q3 Task7: 会话级 L3 快照注入 ---
+    # 首回合只注入 L3 persona；后续只比较轻量 version fingerprint。版本未变复用缓存，
+    # 版本变化才重新 recall 并替换旧块。L2/L1/L0 由模型按需调用 memory_recall，
+    # 按 L3→L2→L1→L0 逐层检索。
     # Q3 Recall Hardening (2026-07-30 LoCoMo full-run bug fix): 外层加
     # asyncio.wait_for(timeout=10) 防 recall 永远 hang 把整条 run_turn 卡死。
     # 原始 bug: runner.py:223 await run_turn → agent.py:315 await recall → 永远
@@ -1047,7 +1067,7 @@ async def run_turn(
         from cc_harness.prompt_rules import production_rule_metadata
         rule_metadata = production_rule_metadata()
         prompt_metadata = {
-            "version": "core-v2",
+            "version": PROMPT_VERSION,
             "digest": hashlib.sha256(system_content.encode("utf-8")).hexdigest(),
             "system_tokens": cats["system_prompt"],
             "rules_version": rule_metadata["version"],

@@ -60,6 +60,28 @@ def test_layered_config_propagates_memory_environment_with_same_precedence(tmp_p
     assert cfg.runtime_environment["EMBEDDING_MODEL"] == "project-embedding"
 
 
+def test_layered_config_propagates_context_environment_with_same_precedence(tmp_path):
+    project = tmp_path / "project"
+    user = tmp_path / "user"
+    project.mkdir()
+    user.mkdir()
+    (user / ".env").write_text(
+        "OPENAI_API_KEY=k\nOPENAI_BASE_URL=https://api\nOPENAI_MODEL=m\n"
+        "CONTEXT_WINDOW=64000\nCONTEXT_PROVIDER_SAFETY_FACTOR=0.8\n",
+        encoding="utf-8",
+    )
+    (project / ".env").write_text(
+        "CONTEXT_WINDOW=10000\nCONTEXT_OUTPUT_RESERVE_TOKENS=0\n",
+        encoding="utf-8",
+    )
+
+    cfg = load_layered_config(project, user_root=user, environ={})
+
+    assert cfg.runtime_environment["CONTEXT_WINDOW"] == "10000"
+    assert cfg.runtime_environment["CONTEXT_OUTPUT_RESERVE_TOKENS"] == "0"
+    assert cfg.runtime_environment["CONTEXT_PROVIDER_SAFETY_FACTOR"] == "0.8"
+
+
 def test_layered_config_propagates_tool_bundle_selection(tmp_path):
     project = tmp_path / "project"
     project.mkdir()

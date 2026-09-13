@@ -30,7 +30,14 @@ class MemoryRetriever:
         self.token_budget = token_budget
         self.drift_detector = drift_detector
 
-    async def search(self, query: str, top_k: int = 5, *, turn_idx: int | None = None) -> list:
+    async def search(
+        self,
+        query: str,
+        top_k: int = 5,
+        *,
+        turn_idx: int | None = None,
+        layers: set[str] | tuple[str, ...] | None = None,
+    ) -> list:
         # M2: turn_idx 优先用 caller 传,None 时退占位(向后兼容)
         actual_turn_idx = turn_idx if turn_idx is not None else 0
         embedding = await self._embedder.embed(query)
@@ -43,7 +50,7 @@ class MemoryRetriever:
                 logger.warning("touch_recall failed (non-fatal): %s", e)
         from cc_harness.memory.maintenance.recall_weight import RecallWeighter
         weighter = RecallWeighter()
-        weighted = weighter.apply(results)
+        weighted = weighter.apply(self._filter_layers(results, layers))
 
         # E5 drift 检测(召出后, ≥2 同 entity 才判)
         if self.drift_detector is not None and weighted:
@@ -70,6 +77,7 @@ class MemoryRetriever:
         entities: list[str] | None = None,
         dates: list[str] | None = None,
         session_ids: set[str] | None = None,
+        layers: set[str] | tuple[str, ...] | None = None,
     ) -> list:
         """混合召回:vector + FTS5 → RRF 合并(Phase 4)。
 
@@ -103,9 +111,9 @@ class MemoryRetriever:
                 query_variants.append(variant)
 
         # 并行跑向量和一个或两个 FTS 变体。
-        vec_task = asyncio.create_task(self._search_vec_only(query, top_k * 2))
+        vec_task = asyncio.create_task(self._search_vec_only(query, top_k * 2, layers=layers))
         fts_tasks = [
-            asyncio.create_task(self._search_fts_only(item, top_k * 2))
+            asyncio.create_task(self._search_fts_only(item, top_k * 2, layers=layers))
             for item in query_variants
         ]
         vec_results, *fts_batches = await asyncio.gather(vec_task, *fts_tasks)
@@ -133,6 +141,8 @@ class MemoryRetriever:
         query_dates = dates if dates is not None else extract_dates(query)
         merged = []
         for mem, vec_s, fts_s in scores.values():
+            if not self._layer_allowed(mem, layers):
+                continue
             if session_ids is not None and mem.session_id not in session_ids:
                 continue
             rrf = alpha * vec_s + (1 - alpha) * fts_s
@@ -163,16 +173,20 @@ class MemoryRetriever:
                 logger.warning("touch_recall failed after hybrid search: %s", exc)
         return selected
 
-    async def _search_vec_only(self, query: str, k: int) -> list:
+    async def _search_vec_only(
+        self, query: str, k: int, *, layers: set[str] | tuple[str, ...] | None = None
+    ) -> list:
         try:
-            return await self.search(query, top_k=k)
+            return await self.search(query, top_k=k, layers=layers)
         except Exception as e:
             logger.warning("_search_vec_only failed, returning []: %s", e)
             return []
 
-    async def _search_fts_only(self, query: str, k: int) -> list:
+    async def _search_fts_only(
+        self, query: str, k: int, *, layers: set[str] | tuple[str, ...] | None = None
+    ) -> list:
         try:
-            return await self._store.search_fts(query, k=k)
+            return self._filter_layers(await self._store.search_fts(query, k=k), layers)
         except Exception as e:
             logger.warning("_search_fts_only failed, returning []: %s", e)
             return []
@@ -202,3 +216,21 @@ class MemoryRetriever:
         if len(lines) == 1:  # only header
             return ""
         return "\n".join(lines)
+
+    @staticmethod
+    def _layer_allowed(memory, layers: set[str] | tuple[str, ...] | None) -> bool:
+        if layers is None:
+            return True
+        allowed = {str(item).upper() for item in layers}
+        return str(getattr(memory, "layer", "L1")).upper() in allowed
+
+    @classmethod
+    def _filter_layers(cls, results: list, layers) -> list:
+        if layers is None:
+            return list(results or ())
+        return [
+            item for item in (results or ())
+            if isinstance(item, tuple)
+            and item
+            and cls._layer_allowed(item[0], layers)
+        ]

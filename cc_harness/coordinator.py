@@ -6,7 +6,7 @@ import json
 import uuid
 from collections.abc import Mapping
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, Sequence
 
 from .approvals import ApprovalDecision, ApprovalService
 from .artifacts import ArtifactStore
@@ -14,6 +14,7 @@ from .followups import FollowUpService
 from .goals import GoalAssessment, GoalContractService
 from .run_events import EventActor, RunEvent
 from .run_model import (
+    ActionStatus,
     CandidateChangeSet,
     EffectClass,
     GoalContract,
@@ -233,6 +234,97 @@ class RunCoordinator:
     async def inspect(self, run_id: str) -> RunView:
         projection = await self.store.load_projection(run_id)
         return RunView(run_id, projection.status, projection.sequence, projection)
+
+    async def reconcile_action(
+        self,
+        run_id: str,
+        action_id: str,
+        resolved_status: ActionStatus | str,
+        *,
+        result_artifact: str | None = None,
+        error_kind: str | None = None,
+        evidence: Sequence[Mapping[str, Any]] = (),
+        reason: str = "external effect reconciled by client",
+    ) -> RunView:
+        """Resolve one durable ``outcome_unknown`` action without replaying it.
+
+        A reconciliation is an explicit operator/provider observation.  The
+        runtime accepts only an action that is already uncertain and only the
+        terminal succeeded/failed statuses; callers must resume the run after a
+        successful reconciliation if more model work is required.
+        """
+
+        try:
+            target = resolved_status if isinstance(resolved_status, ActionStatus) else ActionStatus(str(resolved_status))
+        except ValueError as exc:
+            raise ValueError("reconciliation status must be succeeded or failed") from exc
+        if target not in {ActionStatus.SUCCEEDED, ActionStatus.FAILED}:
+            raise ValueError("reconciliation status must be succeeded or failed")
+        view = await self.inspect(run_id)
+        matching_actions = [
+            item for item in view.projection.actions if item.action_id == action_id
+        ]
+        # A retry keeps the logical action id but advances its attempt.  Always
+        # reconcile the newest attempt; resolving an older unknown attempt
+        # would leave the current one blocked and could authorize a replay.
+        action = max(matching_actions, key=lambda item: item.attempt) if matching_actions else None
+        if action is None:
+            raise ValueError(f"action does not exist: {action_id}")
+        if action.status is not ActionStatus.OUTCOME_UNKNOWN:
+            raise ValueError(
+                f"action {action_id} is {action.status.value}; only outcome_unknown can be reconciled"
+            )
+        reconcilable_statuses = {
+            RunStatus.RUNNING,
+            RunStatus.BLOCKED,
+            RunStatus.CANCELLED,
+            RunStatus.STALLED,
+            RunStatus.FAILED_RECOVERABLE,
+        }
+        if view.status not in reconcilable_statuses:
+            raise ValueError(f"run {run_id} is not at a reconciliation boundary")
+        actor = EventActor("client", "local-client")
+        await self._append(
+            run_id,
+            "ReconciliationStarted",
+            {
+                "action_id": action_id,
+                "attempt": action.attempt,
+                "reason": reason,
+            },
+            actor,
+        )
+        payload: dict[str, Any] = {
+            "action_id": action_id,
+            "resolved_status": target.value,
+            "attempt": action.attempt,
+            "reason": reason,
+        }
+        if result_artifact:
+            payload["result_artifact"] = result_artifact
+        if error_kind:
+            payload["error_kind"] = error_kind
+        if evidence:
+            payload["evidence"] = [dict(item) for item in evidence]
+        artifact_refs = tuple(
+            str(item)
+            for item in (
+                [result_artifact] if result_artifact else []
+            )
+            + [
+                str(item.get("digest"))
+                for item in evidence
+                if isinstance(item, Mapping) and item.get("digest")
+            ]
+        )
+        await self._append(
+            run_id,
+            "ReconciliationResolved",
+            payload,
+            actor,
+            artifact_refs=artifact_refs,
+        )
+        return await self.inspect(run_id)
 
     async def interrupt(self, run_id: str, reason: str) -> ControlReceipt:
         view = await self.inspect(run_id)

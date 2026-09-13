@@ -8,11 +8,20 @@ import logging
 import time
 from collections.abc import Callable
 from dataclasses import dataclass
+from uuid import uuid4
 
 from .followups import FollowUpService
 from .run_model import RunStatus
-from .lease import LeaseManager
-from .run_store import RunStore
+from .lease import (
+    LeaseManager,
+    ResourceLeaseManager,
+    SupervisorLeaseManager,
+)
+from .run_store import (
+    RunStore,
+    SupervisorLeaseConflict,
+    SupervisorLeaseFenceError,
+)
 from .worker import RunWorker
 
 
@@ -60,6 +69,16 @@ class LocalSupervisor:
         self._loop_task: asyncio.Task | None = None
         self._stopping = False
         self._lease_manager = LeaseManager(store)
+        self.supervisor_id = f"supervisor-{uuid4().hex}"
+        self._supervisor_lease_manager = SupervisorLeaseManager(
+            store,
+            owner_id=self.supervisor_id,
+            ttl_seconds=self.lease_ttl_seconds,
+        )
+        self._resource_manager = ResourceLeaseManager(
+            store,
+            ttl_seconds=self.lease_ttl_seconds,
+        )
         self._followups = FollowUpService(store)
 
     async def start(self) -> None:
@@ -72,9 +91,11 @@ class LocalSupervisor:
             with contextlib.suppress(asyncio.CancelledError, Exception):
                 self._loop_task.exception()
         self._stopping = False
+        await self._ensure_supervisor_lease()
         self._loop_task = asyncio.create_task(self._run_loop(), name="cc-harness-supervisor")
 
     async def tick(self) -> SupervisorStats:
+        await self._ensure_supervisor_lease()
         finished = [run_id for run_id, (task, _worker) in self._active.items() if task.done()]
         for run_id in finished:
             task, _worker = self._active.pop(run_id)
@@ -128,6 +149,11 @@ class LocalSupervisor:
                         self.store,
                         ttl_seconds=self.lease_ttl_seconds,
                     )
+                # Resource ownership is shared by every worker under this
+                # supervisor.  Custom workers may opt into their own manager;
+                # the default path receives the durable project-scoped one.
+                if getattr(worker, "resource_manager", None) is None:
+                    worker.resource_manager = self._resource_manager
                 try:
                     lease = await worker.claim(record.run_id)
                 except Exception:  # noqa: BLE001 - one run cannot stop siblings
@@ -138,6 +164,25 @@ class LocalSupervisor:
                 self._active[record.run_id] = (task, worker)
         queued = await self.store.list_runs({RunStatus.QUEUED.value})
         return SupervisorStats(tuple(sorted(self._active)), len(queued))
+
+    async def _ensure_supervisor_lease(self) -> None:
+        """Ensure this process still owns the project scheduler lease."""
+
+        current = self._supervisor_lease_manager.current
+        now = time.time()
+        if current is not None and current.expires_at - now > self.lease_ttl_seconds / 3.0:
+            return
+        try:
+            if current is not None and not current.is_expired(now):
+                await self._supervisor_lease_manager.heartbeat()
+            else:
+                await self._supervisor_lease_manager.acquire()
+        except (SupervisorLeaseConflict, SupervisorLeaseFenceError):
+            # Once leadership is lost this supervisor must stop dispatching;
+            # the next leader will reclaim expired Run leases.  Raising keeps
+            # direct callers informed while the loop handler exits cleanly.
+            self._stopping = True
+            raise
 
     async def _recover_stale_active_workers(self) -> None:
         """Fence and requeue active workers whose lease stopped renewing.
@@ -182,10 +227,13 @@ class LocalSupervisor:
     async def _select_ready_records(self, capacity: int):
         """Select only dependency-ready work from the run PlanGraphs.
 
-        Root runs are serialized per project. Child runs can share capacity only
-        when their parent graph declares the nodes ready and their owned paths
-        are disjoint. Follow-ups use the predecessor gate and never inherit a
-        parent's full transcript as a scheduling shortcut.
+        The project supervisor lease elects a scheduler; it is not an
+        execution mutex.  Root sessions are therefore allowed to occupy
+        independent worker slots at the same time.  Actual file, workspace,
+        and external-effect conflicts are arbitrated by the durable
+        ``run_resource_lease`` table at each action boundary.  Follow-ups and
+        child runs still honor predecessor/dependency gates and the parent's
+        declared child concurrency limit.
         """
 
         records = await self.store.list_runs({RunStatus.QUEUED.value})
@@ -197,42 +245,8 @@ class LocalSupervisor:
             for record in all_records
             if record.run_id not in self._active
         }
-        active_records = [
-            record
-            for record in all_records
-            if record.status
-            in {
-                RunStatus.RUNNING.value,
-                RunStatus.CANCEL_REQUESTED.value,
-                RunStatus.AWAITING_APPROVAL.value,
-            }
-        ]
-        # The store is project-scoped: an active child/follow-up also occupies
-        # the project root gate, even if its parent root has yielded.
-        active_root = bool(active_records)
         selected = []
-        selected_roots = 0
-        selected_child = False
         selected_child_paths: list[str] = []
-        selected_child_worktrees: list[str] = []
-        active_child_paths: list[str] = []
-        active_child_worktrees: list[str] = []
-        active_unscoped_child = False
-        active_unisolated_child = False
-        for active in active_records:
-            if active.parent_run_id is None:
-                continue
-            paths = await self._record_owned_paths(active, projections)
-            worktree = await self._record_worktree(active, projections)
-            read_only = await self._record_effect_class(active, projections) == "read_only"
-            active_child_paths.extend(paths)
-            if worktree or read_only:
-                active_child_worktrees.append(worktree)
-            else:
-                active_unisolated_child = True
-            active_unscoped_child = active_unscoped_child or (not read_only and not paths and not worktree)
-        selected_unscoped_child = False
-        selected_unisolated_child = False
         for record in records:
             if len(selected) >= capacity:
                 break
@@ -242,12 +256,7 @@ class LocalSupervisor:
             if projection is not None and projection.discovery_status == "awaiting":
                 continue
             if record.parent_run_id is None:
-                if active_root or selected_roots or selected_child:
-                    continue
                 selected.append(record)
-                selected_roots += 1
-                continue
-            if selected_roots:
                 continue
             if not await self._record_is_ready(
                 record,
@@ -257,49 +266,8 @@ class LocalSupervisor:
             ):
                 continue
             node_paths = await self._record_owned_paths(record, projections)
-            node_worktree = await self._record_worktree(record, projections)
-            node_read_only = await self._record_effect_class(record, projections) == "read_only"
-            if not node_read_only and (active_unscoped_child or selected_unscoped_child):
-                continue
-            if not node_read_only and (active_unisolated_child or selected_unisolated_child):
-                continue
-            if node_worktree and node_worktree in tuple(item for item in (*active_child_worktrees, *selected_child_worktrees) if item):
-                continue
-            if any(
-                _paths_overlap(left, right)
-                for left in node_paths
-                for right in (*selected_child_paths, *active_child_paths)
-            ):
-                continue
-            # An unscoped child has no proof that it owns an isolated
-            # workspace. It may run alone, but it cannot join a parallel
-            # cohort with another active/selected child.
-            if not node_read_only and not node_paths and (selected_child_paths or active_child_paths):
-                continue
-            if not node_read_only and not node_worktree and (
-                selected_child_paths
-                or active_child_paths
-                or selected_child_worktrees
-                or active_child_worktrees
-            ):
-                continue
-            if not node_read_only and not node_paths and any(
-                item.parent_run_id == record.parent_run_id for item in all_records
-                if item.run_id != record.run_id and item.status in {
-                    RunStatus.RUNNING.value,
-                    RunStatus.AWAITING_APPROVAL.value,
-                    RunStatus.CANCEL_REQUESTED.value,
-                }
-            ):
-                continue
             selected.append(record)
-            selected_child = True
             selected_child_paths.extend(node_paths)
-            if node_worktree or node_read_only:
-                selected_child_worktrees.append(node_worktree)
-            else:
-                selected_unisolated_child = True
-            selected_unscoped_child = selected_unscoped_child or (not node_read_only and not node_paths and not node_worktree)
         return tuple(selected)
 
     async def _record_is_ready(self, record, *, all_records, projections, selected_child_paths) -> bool:
@@ -429,6 +397,8 @@ class LocalSupervisor:
             await asyncio.gather(*tasks, return_exceptions=True)
         self._active.clear()
         self._worker_tasks.clear()
+        with contextlib.suppress(Exception):
+            await self._supervisor_lease_manager.release()
 
     async def _run_loop(self) -> None:
         while not self._stopping:
@@ -442,6 +412,12 @@ class LocalSupervisor:
                     self.tick_timeout,
                 )
                 await asyncio.sleep(self.poll_interval)
+            except (SupervisorLeaseConflict, SupervisorLeaseFenceError):
+                # Leadership is exclusive.  A replacement supervisor owns
+                # recovery now; this process must not continue dispatching.
+                _LOGGER.info("project supervisor lease lost; stopping scheduler")
+                self._stopping = True
+                return
             except Exception:  # noqa: BLE001 - one transient tick must not kill recovery
                 # SQLite contention, a malformed projection, or a transient
                 # provider-side callback must not silently terminate the only

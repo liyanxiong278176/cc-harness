@@ -76,7 +76,7 @@ async def build_memory_extras(
             memory_recall_handler, memory_save_handler,
         )
         from cc_harness.memory.pipeline import MemoryPipeline
-        from cc_harness.memory.recall import layered_memory_fingerprint, layered_recall
+        from cc_harness.memory.recall import l3_memory_fingerprint, layered_recall
         from cc_harness.llm import LLMClient
     except ImportError as e:
         print(f"[memory] import failed: {e}; running without memory tools")
@@ -157,6 +157,9 @@ async def build_memory_extras(
             timeout_s=kw.get(
                 "timeout_s", memory_config.recall_timeout_s if memory_config else 5.0
             ),
+            layers=kw.get("layers"),
+            session_id=kw.get("session_id"),
+            progressive=bool(kw.get("progressive", True)),
         )
 
     read_only = str(env.get("MEMORY_READ_ONLY", "")).casefold() in {"1", "true", "yes"}
@@ -164,7 +167,15 @@ async def build_memory_extras(
         "1", "true", "yes"
     }
     extras: list[dict] = [
-        {"spec": MEMORY_RECALL_SPEC, "handler": memory_recall_handler, "deps": {"retriever": retriever}},
+        {
+            "spec": MEMORY_RECALL_SPEC,
+            "handler": memory_recall_handler,
+            "deps": {
+                "retriever": retriever,
+                "layered_recall": _recall,
+                "session_id": env.get("MEMORY_SESSION_ID"),
+            },
+        },
     ]
     if history_mode:
         extras.append(
@@ -186,7 +197,7 @@ async def build_memory_extras(
         )
 
     async def _context_recall(_q="", **kw):
-        """Automatic session injection reads L2/L3 only; L1 stays tool-driven."""
+        """Automatic session injection is deliberately limited to L3 persona."""
         return await layered_recall(
             retriever, persona_path, scenarios_dir, "",
             top_k=kw.get(
@@ -196,10 +207,11 @@ async def build_memory_extras(
                 "timeout_s", memory_config.recall_timeout_s if memory_config else 5.0
             ),
             include_atoms=False,
+            layers=("L3",),
         )
 
     def _context_version():
-        return layered_memory_fingerprint(persona_path, scenarios_dir)
+        return l3_memory_fingerprint(persona_path)
 
     layered_injection = {
         "recall": _context_recall,

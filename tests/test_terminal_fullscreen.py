@@ -177,7 +177,7 @@ def test_conversation_projection_switches_to_compact_header_after_submit(fullscr
 
 def test_inspector_context_exposes_metadata_but_not_prompt_text(fullscreen_app):
     fullscreen_app.runtime.prompt_metadata = {
-        "version": "core-v2",
+        "version": "core-v3",
         "digest": "a" * 64,
         "cache_epoch": "epoch-1",
         "tool_bundle_digest": "b" * 64,
@@ -187,7 +187,7 @@ def test_inspector_context_exposes_metadata_but_not_prompt_text(fullscreen_app):
     text = "".join(fragment[1] for fragment in lines)
     assert "prompt text: hidden" in text
     assert "must never be rendered" not in text
-    assert "core-v2" in text
+    assert "core-v3" in text
 
 
 def test_rewind_overlay_is_an_in_app_card(fullscreen_app):

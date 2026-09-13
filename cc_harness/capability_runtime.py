@@ -441,15 +441,16 @@ class AgentCapabilityRuntime:
     ) -> ContextBuild:
         """Build one model projection from authoritative history.
 
-        L2/L3 memory is a projection-only snapshot.  It is not included in
+        L3 persona memory is a projection-only snapshot.  It is not included in
         the authoritative source digest used by compaction, so a changed
         memory file cannot invalidate or fork the durable context chain.  The
         snapshot fingerprint and body artifact are persisted in the same
         SQLite state database and reused after a worker restart.  L1 facts are
-        only returned by the explicit ``memory_recall`` tool.
+        returned by the explicit ``memory_recall`` tool, which progressively
+        searches L3 → L2 → L1 → L0 on demand.
         """
 
-        del query  # retained as a compatibility parameter; no automatic L1 search
+        del query  # retained as a compatibility parameter; automatic injection is L3-only
         interaction = await materialize_interaction_messages(self.store, projection)
         source: list[dict[str, Any]] = [
             dict(message) for message in base_messages if not message.get("_memory_block")
@@ -771,14 +772,14 @@ class AgentCapabilityRuntime:
             "memory_recall": bool(memory_snapshot_changed),
             "memory_snapshot_reused": bool(memory_snapshot_reused),
             "memory_injection_mode": (
-                "l2_l3_snapshot" if layered_enabled and isinstance(layered, Mapping) else "disabled"
+                "l3_snapshot" if layered_enabled and isinstance(layered, Mapping) else "disabled"
             ),
             "memory_injection_fingerprint": memory_fingerprint,
             "memory_injection_artifact": memory_block_artifact,
             "memory_degraded_reason": memory_degraded_reason,
             "tool_specs": len(tool_specs),
             "compaction_tier": int(stats.tier),
-            "compaction_applied": bool(int(stats.tier) > 0 or stats.summarized),
+            "compaction_applied": bool(stats.applied),
             "compaction_before_tokens": int(stats.before_tokens),
             "compaction_after_tokens": int(stats.after_tokens),
             "compaction_ratio_before": float(stats.ratio_before),
@@ -1047,7 +1048,7 @@ def _render_recall(result: Any) -> str:
 
 
 def _truncate_memory_block(text: str, counter: TokenCounter, max_tokens: int) -> str:
-    """Bound advisory L2/L3 memory before it enters a model request.
+    """Bound the advisory L3 memory snapshot before it enters a model request.
 
     Memory is a projection, not authoritative history.  A deterministic
     token cap prevents a large scenario/persona file from consuming the

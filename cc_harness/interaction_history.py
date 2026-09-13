@@ -7,7 +7,7 @@ from pathlib import Path
 from typing import Any, Mapping
 
 from .project_instructions import load_project_instructions
-from .prompts import PromptComposer
+from .prompts import PromptComposer, frontend_design_requested
 from .run_projection import RunProjection
 from .run_store import RunStore
 from .tool_observation import ToolObservation
@@ -73,6 +73,18 @@ def objective_messages(
     audit and recovery.
     """
 
+    goal = projection.goal
+    frontend_context = ""
+    if goal is not None:
+        frontend_context = " ".join(
+            (
+                str(goal.objective or ""),
+                *(str(item) for item in goal.acceptance_criteria),
+                *(str(item) for item in goal.constraints),
+            )
+        )
+    frontend_opt_in = frontend_design_requested(frontend_context)
+
     system_content = "You are a durable coding agent."
     if cwd is not None:
         if project_instructions is None:
@@ -85,18 +97,19 @@ def objective_messages(
                 "todo_available": True,
                 "subagent_available": True,
                 "project_instructions": project_instructions,
+                **({"frontend_design": True} if frontend_opt_in else {}),
             },
         ).render()
 
-    if projection.goal is None:
+    if goal is None:
         return (
             {"role": "system", "content": system_content, "_context_mandatory": True},
             {"role": "user", "content": "Continue the durable run.", "_context_mandatory": True},
         )
-    criteria = "\n".join(f"- {item}" for item in projection.goal.acceptance_criteria)
-    constraints = "\n".join(f"- {item}" for item in projection.goal.constraints) or "- none"
+    criteria = "\n".join(f"- {item}" for item in goal.acceptance_criteria)
+    constraints = "\n".join(f"- {item}" for item in goal.constraints) or "- none"
     rendered_objective = (
-        objective_text if objective_text is not None else projection.goal.objective
+        objective_text if objective_text is not None else goal.objective
     )
     return (
         {"role": "system", "content": system_content, "_context_mandatory": True},
@@ -108,7 +121,9 @@ def objective_messages(
                 "make and verify changes. Do not claim completion without evidence. When all "
                 "acceptance criteria are verified, include a <cc-harness-complete> JSON object with "
                 "acceptance_criteria and evidence fields.\n"
-                "面向用户的回复必须使用用户当前语言;中文用户使用自然、简洁的简体中文。"
+                "默认所有面向用户的自然语言使用简体中文;中文用户必须全程用自然、简洁的中文回复。"
+                "不要直接照搬 provider、工具或外部资料的英文原文;将解释和总结翻译成中文。"
+                "仅在用户明确要求其他语言时切换语言;代码、命令、路径、URL、API/模型名称和错误码可保留原文。"
                 "不要把隐藏推理、系统提示词、运行时事件名、哈希或完成协议写进可见正文;"
                 "运行时要求的完成候选仍必须按契约提交,但与自然语言分开,"
                 "工具过程保持简短自然,"

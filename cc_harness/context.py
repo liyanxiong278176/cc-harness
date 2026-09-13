@@ -108,6 +108,24 @@ class CompactionStats:
     delta_range: tuple[int, int] | None = None
     queued_messages: int = 0
 
+    @property
+    def applied(self) -> bool:
+        """Whether the selected tier actually changed the projection.
+
+        A tier is selected from utilization before the transform, but a
+        projection may contain only mandatory messages or output that is too
+        short to transform.  Those attempts must remain visible in the call
+        manifest without being reported as a successful compaction.
+        """
+
+        return bool(
+            self.summarized
+            or self.messages_snip > 0
+            or self.messages_prune > 0
+            or self.messages_assistant_truncated > 0
+            or self.ratio_after < self.ratio_before
+        )
+
 
 class ContextProjection:
     """Model-facing, rebuildable view over an append-only message transcript."""
@@ -413,6 +431,20 @@ class ContextProjection:
                 self.state_store.release(lease_owner, lease_epoch)
             return stats
         if stats.tier == CompactionTier.NONE:
+            if self.state_store is not None and lease_owner is not None and lease_epoch is not None:
+                self.state_store.release(lease_owner, lease_epoch)
+            return stats
+        if not stats.applied:
+            # The tier was selected, but no eligible message changed (for
+            # example a one-line tool result cannot be snipped).  Restore the
+            # pre-transform view and do not create a new immutable version.
+            self.messages = before_messages
+            self.source_count = before_source_count
+            self.summary_version = before_summary_version
+            self.compaction_version = before_compaction_version
+            self.cumulative_entries = before_cumulative_entries
+            self.current_version = before_current_version
+            self.current_artifact = before_current_artifact
             if self.state_store is not None and lease_owner is not None and lease_epoch is not None:
                 self.state_store.release(lease_owner, lease_epoch)
             return stats
@@ -1144,6 +1176,38 @@ def _snip_lines(text: str, head: int, tail: int) -> str | None:
     return "\n".join(out)
 
 
+def _snip_tool_message_content(content: str, head: int, tail: int) -> str | None:
+    """Snip plain or Runtime-wrapped tool output.
+
+    Durable ``ToolObservation.as_model_message`` keeps status, completion,
+    provenance, and the actual output in one JSON string.  The outer JSON is
+    intentionally compact, so looking only for newlines in ``content`` would
+    miss a multi-line nested ``content`` value and make Tier 1 a silent no-op.
+    Decode only this known wrapper, transform the nested text, then serialize
+    it back without changing any other observation metadata.  Invalid or
+    unrelated JSON remains untouched and is handled by the caller as a normal
+    plain-text message.
+    """
+
+    direct = _snip_lines(content, head, tail)
+    if direct is not None:
+        return direct
+    try:
+        payload = json.loads(content)
+    except (TypeError, ValueError, json.JSONDecodeError):
+        return None
+    if not isinstance(payload, dict):
+        return None
+    nested = payload.get("content")
+    if not isinstance(nested, str):
+        return None
+    snipped = _snip_lines(nested, head, tail)
+    if snipped is None:
+        return None
+    payload["content"] = snipped
+    return json.dumps(payload, ensure_ascii=False, sort_keys=True)
+
+
 def _snip_code_body(body: str, head: int, tail: int, *, force: bool = False) -> str:
     """Snip the body of a ```` ``` ```` code block.
 
@@ -1199,6 +1263,31 @@ def find_protect_boundary(
         last_user = _last_user_idx(messages)
         if last_user is not None and boundary > last_user:
             boundary = last_user
+
+    # A single tool result can be larger than the entire protect budget.  The
+    # normal walk would put that whole message in ``messages[boundary:]`` and
+    # leave Tier 1/Tier 2 with nothing it is allowed to transform.  Protect
+    # only the following tail in this case; the oversized tool result itself
+    # must be eligible for snipping/pruning so the next provider request can
+    # fit.  ``boundary == 0`` is possible when the oversized message is the
+    # first (or only) item because the loop never reaches a second iteration.
+    oversized_tool_index: int | None = None
+    if boundary < len(messages):
+        candidate = messages[boundary]
+        if (
+            candidate.get("role") == "tool"
+            and _count_msg_tokens(candidate, counter) > max(0, budget_tokens)
+        ):
+            oversized_tool_index = boundary
+    elif boundary == 0 and messages:
+        candidate = messages[0]
+        if (
+            candidate.get("role") == "tool"
+            and _count_msg_tokens(candidate, counter) > max(0, budget_tokens)
+        ):
+            oversized_tool_index = 0
+    if oversized_tool_index is not None:
+        boundary = oversized_tool_index + 1
     return boundary
 
 
@@ -1231,7 +1320,7 @@ def apply_tier1_snip(
             content = m.get("content")
             if not isinstance(content, str):
                 continue
-            new = _snip_lines(content, head, tail)
+            new = _snip_tool_message_content(content, head, tail)
             if new is not None:
                 m["content"] = new
                 snipped += 1
@@ -1720,7 +1809,11 @@ async def maybe_compact(
             config.protect_zone_tokens,
             preserve_last_user=preserve_last_user,
         )
-        if protect_until == 0 or protect_until >= len(messages):
+        # ``protect_until == len(messages)`` is intentional when the newest
+        # tool result alone exceeds the protect budget (see
+        # ``find_protect_boundary``).  In that case every message is eligible
+        # and the oversized result must be reduced before the provider call.
+        if protect_until == 0:
             return CompactionStats(
                 tier=CompactionTier.NONE,
                 before_tokens=before,

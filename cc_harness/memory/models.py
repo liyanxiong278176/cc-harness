@@ -26,7 +26,12 @@ class Persona:
 
 @dataclass
 class RecallResult:
-    """分层召回结果(高层 Persona/Scenario + 底层 Atom)。"""
+    """分层召回结果(高层 Persona/Scenario + 底层 Atom/L0 对话)。"""
     persona: Persona | None = None
     scenarios: list[Scenario] = field(default_factory=list)
     atoms: list = field(default_factory=list)
+    conversation: list[dict] = field(default_factory=list)
+    # Audit trail for progressive retrieval.  Older callers can ignore these
+    # fields; new callers can explain exactly which layers were consulted.
+    layers: tuple[str, ...] = ()
+    next_layer: str | None = None

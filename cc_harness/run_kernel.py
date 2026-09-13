@@ -8,7 +8,7 @@ import uuid
 from dataclasses import dataclass, field
 from typing import Any, Mapping, Protocol, Sequence
 
-from .run_model import CompletionCandidate, EffectClass, RunProgress
+from .run_model import CompletionCandidate, EffectClass, RunProgress, action_idempotency_key
 from .run_projection import RunProjection
 
 
@@ -23,11 +23,42 @@ class ActionRequest:
     arguments: Mapping[str, Any]
     effect_class: EffectClass | str = EffectClass.UNKNOWN
     requires_approval: bool = False
+    # Providers may supply an application/external idempotency key alongside
+    # the tool arguments.  It is persisted separately from ``arguments`` so a
+    # restart can reconstruct the exact key without leaking it into the tool
+    # payload or changing the semantic argument digest.
+    idempotency_key: str | None = None
+
+    def __post_init__(self) -> None:
+        explicit = self.idempotency_key
+        if explicit is None:
+            explicit = self.arguments.get("idempotency_key") or self.arguments.get(
+                "_cc_idempotency_key"
+            )
+        object.__setattr__(
+            self,
+            "idempotency_key",
+            action_idempotency_key(
+                self.tool_name,
+                self.normalized_args_digest,
+                self.effect_class,
+                str(explicit) if explicit is not None else None,
+            ),
+        )
 
     @property
     def normalized_args_digest(self) -> str:
+        # Internal/provider idempotency metadata is not part of the semantic
+        # action arguments.  Excluding it makes a crash/replan with the same
+        # external key stable even if the metadata is injected at another
+        # protocol layer.
+        arguments = {
+            key: value
+            for key, value in self.arguments.items()
+            if str(key) not in {"idempotency_key", "_cc_idempotency_key"}
+        }
         encoded = json.dumps(
-            self.arguments,
+            arguments,
             ensure_ascii=False,
             sort_keys=True,
             separators=(",", ":"),
@@ -147,6 +178,7 @@ class ReActKernel:
                             else request.effect_class
                         ),
                         "normalized_args_digest": request.normalized_args_digest,
+                        "idempotency_key": request.idempotency_key,
                     },
                 )
             )
@@ -206,6 +238,11 @@ class ReActKernel:
             arguments=dict(raw_arguments),
             effect_class=effect,
             requires_approval=bool(call.get("requires_approval", False)),
+            idempotency_key=(
+                str(call["idempotency_key"])
+                if call.get("idempotency_key") is not None
+                else None
+            ),
         )
 
 

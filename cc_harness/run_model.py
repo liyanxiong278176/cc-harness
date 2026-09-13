@@ -119,6 +119,30 @@ class EffectClass(str, Enum):
     UNKNOWN = "unknown"
 
 
+def action_idempotency_key(
+    tool_name: str,
+    normalized_args_digest: str,
+    effect_class: EffectClass | str,
+    explicit: str | None = None,
+) -> str:
+    """Return the stable semantic identity of a tool action.
+
+    ``action_id`` identifies one model message and therefore changes after a
+    crash/replan.  This key deliberately excludes it so recovery can detect a
+    duplicate side effect.  Callers may provide an application-owned key when
+    the external API has a stronger idempotency contract.
+    """
+
+    if explicit is not None and str(explicit).strip():
+        return str(explicit).strip()
+    effect = effect_class.value if isinstance(effect_class, EffectClass) else str(effect_class)
+    return digest_json({
+        "tool_name": str(tool_name),
+        "normalized_args_digest": str(normalized_args_digest),
+        "effect_class": effect,
+    })
+
+
 @dataclass(frozen=True)
 class EvidenceRef:
     """A verifiable reference; the content itself may live in object storage."""
@@ -561,6 +585,7 @@ class ActionAttempt:
     arguments_artifact: str | None = None
     result_artifact: str | None = None
     error_kind: str | None = None
+    idempotency_key: str = ""
 
     def __post_init__(self) -> None:
         if not self.action_id or not self.run_id or not self.tool_name:
@@ -625,6 +650,64 @@ class Lease:
             raise DomainValidationError("lease epoch must be positive")
         if self.expires_at <= self.acquired_at:
             raise DomainValidationError("lease expiry must be after acquisition")
+
+    def is_expired(self, now: float | None = None) -> bool:
+        return (time.time() if now is None else now) >= self.expires_at
+
+
+@dataclass(frozen=True)
+class SupervisorLease:
+    """Project-scoped scheduler leadership lease.
+
+    This lease elects the process allowed to dispatch work.  It is separate
+    from the per-run :class:`Lease` held by a worker so one supervisor can
+    schedule multiple runs concurrently while a second scheduler is fenced.
+    """
+
+    project_id: str
+    owner_id: str
+    epoch: int
+    acquired_at: float
+    expires_at: float
+    heartbeat_at: float | None = None
+
+    def __post_init__(self) -> None:
+        if not self.project_id or not self.owner_id:
+            raise DomainValidationError("supervisor lease project and owner are required")
+        if self.epoch < 1:
+            raise DomainValidationError("supervisor lease epoch must be positive")
+        if self.expires_at <= self.acquired_at:
+            raise DomainValidationError("supervisor lease expiry must be after acquisition")
+
+    def is_expired(self, now: float | None = None) -> bool:
+        return (time.time() if now is None else now) >= self.expires_at
+
+
+@dataclass(frozen=True)
+class ResourceLease:
+    """Lease for one workspace or external resource used by an action."""
+
+    lease_id: str
+    project_id: str
+    run_id: str
+    resource_key: str
+    mode: str
+    lease_epoch: int
+    acquired_at: float
+    expires_at: float
+    action_id: str | None = None
+
+    def __post_init__(self) -> None:
+        if not self.lease_id or not self.project_id or not self.run_id:
+            raise DomainValidationError("resource lease identifiers are required")
+        if not self.resource_key:
+            raise DomainValidationError("resource lease resource_key is required")
+        if self.mode not in {"shared", "exclusive"}:
+            raise DomainValidationError("resource lease mode must be shared or exclusive")
+        if self.lease_epoch < 1:
+            raise DomainValidationError("resource lease epoch must be positive")
+        if self.expires_at <= self.acquired_at:
+            raise DomainValidationError("resource lease expiry must be after acquisition")
 
     def is_expired(self, now: float | None = None) -> bool:
         return (time.time() if now is None else now) >= self.expires_at
@@ -944,8 +1027,24 @@ class RunStateMachine:
         "MemoryCheckpointCommitted": set(RunStatus),
         "PredecessorHandoffCommitted": set(RunStatus),
         "ChildDelegationCommitted": {RunStatus.RUNNING, RunStatus.QUEUED},
-        "ReconciliationStarted": {RunStatus.RUNNING, RunStatus.BLOCKED},
-        "ReconciliationResolved": {RunStatus.RUNNING, RunStatus.BLOCKED},
+        # Reconciliation is the explicit way to resolve an external effect
+        # after cancellation, a stall diagnosis, or a recoverable worker
+        # failure.  These states are intentionally still operator-repairable;
+        # terminally completed/failed runs remain immutable.
+        "ReconciliationStarted": {
+            RunStatus.RUNNING,
+            RunStatus.BLOCKED,
+            RunStatus.CANCELLED,
+            RunStatus.STALLED,
+            RunStatus.FAILED_RECOVERABLE,
+        },
+        "ReconciliationResolved": {
+            RunStatus.RUNNING,
+            RunStatus.BLOCKED,
+            RunStatus.CANCELLED,
+            RunStatus.STALLED,
+            RunStatus.FAILED_RECOVERABLE,
+        },
         "ProgressRecorded": {RunStatus.RUNNING},
         "TodoCreated": {RunStatus.DRAFT, RunStatus.QUEUED, RunStatus.RUNNING},
         "TodoUpdated": {RunStatus.QUEUED, RunStatus.RUNNING, RunStatus.BLOCKED},
@@ -1068,6 +1167,9 @@ __all__ = [
     "RunStateMachine",
     "RunStatus",
     "RuntimeContract",
+    "ResourceLease",
+    "SupervisorLease",
+    "action_idempotency_key",
     "digest_json",
     "predecessor_gate",
 ]

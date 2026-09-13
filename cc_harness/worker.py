@@ -13,6 +13,7 @@ import os
 import traceback
 import re
 import time
+import uuid
 from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any, Awaitable, Callable, Mapping, Sequence
@@ -21,7 +22,7 @@ from .action_contracts import ToolContractRegistry
 from .activation import ActivationManifest
 from .capability_runtime import AgentCapabilityRuntime
 from .interaction_history import assistant_message, materialize_interaction_messages, objective_messages
-from .lease import LeaseManager
+from .lease import LeaseManager, ResourceLeaseManager
 from .loop_control import (
     TaskContract,
     artifact_validation_issues,
@@ -69,6 +70,69 @@ ChildCompletionCallback = Callable[[str, CompletionCandidate], Awaitable[None]]
 ChildCancellationCallback = Callable[[str, str], Awaitable[None]]
 ChildFailureCallback = Callable[[str, str], Awaitable[None]]
 WorkingDirectoryResolver = Callable[[str], Awaitable[Path]]
+
+
+class ModelInvocationTimeout(RuntimeError):
+    """The provider did not finish one model segment before its watchdog."""
+
+
+def _bounded_timeout(value: float | int | None, *, default: float, minimum: float = 0.1) -> float:
+    """Normalize a watchdog duration without allowing an accidental infinity."""
+
+    if value is None:
+        return default
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError):
+        return default
+    if parsed <= 0:
+        return 0.0
+    return max(minimum, min(parsed, 3600.0))
+
+
+async def _cancel_task_bounded(task: asyncio.Task, *, grace_seconds: float = 0.2) -> bool:
+    """Request cancellation without waiting forever for a non-cooperative task.
+
+    ``asyncio.wait_for(task, timeout=...)`` first cancels *and then waits for
+    the cancellation to finish*.  A provider that catches ``CancelledError``
+    can therefore defeat the timeout and keep the Worker stuck in its own
+    cleanup path.  ``asyncio.wait`` has a real wall-clock bound: unfinished
+    tasks are deliberately retained as orphans and their durable action stays
+    ``outcome_unknown`` until reconciliation.
+    """
+
+    if task.done():
+        with contextlib.suppress(asyncio.CancelledError, Exception):
+            task.result()
+        return True
+    task.cancel()
+    try:
+        done, _pending = await asyncio.wait(
+            {task}, timeout=max(0.0, float(grace_seconds))
+        )
+    except asyncio.CancelledError:
+        # The owning Worker is itself being cancelled.  Do not turn cleanup
+        # into another unbounded await; the event loop will finish the orphan
+        # when it can, while the Worker persists the safe unknown outcome.
+        return False
+    if task in done:
+        with contextlib.suppress(asyncio.CancelledError, Exception):
+            task.result()
+        return True
+    # Keep the eventual exception from becoming an un-retrieved-task warning.
+    # The orphan is intentionally not awaited here: a provider that ignores
+    # cancellation must not hold the Worker hostage.  Its durable action is
+    # already ``outcome_unknown`` and remains eligible for reconciliation.
+    task.add_done_callback(_consume_orphan_task_result)
+    return False
+
+
+def _consume_orphan_task_result(task: asyncio.Task) -> None:
+    """Drain a detached provider/action task once it eventually finishes."""
+
+    with contextlib.suppress(BaseException):
+        task.result()
+
 
 _SENSITIVE_KEY = re.compile(
     r"(?:api.?key|access.?token|authorization|cookie|credential|password|passwd|private.?key|secret|token)",
@@ -190,6 +254,7 @@ class RunWorker:
         *,
         worker_id: str,
         lease_manager: LeaseManager | None = None,
+        resource_manager: ResourceLeaseManager | None = None,
         action_executor: ActionExecutor | None = None,
         contracts: ToolContractRegistry | None = None,
         completion_verifier: CompletionVerifier | None = None,
@@ -205,12 +270,18 @@ class RunWorker:
         child_failure_callback: ChildFailureCallback | None = None,
         working_directory_resolver: WorkingDirectoryResolver | None = None,
         permission_mode: str = "default",
+        action_timeout_seconds: float | None = None,
+        model_timeout_seconds: float | None = None,
     ) -> None:
         self.store = store
         self.kernel = kernel
         self.worker_id = worker_id
         self._uses_default_lease_manager = lease_manager is None
         self.lease_manager = lease_manager or LeaseManager(store)
+        # The supervisor injects one project-backed manager shared by its
+        # workers.  Keeping this optional preserves direct worker/test usage
+        # while making durable action conflicts visible across processes.
+        self.resource_manager = resource_manager
         self.action_executor = action_executor
         self.contracts = contracts or ToolContractRegistry.first_party()
         self.completion_verifier = completion_verifier
@@ -231,9 +302,23 @@ class RunWorker:
         self.child_failure_callback = child_failure_callback
         self.working_directory_resolver = working_directory_resolver
         self.permission_mode = normalize_permission_mode(permission_mode)
+        self.action_timeout_seconds = _bounded_timeout(
+            action_timeout_seconds
+            if action_timeout_seconds is not None
+            else os.getenv("CC_HARNESS_ACTION_TIMEOUT_SECONDS"),
+            default=300.0,
+        )
+        self.model_timeout_seconds = _bounded_timeout(
+            model_timeout_seconds
+            if model_timeout_seconds is not None
+            else os.getenv("CC_HARNESS_MODEL_TIMEOUT_SECONDS"),
+            default=300.0,
+        )
         self.working_directory: Path = self.store.project_root
         self._active_node_id: str | None = None
         self._event_lock = asyncio.Lock()
+        self._execution_task: asyncio.Task | None = None
+        self._cancellation_watchdog_task: asyncio.Task | None = None
 
     def _requires_approval(self, request: ActionRequest) -> bool:
         """Apply the selected mode to a model action and its durable contract.
@@ -260,6 +345,11 @@ class RunWorker:
             raise RuntimeError("worker lease expired before execution")
         heartbeat_task: asyncio.Task[None] | None = None
         current_lease = lease
+        self._execution_task = asyncio.current_task()
+        self._cancellation_watchdog_task = asyncio.create_task(
+            self._cancellation_watchdog(lease.run_id, self._execution_task),
+            name=f"cc-harness-cancel-watchdog-{lease.run_id}",
+        )
         try:
             projection = await self.store.load_projection(lease.run_id)
             if self.working_directory_resolver is not None:
@@ -348,8 +438,8 @@ class RunWorker:
                         projection,
                         messages,
                         self.available_tools,
-                        # Automatic memory injection is an L2/L3 snapshot;
-                        # concrete L1 recall remains an explicit model tool.
+                        # Automatic memory injection is an L3 persona snapshot;
+                        # explicit memory_recall progressively searches L3→L0.
                         query="",
                     )
                     messages = context_build.messages
@@ -373,6 +463,7 @@ class RunWorker:
                                 "ratio_before": context_build.compaction.ratio_before,
                                 "ratio_after": context_build.compaction.ratio_after,
                                 "summarized": context_build.compaction.summarized,
+                                "applied": context_build.compaction.applied,
                                 "error": context_build.compaction.error,
                             },
                             "effective_context_window": context_build.effective_context_window,
@@ -426,8 +517,7 @@ class RunWorker:
                     if context_overflow and not compaction_error:
                         compaction_error = "mandatory context overflow after compaction"
                     if (
-                        int(context_build.compaction.tier) > 0
-                        or context_build.compaction.summarized
+                        context_build.compaction.applied
                         or compaction_error
                     ):
                         await self._append(
@@ -442,6 +532,7 @@ class RunWorker:
                                 "after_tokens": context_build.compaction.after_tokens,
                                 "ratio_before": context_build.compaction.ratio_before,
                                 "ratio_after": context_build.compaction.ratio_after,
+                                "applied": context_build.compaction.applied,
                                 "effective_context_window": context_build.effective_context_window,
                                 "provider_safety_factor": context_build.provider_safety_factor,
                             },
@@ -462,7 +553,13 @@ class RunWorker:
                         )
                         return
                 round_index = len(projection.actions)
-                invocation_id = f"model-{lease.run_id}-{segment}-{round_index}"
+                # ``segment``/``round`` describe the logical position but are
+                # not unique across a durable resume: a stalled no-action
+                # turn can be resumed with the same pair.  A fresh nonce is
+                # therefore part of every invocation identity so usage
+                # aggregation, WebUI latest-call telemetry, and audit joins
+                # never collapse two real provider requests into one.
+                invocation_id = f"model-{lease.run_id}-{uuid.uuid4().hex}"
                 await self._append(
                     current_lease,
                     "ModelInvocationStarted",
@@ -499,7 +596,7 @@ class RunWorker:
                 invocation_error: str | None = None
                 outcome = None
                 try:
-                    outcome = await self.kernel.execute_segment(context)
+                    outcome = await self._execute_model_segment(context)
                     invocation_status = "succeeded"
                 except asyncio.CancelledError as exc:
                     invocation_status = "cancelled"
@@ -607,12 +704,20 @@ class RunWorker:
                     break
 
                 had_action = True
-                requests = tuple(
-                    request
-                    for request in outcome.action_requests
-                    if not self._action_already_committed(projection, request)
+                requests, duplicate_inflight = self._deduplicate_action_requests(
+                    projection, outcome.action_requests
                 )
                 if not requests:
+                    if duplicate_inflight:
+                        await self._append(
+                            current_lease,
+                            "RunBlocked",
+                            {
+                                "reason": "duplicate action requires durable reconciliation",
+                                "action_ids": [request.action_id for request in outcome.action_requests],
+                            },
+                        )
+                        return
                     if outcome.progress is not None:
                         await self._append(
                             current_lease,
@@ -701,6 +806,17 @@ class RunWorker:
                 had_action=had_action,
                 had_progress=had_progress,
             )
+        except asyncio.CancelledError:
+            # Ctrl+C/cancel is delivered by the watchdog as soon as the client
+            # appends InterruptRequested.  Before acknowledging it, close every
+            # started action conservatively: a started effect without a durable
+            # observation is *unknown*, never silently successful.
+            with contextlib.suppress(Exception):
+                projection = await self.store.load_projection(lease.run_id)
+                if projection.status in {RunStatus.CANCEL_REQUESTED, RunStatus.CANCELLED}:
+                    await self._finalize_interruption(current_lease, "cancel requested")
+                    return
+            raise
         except LeaseFenceError:
             # A supervisor may reclaim an expired lease while a provider or
             # subprocess is still unwinding.  The old worker is intentionally
@@ -751,6 +867,12 @@ class RunWorker:
                     )
             raise
         finally:
+            if self._cancellation_watchdog_task is not None:
+                self._cancellation_watchdog_task.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await self._cancellation_watchdog_task
+                self._cancellation_watchdog_task = None
+            self._execution_task = None
             if heartbeat_task is not None:
                 heartbeat_task.cancel()
                 with contextlib.suppress(asyncio.CancelledError):
@@ -779,6 +901,105 @@ class RunWorker:
                 current = await self.heartbeat(current)
             except Exception:  # noqa: BLE001 - the owning segment will be fenced on its next write
                 return
+
+    async def _cancellation_watchdog(
+        self, run_id: str, execution_task: asyncio.Task | None
+    ) -> None:
+        """Turn a durable cancellation request into prompt task cancellation.
+
+        The coordinator intentionally writes InterruptRequested first so an
+        in-flight effect remains auditable.  Polling the authoritative
+        projection avoids waiting for a lease TTL and works for provider calls,
+        subprocesses, and custom action executors alike.
+        """
+
+        if execution_task is None:
+            return
+        while not execution_task.done():
+            await asyncio.sleep(0.05)
+            try:
+                projection = await self.store.load_projection(run_id)
+            except Exception:
+                continue
+            if projection.status in {RunStatus.CANCEL_REQUESTED, RunStatus.CANCELLED}:
+                if not execution_task.done():
+                    execution_task.cancel()
+                return
+
+    async def _execute_model_segment(self, context: SegmentContext):
+        """Run one provider segment behind a bounded, cancellation-safe task."""
+
+        if self.model_timeout_seconds == 0:
+            return await self.kernel.execute_segment(context)
+        task = asyncio.create_task(
+            self.kernel.execute_segment(context),
+            name=f"cc-harness-model-{context.run_id}-{context.lease_epoch}",
+        )
+        try:
+            return await asyncio.wait_for(asyncio.shield(task), self.model_timeout_seconds)
+        except asyncio.TimeoutError as exc:
+            # Give cooperative adapters a short opportunity to close their HTTP
+            # stream.  A non-cooperative provider is intentionally left as an
+            # orphan task: the durable worker is failed/recoverable and will
+            # never replay its model result as an action without a new segment.
+            await _cancel_task_bounded(task)
+            raise ModelInvocationTimeout(
+                f"model segment timed out after {self.model_timeout_seconds:.3f}s"
+            ) from exc
+        except asyncio.CancelledError:
+            await _cancel_task_bounded(task)
+            raise
+
+    async def _finalize_interruption(self, lease: Lease, reason: str) -> None:
+        """Persist safe cancellation outcomes before ``RunCancelled``."""
+
+        projection = await self.store.load_projection(lease.run_id)
+        for action in projection.actions:
+            if action.status in {ActionStatus.PLANNED, ActionStatus.PREPARED}:
+                await self._append(
+                    lease,
+                    "ActionCancelled",
+                    {
+                        "action_id": action.action_id,
+                        "attempt": action.attempt,
+                        "cancellation_reason": reason,
+                    },
+                )
+                continue
+            if action.status is not ActionStatus.STARTED:
+                continue
+            observation, observation_artifact = await self._find_action_observation(
+                lease.run_id, action.action_id, action.attempt
+            )
+            if observation is None:
+                effect = action.effect_class.value if isinstance(action.effect_class, EffectClass) else str(action.effect_class)
+                observation = make_observation(
+                    action_id=action.action_id,
+                    attempt=action.attempt,
+                    tool_name=action.tool_name,
+                    status="unknown",
+                    effect_class=effect,
+                    text="action interrupted before its external outcome was durable",
+                    error_kind="interrupted_before_observation",
+                    recovery="reconcile",
+                    provenance=("durable-cancellation", "watchdog"),
+                    metadata={"requires_reconciliation": True, "interrupted": True},
+                )
+                observation_ref = self.store.artifacts.put_text(
+                    json.dumps(
+                        observation.to_dict(),
+                        ensure_ascii=False,
+                        sort_keys=True,
+                        separators=(",", ":"),
+                    ),
+                    media_type="application/json; purpose=tool-observation-cancellation",
+                )
+                observation_artifact = observation_ref.digest
+                await self._append_observation_event(lease, observation, observation_artifact)
+            await self._append_recovered_terminal(
+                lease, action, observation, observation_artifact
+            )
+        await self._acknowledge_cancellation(lease, reason)
 
     async def _execute_granted_actions(self, lease: Lease, projection: RunProjection) -> bool:
         granted = {item.action_id for item in projection.approvals if item.status.value == "granted"}
@@ -830,6 +1051,7 @@ class RunWorker:
                 arguments=arguments,
                 effect_class=action.effect_class,
                 requires_approval=False,
+                idempotency_key=action.idempotency_key,
             )
             status = await self._execute_action(
                 lease,
@@ -885,6 +1107,7 @@ class RunWorker:
                     arguments=arguments,
                     effect_class=action.effect_class,
                     requires_approval=False,
+                    idempotency_key=action.idempotency_key,
                 )
                 status = await self._execute_action(
                     lease,
@@ -954,6 +1177,7 @@ class RunWorker:
                         arguments=retry_arguments,
                         effect_class=action.effect_class,
                         requires_approval=False,
+                        idempotency_key=action.idempotency_key,
                     )
                     retry_status = await self._execute_action(
                         lease,
@@ -1155,18 +1379,71 @@ class RunWorker:
         return len(projection.progress) + len(projection.actions) + 1
 
     @staticmethod
-    def _action_already_committed(projection: RunProjection, request: ActionRequest) -> bool:
-        return any(
-            action.action_id == request.action_id
-            and action.status
-            in {
+    def _deduplicate_action_requests(
+        projection: RunProjection,
+        requests: Sequence[ActionRequest],
+    ) -> tuple[tuple[ActionRequest, ...], bool]:
+        """Select one executable request per semantic action key.
+
+        The durable projection is loaded before a model batch is parsed.  A
+        provider can nevertheless return duplicate calls in that same batch,
+        so a local key set closes the intra-response race before any executor
+        is invoked.  ``True`` means at least one request was already in flight
+        and requires reconciliation/blocking rather than a blind replay.
+        """
+
+        duplicate_inflight = False
+        request_buffer: list[ActionRequest] = []
+        seen_idempotency_keys: set[str] = set()
+        for request in requests:
+            if request.idempotency_key in seen_idempotency_keys:
+                duplicate_inflight = True
+                continue
+            seen_idempotency_keys.add(request.idempotency_key)
+            duplicate_status = RunWorker._action_deduplication_status(projection, request)
+            if duplicate_status in {
                 ActionStatus.SUCCEEDED,
                 ActionStatus.FAILED,
                 ActionStatus.CANCELLED,
+            }:
+                continue
+            if duplicate_status in {
+                ActionStatus.PLANNED,
+                ActionStatus.PREPARED,
+                ActionStatus.STARTED,
                 ActionStatus.OUTCOME_UNKNOWN,
-            }
+            }:
+                duplicate_inflight = True
+                continue
+            request_buffer.append(request)
+        return tuple(request_buffer), duplicate_inflight
+
+    @staticmethod
+    def _action_deduplication_status(
+        projection: RunProjection, request: ActionRequest
+    ) -> ActionStatus | None:
+        """Find the durable receipt for an action or semantic duplicate."""
+
+        candidates = [
+            action
             for action in projection.actions
-        )
+            if action.action_id == request.action_id
+            or (
+                action.idempotency_key
+                and action.idempotency_key == request.idempotency_key
+            )
+        ]
+        if not candidates:
+            return None
+        return max(candidates, key=lambda item: (item.attempt, item.action_id)).status
+
+    def _action_already_committed(self, projection: RunProjection, request: ActionRequest) -> bool:
+        return self._action_deduplication_status(projection, request) in {
+            ActionStatus.SUCCEEDED,
+            ActionStatus.FAILED,
+            ActionStatus.CANCELLED,
+            ActionStatus.OUTCOME_UNKNOWN,
+        }
 
     async def _execute_request_batch(
         self,
@@ -2022,6 +2299,41 @@ class RunWorker:
         planned: bool = False,
         attempt: int = 1,
     ) -> ActionStatus:
+        """Execute one action while holding its durable resource leases."""
+
+        if self.resource_manager is None:
+            return await self._execute_action_unlocked(
+                lease,
+                request,
+                planned=planned,
+                attempt=attempt,
+            )
+        effect = request.effect_class
+        contract = self.contracts.get(request.tool_name)
+        if effect == EffectClass.UNKNOWN:
+            effect = contract.effect_class
+        async with self.resource_manager.hold_for_action(
+            lease,
+            request,
+            effect=effect,
+            working_directory=self.working_directory,
+            action_id=request.action_id,
+        ):
+            return await self._execute_action_unlocked(
+                lease,
+                request,
+                planned=planned,
+                attempt=attempt,
+            )
+
+    async def _execute_action_unlocked(
+        self,
+        lease: Lease,
+        request: ActionRequest,
+        *,
+        planned: bool = False,
+        attempt: int = 1,
+    ) -> ActionStatus:
         contract = self.contracts.get(request.tool_name)
         effect = request.effect_class
         if effect == EffectClass.UNKNOWN:
@@ -2078,7 +2390,7 @@ class RunWorker:
                     error_kind="no_executor",
                 )
             else:
-                result = await self.action_executor(request)
+                result = await self._execute_action_call(request, contract)
         except asyncio.CancelledError:
             # Cancellation is the supervisor's safety boundary.  Never turn
             # it into OUTCOME_UNKNOWN: doing so lets a wedged action swallow
@@ -2200,6 +2512,38 @@ class RunWorker:
                 )
         return result.status
 
+    def _action_timeout_for(self, request: ActionRequest, contract) -> float:
+        """Resolve one bounded action timeout from request/contract/runtime."""
+
+        raw = request.arguments.get("action_timeout_seconds")
+        if raw is None:
+            raw = request.arguments.get("timeout_seconds")
+        if raw is None:
+            raw = getattr(contract, "metadata", {}).get("timeout_seconds")
+        return _bounded_timeout(raw, default=self.action_timeout_seconds)
+
+    async def _execute_action_call(self, request: ActionRequest, contract) -> ActionExecutionResult:
+        if self.action_executor is None:
+            return ActionExecutionResult(ActionStatus.OUTCOME_UNKNOWN, error_kind="no_executor")
+        timeout = self._action_timeout_for(request, contract)
+        task = asyncio.create_task(
+            self.action_executor(request),
+            name=f"cc-harness-action-{request.action_id}",
+        )
+        try:
+            if timeout == 0:
+                return await task
+            return await asyncio.wait_for(asyncio.shield(task), timeout)
+        except asyncio.TimeoutError:
+            await _cancel_task_bounded(task)
+            return ActionExecutionResult(
+                ActionStatus.OUTCOME_UNKNOWN,
+                error_kind=f"action_timeout:{timeout:.3f}s",
+            )
+        except asyncio.CancelledError:
+            await _cancel_task_bounded(task)
+            raise
+
     @staticmethod
     def _verification_evidence(
         request: ActionRequest,
@@ -2294,6 +2638,7 @@ class RunWorker:
                 "tool_name": request.tool_name,
                 "effect_class": effect.value if isinstance(effect, EffectClass) else effect,
                 "normalized_args_digest": request.normalized_args_digest,
+                "idempotency_key": request.idempotency_key,
                 "contract_digest": contract_digest,
                 "worker_id": self.worker_id,
                 "arguments_artifact": artifact.digest,
@@ -2441,4 +2786,4 @@ class RunWorker:
         return stored
 
 
-__all__ = ["ActionExecutionResult", "RunWorker"]
+__all__ = ["ActionExecutionResult", "ModelInvocationTimeout", "RunWorker"]

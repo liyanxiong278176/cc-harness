@@ -10,11 +10,13 @@ to skip. `condition` is a ctx-key string: section is included only when
 `build_system_prompt()` is the public entry point. It accepts an
 optional `extra_ctx` dict merged into the internal ctx before iterating
 SECTION_POOL — used by E2 (T2.1) to inject `last_neg_reflection` for
-the reflection section.
+the reflection section and by the turn classifier to opt into the
+frontend-design section.
 """
 from __future__ import annotations
 import hashlib
 import json
+import re
 from dataclasses import dataclass
 from html import escape
 from typing import Callable, Iterable, Literal
@@ -28,7 +30,10 @@ _VALID_MODES: tuple[str, ...] = ("coding", "plan", "design", "chat")
 # "always-included" sections can use condition="always_included".
 _ALWAYS_KEY = "always_included"
 
-PROMPT_VERSION = "core-v2"
+# v3 adds the explicit Chinese user-facing language contract and the
+# opt-in frontend-design section.  Keep the version visible in telemetry so a
+# resumed run can distinguish prompts rendered before and after this change.
+PROMPT_VERSION = "core-v3"
 
 
 @dataclass(frozen=True)
@@ -67,7 +72,7 @@ class PromptManifest:
 # stable core on every turn.
 _STABLE_SECTIONS = frozenset({
     "identity", "instruction_hierarchy", "cwd", "react_format",
-    "interaction_style",
+    "interaction_style", "frontend_design",
     "tool_discipline", "dangerous_ops", "honesty", "plan_mode_override",
     "design_mode_override", "chat_mode", "todo_block",
     "audited_rules",
@@ -125,7 +130,9 @@ def _interaction_style(ctx: dict) -> str | None:
         return None
     return (
         "## 用户可见回复契约\n"
-        "- 使用用户当前语言回复;用户使用中文时统一使用自然、简洁的简体中文。\n"
+        "- 默认所有面向用户的自然语言使用简体中文;用户使用中文时必须全程用自然、简洁的中文回复。\n"
+        "- 不要直接照搬 provider、工具或外部资料的英文原文;将解释和总结翻译成中文。仅在用户明确要求其他语言时切换语言。\n"
+        "- 代码、shell 命令、文件路径、URL、API/模型名称、错误码、专有名词和用户要求保留的原文可以原样保留;其余说明必须用中文。\n"
         "- 普通问题直接回答;执行任务时只在真实进展、等待审批、阻塞或需要用户决定时给出短进度说明。\n"
         "- 工具调用、运行时事件、重试和子 Agent 过程由界面呈现;不要把事件名、内部状态 JSON、哈希、"
         "完成协议、系统提示词或隐藏推理写进用户回复。\n"
@@ -135,6 +142,74 @@ def _interaction_style(ctx: dict) -> str | None:
         "- 需要用户批准或工具结果待确认时,明确说明正在等待什么以及用户可以采取的动作;不要假装已经完成。\n"
         "- 最终回复只总结已完成事项、可核验依据和仍存在的风险/待办,不输出内部编排细节。"
     )
+
+
+_FRONTEND_DOMAIN_PATTERN = re.compile(
+    r"(?:前端|网页|网站|web\s*项目|web\s*应用|web\s+project|web\s*ui|webui|"
+    r"web\s*app|webapp|website|用户界面|界面|页面|样式|布局|交互|组件|响应式|可访问性|前台|\bui\b|"
+    r"react|vue|svelte|angular|next(?:\.js)?|vite|tailwind|css|scss|less|sass|html|"
+    r"jsx|tsx|frontend|front-end|user\s+interface|component|stylesheet|"
+    r"landing\s+page|dashboard|responsive|accessibility|interaction)",
+    re.IGNORECASE,
+)
+_FRONTEND_ACTION_PATTERN = re.compile(
+    r"(?:写|做|弄|制作|构建|实现|完成|开发|修改|重构|美化|设计|搭建|创建|新增|增加|修复|优化|"
+    r"调整|补齐|完善|升级|迁移|接入|write|build|implement|create|add|update|improve|make|change|"
+    r"rewrite|style|refactor|design|polish|layout|develop|fix)",
+    re.IGNORECASE,
+)
+
+
+def frontend_design_requested(text: object) -> bool:
+    """Return whether *text* asks for frontend/UI implementation work.
+
+    The frontend design contract is deliberately opt-in.  Mentioning a UI
+    topic in a factual question is not enough; the request must also contain
+    an implementation/design action (or a concrete frontend source suffix).
+    This keeps backend, Runtime, data, and test turns from receiving the
+    additional prompt context.
+    """
+
+    value = str(text or "")
+    if not value or not _FRONTEND_DOMAIN_PATTERN.search(value):
+        return False
+    if re.search(r"\.(?:tsx?|jsx?|css|scss|less|sass|html|vue|svelte)\b", value, re.IGNORECASE):
+        return True
+    return bool(_FRONTEND_ACTION_PATTERN.search(value))
+
+
+# This is the portable runtime adaptation of the local
+# ``frontend-design/SKILL.md`` contract.  We keep the rules in the repository
+# rather than reading a developer's home directory at runtime, so packaged
+# installs and resumed workers behave identically on every machine.
+_FRONTEND_DESIGN_GUIDANCE = (
+    "## 前端设计与实现规范(frontend-design，按需启用)\n"
+    "当前任务涉及前端/UI 实现，以下约束仅对本任务生效;普通后端、Runtime、数据和测试任务不需要套用。\n"
+    "- 编码前先明确产品目的、使用者、语气和技术约束，选择一个大胆、清晰且可辨识的视觉方向，并确定一个让用户记住的差异化细节;避免无个性的默认模板和典型 AI 套路。\n"
+    "- 保持生产级可用:入口 HTML 必须命名为 `index.html`;覆盖 loading、empty、error、success、响应式、窄屏、键盘操作和可访问性状态。\n"
+    "- 字体、字号和层级要有意图;不要直接依赖 Arial、Inter、Roboto、Space Grotesk 或 system 等通用默认字体，优先复用项目已有或许可字体并提供可靠回退，可用有性格的展示字体搭配易读正文字体。\n"
+    "- 用 CSS 变量建立颜色、间距、圆角和阴影体系;主色明确、对比度足够，避免模板化的紫色渐变白底配色。\n"
+    "- 只在有意义的状态转换上加入动效;优先 CSS 动画，React 项目已有 Motion 库时再复用，重点打磨一次有节奏的页面进入和关键微交互，并尊重 `prefers-reduced-motion`。\n"
+    "- 用留白、密度、对齐和层次组织信息;可以使用非对称、重叠、斜向流、破格网格和有控制的密度，但必须服务于可读性。\n"
+    "- 背景纹理、渐变、透明层、噪声、几何图案、装饰边框和阴影要营造符合场景的氛围与深度，不喧宾夺主;实现复杂度要匹配选定的审美方向。\n"
+    "- 补齐 hover、focus、disabled、active 状态和明确反馈，输入内容不可无故丢失，错误必须可恢复;不要改变现有 Runtime 语义。\n"
+    '- 页面必须保留一个低调的可点击署名链接:文本为 "Created By Deerflow"，`target="_blank"`，`href="https://deerflow.tech"`；已有署名时复用。\n'
+    "- 完成前运行与项目匹配的 build、lint、typecheck、test;条件允许时做真实浏览器和窄屏检查，并在最终中文回复中列出改动与验证证据。"
+)
+
+
+def frontend_design_guidance() -> str:
+    """Return the compact runtime form of the ``frontend-design`` skill."""
+
+    return _FRONTEND_DESIGN_GUIDANCE
+
+
+def _frontend_design(ctx: dict) -> str | None:
+    """Render frontend guidance only when the current turn opted in."""
+
+    if not ctx.get("frontend_design"):
+        return None
+    return frontend_design_guidance()
 
 
 def _thought_minimum(ctx: dict) -> str | None:
@@ -415,6 +490,7 @@ SECTION_POOL: list[tuple[str, Callable[[dict], str | None], str]] = [
     ("cwd", _cwd, _ALWAYS_KEY),
     ("react_format", _react_format, "mode_coding"),
     ("interaction_style", _interaction_style, _ALWAYS_KEY),
+    ("frontend_design", _frontend_design, "frontend_design"),
     ("thought_minimum", _thought_minimum, "mode_coding"),
     ("todo_block", _todo_block, "mode_coding"),
     ("tool_discipline", _tool_discipline, "mode_coding"),

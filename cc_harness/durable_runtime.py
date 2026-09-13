@@ -9,6 +9,7 @@ import os
 import re
 import subprocess
 import sys
+import time
 from dataclasses import replace
 from pathlib import Path
 from typing import Any, Mapping, Sequence
@@ -28,6 +29,7 @@ from .llm import LLMClient, ProviderProtocolError, normalize_thinking_mode
 from .mcp_client import MCPClient, ToolResult
 from .native_tools import NATIVE_FILE_TOOLS
 from .policy import Action
+from .prompts import PROMPT_VERSION
 from .run_kernel import ActionRequest, ModelAdapter, ModelSegment, ReActKernel
 from .run_events import EventActor
 from .run_model import ActionStatus, CompletionCandidate, EffectClass, RunStatus
@@ -373,7 +375,7 @@ class DurableModelAdapter(ModelAdapter):
             "",
         )
         prompt_meta = {
-            "version": "core-v2",
+            "version": PROMPT_VERSION,
             "digest": hashlib.sha256(system_content.encode("utf-8")).hexdigest(),
             "rules_digest": production_rule_metadata()["digest"],
             "tool_bundle_digest": bundle_digest(list(tools), self.tool_bundles),
@@ -1058,19 +1060,75 @@ class DurableRuntimeClient:
         if self.supervisor is not None:
             raise RuntimeError("a local supervisor is already attached to this client")
         pid_path = self.store.state_dir / "supervisor.pid"
-        try:
-            existing_pid = int(pid_path.read_text(encoding="utf-8").strip())
-        except (OSError, ValueError):
-            existing_pid = None
-        if existing_pid is not None:
+        start_lock = self.store.state_dir / "supervisor.start.lock"
+
+        def pid_is_alive(pid: int) -> bool:
             try:
-                os.kill(existing_pid, 0)
+                os.kill(pid, 0)
             except PermissionError:
-                return existing_pid
+                return True
             except (OSError, ProcessLookupError):
-                existing_pid = None
-            else:
-                return existing_pid
+                return False
+            return True
+
+        def read_live_pid() -> int | None:
+            try:
+                candidate = int(pid_path.read_text(encoding="utf-8").strip())
+            except (OSError, ValueError):
+                return None
+            return candidate if candidate > 0 and pid_is_alive(candidate) else None
+
+        existing_pid = read_live_pid()
+        if existing_pid is not None:
+            return existing_pid
+
+        # The old check-then-Popen sequence allowed two UI clients to observe a
+        # stale/missing PID and launch two supervisors before either wrote its
+        # marker.  O_CREAT|O_EXCL is the portable atomic claim we need here;
+        # the short-lived marker is removed only by its creator after the PID
+        # has been published atomically.  A live creator is allowed a brief
+        # startup window so the second client returns the same child instead
+        # of spawning a duplicate.  Dead creators leave a recoverable marker.
+        lock_fd: int | None = None
+        for _attempt in range(2):
+            try:
+                lock_fd = os.open(
+                    start_lock,
+                    os.O_CREAT | os.O_EXCL | os.O_WRONLY,
+                    0o600,
+                )
+                os.write(lock_fd, f"{os.getpid()}\n".encode("ascii"))
+                os.close(lock_fd)
+                lock_fd = None
+                break
+            except FileExistsError:
+                try:
+                    owner_pid = int(start_lock.read_text(encoding="ascii").strip())
+                except (OSError, ValueError):
+                    owner_pid = None
+                if owner_pid is not None and pid_is_alive(owner_pid):
+                    deadline = time.monotonic() + 2.0
+                    while time.monotonic() < deadline:
+                        existing_pid = read_live_pid()
+                        if existing_pid is not None:
+                            return existing_pid
+                        time.sleep(0.05)
+                    raise RuntimeError("supervisor start is already in progress")
+                # A crashed starter can leave only the marker.  Remove it and
+                # retry the atomic claim once; never unlink a live owner's
+                # marker.
+                try:
+                    start_lock.unlink()
+                except FileNotFoundError:
+                    pass
+            except OSError:
+                if lock_fd is not None:
+                    os.close(lock_fd)
+                    lock_fd = None
+                raise
+        if lock_fd is not None:
+            os.close(lock_fd)
+            raise RuntimeError("unable to claim supervisor start lock")
 
         log_path = self.store.state_dir / "supervisor.log"
         log_path.parent.mkdir(parents=True, exist_ok=True)
@@ -1106,17 +1164,25 @@ class DurableRuntimeClient:
         else:
             popen_kwargs["start_new_session"] = True
         try:
-            process = subprocess.Popen(command, **popen_kwargs)
-        except Exception:
-            log_file.close()
-            raise
+            try:
+                process = subprocess.Popen(command, **popen_kwargs)
+            finally:
+                # The child has its own inherited descriptor; the TUI must not
+                # keep the log file open after spawning it.
+                if not log_file.closed:
+                    log_file.close()
+            temporary_pid = pid_path.with_name(f"{pid_path.name}.{os.getpid()}.tmp")
+            temporary_pid.write_text(str(process.pid), encoding="ascii")
+            os.replace(temporary_pid, pid_path)
+            return process.pid
         finally:
-            # The child has its own inherited descriptor; the TUI must not keep
-            # the log file open after spawning it.
-            if not log_file.closed:
-                log_file.close()
-        pid_path.write_text(str(process.pid), encoding="utf-8")
-        return process.pid
+            # The lock protects only the check/spawn/publish critical section.
+            # Once supervisor.pid is visible, future callers can safely use
+            # the live-process check above.
+            try:
+                start_lock.unlink()
+            except FileNotFoundError:
+                pass
 
     async def run_supervisor_forever(
         self,
