@@ -148,6 +148,35 @@ cc-harness 适配边界记录在 [`docs/deepseek-harness-ui-observations.md`](do
 审阅过的源码快照固定在仓库内 [`vendor/deepseek-ui/`](vendor/deepseek-ui/)，不会在构建时
 联网拉取，也不会启动上游 Runtime。
 
+## 评测访问路径
+
+评测命令均从仓库根目录 `D:\agent_learning\cc-harness` 执行。正式评测产生的任务、状态、
+事件流和报告保存在本机 `eval/result/`，该目录已加入 `.gitignore`，不会随代码提交。
+需要在浏览器观察运行过程时，先启动 WebUI：
+
+```powershell
+cc-harness --no-open --port 3080
+# 浏览器打开；若端口被占用，以终端打印的实际地址为准
+http://127.0.0.1:3080/
+```
+
+实时观察使用 `GET /api/web/v1/sessions` 获取会话列表，使用
+`GET /api/web/v1/sessions/{run_id}/events` 订阅可重放的 SSE 事件流；健康检查地址为
+`http://127.0.0.1:3080/api/health`。会话时间线和上下文明细分别位于
+`/api/web/v1/sessions/{run_id}/timeline` 与 `/api/web/v1/sessions/{run_id}/context`。
+
+| 评测套件 | 权威数据/说明 | 检查与正式入口 | 本地结果访问路径 |
+| --- | --- | --- | --- |
+| Terminal-Bench 2.1（89 个任务） | [Harbor 数据集](https://hub.harborframework.com/datasets/terminal-bench/terminal-bench-2-1/latest) · [Terminal-Bench 版本列表](https://www.tbench.ai/benchmarks) | `scripts\run_eval_terminal_bench_2_1.cmd --check`；`scripts\run_eval_terminal_bench_2_1.cmd --profile full --confirm-live` | `eval/result/cc-only/terminal-bench-2.1/deepseek-v4-flash/full-single-pass/` |
+| SWE-bench Verified（500 个任务） | [SWE-bench 官方仓库](https://github.com/SWE-bench/SWE-bench) · [Verified 数据集](https://huggingface.co/datasets/princeton-nlp/SWE-bench_Verified) | `scripts\run_eval_swebench_verified.cmd --check`；`scripts\run_eval_swebench_verified.cmd` | `eval/result/cc-only/swe-bench-verified/deepseek-v4-flash/portfolio/` |
+
+Terminal-Bench 的正式运行会在同一 `full-single-pass` 目录中断点续跑，已完成任务不会重放。
+需要 SWE-bench Verified 的 cc-harness/Claude Code 配对结果时，使用
+`scripts\run_harbor_verified500.cmd --check` 和 `scripts\run_harbor_verified500.cmd`，其
+结果目录为 `eval/result/harbor-verified500-deepseek-v4-flash/`。完整套件索引与协议说明见
+[`docs/eval/cc-only-benchmark-portfolio.md`](docs/eval/cc-only-benchmark-portfolio.md)；配对评测
+说明见 [`docs/eval/run-claude-parity.md`](docs/eval/run-claude-parity.md)。
+
 ## TUI 兼容交互
 
 - 启动页采用 Claude Code classic inline shell 的双栏结构，但使用 cc-harness 自有名称、版本、更新记录，以及从用户参考图提取的彩色遮脸月薪喵像素形象；窄于 80 列时自动改为上下布局。
