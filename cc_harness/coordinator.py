@@ -97,6 +97,9 @@ class RunRequest:
     # official benchmark adapter may opt into this provenance, so words such
     # as "push" in a fixture do not trigger the user-facing high-risk gate.
     goal_provenance: str = "user"
+    # Persisted on the GoalContract so completion behavior is explicit and
+    # recoverable. The default remains the strict coding contract.
+    interaction_mode: str = "coding"
 
 
 @dataclass(frozen=True)
@@ -162,6 +165,7 @@ class RunCoordinator:
             allowed_scope=request.allowed_scope,
             excluded_scope=request.excluded_scope,
             required_evidence=request.required_evidence,
+            interaction_mode=request.interaction_mode,
         )
         assessment = self.goals.assess(goal, goal_provenance=request.goal_provenance)
         await self.store.create_run(Run(run_id, goal, contract))
@@ -228,6 +232,7 @@ class RunCoordinator:
             allowed_scope=request.allowed_scope,
             excluded_scope=request.excluded_scope,
             required_evidence=request.required_evidence,
+            interaction_mode=request.interaction_mode,
         )
         return self.goals.assess(goal)
 

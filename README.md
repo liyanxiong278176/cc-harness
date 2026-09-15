@@ -128,12 +128,25 @@ cc-harness -p "summarize this repo" # 非交互打印模式
   窗口来源（分类是 Runtime 的本地 tokenizer 明细，费用仍以 provider 返回为准）。
 - 消息使用 Markdown 渲染，工具输出默认折叠；审批、停止、继续均调用现有 Durable
   Coordinator。系统提示词、隐藏规则、完整推理和工具参数不会发送到浏览器。
+- 切换大历史会话时会显示“正在载入会话”并暂时禁用发送；右侧运行面板集中展示
+  投影不一致、缺少完成证据、未知副作用、租约冲突和环境降级的脱敏诊断。短的纯对话
+  由 Runtime 以已落盘的助手消息完成，编码任务仍必须通过工具/验证完成门。
 
-前端源代码位于 [`web/`](web/)，开发时可运行 `npm install`、`npm run dev`；发布构建
-可运行 `python scripts/build_webui.py`，它会把产物复制到 `cc_harness/web_assets/`，
-因此安装 Python wheel 后不需要 Node.js。
-启动链接和默认端口沿用 [DeepSeek Harness 的本地 WebUI 入口](https://github.com/deepseek-ai/deepseek-harness)
-的使用习惯，但 cc-harness 保持自己的界面与 Runtime 协议。
+前端源代码入口位于 [`web/src/main.tsx`](web/src/main.tsx)，cc-harness 适配层位于
+[`web/src/cc/`](web/src/cc/)。页面依赖的 DeepSeek Harness 源码快照固定在
+[`vendor/deepseek-ui/`](vendor/deepseek-ui/)，并记录官方 commit、许可证和第三方声明；
+快照用于复用布局/交互语义，不会启动第二套 Runtime。开发时可运行 `npm install`、
+`npm run dev`；发布构建可运行 `python scripts/build_webui.py`，它会把产物复制到
+`cc_harness/web_assets/`，因此安装 Python wheel 后不需要 Node.js。
+浏览器调用版本化的 `/api/web/v1` REST + replayable SSE 兼容层，旧 `/api`、TUI、
+headless JSON 和 SDK 继续可用。启动链接和默认端口沿用
+[DeepSeek Harness 的本地 WebUI 入口](https://github.com/deepseek-ai/deepseek-harness)
+的使用习惯，但 cc-harness 保持自己的界面、品牌与 Runtime 协议。
+
+本次对官方 DeepSeek Harness 的交互/视觉观察、模型环境变量映射、截图和
+cc-harness 适配边界记录在 [`docs/deepseek-harness-ui-observations.md`](docs/deepseek-harness-ui-observations.md)。
+审阅过的源码快照固定在仓库内 [`vendor/deepseek-ui/`](vendor/deepseek-ui/)，不会在构建时
+联网拉取，也不会启动上游 Runtime。
 
 ## TUI 兼容交互
 

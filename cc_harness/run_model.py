@@ -99,6 +99,7 @@ class EvidenceKind(str, Enum):
     ACTION_RESULT = "action_result"
     CHILD_CANDIDATE = "child_candidate"
     RECONCILIATION = "reconciliation"
+    ASSISTANT_RESPONSE = "assistant_response"
 
 
 class ProgressKind(str, Enum):
@@ -198,6 +199,10 @@ class GoalContract:
     required_evidence: tuple[str, ...] = ()
     human_review: tuple[str, ...] = ()
     contract_version: int = 1
+    # Explicitly persisted interaction policy. Coding tasks retain the strict
+    # verification gate; conversational turns may close on a durable response
+    # artifact, without treating model prose as proof of a code change.
+    interaction_mode: str = "coding"
 
     def __post_init__(self) -> None:
         if not self.objective.strip():
@@ -206,6 +211,8 @@ class GoalContract:
             raise DomainValidationError("goal must contain non-empty acceptance criteria")
         if self.contract_version < 1:
             raise DomainValidationError("goal contract version must be positive")
+        if self.interaction_mode not in {"coding", "conversation"}:
+            raise DomainValidationError("goal interaction_mode must be coding or conversation")
 
     @classmethod
     def create(
@@ -226,6 +233,7 @@ class GoalContract:
             "required_evidence": list(self.required_evidence),
             "human_review": list(self.human_review),
             "contract_version": self.contract_version,
+            "interaction_mode": self.interaction_mode,
         }
 
     @classmethod
@@ -239,6 +247,7 @@ class GoalContract:
             required_evidence=tuple(str(item) for item in data.get("required_evidence") or ()),
             human_review=tuple(str(item) for item in data.get("human_review") or ()),
             contract_version=int(data.get("contract_version", 1)),
+            interaction_mode=str(data.get("interaction_mode", "coding")),
         )
 
     @property
@@ -857,6 +866,10 @@ class RunStateMachine:
         "RunYielded": {RunStatus.RUNNING: {RunStatus.QUEUED}},
         "WorkerLeaseExpired": {RunStatus.RUNNING: {RunStatus.QUEUED}},
         "RunResumed": {
+            # A retried resume request may be appended after the first
+            # request already put the run back in the durable queue.  Treat
+            # that duplicate as an idempotent no-op during replay.
+            RunStatus.QUEUED: {RunStatus.QUEUED},
             RunStatus.STALLED: {RunStatus.QUEUED},
             RunStatus.BLOCKED: {RunStatus.QUEUED},
             RunStatus.FAILED_RECOVERABLE: {RunStatus.QUEUED},
@@ -872,7 +885,11 @@ class RunStateMachine:
         "ApprovalRequested": {RunStatus.RUNNING: {RunStatus.AWAITING_APPROVAL}},
         "ApprovalGranted": {RunStatus.AWAITING_APPROVAL: {RunStatus.QUEUED}},
         "ApprovalRejected": {
-            RunStatus.AWAITING_APPROVAL: {RunStatus.BLOCKED},
+            # Rejecting a single tool call is not a decision to stop the
+            # whole run.  The worker will persist a terminal cancellation and
+            # feed a structured tool result back to the model before it is
+            # scheduled again, allowing the model to choose another path.
+            RunStatus.AWAITING_APPROVAL: {RunStatus.QUEUED},
         },
         "InterruptRequested": {
             RunStatus.RUNNING: {RunStatus.CANCEL_REQUESTED},

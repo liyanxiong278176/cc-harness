@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import asyncio
+import json
+import sqlite3
 
 import pytest
 
@@ -221,4 +223,61 @@ async def test_supervisor_bounds_a_stuck_tick(tmp_path, monkeypatch) -> None:
         await supervisor.stop()
         assert calls >= 2
     finally:
+        await store.close()
+
+
+@pytest.mark.asyncio
+async def test_corrupt_terminal_projection_does_not_starve_healthy_queued_run(tmp_path) -> None:
+    """One damaged historical snapshot must not wedge the project scheduler."""
+
+    project = tmp_path / "project"
+    project.mkdir()
+    store = RunStore(project, data_root=tmp_path / "data")
+    await store.open()
+    supervisor = None
+    try:
+        coordinator = RunCoordinator(store)
+        damaged = await coordinator.submit(RunRequest("damaged history", ("recorded",)))
+        snapshot = await store.checkpoint(damaged.run_id)
+
+        # Simulate a copied/truncated snapshot while preserving the immutable
+        # trigger after the injection.  The event log is still intact; only
+        # this historical accelerator is unreadable.
+        with sqlite3.connect(store.db_path) as database:
+            database.execute("DROP TRIGGER run_snapshot_no_update")
+            payload = snapshot.to_dict()
+            payload["status"] = "completed"
+            database.execute(
+                "UPDATE run_snapshot SET projection_json = ? WHERE run_id = ? AND sequence = ?",
+                (json.dumps(payload, ensure_ascii=False), damaged.run_id, snapshot.sequence),
+            )
+            database.execute(
+                "UPDATE run_record SET status = 'stalled' WHERE run_id = ?",
+                (damaged.run_id,),
+            )
+            database.execute(
+                """CREATE TRIGGER run_snapshot_no_update
+                   BEFORE UPDATE ON run_snapshot BEGIN
+                       SELECT RAISE(ABORT, 'run snapshots are immutable');
+                   END"""
+            )
+            database.commit()
+
+        healthy = await coordinator.submit(RunRequest("healthy sibling", ("recorded",)))
+
+        def factory(_run_id):
+            return RunWorker(
+                store,
+                ReActKernel(EmptyModel()),
+                worker_id="worker-isolation",
+            )
+
+        supervisor = LocalSupervisor(store, factory, max_workers=1, poll_interval=0.01)
+        stats = await supervisor.tick()
+        assert healthy.run_id in stats.active_runs
+        assert damaged.run_id not in stats.active_runs
+        assert healthy.run_id not in supervisor._projection_errors
+    finally:
+        if supervisor is not None:
+            await supervisor.stop(drain=False)
         await store.close()

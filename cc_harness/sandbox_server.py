@@ -145,7 +145,24 @@ def attest_server_config(
             if capability not in cap_drop:
                 failures.append(f"docker.drop_capabilities must include {capability}")
     if failures:
-        raise ServerAttestationError("; ".join(failures))
+        # A local server can legitimately outlive the project that started
+        # it.  In that case its static host-path list may not contain the
+        # newly selected workspace even though the server's security profile
+        # (egress, pid and capability restrictions) is otherwise valid.  This
+        # is an infrastructure readiness problem, not permission to bypass a
+        # command-level policy: ordinary local Runtime sessions may activate
+        # their audited native fallback, while hardened/evaluation profiles
+        # still disable that fallback at the Runtime seam.  Keep mixed
+        # attestation failures fail-closed; only a path-only mismatch gets the
+        # recoverable marker.
+        path_only = bool(failures) and all(
+            item.startswith("host path is not allowlisted:") for item in failures
+        )
+        raise ServerAttestationError(
+            "; ".join(failures),
+            fallback_safe=path_only,
+            stage="host_path_allowlist" if path_only else "server_attestation",
+        )
 
     try:
         version = importlib.metadata.version("opensandbox-server")

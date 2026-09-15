@@ -1,0 +1,40 @@
+/* Keep the upstream shell reset in the same Vite graph as the adapter.  The
+ * pinned source is deliberately imported as CSS only; its Cordis runtime and
+ * module graph are not started by cc-harness.
+ */
+@import '@deepseek-ui/source/base.css';
+
+/*
+ * Selected tokens from the pinned DeepSeek Harness UI snapshot.  We keep the
+ * namespaced values here instead of importing the upstream monorepo CSS (which
+ * depends on its Cordis module loader), so the single Vite build stays
+ * deterministic while spacing, typography and motion remain visually aligned.
+ */
+:root {
+  --dsw-font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'PingFang SC',
+    'Hiragino Sans GB', 'Microsoft YaHei', 'Helvetica Neue', Helvetica, Arial, sans-serif;
+  --ds-font-family-code: 'SF Mono', 'JetBrains Mono', 'Fira Code', Consolas,
+    'Liberation Mono', Menlo, Courier, 'PingFang SC', 'Microsoft YaHei';
+  --ds-ease-in-out: cubic-bezier(0.4, 0, 0.2, 1);
+  --ds-transition-duration: 0.2s;
+  --ds-transition-duration-fast: 0.1s;
+  --ds-transition-duration-slow: 0.3s;
+  --dsw-static-deepseek-400: rgb(103, 158, 254);
+  --dsw-static-deepseek-450: rgb(86, 134, 254);
+  --dsw-static-deepseek-500: rgb(65, 118, 230);
+  --dsw-static-neutral-bluish-1000: rgb(15, 17, 21);
+  --dsw-static-neutral-bluish-900: rgb(27, 27, 28);
+  --dsw-static-neutral-bluish-850: rgb(44, 44, 46);
+  --dsw-static-neutral-bluish-800: rgb(53, 54, 56);
+  --dsw-static-neutral-bluish-700: rgb(97, 102, 107);
+  --dsw-static-neutral-bluish-500: rgb(151, 157, 166);
+  --dsw-static-neutral-bluish-100: rgb(235, 238, 242);
+}
+
+:root[data-theme='light'] {
+  --dsw-static-neutral-bluish-1000: rgb(255, 255, 255);
+  --dsw-static-neutral-bluish-900: rgb(249, 250, 251);
+  --dsw-static-neutral-bluish-850: rgb(245, 246, 247);
+  --dsw-static-neutral-bluish-800: rgb(233, 236, 242);
+  --dsw-static-neutral-bluish-100: rgb(27, 27, 28);
+}

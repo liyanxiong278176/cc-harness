@@ -36,8 +36,11 @@ from pydantic import BaseModel, Field
 from .config import ConfigError, load_context_config
 from .durable_runtime import DurableRuntimeClient
 from .fact_store import default_user_data_dir
+from .live_stream import LiveStreamHub
 from .permissions import normalize_permission_mode
 from .run_model import RunStatus
+from .run_store import RunNotFound, SequenceConflict, SupervisorLeaseConflict, SupervisorLeaseFenceError
+from .approvals import ApprovalDigestMismatchError, ApprovalNotFoundError
 
 
 _SECRET_KEY = re.compile(
@@ -75,6 +78,24 @@ _RECOVERABLE_STATUSES = {
     RunStatus.FAILED_RECOVERABLE,
     RunStatus.WAITING_ON_PREDECESSOR,
 }
+
+
+class SessionDeleteConflict(RuntimeError):
+    """Raised when a running session has not reached a safe delete boundary."""
+
+
+class ApprovalStaleError(RuntimeError):
+    """Raised when a browser approval card is no longer actionable.
+
+    ApprovalRequested is immutable audit evidence.  The actionable state is
+    the latest projection, so a card can legitimately become stale after a
+    stop, retry, another browser tab, or a supervisor decision.  This is a
+    recoverable control-plane conflict, not a malformed request.
+    """
+
+    def __init__(self, approval_id: str) -> None:
+        self.approval_id = approval_id
+        super().__init__("审批不存在、已处理或不属于当前会话")
 
 
 def _redact(value: Any, *, key: str = "") -> Any:
@@ -178,6 +199,50 @@ def _visible_assistant_text(value: str) -> str:
     return text
 
 
+# WebUI submissions default to an explicit interaction contract. Keep the
+# automatic classifier conservative: anything that might touch a project,
+# invoke a tool, or require verification remains a coding run. Only short,
+# tool-free conversational prompts take the response-artifact completion path.
+_CODING_INTENT_MARKERS = re.compile(
+    r"(?:\b(?:code|file|files|project|directory|folder|test|tests|run|build|fix|implement|create|update|delete|install|dependency|dependencies|git|npm|python|docker|api|bug|review|deploy|refactor|command|terminal|service|server|database|frontend|backend|endpoint|config|configuration|commit|push|tool)\b|"
+    r"代码|文件|项目|目录|文件夹|测试|运行|构建|修复|实现|创建|修改|删除|安装|依赖|命令|终端|服务|服务器|数据库|前端|后端|接口|配置|重构|提交|推送|审查|检查|部署|迁移|外卖|任务|读取|编辑|搜索|生成|写一个)",
+    re.IGNORECASE,
+)
+
+
+def classify_interaction_mode(text: str, requested: str = "auto") -> str:
+    """Choose a persisted interaction mode without trusting model prose.
+
+    Callers may explicitly request ``coding`` or ``conversation``. ``auto``
+    only selects conversation for a short prompt with no coding/tool intent;
+    this prevents a coding task from bypassing verification because it happens
+    to end with a question mark.
+    """
+
+    mode = str(requested or "auto").strip().casefold()
+    if mode in {"coding", "conversation"}:
+        return mode
+    if mode != "auto":
+        raise ValueError("interaction_mode must be auto, coding, or conversation")
+    cleaned = str(text or "").strip()
+    if not cleaned or len(cleaned) > 320 or cleaned.startswith("/"):
+        return "coding"
+    # A short prompt that explicitly says not to use tools is still a
+    # conversation.  Strip those negated phrases before applying the marker
+    # check; otherwise a natural-language smoke test such as
+    # ``请简短回复，不要执行工具`` would be incorrectly sent through the
+    # coding completion contract merely because it contains the word 工具.
+    intent_text = re.sub(
+        r"(?:不要|无需|请勿|禁止)(?:执行|调用|使用)?(?:任何)?工具",
+        "",
+        cleaned,
+        flags=re.IGNORECASE,
+    )
+    if _CODING_INTENT_MARKERS.search(intent_text):
+        return "coding"
+    return "conversation"
+
+
 def _public_event(
     client: DurableRuntimeClient,
     event: Any,
@@ -237,13 +302,26 @@ def _public_event(
         if observation is not None:
             result["kind"] = "tool"
             result["tool_name"] = observation.get("tool_name") or payload.get("tool_name")
-            result["status"] = payload.get("status")
-            result["content"] = str(
-                observation.get("model_text")
-                or observation.get("llm_text")
-                or observation.get("content")
-                or ""
-            )
+            # A rejected approval is a completed policy decision, not a
+            # failed/unknown tool execution.  Preserve that distinction in
+            # the public projection so the WebUI can explain why the tool
+            # did not run and why the Runtime was allowed to continue.
+            rejected = observation.get("error_kind") == "user_rejected"
+            result["status"] = "rejected" if rejected else payload.get("status")
+            if rejected:
+                result["rejected"] = True
+            content = observation.get("model_text") or observation.get("llm_text")
+            if not content:
+                blocks = observation.get("content")
+                if isinstance(blocks, list):
+                    content = "\n".join(
+                        str(block.get("text") or "")
+                        for block in blocks
+                        if isinstance(block, Mapping) and block.get("text")
+                    )
+                else:
+                    content = blocks or ""
+            result["content"] = str(content)
     elif event_type in {"ActionPlanned", "ActionStarted", "ActionSucceeded", "ActionFailed", "ActionCancelled", "ActionOutcomeUnknown"}:
         result["tool_name"] = payload.get("tool_name")
         result["action_id"] = payload.get("action_id")
@@ -428,7 +506,120 @@ class WebRuntimeManager:
         self.selected_root: Path | None = None
         self._clients: dict[str, DurableRuntimeClient] = {}
         self._client_fingerprints: dict[str, tuple[str, str, str, str]] = {}
+        # A crashed scheduler leaves a valid project lease until its TTL
+        # expires.  Keep a bounded, in-process takeover watcher so a restarted
+        # WebUI can resume queued Runs without requiring a second user click;
+        # this is recovery logic, not an external scheduled job.
+        self._supervisor_retry_tasks: dict[str, asyncio.Task[None]] = {}
         self._lock = asyncio.Lock()
+        # Best-effort in-process stream fan-out.  Durable events remain the
+        # replay source; this hub only removes the visible delay between a
+        # provider chunk and the next committed event.
+        self.live_stream = LiveStreamHub()
+
+    async def _emit_live_stream(self, event: Mapping[str, Any]) -> None:
+        await self.live_stream.publish(event)
+
+    def _schedule_supervisor_retry(self, root: Path) -> None:
+        """Watch an expired project lease and reclaim scheduler leadership.
+
+        Lease conflicts are normal when two WebUI windows attach to one
+        project.  If the previous owner actually crashed, however, simply
+        marking this process as control-only would strand queued work until a
+        new manual request.  The watcher waits for the authoritative lease
+        expiry, then performs a bounded takeover attempt using the same
+        configuration path as an explicit send/resume.
+        """
+
+        key = str(Path(root).resolve())
+        existing = self._supervisor_retry_tasks.get(key)
+        if existing is not None and not existing.done():
+            return
+        task = asyncio.create_task(
+            self._retry_supervisor_until_available(Path(root).resolve()),
+            name=f"cc-harness-supervisor-retry-{hashlib.sha1(key.encode()).hexdigest()[:10]}",
+        )
+        self._supervisor_retry_tasks[key] = task
+
+        def finish(done: asyncio.Task[None]) -> None:
+            if self._supervisor_retry_tasks.get(key) is done:
+                self._supervisor_retry_tasks.pop(key, None)
+            with contextlib.suppress(asyncio.CancelledError, Exception):
+                done.result()
+
+        task.add_done_callback(finish)
+
+    async def _retry_supervisor_until_available(self, root: Path) -> None:
+        """Bounded takeover watcher for a stale project supervisor lease."""
+
+        deadline = time.monotonic() + 15 * 60
+        key = str(root.resolve())
+        while time.monotonic() < deadline:
+            client = self._clients.get(key)
+            if client is None:
+                return
+            try:
+                lease = await client.store.current_supervisor_lease()
+            except Exception:
+                await asyncio.sleep(1.0)
+                continue
+            if lease is not None and lease.expires_at > time.time():
+                # Poll for an early, clean owner shutdown while never starting
+                # the expensive provider stack while a live owner is present.
+                await asyncio.sleep(min(10.0, max(0.25, lease.expires_at - time.time() + 0.05)))
+                continue
+            try:
+                await self._client_for_root(root, start=True)
+            except (SupervisorLeaseConflict, SupervisorLeaseFenceError):
+                await asyncio.sleep(1.0)
+                continue
+            except (ConfigError, RunNotFound, ValueError):
+                # Settings may have been cleared or the project removed while
+                # waiting.  A subsequent explicit action will surface the
+                # actionable setup error; do not spin in the background.
+                return
+            except Exception:
+                # Environment/provider failures are surfaced by the next user
+                # action.  Recovery must not become an unbounded error loop.
+                return
+            current_client = self._clients.get(key)
+            if (
+                current_client is not None
+                and current_client.supervisor is not None
+                and getattr(current_client.supervisor, "is_running", False)
+            ):
+                return
+            await asyncio.sleep(1.0)
+
+    @staticmethod
+    def _scheduler_status(client: DurableRuntimeClient) -> dict[str, Any]:
+        """Describe scheduler ownership without exposing lease internals.
+
+        A project has one elected scheduler, but every WebUI/CLI process may
+        still act as a durable control plane.  Returning this distinction to
+        the browser turns a former ``SupervisorLeaseConflict`` 500 into an
+        actionable, observable state (the other owner will consume queued
+        work) instead of making the conversation look broken.
+        """
+
+        if client.supervisor_owned_elsewhere:
+            return {
+                "mode": "external",
+                "running": False,
+                "label": "其他窗口运行中",
+            }
+        supervisor = client.supervisor
+        if supervisor is not None and getattr(supervisor, "is_running", False):
+            return {
+                "mode": "local",
+                "running": True,
+                "label": "本窗口运行中",
+            }
+        return {
+            "mode": "idle",
+            "running": False,
+            "label": "等待启动",
+        }
 
     @property
     def project_key(self) -> str | None:
@@ -582,6 +773,14 @@ class WebRuntimeManager:
         missing = [name for name, value in (("base_url", values["base_url"]), ("model", values["model"]), ("api_key", values["api_key"])) if not value]
         if missing:
             raise ConfigError("missing model configuration: " + ", ".join(missing))
+        if client.supervisor_owned_elsewhere:
+            # Avoid rebuilding MCP/LLM/capability resources on every browser
+            # poll while the elected scheduler is still alive.  The bounded
+            # watcher above will retry once this lease expires or is released.
+            lease = await client.store.current_supervisor_lease()
+            if lease is not None and lease.expires_at > time.time():
+                return client
+            client.clear_supervisor_owned_elsewhere()
         # Keep the API key out of manager state/logs while still recycling a
         # supervisor when the user changes credentials.
         key_digest = hashlib.sha256(values["api_key"].encode("utf-8")).hexdigest()
@@ -601,17 +800,42 @@ class WebRuntimeManager:
             await client.close()
             client = await DurableRuntimeClient.create(root, data_root=self.data_root)
             self._clients[key] = client
-        if client.supervisor is None:
-            await client.start_supervisor(
-                max_workers=3,
-                config_overrides={
-                    "OPENAI_BASE_URL": values["base_url"],
-                    "OPENAI_MODEL": values["model"],
-                    "OPENAI_API_KEY": values["api_key"],
-                    "CC_HARNESS_PERMISSION_MODE": permission_mode,
-                },
-                permission_mode=permission_mode,
-            )
+        # ``client.supervisor`` is a handle, not a liveness guarantee.  A
+        # detached loop can have exited after a lease conflict or an
+        # unexpected event-loop error while the handle remains attached.  Ask
+        # DurableRuntimeClient to restart that loop so a rejection/resume can
+        # never leave a queued run stranded behind a dead supervisor.
+        supervisor_running = (
+            client.supervisor is not None
+            and getattr(client.supervisor, "is_running", True)
+        )
+        if not supervisor_running:
+            try:
+                await client.start_supervisor(
+                    max_workers=3,
+                    config_overrides={
+                        "OPENAI_BASE_URL": values["base_url"],
+                        "OPENAI_MODEL": values["model"],
+                        "OPENAI_API_KEY": values["api_key"],
+                        "CC_HARNESS_PERMISSION_MODE": permission_mode,
+                    },
+                    permission_mode=permission_mode,
+                    stream_emitter=self._emit_live_stream,
+                )
+            except (SupervisorLeaseConflict, SupervisorLeaseFenceError):
+                # Another WebUI/CLI process is already the project scheduler.
+                # This process remains a control plane: durable submit/resume/
+                # approval writes are safe, and the existing owner will pick
+                # them up.  Do not turn a benign multi-window race into HTTP
+                # 500 or strand the conversation behind a dead UI.
+                client.supervisor = None
+                client.mark_supervisor_owned_elsewhere()
+                self._schedule_supervisor_retry(root)
+        else:
+            # A client may have been started by another control-plane path
+            # before the WebUI attached.  Update the worker-factory closure so
+            # newly claimed Runs still publish ephemeral chunks here.
+            client.set_stream_emitter(self._emit_live_stream)
         self._client_fingerprints[key] = fingerprint
         return client
 
@@ -645,6 +869,7 @@ class WebRuntimeManager:
                         "active_worker_id": view.projection.active_worker_id,
                         "updated_sequence": sequence,
                         "project_root": str(root),
+                        "scheduler": self._scheduler_status(client),
                     }
                 )
         return result
@@ -707,7 +932,16 @@ class WebRuntimeManager:
             (view.run_id, approval)
             for view in views
             for approval in view.projection.approvals
-            if approval.status.value == "requested"
+            # An approval belongs to the lifecycle of its owning Run.  Once
+            # that Run has crossed a terminal boundary (for example the user
+            # pressed Stop while the card was visible), the immutable
+            # ApprovalRequested fact remains in the event log for audit but
+            # must not be presented as actionable UI state.  Otherwise the
+            # browser can submit ApprovalRejected/ApprovalGranted against a
+            # cancelled Run and receive the misleading "invalid from
+            # cancelled" transition error.
+            if view.status is RunStatus.AWAITING_APPROVAL
+            and approval.status.value == "requested"
         )
         return root_view, effective, head, approvals, tuple(views)
 
@@ -732,7 +966,11 @@ class WebRuntimeManager:
             if not start:
                 await self._start_pending_if_configured(root)
             return await self._client_for_root(root, start=start)
-        raise ValueError("会话不存在或不属于当前本机项目")
+        # Keep a missing/stale browser id distinguishable from malformed
+        # control requests.  The HTTP layer maps this durable lookup result
+        # to 404 so the frontend can clear its selection instead of polling a
+        # dead session indefinitely.
+        raise RunNotFound(run_id)
 
     async def _validate_root_run(self, run_id: str) -> DurableRuntimeClient:
         return await self._client_for_run(run_id)
@@ -743,6 +981,7 @@ class WebRuntimeManager:
         *,
         session_id: str | None = None,
         project_root: str | None = None,
+        interaction_mode: str = "auto",
     ) -> dict[str, Any]:
         if not text.strip():
             raise ValueError("消息不能为空")
@@ -763,6 +1002,7 @@ class WebRuntimeManager:
                 RunStatus.FAILED_RECOVERABLE,
             }:
                 receipt = await client.coordinator.resume(head.run_id, text.strip())
+                await self._wake_supervisor(client)
                 return {
                     "session_id": session_id,
                     "run_id": session_id,
@@ -773,6 +1013,7 @@ class WebRuntimeManager:
                     "status": "queued",
                 }
             receipt = await client.coordinator.send(head.run_id, text.strip())
+            await self._wake_supervisor(client)
             return {
                 "session_id": session_id,
                 "run_id": session_id,
@@ -799,7 +1040,11 @@ class WebRuntimeManager:
             client = await self._client_for_root(requested_root, start=True)
         else:
             client = await self._client(start=True)
-        run_id = await client.submit(text.strip())
+        run_id = await client.submit(
+            text.strip(),
+            interaction_mode=classify_interaction_mode(text, interaction_mode),
+        )
+        await self._wake_supervisor(client)
         # ``RunCreated`` is the first durable root event and is therefore a
         # stable acknowledgement target for the optimistic WebUI message.
         return {
@@ -834,6 +1079,7 @@ class WebRuntimeManager:
             "context": context,
             "capabilities": context.get("capabilities", {}),
             "executor": client.executor_status(),
+            "scheduler": self._scheduler_status(client),
         }
 
     async def context(self, run_id: str, *, client: DurableRuntimeClient | None = None, usage: dict[str, Any] | None = None) -> dict[str, Any]:
@@ -1062,6 +1308,66 @@ class WebRuntimeManager:
         client = await self._validate_root_run(run_id)
         await client.terminate_run_tree(run_id, reason="WebUI 用户停止", stop_supervisor=False)
 
+    async def delete_session(self, run_id: str) -> dict[str, Any]:
+        """Remove a conversation from the WebUI without destroying its facts.
+
+        Deletion is intentionally a durable tombstone.  If a run is still
+        queued/running, request cancellation for its complete tree first so
+        the scheduler cannot claim it after the row is hidden.  The immutable
+        event/snapshot records remain available to future audit tooling while
+        normal listings and control endpoints treat the conversation as gone.
+        """
+
+        client = await self._client_for_run(run_id)
+        _root_view, _effective, _head, _approvals, tree = await self._conversation_snapshot(client, run_id)
+        tree_views = []
+        for tree_run_id in (item.run_id for item in tree):
+            with contextlib.suppress(Exception):
+                tree_views.append(await client.coordinator.inspect(tree_run_id))
+        if any(view.status in _ACTIVE_STATUSES for view in tree_views):
+            await client.terminate_run_tree(
+                run_id,
+                reason="WebUI 删除会话",
+                grace_seconds=0.2,
+                stop_supervisor=False,
+            )
+            # Do not create a tombstone while a worker may still own an action
+            # lease.  The worker must first persist its safe cancellation
+            # boundary (including ActionOutcomeUnknown when needed); otherwise
+            # hiding the run would make that final fact impossible to append
+            # and could leave a subprocess running after the user thinks the
+            # session was deleted.  A bounded wait keeps the endpoint
+            # responsive and asks the user to retry if a non-cooperative
+            # provider exceeds the grace period.
+            deadline = asyncio.get_running_loop().time() + 8.0
+            while True:
+                pending: list[str] = []
+                for tree_run_id in (item.run_id for item in tree):
+                    try:
+                        view = await client.coordinator.inspect(tree_run_id)
+                    except Exception:
+                        # A transient projection read failure is not proof of
+                        # safety; keep the run visible and let the caller
+                        # retry after the supervisor has repaired the cursor.
+                        pending.append(tree_run_id)
+                        continue
+                    if view.status in _ACTIVE_STATUSES:
+                        pending.append(tree_run_id)
+                if not pending:
+                    break
+                if asyncio.get_running_loop().time() >= deadline:
+                    raise SessionDeleteConflict(
+                        "会话正在安全停止，请稍后重试删除；运行证据仍保留"
+                    )
+                await asyncio.sleep(0.05)
+        hidden = await client.store.tombstone_run_tree(run_id)
+        return {
+            "run_id": run_id,
+            "deleted": True,
+            "hidden_run_count": len(hidden),
+            "audit_retained": True,
+        }
+
     async def resume(self, run_id: str) -> None:
         # Resuming may need to create a supervisor.  Use the same explicit
         # WebUI settings path as a new message so a resume never falls back to
@@ -1073,28 +1379,162 @@ class WebRuntimeManager:
             raise ValueError("当前会话有待处理审批，请先在运行面板中允许或拒绝该动作")
         if head.status not in _RECOVERABLE_STATUSES:
             raise ValueError(f"当前状态不可恢复: {head.status.value}")
-        await client.continue_run(head.run_id, reason="WebUI 用户继续")
+        # ``_client_for_run(start=True)`` already attempted to attach a local
+        # supervisor.  If another process owns the project lease, continue
+        # remains a durable control-plane write and must not retry leadership
+        # a second time in the same request.
+        await client.continue_run(
+            head.run_id,
+            reason="WebUI 用户继续",
+        )
 
-    async def approve(self, run_id: str, approval_id: str, digest: str) -> None:
+    async def _wake_supervisor(self, client: DurableRuntimeClient) -> None:
+        """Wake the project scheduler after a durable control decision."""
+
+        supervisor = client.supervisor
+        wake = getattr(supervisor, "wake", None) if supervisor is not None else None
+        if callable(wake):
+            wake()
+
+    @staticmethod
+    def _approval_in_tree(
+        tree: tuple[Any, ...],
+        approval_id: str,
+    ) -> tuple[str, Any, Any] | None:
+        """Find an approval in the authoritative tree, including decided ones.
+
+        ``_conversation_snapshot`` intentionally returns only requested
+        approvals for the composer.  Decision endpoints must also inspect
+        terminal approvals so a stale browser click can be answered
+        idempotently instead of being reported as an unknown approval.
+        """
+
+        for view in tree:
+            for approval in view.projection.approvals:
+                if approval.approval_id == approval_id:
+                    return view.run_id, approval, view
+        return None
+
+    @staticmethod
+    def _approval_result(
+        effective: Any,
+        tree: tuple[Any, ...],
+        decision: str,
+        *,
+        idempotent: bool = False,
+    ) -> dict[str, Any]:
+        return {
+            "decision": decision,
+            "status": effective.status.value,
+            "sequence": max((item.sequence for item in tree), default=effective.sequence),
+            "continuation": "queued" if effective.status in _ACTIVE_STATUSES else effective.status.value,
+            "idempotent": idempotent,
+        }
+
+    async def approve(self, run_id: str, approval_id: str, digest: str) -> dict[str, Any]:
+        # Resolve the card before starting provider resources.  A stale card
+        # should return immediately after a Stop/other-tab decision instead
+        # of blocking while a fresh supervisor initializes.  Only an
+        # actually requested approval needs the detached worker restarted.
+        client = await self._client_for_run(run_id)
+        _root_view, effective, _head, _approvals, tree = await self._conversation_snapshot(client, run_id)
+        match = self._approval_in_tree(tree, approval_id)
+        if match is None:
+            raise ApprovalStaleError(approval_id)
+        owner, approval, _owner_view = match
+        if approval.status.value != "requested":
+            # A second click, another browser tab, or a stop may have already
+            # decided the action.  Return the durable decision without
+            # appending a second event.
+            return self._approval_result(effective, tree, approval.status.value, idempotent=True)
         # Approval may be the first interaction after a WebUI restart. Start
         # the detached supervisor before granting the child action so the
-        # worker can consume the durable decision immediately.
+        # worker can consume the durable decision immediately, then re-read
+        # the projection because startup can race a cancellation/decision.
         client = await self._client_for_run(run_id, start=True)
-        _root_view, _effective, _head, approvals, _tree = await self._conversation_snapshot(client, run_id)
-        owner = next((owner for owner, item in approvals if item.approval_id == approval_id), None)
-        if owner is None:
-            raise ValueError("审批不存在、已处理或不属于当前会话")
-        await client.coordinator.approve(run_id=owner, approval_id=approval_id, action_args_digest=digest)
+        _root_view, effective, _head, _approvals, tree = await self._conversation_snapshot(client, run_id)
+        match = self._approval_in_tree(tree, approval_id)
+        if match is None:
+            raise ApprovalStaleError(approval_id)
+        owner, approval, _owner_view = match
+        if approval.status.value != "requested":
+            return self._approval_result(effective, tree, approval.status.value, idempotent=True)
+        try:
+            decision = await client.coordinator.approve(
+                run_id=owner,
+                approval_id=approval_id,
+                action_args_digest=digest,
+            )
+        except (ApprovalNotFoundError, SequenceConflict):
+            # Resolve a cross-process race against the fresh projection.  If
+            # another actor won, expose its terminal decision as a successful
+            # no-op; otherwise report a recoverable stale-card conflict.
+            _root_view, effective, _head, _approvals, tree = await self._conversation_snapshot(client, run_id)
+            latest = self._approval_in_tree(tree, approval_id)
+            if latest is None:
+                raise ApprovalStaleError(approval_id) from None
+            owner, approval, _owner_view = latest
+            if approval.status.value == "requested":
+                # The projection is still actionable but another durable
+                # event kept changing its sequence.  Ask the browser to
+                # refresh and retry instead of leaking a store race as 500.
+                raise ApprovalStaleError(approval_id) from None
+            return self._approval_result(effective, tree, approval.status.value, idempotent=True)
+        except ApprovalDigestMismatchError:
+            raise ValueError("审批参数已变化，请刷新会话后重新确认") from None
+        await self._wake_supervisor(client)
+        _root_view, effective, _head, _approvals, tree = await self._conversation_snapshot(client, run_id)
+        return self._approval_result(effective, tree, decision.status)
 
-    async def reject(self, run_id: str, approval_id: str, reason: str) -> None:
+    async def reject(self, run_id: str, approval_id: str, reason: str) -> dict[str, Any]:
+        # As with approve(), inspect the durable card before doing potentially
+        # expensive provider/supervisor startup so a stale click is fast and
+        # deterministic.
+        client = await self._client_for_run(run_id)
+        _root_view, effective, _head, _approvals, tree = await self._conversation_snapshot(client, run_id)
+        match = self._approval_in_tree(tree, approval_id)
+        if match is None:
+            raise ApprovalStaleError(approval_id)
+        owner, approval, _owner_view = match
+        if approval.status.value != "requested":
+            return self._approval_result(effective, tree, approval.status.value, idempotent=True)
         client = await self._client_for_run(run_id, start=True)
-        _root_view, _effective, _head, approvals, _tree = await self._conversation_snapshot(client, run_id)
-        owner = next((owner for owner, item in approvals if item.approval_id == approval_id), None)
-        if owner is None:
-            raise ValueError("审批不存在、已处理或不属于当前会话")
-        await client.coordinator.reject(run_id=owner, approval_id=approval_id, reason=reason or "WebUI 用户拒绝")
+        _root_view, effective, _head, _approvals, tree = await self._conversation_snapshot(client, run_id)
+        match = self._approval_in_tree(tree, approval_id)
+        if match is None:
+            raise ApprovalStaleError(approval_id)
+        owner, approval, _owner_view = match
+        if approval.status.value != "requested":
+            return self._approval_result(effective, tree, approval.status.value, idempotent=True)
+        try:
+            decision = await client.coordinator.reject(
+                run_id=owner,
+                approval_id=approval_id,
+                reason=reason or "WebUI 用户拒绝",
+            )
+        except (ApprovalNotFoundError, SequenceConflict):
+            _root_view, effective, _head, _approvals, tree = await self._conversation_snapshot(client, run_id)
+            latest = self._approval_in_tree(tree, approval_id)
+            if latest is None:
+                raise ApprovalStaleError(approval_id) from None
+            owner, approval, _owner_view = latest
+            if approval.status.value == "requested":
+                raise ApprovalStaleError(approval_id) from None
+            return self._approval_result(effective, tree, approval.status.value, idempotent=True)
+        # ApprovalRejected moves only this action back to the queue.  Wake the
+        # scheduler rather than waiting for its next polling interval, so the
+        # frontend can observe RunClaimed/ToolObservationCommitted promptly.
+        await self._wake_supervisor(client)
+        _root_view, effective, _head, _approvals, tree = await self._conversation_snapshot(client, run_id)
+        return self._approval_result(effective, tree, decision.status)
 
     async def shutdown(self) -> None:
+        retry_tasks = tuple(self._supervisor_retry_tasks.values())
+        self._supervisor_retry_tasks.clear()
+        for task in retry_tasks:
+            task.cancel()
+        if retry_tasks:
+            await asyncio.gather(*retry_tasks, return_exceptions=True)
         clients = tuple(self._clients.values())
         for client in clients:
             with contextlib.suppress(Exception):
@@ -1110,6 +1550,7 @@ class WebRuntimeManager:
                 await client.close()
         self._clients.clear()
         self._client_fingerprints.clear()
+        await self.live_stream.close()
 
 
 class ProjectSelectRequest(BaseModel):
@@ -1124,6 +1565,9 @@ class MessageRequest(BaseModel):
     # through the manager's mutable UI selection when multiple project
     # histories are being refreshed concurrently.
     project_root: str | None = None
+    # ``auto`` is intentionally conservative; callers can opt into the
+    # explicit conversation contract for a tool-free turn.
+    interaction_mode: str = "auto"
 
 
 class SettingsRequest(BaseModel):
@@ -1145,6 +1589,14 @@ class RejectRequest(BaseModel):
 def _http_error(exc: Exception) -> HTTPException:
     if isinstance(exc, ConfigError):
         return HTTPException(status_code=400, detail={"code": "configuration_required", "message": str(exc)})
+    if isinstance(exc, RunNotFound):
+        return HTTPException(status_code=404, detail={"code": "session_not_found", "message": "会话不存在或已被清理"})
+    if isinstance(exc, SessionDeleteConflict):
+        return HTTPException(status_code=409, detail={"code": "session_delete_pending", "message": str(exc)})
+    if isinstance(exc, ApprovalStaleError):
+        return HTTPException(status_code=409, detail={"code": "approval_stale", "message": str(exc)})
+    if isinstance(exc, ApprovalDigestMismatchError):
+        return HTTPException(status_code=409, detail={"code": "approval_digest_mismatch", "message": str(exc)})
     if isinstance(exc, (ValueError, KeyError)):
         return HTTPException(status_code=400, detail={"code": "invalid_request", "message": str(exc)})
     # Preserve a concise, sanitized diagnostic for local setup failures (for
@@ -1184,13 +1636,17 @@ def create_web_app(manager: WebRuntimeManager | None = None) -> FastAPI:
         return {"status": "ok", "service": "cc-harness-webui", "runtime": "durable", "time": time.time()}
 
     @app.get("/api/bootstrap")
-    async def bootstrap() -> dict[str, Any]:
+    async def bootstrap(include_sessions: bool = True) -> dict[str, Any]:
         project = manager.project_key
         settings = await manager.settings.public(manager.selected_root)
         # Keep durable history discoverable even before a workspace is picked.
         # The project gate still prevents sending work, while the grouped
         # sidebar lets a user choose a previously opened project/session.
-        sessions = await manager.sessions(all_projects=True)
+        # The browser requests ``include_sessions=false`` for the first paint;
+        # scanning every known project replays each run tree and should not
+        # block the shell. The historical/default contract still includes the
+        # complete list for API consumers that need a single bootstrap call.
+        sessions = await manager.sessions(all_projects=True) if include_sessions else []
         return {
             "service": "cc-harness-webui",
             "runtime": "durable",
@@ -1293,6 +1749,7 @@ def create_web_app(manager: WebRuntimeManager | None = None) -> FastAPI:
                 payload.text,
                 session_id=payload.session_id,
                 project_root=payload.project_root,
+                interaction_mode=payload.interaction_mode,
             )
         except Exception as exc:
             raise _http_error(exc) from exc
@@ -1333,7 +1790,7 @@ def create_web_app(manager: WebRuntimeManager | None = None) -> FastAPI:
     @app.get("/api/sessions/{run_id}/events")
     async def stream_events(run_id: str, request: Request, after: int = 0) -> StreamingResponse:
         try:
-            await manager._validate_root_run(run_id)
+            client = await manager._validate_root_run(run_id)
         except Exception as exc:
             raise _http_error(exc) from exc
         header_cursor = request.headers.get("last-event-id")
@@ -1349,20 +1806,56 @@ def create_web_app(manager: WebRuntimeManager | None = None) -> FastAPI:
 
         async def events() -> AsyncIterator[str]:
             cursors: dict[str, int] = {run_id: cursor}
-            while not await request.is_disconnected():
-                try:
-                    items, cursors = await manager.tree_events(run_id, cursors=cursors)
-                except Exception:
-                    break
-                for item in items:
-                    # Keep root IDs numeric for old clients; child IDs are
-                    # composite but still stable and are de-duplicated by the
-                    # browser using the public event envelope.
-                    stream_id = item["sequence"] if item["run_id"] == run_id else item["id"]
-                    yield f"id: {stream_id}\nevent: runtime\ndata: {json.dumps(item, ensure_ascii=False)}\n\n"
-                if not items:
-                    yield ": heartbeat\n\n"
-                await asyncio.sleep(0.5)
+            # Register before the first Durable read so a chunk emitted while
+            # the browser is loading its timeline cannot be lost.  The hub is
+            # best-effort; a detached supervisor in another process simply
+            # produces no live messages and is still covered by polling.
+            async with manager.live_stream.subscription() as live_queue:
+                tree_ids = set(await client.run_tree(run_id))
+                last_tree_refresh = time.monotonic()
+                while not await request.is_disconnected():
+                    try:
+                        items, cursors = await manager.tree_events(run_id, cursors=cursors)
+                    except Exception:
+                        break
+                    for item in items:
+                        # Keep root IDs numeric for old clients; child IDs are
+                        # composite but still stable and are de-duplicated by
+                        # the browser using the public event envelope.
+                        stream_id = item["sequence"] if item["run_id"] == run_id else item["id"]
+                        yield f"id: {stream_id}\nevent: runtime\ndata: {json.dumps(item, ensure_ascii=False)}\n\n"
+
+                    # Child Runs can be created after the stream starts.  A
+                    # small refresh window lets their live chunks enter the
+                    # same conversation without querying SQLite per token.
+                    if time.monotonic() - last_tree_refresh >= 1.0:
+                        with contextlib.suppress(Exception):
+                            tree_ids = set(await client.run_tree(run_id))
+                        last_tree_refresh = time.monotonic()
+
+                    wait_timeout = 0.05 if items else 0.5
+                    try:
+                        live = await asyncio.wait_for(live_queue.get(), timeout=wait_timeout)
+                    except asyncio.TimeoutError:
+                        if not items:
+                            yield ": heartbeat\n\n"
+                        continue
+                    if str(live.get("run_id") or "") not in tree_ids:
+                        continue
+                    live_id = live.get("live_id") or f"live-{time.time_ns()}"
+                    live_payload = {**live, "root_run_id": run_id}
+                    yield f"id: live:{live_id}\nevent: stream\ndata: {json.dumps(live_payload, ensure_ascii=False)}\n\n"
+                    # Drain a small burst without blocking the durable poll.
+                    for _ in range(32):
+                        try:
+                            live = live_queue.get_nowait()
+                        except asyncio.QueueEmpty:
+                            break
+                        if str(live.get("run_id") or "") not in tree_ids:
+                            continue
+                        live_id = live.get("live_id") or f"live-{time.time_ns()}"
+                        live_payload = {**live, "root_run_id": run_id}
+                        yield f"id: live:{live_id}\nevent: stream\ndata: {json.dumps(live_payload, ensure_ascii=False)}\n\n"
 
         return StreamingResponse(
             events(),
@@ -1378,6 +1871,13 @@ def create_web_app(manager: WebRuntimeManager | None = None) -> FastAPI:
             raise _http_error(exc) from exc
         return {"stopped": True, "run_id": run_id}
 
+    @app.delete("/api/sessions/{run_id}")
+    async def delete_session(run_id: str) -> dict[str, Any]:
+        try:
+            return await manager.delete_session(run_id)
+        except Exception as exc:
+            raise _http_error(exc) from exc
+
     @app.post("/api/sessions/{run_id}/resume")
     async def resume_session(run_id: str) -> dict[str, Any]:
         try:
@@ -1391,18 +1891,77 @@ def create_web_app(manager: WebRuntimeManager | None = None) -> FastAPI:
         if not payload.action_args_digest:
             raise HTTPException(status_code=400, detail={"code": "digest_required", "message": "缺少 action_args_digest"})
         try:
-            await manager.approve(run_id, approval_id, payload.action_args_digest)
+            result = await manager.approve(run_id, approval_id, payload.action_args_digest)
         except Exception as exc:
             raise _http_error(exc) from exc
-        return {"approved": True, "run_id": run_id, "approval_id": approval_id}
+        return {"approved": True, "run_id": run_id, "approval_id": approval_id, **result}
 
     @app.post("/api/sessions/{run_id}/approvals/{approval_id}/reject")
     async def reject(run_id: str, approval_id: str, payload: RejectRequest) -> dict[str, Any]:
         try:
-            await manager.reject(run_id, approval_id, payload.reason)
+            result = await manager.reject(run_id, approval_id, payload.reason)
         except Exception as exc:
             raise _http_error(exc) from exc
-        return {"rejected": True, "run_id": run_id, "approval_id": approval_id}
+        return {"rejected": True, "run_id": run_id, "approval_id": approval_id, **result}
+
+    # The migrated DeepSeek-style client talks to a versioned Web contract.
+    # Keep the historical ``/api`` routes above for TUI/headless clients, but
+    # register the exact same handlers under one explicit compatibility
+    # namespace.  Aliasing the handlers (instead of duplicating business
+    # logic) guarantees that browser commands and legacy clients share the
+    # same Durable Runtime, event cursor semantics, redaction, and approval
+    # behavior.
+    async def web_capabilities() -> dict[str, Any]:
+        return {
+            "version": "v1",
+            "runtime": "durable",
+            "transport": {"commands": "rest", "events": "sse", "reconnect": "cursor"},
+            "features": {
+                "projects": {"supported": True},
+                "sessions": {
+                    "supported": True,
+                    "hierarchy": "project/session/run",
+                    # Deletion is a reversible presentation action: the
+                    # sidebar hides a tombstoned tree while immutable events
+                    # and snapshots remain available to audit tooling.
+                    "delete": "tombstone",
+                },
+                "approvals": {"supported": True, "reject_continues": True},
+                "stop": {"supported": True, "scope": "run_tree"},
+                "resume": {"supported": True, "mode": "natural_language_or_checkpoint"},
+                "context": {"supported": True, "source": "runtime"},
+                "memory": {"supported": True, "source": "runtime", "injection": "L3>L2>L1>L0"},
+                "security": {"supported": True, "source": "runtime"},
+            },
+            "unsupported_controls": [],
+        }
+
+    # Explicit aliases are part of the public API contract.  FastAPI keeps the
+    # original endpoint names and OpenAPI metadata intact for compatibility.
+    versioned_routes = (
+        ("/api/web/v1/health", health, ["GET"]),
+        ("/api/web/v1/bootstrap", bootstrap, ["GET"]),
+        ("/api/web/v1/capabilities", web_capabilities, ["GET"]),
+        ("/api/web/v1/settings", get_settings, ["GET"]),
+        ("/api/web/v1/settings", save_settings, ["POST"]),
+        ("/api/web/v1/settings/test", test_settings, ["POST"]),
+        ("/api/web/v1/projects/select", select_project, ["POST"]),
+        ("/api/web/v1/sessions", list_sessions, ["GET"]),
+        ("/api/web/v1/messages", post_message, ["POST"]),
+        ("/api/web/v1/sessions", create_session, ["POST"]),
+        ("/api/web/v1/sessions/{run_id}/messages", post_session_message, ["POST"]),
+        ("/api/web/v1/sessions/{run_id}", get_session, ["GET"]),
+        ("/api/web/v1/sessions/{run_id}/timeline", get_timeline, ["GET"]),
+        ("/api/web/v1/sessions/{run_id}/context", get_context, ["GET"]),
+        ("/api/web/v1/sessions/{run_id}/events", stream_events, ["GET"]),
+        ("/api/web/v1/sessions/{run_id}", delete_session, ["DELETE"]),
+        ("/api/web/v1/sessions/{run_id}/stop", stop_session, ["POST"]),
+        ("/api/web/v1/sessions/{run_id}/resume", resume_session, ["POST"]),
+        ("/api/web/v1/sessions/{run_id}/approvals/{approval_id}/approve", approve, ["POST"]),
+        ("/api/web/v1/sessions/{run_id}/approvals/{approval_id}/reject", reject, ["POST"]),
+    )
+    for route_path, endpoint, methods in versioned_routes:
+        app.add_api_route(route_path, endpoint, methods=methods, include_in_schema=True)
 
     static = _static_root()
     if static is not None:

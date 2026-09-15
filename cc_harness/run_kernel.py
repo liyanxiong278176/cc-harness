@@ -6,7 +6,8 @@ import hashlib
 import json
 import uuid
 from dataclasses import dataclass, field
-from typing import Any, Mapping, Protocol, Sequence
+import inspect
+from typing import Any, Awaitable, Callable, Mapping, Protocol, Sequence
 
 from .run_model import CompletionCandidate, EffectClass, RunProgress, action_idempotency_key
 from .run_projection import RunProjection
@@ -116,6 +117,8 @@ class ModelAdapter(Protocol):
         self,
         messages: Sequence[Mapping[str, Any]],
         tools: Sequence[Mapping[str, Any]],
+        *,
+        stream_callback: "StreamCallback | None" = None,
     ) -> ModelSegment | Mapping[str, Any]: ...
 
 
@@ -129,6 +132,9 @@ class SegmentContext:
     lease_epoch: int = 0
     worker_id: str = ""
     cancellation_requested: bool = False
+
+
+StreamCallback = Callable[[Mapping[str, Any]], Awaitable[None]]
 
 
 @dataclass(frozen=True)
@@ -146,7 +152,12 @@ class SegmentOutcome:
 
 
 class AgentKernel(Protocol):
-    async def execute_segment(self, context: SegmentContext) -> SegmentOutcome: ...
+    async def execute_segment(
+        self,
+        context: SegmentContext,
+        *,
+        stream_callback: StreamCallback | None = None,
+    ) -> SegmentOutcome: ...
 
 
 class ReActKernel:
@@ -155,10 +166,36 @@ class ReActKernel:
     def __init__(self, model: ModelAdapter) -> None:
         self.model = model
 
-    async def execute_segment(self, context: SegmentContext) -> SegmentOutcome:
+    async def execute_segment(
+        self,
+        context: SegmentContext,
+        *,
+        stream_callback: StreamCallback | None = None,
+    ) -> SegmentOutcome:
         if context.cancellation_requested:
             return SegmentOutcome("", stop_reason="cancel_requested")
-        raw = await self.model.complete(context.messages, context.available_tools)
+        complete = self.model.complete
+        # Keep custom/test ModelAdapter implementations source-compatible.  A
+        # third-party adapter may still implement the original two-argument
+        # method; only pass the optional callback when its signature advertises
+        # it (or accepts arbitrary keyword arguments).
+        supports_callback = False
+        try:
+            parameters = inspect.signature(complete).parameters.values()
+            supports_callback = "stream_callback" in inspect.signature(complete).parameters or any(
+                parameter.kind is inspect.Parameter.VAR_KEYWORD
+                for parameter in parameters
+            )
+        except (TypeError, ValueError):
+            supports_callback = False
+        if stream_callback is not None and supports_callback:
+            raw = await complete(
+                context.messages,
+                context.available_tools,
+                stream_callback=stream_callback,
+            )
+        else:
+            raw = await complete(context.messages, context.available_tools)
         segment = raw if isinstance(raw, ModelSegment) else ModelSegment.from_mapping(raw)
         requests: list[ActionRequest] = []
         intents: list[EventIntent] = []

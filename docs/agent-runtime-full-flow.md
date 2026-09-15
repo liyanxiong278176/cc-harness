@@ -64,7 +64,7 @@ flowchart TD
         DENY["ActionDenied / Tool Error<br/>作用：拒绝动作并把结构化原因反馈给模型"]
         ASK["ApprovalRequested<br/>作用：持久化工具、参数、风险、范围和有效期"]
         APPR{"用户/审批结果？"}
-        REJECT["ApprovalRejected → RunBlocked<br/>作用：保留拒绝证据，不执行动作"]
+        REJECT["ApprovalRejected → RunQueued + ActionCancelled<br/>作用：保留拒绝证据，不执行本次动作，向模型返回工具结果并继续"]
         ALLOW["ActionAllowed<br/>作用：允许进入实际工具执行"]
         EXEC["Dispatch Tool<br/>作用：调用 Native/MCP/子任务等能力适配器"]
         OBS["ToolObservationCommitted<br/>作用：提交工具结果、状态、错误和副作用证据"]
@@ -80,7 +80,7 @@ flowchart TD
 
     TOOLCALL --> CHECK
     DENY -.->|模型收到拒绝原因后重新规划| SNAP
-    REJECT --> END_BLOCK["RunBlocked<br/>作用：等待用户后续决定"]
+    REJECT --> SNAP
     UPDATE --> NODE{"当前 PlanNode 是否完成？"}
     NODE --"否"--> SEGEND
     NODE --"是"--> PN["PlanNodeCompleted / TodoCompleted<br/>作用：推进计划图和节点状态"]
@@ -109,6 +109,7 @@ flowchart TD
         SAFE_RETRY["Safe Retry<br/>作用：未开始或可证明幂等的只读动作可重试"]
         UNKNOWN["ActionOutcomeUnknown + RunBlocked<br/>作用：外部副作用可能已发生，禁止盲目重放"]
         RECON["Reconciliation / Human Review<br/>作用：查询外部状态后决定继续、终止或人工处理"]
+        END_BLOCK["RunBlocked<br/>作用：无法安全确认外部结果时等待人工处理"]
         LOST --> EXPIRED --> REBUILD --> INFLIGHT
         INFLIGHT --"未开始 / 只读幂等"--> SAFE_RETRY
         INFLIGHT --"外部写入 / 状态不明"--> UNKNOWN --> RECON
@@ -156,6 +157,12 @@ flowchart TD
     class COMPLETE,RESULT,END_BLOCK,FAILED,CANCEL terminal;
 ```
 
+投影快照只是恢复加速器，不是事实源。启动或读取时如果发现旧版本快照缺少
+新增字段，Runtime 会先校验快照原始摘要，再从不可变事件流重放；重放成功后只修复
+`run_record` 游标和动作/审批/跟进索引，不改写事件或快照。这样升级后的旧会话不会被
+`snapshot digest mismatch` 或 `stored projection cursor does not match event rebuild`
+反复卡住；若原始快照摘要本身不匹配，则仍按篡改处理并安全拒绝，避免把不可信数据当成状态。
+
 ## 英文术语的作用
 
 | 英文术语 | 在 Agent Runtime 中的作用 |
@@ -178,6 +185,20 @@ flowchart TD
 | Working State | 当前 Run 的进度、错误和验证状态 |
 | CompletionVerifier | 判断是否具备完成证据，防止模型自称完成 |
 | OutcomeUnknown | 外部副作用可能已经发生，但结果尚未确认 |
+
+## WebUI 审批拒绝的展示与续跑
+
+用户在运行面板点击“拒绝”后，Runtime 只取消当前工具动作：事件流记录
+`ApprovalRejected`、`ToolObservationCommitted(status=cancelled)` 和
+`ActionCancelled(cancellation_reason=user_rejected)`，随后唤醒 Supervisor 重新调度
+同一 Run。页面会在会话过程显示“已拒绝（未执行）”，并在实时状态中显示
+“已拒绝本次动作，继续运行”；如果模型没有产生可验证的新进展，仍会按完成门规则
+显示“已暂停”，用户可以继续发送指令。
+
+如果用户在审批卡片出现后先点击“停止”，`RunCancelled` 会让尚未决定的审批在
+投影中变为 `expired`。它仍保留在不可变事件流中供审计，但不会再显示为可点击卡片；
+之后从检查点继续时，Runtime 会先提交“未执行”的工具观察并关闭原动作，不会绕过授权
+重放该命令。
 | RunStore | 保存不可变 Run Event 的事实存储 |
 | Checkpoint / Projection | 从事件恢复出的当前状态快照，不是新的事实源 |
 

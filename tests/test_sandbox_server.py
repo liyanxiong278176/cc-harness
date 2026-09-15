@@ -207,6 +207,27 @@ def test_attest_server_config_accepts_required_security_controls(tmp_path):
     assert state.config_digest.startswith("sha256:")
 
 
+def test_attest_server_config_marks_project_path_only_mismatch_recoverable(tmp_path):
+    """A stale local mount list may use the audited native fallback."""
+
+    from cc_harness.sandbox_server import ServerAttestationError, attest_server_config
+
+    config = tmp_path / "external.toml"
+    _write_attested_config(config, tmp_path / "old-project")
+    missing_project = tmp_path / "new-project"
+    with pytest.raises(ServerAttestationError, match="host path is not allowlisted") as caught:
+        attest_server_config(
+            config,
+            host="127.0.0.1",
+            port=8000,
+            required_host_paths=[str(missing_project)],
+            max_pids=256,
+        )
+
+    assert caught.value.fallback_safe is True
+    assert caught.value.stage == "host_path_allowlist"
+
+
 @pytest.mark.parametrize(
     ("mutate", "expected"),
     [

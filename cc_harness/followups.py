@@ -126,6 +126,7 @@ class FollowUpService:
             objective=message,
             acceptance_criteria=("follow-up request addressed",),
             constraints=constraints,
+            interaction_mode=predecessor.goal.interaction_mode if predecessor.goal else "coding",
         )
         handoff = self.artifacts.put_text(
             json.dumps(

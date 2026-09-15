@@ -46,6 +46,84 @@ treatment 与必要的隔离 judge 均使用经服务端身份验证的 `deepsee
 **产品对标边界（Product Parity Boundary）**:
 cc-harness 对标 Claude Code/DeepSeek Harness 的本地 coding-agent 内核、WebUI 和 headless/SDK 能力；云端协作、Desktop/Mobile 原生壳、Slack、Chrome 与完整企业平台不属于当前对标范围。_Avoid_: 完整复制云平台、只对齐界面外观、让 WebUI 旁路 Runtime
 
+**选择性 WebUI 移植（Selective WebUI Port）**:
+以 DeepSeek Harness 的成熟界面结构和交互语义为参考，移植可复用的呈现层能力，同时保留 cc-harness 的运行时、事件、权限、上下文与会话事实；用户看到的状态必须由 cc-harness 的权威事实驱动。_Avoid_: 整体替换运行时、复制与本项目事实模型冲突的会话协议、把外观相似误认为能力接通、让前端维护第二套运行状态
+
+**固定 UI 快照（Pinned UI Snapshot）**:
+移植的第三方界面代码绑定到可追溯且可复现的上游版本，在升级前经过许可证、依赖、交互和兼容性审查；快照只提供呈现能力，不成为 cc-harness 的运行事实源。_Avoid_: 直接跟随上游分支、构建时隐式联网拉取、混用不匹配的发行包、遗漏版权与第三方通知
+
+**UI 依赖闭包（UI Dependency Closure）**:
+固定快照包含完整的 Web UI 表现层，以及使其可构建、可运行所必需的最小布局、会话、对话、编辑器、状态和 client/store/session/tool 依赖；不包含 DeepSeek 的 Agent Runtime、CLI、评测、原生端或无关文档。依赖闭包只服务于呈现和交互，cc-harness 的 Runtime、事件、权限、上下文、记忆与安全事实保持唯一权威。_Avoid_: 只复制静态 dist 导致无法维护、把整套上游 Runtime 一并带入形成双内核、遗漏隐式 UI 依赖、让闭包依赖网络安装
+
+**整体前端迁移（Full Frontend Migration）**:
+删除现有 cc-harness `web/src` 页面实现，以固定的 DeepSeek UI 依赖闭包作为唯一页面源码，并在同一 `web` 工程内用 Vite 构建；迁移范围只覆盖前端呈现、交互和客户端状态编排，后端 API、Durable Runtime、不可变事件、权限、上下文、记忆与安全仍由 cc-harness 提供。_Avoid_: 保留两套可见页面、把 DeepSeek Runtime 一并迁入、让客户端状态取代事件事实、迁移后继续维护旧页面分支
+
+**Web 兼容适配层（Web Compatibility Facade）**:
+在 cc-harness 后端提供 DeepSeek UI 所需的查询、命令和流式事件接口，但适配层只翻译协议和数据形状，所有状态变更仍调用现有 Runtime、会话库、权限门和不可变事件追加；前端不直接写数据库，也不拥有第二套运行事实。_Avoid_: 让适配层复制执行逻辑、让客户端事件覆盖服务端事实、为兼容 UI 绕过审批或沙箱、同时维护两套写入协议
+
+**能力驱动界面（Capability-Driven UI）**:
+后端为当前 Runtime 发布可验证的能力清单；迁移后的 UI 只启用有对应后端契约的操作，未支持的控件保持可见但置灰并说明原因，不能通过客户端假状态或错误吞掉来伪造成功。能力启用必须随服务端契约和权限状态实时更新。_Avoid_: 静态假设所有上游功能都可用、点击未支持功能后写入临时成功状态、用 UI 隐藏掩盖能力缺口、绕过审批或沙箱启用功能
+
+**项目-会话-运行树（Project–Session–Run Tree）**:
+DeepSeek UI 的左侧层级只呈现 cc-harness 的权威对象：规范化项目根目录为项目节点，`session_id` 为会话节点，`run_id`/任务节点为会话下的执行子节点；节点状态和标题来自服务端投影，切换只改变当前查看对象，不复制或迁移 Runtime 状态。_Avoid_: 用浏览器 localStorage 生成影子会话、把同一 Run 显示成多个可写实例、以标题代替稳定 ID、项目路径未选择时创建工作会话
+
+**工具级审批继续（Tool-Level Approval Continuation）**:
+审批决定只作用于当前待执行的工具动作；用户拒绝时追加可审计的拒绝结果并将其作为工具结果返回给主 Agent，当前 Run 保持可继续状态，模型可据此改用其他方案或完成任务。拒绝不应自动取消整个 Run，也不能重放被拒绝的动作；只有显式停止、策略硬拒绝或不可恢复错误才终止 Run。_Avoid_: 将 `ApprovalRejected` 当作 Run 取消、拒绝后让 UI 永久显示排队、吞掉拒绝原因、让模型绕过拒绝直接重试同一副作用动作
+
+**可观测状态表面（Observability Surface）**:
+页面只展示由 Runtime 事实驱动的最小实时状态：运行/排队/审批/阻塞/完成、当前模型、上下文占用摘要和安全策略；详细上下文分项、记忆检索命中、压缩/卸载轨迹与安全决策通过可展开面板查看。所有数字和状态都带事件序号或更新时间，未知值保持未知。_Avoid_: 把内部事件原文塞进对话气泡、展示模型臆测状态、用静态百分比冒充实时用量、把记忆或安全模块做成独立的第二状态源
+
+**分层记忆按需注入（Layered Memory On-Demand Injection）**:
+每次新 Run 初始只注入 L3 项目级记忆；当当前任务的相关性或 Runtime 决策证明需要更多历史时，按 L3 → L2 → L1 → L0 顺序检索并记录命中、注入和未命中证据。前端只展示检索轨迹和摘要，不能自行拼接、降级或覆盖主记忆。_Avoid_: 每轮全量注入记忆、把向量命中当作已注入、跳级读取 L0、让 UI localStorage 成为记忆源、为展示填充虚构命中
+
+**运行时自动压缩（Runtime-Governed Compaction）**:
+Runtime 在模型请求前根据有效窗口和已确认的 token 账本决定是否压缩，按可审计的策略生成不可变压缩版本并在事件流中记录开始、完成或失败；压缩完成后才发送请求，失败则保留原上下文并明确阻止超窗请求。前端显示压缩中的实时状态和结果详情，不自行截断消息或伪造节省量。_Avoid_: 等 provider 返回超窗错误才处理、客户端按字符数粗暴截断、压缩失败后继续发送未知上下文、把压缩摘要当作原始消息、用静态进度冒充完成
+
+**自动恢复交互（Automatic Recovery UX）**:
+页面加载、刷新或 SSE 断线时，前端先读取服务端投影并从最后事件序号补读，恢复会话、Run、审批和上下文状态；不要求用户输入 `/resume`。用户发送“继续”等自然语言后，由主 Agent 读取 checkpoint 和事件事实决定下一步；若原 Run 仍由其他进程持有租约，页面显示只读/恢复中原因，不把租约冲突伪装成永久排队。_Avoid_: 只依赖内存状态、断线后从头重放副作用动作、把恢复按钮当作唯一入口、把 lease conflict 变成无解释的 500、让浏览器直接修改 checkpoint
+
+**品牌与素材边界（Brand and Asset Boundary）**:
+迁移遵循上游源码许可证和第三方通知，但 cc-harness 使用自己的名称、图标和品牌标识；DeepSeek 的 Logo、专属插画、字体或其他可能有独立权利的素材不直接复制，必要时用自有或明确许可的替代素材保持布局和交互语义。页面和仓库保留上游 commit、许可证及第三方通知的可追溯说明。_Avoid_: 把界面相似误作品牌授权、遗漏 MIT/第三方声明、把不明来源图片提交到仓库、让用户误以为 cc-harness 是 DeepSeek 官方产品
+
+**服务端模型配置（Server-Owned Model Configuration）**:
+`base_url`、`api_key` 和模型名由本地服务端配置层保存和校验，前端设置页只通过受控 API 读取脱敏值并提交修改；API key 仅在用户明确操作时短暂显示，不进入 Runtime 事件、提示词、日志、SSE 或浏览器持久化存储。配置变更产生可审计的非敏感元数据并在下一次模型调用生效。_Avoid_: 把密钥写入 localStorage、把完整配置回显到错误或事件、前端直接拼接 provider 请求、修改配置后悄悄影响正在运行的 Run
+
+**对话渲染契约（Conversation Rendering Contract）**:
+对话区只渲染面向用户的模型 Markdown/纯文本、用户消息和可读的工具卡片；`CompletionCandidate`、evidence、内部事件名、调度字段和 provider 原始协议不直接作为气泡内容展示，而是进入可展开的运行详情或审计面板。工具卡片的状态、结果和错误来自事件投影，部分流和推理内容保持可折叠且不冒充最终答案。_Avoid_: 把控制协议 JSON 原样展示、用模型文本覆盖工具真实状态、把内部错误当作用户回答、隐藏工具失败导致用户误以为任务完成
+
+**中文优先回复（Chinese-First Responses）**:
+系统提示和 WebUI 默认要求主 Agent 使用简体中文解释计划、进度、结果和错误；代码、命令、路径、协议字段、堆栈和 provider 原始错误保持原样以便复制和审计，用户明确指定其他语言时遵循用户要求。语言规则只影响用户可见表达，不翻译或修改 Runtime 事实。_Avoid_: 把英文模型原文无条件直出、翻译命令和错误导致无法执行、用中文替换稳定协议字段、让语言切换改变事件语义
+
+**项目目录门禁（Project Directory Gate）**:
+迁移后的 composer 使用本机目录选择器绑定一个规范化项目根目录；后端重新解析并校验该路径后，才允许创建会话或提交用户消息。未选择、路径失效、路径越界或项目租约不可用时，发送按钮保持禁用并给出可操作提示，不通过前端传入任意路径绕过安全策略。_Avoid_: 用文本框未经校验接受路径、未选目录仍启动 Run、把浏览器选择结果当作授权、让一个会话静默切换工作目录
+
+**三档权限策略映射（Three-Tier Policy Mapping）**:
+WebUI 的“请求批准”“帮我批准”“完全访问权限”是 Runtime 策略的真实选择，而非外观标签：请求批准对需要用户决定的工具动作逐次询问；帮我批准只对策略标记的风险动作询问、对安全动作自动放行；完全访问权限在项目沙箱和硬拒绝边界内自动放行。三档策略都不能越过 hard-deny、项目目录门禁、网络/凭据限制或审计要求，当前 Run 的生效策略随事件记录。_Avoid_: 前端改标签但后端仍用旧策略、完全访问绕过硬拒绝、拒绝后取消整个 Run、把自动放行当作无边界 root 权限
+
+**版本化 Web 兼容 API（Versioned Web Compatibility API）**:
+迁移后的 DeepSeek UI 通过独立、版本化的 Web 兼容路由访问 cc-harness；路由只承担数据形状和流式协议转换，内部调用现有 API/Runtime 契约。既有 `/api`、TUI、headless JSON 和 SDK 接口保持兼容，兼容层升级必须提供 schema、迁移和回归证据。_Avoid_: 直接改写现有接口让所有客户端被迫升级、无版本的隐式字段变化、让 DeepSeek 私有协议渗透 Runtime、为兼容层复制业务状态
+
+**上游源码隔离（Upstream Source Boundary）**:
+固定 DeepSeek UI 快照放在仓库的 `vendor/deepseek-ui/` 边界内，保留上游目录结构、commit 和许可证；cc-harness 自有入口、后端适配和少量覆盖组件放在 `web/src/cc/`，通过 Vite 本地别名引用。旧的 cc-harness 页面实现删除，不把上游源码和本地改动无标记地揉成一份，便于差异审查、升级和回滚。_Avoid_: 只提交构建产物、把 vendor 代码散落到业务目录、直接修改上游文件而不留 patch、升级时覆盖 cc-harness 适配逻辑
+
+**锁定前端依赖（Locked Frontend Dependencies）**:
+迁移后的 Web 工程继续使用单一 Vite 入口，将 UI 依赖闭包整理到 `web/package.json` 并由 `package-lock.json` 锁定精确版本；安装阶段允许显式联网或使用缓存，构建阶段不隐式拉取网络。生产/验证构建使用干净安装和锁文件校验，第三方依赖许可证和安全扫描结果随快照保存。_Avoid_: 提交 `node_modules`、混用 DeepSeek 的 pnpm workspace 与本地 npm 依赖、使用浮动版本、构建时偷偷联网、忽略 transitive 依赖的许可证
+
+**前端迁移验收门（Frontend Migration Acceptance Gate）**:
+迁移完成必须同时通过构建、后端兼容 API 契约测试、浏览器端关键流程和视觉回归：项目选择门禁、会话树切换、消息流式回复、工具审批/拒绝继续、停止后自然语言续跑、断线补读、上下文压缩状态、记忆/安全详情、设置保存和错误恢复。验收还要检查无原始协议 JSON、无虚假 Runtime 状态、无密钥泄露、无隐式网络构建，并保留截图、事件序号和测试日志。_Avoid_: 只运行 `npm run build`、只做像素截图、用 mock 成功掩盖真实 API 失败、跳过断线/拒绝/停止流程、把视觉回归当作功能验收
+
+**项目内多会话并行（In-Project Session Concurrency）**:
+同一规范化项目可拥有多个会话和并行 Run；项目级 Supervisor lease 只选出一个调度者，不把其他 Web 控制端阻塞为不可用。每个 Run 使用独立 worker lease，工具动作再按路径、workspace 或外部副作用申请 resource lease；可安全并行的读操作和不重叠写操作同时运行，冲突动作明确等待、改用隔离 worktree 或返回可恢复冲突。_Avoid_: 每个会话抢项目 Supervisor 导致一个永久排队、多个 Supervisor 同时写事件、用全项目互斥锁阻塞无关 Run、静默覆盖其他会话文件
+
+**Run 级停止与后续指令（Run-Scoped Stop and Follow-up）**:
+页面“停止”只取消当前 Run 的新动作和在途工具，保存已落盘事件、checkpoint、部分流和取消原因；会话及历史消息保持可用，用户可以直接发送新消息，主 Agent 读取最近状态后决定继续、重规划或开始新 Run。停止动作不能清空会话、删除证据或强杀其他会话的 Worker；Ctrl+C/进程退出走同一可恢复取消边界。_Avoid_: 停止按钮杀掉 Supervisor 或整个进程树、把 cancel 当作删除、停止后复用未确认的副作用、要求用户输入内部 resume 命令
+
+**单命令 Web 启动（Single-Command Web Launch）**:
+`cc-harness` 默认启动本地 Python WebUI 并提供迁移后 Vite 构建的静态资源，终端输出可点击的 loopback URL；开发时可单独运行 Vite dev server，但生产/验证路径不依赖额外 Node 服务。自动打开浏览器是可选行为，`--no-open` 等显式开关保持脚本和 headless 使用稳定。_Avoid_: 用户必须手动启动两个服务、把开发代理地址写入生产配置、静默绑定公网、URL 与实际监听端口不一致
+
+**WebUI 主控面（WebUI-Primary Control Plane）**:
+迁移后的 WebUI 是默认且完整的用户控制面；TUI 不参与页面实现和默认启动，但暂时保留为兼容、无浏览器环境和故障排查接口，继续使用同一 Runtime/API/事件事实。WebUI 与 TUI 不得各自维护会话、审批或执行状态。_Avoid_: 两个界面各自演进协议、为迁移删除可用于恢复的 TUI、默认同时启动两套控制面、让 TUI 绕过 WebUI 的权限和事件契约
+
 **可信内核阶段（Trusted Core Phase）**:
 第一阶段优先完成原生文件与搜索工具、不可绕过的 hard-deny 与 sandbox、模型和成本追踪、headless JSON 协议及持续 coding benchmark，再建设 Skills、Hooks 与增强型 Subagents；UI 仅修复阻塞真实使用或验证的问题。_Avoid_: 用像素级界面对齐代替底层能力、在核心契约未成立前继续扩大 UI 表面积
 
@@ -1805,9 +1883,9 @@ _Avoid_: 未读代码便生成虚假精确计划、以探索名义提前写入�
 Run Plan Graph 节点的用户可见进度投影，显示待处理、运行、完成或阻塞状态，但不独立拥有依赖或启动权限。
 _Avoid_: 让 Todo 状态绕过计划依赖启动工作、同时维护两套不一致的依赖图、把 Todo `done` 单独当作 Run 完成证据
 
-**Project Root Run Gate（项目根运行串行门）**:
-同一项目默认一次只允许一个根 Run 推进，后续根 Run 按前序门等待；只有同一 Run Plan Graph 中依赖已满足、文件所有权不冲突且隔离成立的 child 节点可以并行，不同项目独立调度。
-_Avoid_: 用空闲 Worker 绕过项目顺序、让互不知情的根 Run 并行写同一项目、把全局串行扩展到彼此隔离的项目
+**Project Root Run Gate（项目根运行并发门）**:
+项目级 supervisor lease 只负责选出一个调度器，不是项目范围的执行互斥锁；同一目录下相互独立的根 Run 可以在 `max_workers` 范围内并行。每个 Run 仍由独立的 `run_lease` 栅栏化，工具动作在资源租约上声明共享或独占，只有重叠文件、工作区或外部副作用会被串行化；不同项目独立调度。
+_Avoid_: 把 supervisor 选主误当成项目全局锁、让同一 Run 被多个 worker 并行、绕过重叠资源互斥、把局部冲突扩展成无关会话全部阻塞
 
 **Advisory Memory Evidence（建议性记忆证据）**:
 带来源、时间、项目范围和置信状态的长期记忆候选，可辅助规划但不能修改 Goal Contract、授予权限或证明完成；采用后仍须以当前项目事实验证。

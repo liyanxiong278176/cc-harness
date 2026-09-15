@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import re
 import time
 from contextlib import asynccontextmanager, suppress
@@ -18,9 +19,12 @@ import aiosqlite
 from .artifacts import ArtifactStore, GarbageCollectionReport
 from .fact_store import default_user_data_dir, project_identity
 from .run_events import EventActor, EventValidationError, RunEvent
-from .run_model import Lease, ResourceLease, Run, SupervisorLease
+from .run_model import Lease, ResourceLease, Run, SupervisorLease, digest_json
 from .run_projection import ProjectionBuilder, ProjectionError, RunProjection
 from .sqlite_utils import begin_immediate
+
+
+_LOGGER = logging.getLogger(__name__)
 
 
 class RunStoreError(RuntimeError):
@@ -112,6 +116,10 @@ class RunStore:
         self._db: aiosqlite.Connection | None = None
         self._write_lock = asyncio.Lock()
         self._open_lock = asyncio.Lock()
+        # Legacy snapshots can be replayed safely, but a terminal Run may be
+        # read many times by the supervisor.  Keep the migration diagnostic
+        # once per snapshot so compatibility does not turn into log spam.
+        self._legacy_projection_warnings: set[tuple[str, int, str]] = set()
 
     async def open(self) -> "RunStore":
         async with self._open_lock:
@@ -150,7 +158,17 @@ class RunStore:
                         lease_epoch INTEGER NOT NULL DEFAULT 0,
                         projection_digest TEXT,
                 created_at REAL NOT NULL,
-                updated_at REAL NOT NULL
+                        updated_at REAL NOT NULL
+            );
+            -- A WebUI deletion is a presentation-level tombstone rather than
+            -- a destructive rewrite of the immutable event stream.  Keeping
+            -- the stream/snapshots preserves auditability while excluding the
+            -- root and its descendants from future scheduling and history
+            -- listings.
+            CREATE TABLE IF NOT EXISTS run_tombstone (
+                run_id TEXT PRIMARY KEY REFERENCES run_record(run_id),
+                project_id TEXT NOT NULL REFERENCES project_record(project_id),
+                deleted_at REAL NOT NULL
             );
             CREATE TABLE IF NOT EXISTS run_event (
                 run_id TEXT NOT NULL REFERENCES run_record(run_id),
@@ -604,20 +622,153 @@ class RunStore:
         db = self._require_db()
         async with self._write_lock:
             # Rebuilding the projection and validating the denormalized cursor
-            # must observe one SQLite snapshot.  Previously the rebuild ran
-            # without a read transaction and the cursor was fetched after the
-            # local lock was released.  A supervisor in another process could
-            # commit an event between those reads, making a healthy stream look
-            # corrupt (and aborting an otherwise recoverable run).
-            async with self._transaction(db, write=False):
-                row = await self._run_row_tx(run_id)
-                projection = await self._projection_tx(run_id, int(row["last_sequence"]))
-                if (
-                    int(row["last_sequence"]) != projection.sequence
-                    or row["projection_digest"] != projection.digest
-                ):
-                    raise RunStoreError("stored projection cursor does not match event rebuild")
-            return projection
+            # must observe one SQLite snapshot.  A second, short write
+            # transaction repairs only derived metadata after a legacy schema
+            # replay.  The immutable event stream remains the authority.
+            #
+            # The retry handles another process appending an event between the
+            # read and repair transactions.  Without it a perfectly healthy
+            # concurrent append could make this call return a stale projection
+            # (or, worse, overwrite the newer cursor).
+            for _attempt in range(3):
+                repair: tuple[int, str | None, RunProjection, str] | None = None
+                async with self._transaction(db, write=False):
+                    row = await self._run_row_tx(run_id)
+                    expected_sequence = int(row["last_sequence"])
+                    expected_digest = row["projection_digest"]
+                    diagnostics: list[str] = []
+                    projection = await self._projection_tx(
+                        run_id,
+                        expected_sequence,
+                        diagnostics=diagnostics,
+                    )
+                    if projection.sequence != expected_sequence:
+                        raise RunStoreError(
+                            "stored projection cursor does not match event rebuild"
+                        )
+                    if expected_digest != projection.digest:
+                        legacy_snapshot = next(
+                            (
+                                item
+                                for item in diagnostics
+                                if item.startswith("legacy_snapshot|")
+                            ),
+                            None,
+                        )
+                        if legacy_snapshot is None:
+                            # ``projection_digest`` is a denormalized cursor,
+                            # not part of the immutable event stream.  Older
+                            # runtimes could leave it stale after a process
+                            # crash (or after a projection schema upgrade),
+                            # even though replaying the verified events gives
+                            # a valid projection at the exact stored
+                            # sequence.  Refusing to repair that derived field
+                            # strands the supervisor in a retry loop and
+                            # leaves WebUI messages permanently queued.
+                            #
+                            # A sequence mismatch is still fail-closed above:
+                            # this branch is reached only when the event
+                            # stream replayed to ``expected_sequence`` and
+                            # therefore provides an authoritative repair
+                            # target.  Snapshot byte tampering also still
+                            # raises from ``_projection_tx`` before reaching
+                            # this branch.
+                            repair = (
+                                expected_sequence,
+                                expected_digest,
+                                projection,
+                                "derived_cursor_rebuild",
+                            )
+                            warning_key = (run_id, expected_sequence, expected_digest or "")
+                            if warning_key not in self._legacy_projection_warnings:
+                                self._legacy_projection_warnings.add(warning_key)
+                                _LOGGER.warning(
+                                    "rebuilt projection cursor for run_id=%s at sequence=%s; "
+                                    "repairing stale derived digest",
+                                    run_id,
+                                    projection.sequence,
+                                )
+                        else:
+                            _, legacy_digest, legacy_sequence = legacy_snapshot.split("|", 2)
+                            # The raw snapshot digest was verified before this
+                            # diagnostic was emitted.  Its dataclass digest is
+                            # different only because the projection schema grew;
+                            # replaying events from sequence zero is authoritative.
+                            repair = (
+                                expected_sequence,
+                                expected_digest,
+                                projection,
+                                f"legacy_snapshot:{legacy_digest}:{legacy_sequence}",
+                            )
+                            warning_key = (run_id, int(legacy_sequence), legacy_digest)
+                            if warning_key not in self._legacy_projection_warnings:
+                                self._legacy_projection_warnings.add(warning_key)
+                                _LOGGER.warning(
+                                    "rebuilt legacy projection for run_id=%s at sequence=%s; "
+                                    "repairing derived cursor",
+                                    run_id,
+                                    projection.sequence,
+                                )
+                if repair is None:
+                    return projection
+                if await self._repair_projection_cursor(run_id, *repair):
+                    return projection
+                # A concurrent append or repair won the race.  Rebuild against
+                # the new cursor before returning to the caller.
+            raise RunStoreError("projection changed while rebuilding; retry the read")
+
+    async def _repair_projection_cursor(
+        self,
+        run_id: str,
+        expected_sequence: int,
+        expected_digest: str | None,
+        projection: RunProjection,
+        reason: str,
+    ) -> bool:
+        """Repair denormalized projection metadata after a safe event replay.
+
+        Snapshots and events are append-only and are never rewritten here.
+        Only indexes/cursors that are derivable from the immutable stream are
+        refreshed.  ``False`` tells the caller that another process changed
+        the run while the read transaction was closing, so it should rebuild.
+        """
+
+        db = self._require_db()
+        async with self._transaction(db, write=True):
+            row = await self._run_row_tx(run_id)
+            current_sequence = int(row["last_sequence"])
+            current_digest = row["projection_digest"]
+            if current_sequence != expected_sequence:
+                return False
+            if current_digest == projection.digest:
+                return True
+            if current_digest != expected_digest:
+                return False
+            await db.execute(
+                """UPDATE run_record
+                   SET status = ?, runtime_contract_digest = COALESCE(?, runtime_contract_digest),
+                       projection_digest = ?, updated_at = ?
+                   WHERE run_id = ? AND last_sequence = ?""",
+                (
+                    projection.status.value,
+                    projection.runtime_contract_digest,
+                    projection.digest,
+                    time.time(),
+                    run_id,
+                    expected_sequence,
+                ),
+            )
+            # These tables are rebuildable indexes, not independent sources of
+            # truth.  Refreshing them keeps approvals/actions/follow-ups
+            # consistent for the WebUI and supervisor after a schema upgrade.
+            await self._persist_projection_tx(projection)
+            _LOGGER.info(
+                "repaired projection cursor for run_id=%s sequence=%s (%s)",
+                run_id,
+                expected_sequence,
+                reason,
+            )
+            return True
 
     async def save_snapshot(self, snapshot: RunProjection) -> None:
         db = self._require_db()
@@ -660,13 +811,16 @@ class RunStore:
         query = (
             "SELECT run_id, status, last_sequence, runtime_contract_digest, "
             "parent_run_id, predecessor_run_id "
-            "FROM run_record"
+            "FROM run_record "
+            "WHERE NOT EXISTS ("
+            "SELECT 1 FROM run_tombstone hidden WHERE hidden.run_id = run_record.run_id"
+            ")"
         )
         params: tuple[Any, ...] = ()
         if statuses:
             ordered = tuple(sorted(statuses))
             placeholders = ",".join("?" for _ in ordered)
-            query += f" WHERE status IN ({placeholders})"
+            query += f" AND status IN ({placeholders})"
             params = ordered
         query += " ORDER BY updated_at, run_id"
         db = self._require_db()
@@ -695,7 +849,12 @@ class RunStore:
                 cursor = await db.execute(
                     """SELECT run_id, status, last_sequence, runtime_contract_digest,
                               parent_run_id, predecessor_run_id
-                       FROM run_record WHERE run_id = ?""",
+                       FROM run_record
+                       WHERE run_id = ?
+                         AND NOT EXISTS (
+                             SELECT 1 FROM run_tombstone hidden
+                             WHERE hidden.run_id = run_record.run_id
+                         )""",
                     (run_id,),
                 )
                 row = await cursor.fetchone()
@@ -710,6 +869,46 @@ class RunStore:
                     (str(row[5]) if row[5] else None),
                 )
                 return view
+
+    async def tombstone_run_tree(self, root_run_id: str) -> tuple[str, ...]:
+        """Hide a root conversation and all descendants without rewriting facts.
+
+        The WebUI's delete action must not issue ``DELETE`` against
+        ``run_event``/``run_snapshot``: both tables are intentionally
+        immutable and are the audit source of truth.  A tombstone is a small,
+        transactional index that makes the whole run tree disappear from
+        scheduling and user-facing history while retaining the evidence for
+        later audit/forensics.
+        """
+
+        root = str(root_run_id).strip()
+        if not root:
+            raise RunNotFound(root_run_id)
+        db = self._require_db()
+        async with self._write_lock:
+            async with self._transaction(db, write=True):
+                cursor = await db.execute(
+                    """WITH RECURSIVE run_tree(run_id) AS (
+                           SELECT run_id FROM run_record
+                           WHERE run_id = ? AND parent_run_id IS NULL
+                           UNION ALL
+                           SELECT child.run_id
+                           FROM run_record child
+                           JOIN run_tree parent ON child.parent_run_id = parent.run_id
+                       )
+                       SELECT run_id FROM run_tree""",
+                    (root,),
+                )
+                run_ids = tuple(str(row[0]) for row in await cursor.fetchall())
+                if not run_ids:
+                    raise RunNotFound(root_run_id)
+                now = time.time()
+                await db.executemany(
+                    """INSERT OR IGNORE INTO run_tombstone(run_id, project_id, deleted_at)
+                       SELECT ?, ?, ?""",
+                    ((run_id, self.project_id, now) for run_id in run_ids),
+                )
+                return run_ids
 
     async def current_lease(self, run_id: str) -> Lease | None:
         db = self._require_db()
@@ -1151,7 +1350,13 @@ class RunStore:
                     for row in await cursor.fetchall()
                 )
 
-    async def _projection_tx(self, run_id: str, through_sequence: int | None = None) -> RunProjection:
+    async def _projection_tx(
+        self,
+        run_id: str,
+        through_sequence: int | None = None,
+        *,
+        diagnostics: list[str] | None = None,
+    ) -> RunProjection:
         db = self._require_db()
         current_sequence = through_sequence
         if current_sequence is None:
@@ -1166,10 +1371,27 @@ class RunStore:
         snapshot: RunProjection | None = None
         start_sequence = 0
         if snapshot_row is not None:
-            snapshot = RunProjection.from_dict(json.loads(snapshot_row[1]))
-            if snapshot.digest != snapshot_row[2]:
+            raw_snapshot = json.loads(snapshot_row[1])
+            # First validate the bytes that were actually stored.  This keeps
+            # tampering fail-closed even though we tolerate a schema-evolved
+            # projection whose current dataclass digest is different.
+            if digest_json(raw_snapshot) != snapshot_row[2]:
                 raise RunStoreError("snapshot digest mismatch")
-            start_sequence = snapshot.sequence
+            parsed_snapshot = RunProjection.from_dict(raw_snapshot)
+            if parsed_snapshot.digest != snapshot_row[2]:
+                # Older releases serialized a smaller ActionAttempt shape.  A
+                # current parser can still read it, but replay from the event
+                # stream is safer than trusting an accelerator whose canonical
+                # shape no longer matches the current projection contract.
+                if diagnostics is not None:
+                    diagnostics.append(
+                        f"legacy_snapshot|{snapshot_row[2]}|{parsed_snapshot.sequence}"
+                    )
+                snapshot = None
+                start_sequence = 0
+            else:
+                snapshot = parsed_snapshot
+                start_sequence = snapshot.sequence
         cursor = await db.execute(
             """SELECT run_id, sequence, event_id, event_type, schema_version, occurred_at,
                       actor_kind, actor_id, causation_id, correlation_id, lease_epoch,
@@ -1304,11 +1526,32 @@ class RunStore:
             )
         except aiosqlite.IntegrityError as exc:
             cursor = await db.execute(
-                "SELECT projection_digest FROM run_snapshot WHERE run_id = ? AND sequence = ?",
+                "SELECT projection_json, projection_digest FROM run_snapshot "
+                "WHERE run_id = ? AND sequence = ?",
                 (snapshot.run_id, snapshot.sequence),
             )
             row = await cursor.fetchone()
-            if row is None or row[0] != snapshot.digest:
+            if row is None:
+                # The INSERT may have failed for a reason other than the
+                # immutable primary-key collision (for example, a missing
+                # run foreign key).  Do not turn that failure into a false
+                # success by assuming the row already exists.
+                raise RunStoreError("snapshot insert failed") from exc
+            if row[1] == snapshot.digest:
+                return
+            # A snapshot written by an older schema may be byte-integrity
+            # valid while its parsed dataclass digest differs (for example,
+            # when ``outcome`` was added).  Snapshots are intentionally
+            # immutable, so keep the old accelerator and let _projection_tx
+            # replay events instead of treating a harmless migration as a
+            # conflicting write.  Any raw-byte mismatch remains fail-closed.
+            try:
+                raw = json.loads(row[0])
+                raw_digest = digest_json(raw)
+                parsed = RunProjection.from_dict(raw)
+            except (KeyError, TypeError, ValueError, json.JSONDecodeError) as parse_error:
+                raise RunStoreError("snapshot already exists with a different digest") from parse_error
+            if raw_digest != row[1] or parsed.digest == row[1]:
                 raise RunStoreError("snapshot already exists with a different digest") from exc
 
     async def _validate_lease_tx(
@@ -1341,7 +1584,12 @@ class RunStore:
         cursor = await self._require_db().execute(
             """SELECT run_id, status, runtime_contract_digest, last_sequence,
                       projection_digest, lease_epoch
-               FROM run_record WHERE run_id = ?""",
+               FROM run_record
+               WHERE run_id = ?
+                 AND NOT EXISTS (
+                     SELECT 1 FROM run_tombstone hidden
+                     WHERE hidden.run_id = run_record.run_id
+                 )""",
             (run_id,),
         )
         row = await cursor.fetchone()

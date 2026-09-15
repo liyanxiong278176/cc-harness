@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import hashlib
 import json
 import os
@@ -12,7 +13,7 @@ import sys
 import time
 from dataclasses import replace
 from pathlib import Path
-from typing import Any, Mapping, Sequence
+from typing import Any, Awaitable, Callable, Mapping, Sequence
 
 from .action_contracts import ToolContractRegistry, ToolRecoveryContract
 from .activation import ActivationManifest, CapabilityProfile
@@ -30,10 +31,16 @@ from .mcp_client import MCPClient, ToolResult
 from .native_tools import NATIVE_FILE_TOOLS
 from .policy import Action
 from .prompts import PROMPT_VERSION
-from .run_kernel import ActionRequest, ModelAdapter, ModelSegment, ReActKernel
+from .run_kernel import ActionRequest, ModelAdapter, ModelSegment, ReActKernel, StreamCallback
 from .run_events import EventActor
 from .run_model import ActionStatus, CompletionCandidate, EffectClass, RunStatus
-from .run_store import RunNotFound, RunStore, RunStoreError
+from .run_store import (
+    RunNotFound,
+    RunStore,
+    RunStoreError,
+    SupervisorLeaseConflict,
+    SupervisorLeaseFenceError,
+)
 from .run_telemetry import aggregate_model_usage
 from .supervisor import LocalSupervisor
 from .permissions import normalize_permission_mode, requires_approval_for_mode
@@ -252,6 +259,8 @@ class DurableModelAdapter(ModelAdapter):
         self,
         messages: Sequence[Mapping[str, Any]],
         tools: Sequence[Mapping[str, Any]],
+        *,
+        stream_callback: StreamCallback | None = None,
     ) -> ModelSegment:
         content: list[str] = []
         pending = []
@@ -285,6 +294,39 @@ class DurableModelAdapter(ModelAdapter):
                     refusal = event.refusal
                     usage = event.usage
                     provider_metadata = dict(event.provider_metadata or {})
+                if stream_callback is not None:
+                    # Stream callbacks are presentation-only.  Do not pass
+                    # provider-private reasoning text or raw tool arguments to
+                    # the WebUI; the durable assistant/tool artifacts remain
+                    # the only authoritative replay source.
+                    envelope: dict[str, Any] = {"kind": event.kind}
+                    if event.kind == "content":
+                        envelope["text"] = event.text
+                    elif event.kind == "tool_call_delta":
+                        tool_call = event.tool_call
+                        envelope.update(
+                            {
+                                "tool_name": getattr(tool_call, "name", None),
+                                "tool_index": getattr(tool_call, "index", None),
+                            }
+                        )
+                    elif event.kind == "done":
+                        envelope.update(
+                            {
+                                "finish_reason": event.finish_reason,
+                                "tool_call_count": len(event.pending),
+                                "usage": (
+                                    {
+                                        "input_tokens": event.usage.prompt_tokens,
+                                        "output_tokens": event.usage.completion_tokens,
+                                        "total_tokens": event.usage.total_tokens,
+                                    }
+                                    if event.usage is not None
+                                    else None
+                                ),
+                            }
+                        )
+                    await stream_callback(envelope)
         finally:
             close_stream = getattr(stream, "aclose", None)
             if close_stream is not None:
@@ -446,6 +488,15 @@ class DurableRuntimeClient:
         self._activation_manifest: ActivationManifest | None = None
         self._workspace_command_lock = asyncio.Lock()
         self._execution_started = False
+        # Optional in-process WebUI stream sink.  It is intentionally not
+        # persisted and remains unset for the CLI/TUI or detached supervisor.
+        self._stream_emitter: Callable[[Mapping[str, Any]], Awaitable[None]] | None = None
+        # A different WebUI/CLI process may already own the project scheduler
+        # lease.  The control plane can still append/resume durable work in
+        # that case; the owning supervisor will claim it.  Keep this marker
+        # local so a later explicit retry can attempt leadership again after
+        # the owner exits or its lease expires.
+        self._supervisor_external_owner = False
         # Redaction-safe execution status for WebUI/diagnostics.  Keep the
         # requested and effective backends separate so a native fallback is
         # visible instead of looking like a normal host session.
@@ -458,6 +509,36 @@ class DurableRuntimeClient:
         }
         self.project_instructions = None
         self.tool_bundles = None
+
+    def set_stream_emitter(
+        self,
+        emitter: Callable[[Mapping[str, Any]], Awaitable[None]] | None,
+    ) -> None:
+        """Attach or detach a process-local WebUI stream sink.
+
+        The sink is presentation-only and is intentionally not part of the
+        durable client state.  A WebUI can attach after a client has already
+        started a supervisor without reaching into this client's private
+        attributes; CLI/TUI callers simply leave it unset.
+        """
+
+        self._stream_emitter = emitter
+
+    @property
+    def supervisor_owned_elsewhere(self) -> bool:
+        """Whether this client is currently control-only behind another owner."""
+
+        return self._supervisor_external_owner
+
+    def mark_supervisor_owned_elsewhere(self) -> None:
+        """Record a benign leadership conflict for WebUI control operations."""
+
+        self._supervisor_external_owner = True
+
+    def clear_supervisor_owned_elsewhere(self) -> None:
+        """Allow an explicit/recovery retry to attempt lease acquisition."""
+
+        self._supervisor_external_owner = False
 
     def executor_status(self) -> dict[str, Any]:
         """Return the effective executor state without secrets or commands."""
@@ -505,6 +586,7 @@ class DurableRuntimeClient:
         acceptance_criteria: tuple[str, ...] = ("request addressed",),
         *,
         confirm_high_risk: bool = False,
+        interaction_mode: str = "coding",
     ) -> str:
         # Terminal-Bench supplies a frozen official task statement inside an
         # isolated Harbor container.  Its instructions can describe external
@@ -537,6 +619,7 @@ class DurableRuntimeClient:
                     objective,
                     acceptance_criteria,
                     goal_provenance=goal_provenance,
+                    interaction_mode=interaction_mode,
                 )
             )
         ).run_id
@@ -742,7 +825,7 @@ class DurableRuntimeClient:
                         descendant_id,
                         f"{reason}; recover descendant checkpoint",
                     )
-        if self.supervisor is None:
+        if self.supervisor is None and not self._supervisor_external_owner:
             await self.start_supervisor()
         return run_id
 
@@ -756,8 +839,33 @@ class DurableRuntimeClient:
         host_execution: bool = False,
         permission_mode: str | None = None,
         config_overrides: Mapping[str, str] | None = None,
+        stream_emitter: Callable[[Mapping[str, Any]], Awaitable[None]] | None = None,
     ) -> LocalSupervisor:
+        # An explicit retry is allowed to take leadership after a previous
+        # control-only conflict.  If the row is still owned elsewhere the
+        # caller will mark it external again.
+        self._supervisor_external_owner = False
+        if stream_emitter is not None:
+            self._stream_emitter = stream_emitter
         if self.supervisor is not None:
+            # A supervisor object can outlive its scheduling task.  This is
+            # common after a transient lease conflict, an event-loop failure,
+            # or a WebUI reconnect: the old object remains attached to the
+            # client, so the previous early return silently stranded newly
+            # queued work.  Reuse the initialized worker factory and restart
+            # only the failed loop; a healthy supervisor remains untouched.
+            if getattr(self.supervisor, "is_running", True):
+                return self.supervisor
+            try:
+                await self.supervisor.start()
+            except (SupervisorLeaseConflict, SupervisorLeaseFenceError):
+                failed_supervisor = self.supervisor
+                self.supervisor = None
+                with contextlib.suppress(Exception):
+                    await failed_supervisor.stop(drain=False)
+                with contextlib.suppress(Exception):
+                    await self._close_execution_components()
+                raise
             return self.supervisor
         # WebUI settings are kept in the control plane and passed explicitly
         # for this supervisor.  ``load_layered_config`` remains the one
@@ -1029,6 +1137,7 @@ class DurableRuntimeClient:
                 child_failure_callback=self._on_child_failed,
                 working_directory_resolver=self._resolve_run_root,
                 permission_mode=self.permission_mode,
+                stream_emitter=self._stream_emitter,
             )
             worker_ref["worker"] = worker
             return worker
@@ -1038,7 +1147,22 @@ class DurableRuntimeClient:
             worker_factory,
             max_workers=max_workers,
         )
-        await self.supervisor.start()
+        try:
+            await self.supervisor.start()
+        except (SupervisorLeaseConflict, SupervisorLeaseFenceError):
+            # ``start_supervisor`` initializes provider/capability resources
+            # before the project lease is elected.  If another process wins
+            # that election, this client remains a useful control plane but
+            # must not retain a half-started MCP/LLM/sandbox stack.  Clean the
+            # failed scheduler and release those process-local resources while
+            # preserving the open durable store for submit/resume operations.
+            failed_supervisor = self.supervisor
+            self.supervisor = None
+            with contextlib.suppress(Exception):
+                await failed_supervisor.stop(drain=False)
+            with contextlib.suppress(Exception):
+                await self._close_execution_components()
+            raise
         return self.supervisor
 
     def start_detached_supervisor(
@@ -2007,16 +2131,15 @@ class DurableRuntimeClient:
             next_cursor=next_cursor,
         )
 
-    async def close(self) -> None:
-        if self.supervisor is not None:
-            await self.supervisor.stop(drain=False)
-            self.supervisor = None
-        pid_path = self.store.state_dir / "supervisor.pid"
-        try:
-            if int(pid_path.read_text(encoding="utf-8").strip()) == os.getpid():
-                pid_path.unlink(missing_ok=True)
-        except (OSError, ValueError):
-            pass
+    async def _close_execution_components(self) -> None:
+        """Release provider/capability/executor resources but keep the store.
+
+        Lease election can fail after these components have been initialized.
+        WebUI control-only clients still need their SQLite store open so they
+        can append a queued message or a resume decision; therefore this
+        cleanup is intentionally separate from :meth:`close`.
+        """
+
         if self._mcp is not None:
             await self._mcp.shutdown()
             self._mcp = None
@@ -2035,6 +2158,18 @@ class DurableRuntimeClient:
         if self._execution_started:
             await shutdown_session_executor()
             self._execution_started = False
+
+    async def close(self) -> None:
+        if self.supervisor is not None:
+            await self.supervisor.stop(drain=False)
+            self.supervisor = None
+        pid_path = self.store.state_dir / "supervisor.pid"
+        try:
+            if int(pid_path.read_text(encoding="utf-8").strip()) == os.getpid():
+                pid_path.unlink(missing_ok=True)
+        except (OSError, ValueError):
+            pass
+        await self._close_execution_components()
         await self.store.close()
 
 

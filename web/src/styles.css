@@ -1,5 +1,7 @@
 :root {
-  font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+  /* Values mirror the pinned DeepSeek Harness design-platform tokens while
+     retaining cc-harness' semantic aliases for the Runtime-specific cards. */
+  font-family: var(--dsw-font-family), ui-sans-serif, system-ui, sans-serif;
   color: #e7ebf2;
   background: #0b0d10;
   font-synthesis: none;
@@ -15,8 +17,8 @@
   --text-soft: #c5ccda;
   --muted: #7c879b;
   --muted-2: #596477;
-  --blue: #6aa5ff;
-  --blue-strong: #4288f5;
+  --blue: var(--dsw-static-deepseek-400, #6aa5ff);
+  --blue-strong: var(--dsw-static-deepseek-450, #4288f5);
   --blue-soft: rgba(96, 158, 255, .13);
   --violet: #a892ff;
   --cyan: #4cc9d8;
@@ -25,6 +27,7 @@
   --warning: #eebc72;
   --shadow-panel: 0 20px 55px rgba(0, 0, 0, .34);
   --shadow-soft: 0 10px 35px rgba(0, 0, 0, .22);
+  --motion-ease: var(--ds-ease-in-out, cubic-bezier(0.4, 0, 0.2, 1));
 }
 
 :root[data-theme="light"] {
@@ -116,15 +119,19 @@ button:focus-visible, input:focus-visible, textarea:focus-visible, a:focus-visib
 .project-group-chevron { color: var(--muted-2); transition: transform .18s ease; }
 .project-group-chevron.collapsed { transform: rotate(-90deg); }
 .project-group-sessions { padding: 0 0 0 8px; border-left: 1px solid var(--border); margin-left: 20px; }
+.session-item-row { position: relative; display: flex; align-items: stretch; min-width: 0; }
 .project-group-empty { padding: 7px 9px 10px; color: var(--muted-2); font-size: 10px; }
-.session-item { width: 100%; min-height: 56px; position: relative; display: grid; grid-template-columns: 10px minmax(0, 1fr) 17px; grid-template-rows: 20px 16px; column-gap: 9px; padding: 9px 9px; text-align: left; border: 1px solid transparent; border-radius: 9px; background: transparent; color: var(--text-soft); cursor: pointer; }
+.session-item { width: 100%; min-height: 56px; position: relative; display: grid; grid-template-columns: 10px minmax(0, 1fr); grid-template-rows: 20px 16px; column-gap: 9px; padding: 9px 34px 9px 9px; text-align: left; border: 1px solid transparent; border-radius: 9px; background: transparent; color: var(--text-soft); cursor: pointer; }
 .session-item:hover { background: var(--surface-hover); }
 .session-item.selected { border-color: rgba(106, 165, 255, .29); background: var(--blue-soft); }
 .session-title { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 12px; line-height: 20px; }
 .session-status { grid-column: 2 / span 2; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--muted); font-size: 10px; }
 .session-sequence { color: var(--muted-2); }
-.session-more { grid-column: 3; grid-row: 1; align-self: center; color: var(--muted-2); opacity: 0; }
-.session-item:hover .session-more, .session-item.selected .session-more { opacity: 1; }
+.session-delete { position: absolute; z-index: 2; top: 50%; right: 7px; width: 25px; height: 25px; display: inline-flex; align-items: center; justify-content: center; transform: translateY(-50%); border: 1px solid var(--border); border-radius: 7px; background: var(--surface-soft); color: var(--muted); cursor: pointer; opacity: .76; pointer-events: auto; transition: opacity .16s ease, color .16s ease, background .16s ease, border-color .16s ease; }
+.session-item-row:hover .session-delete, .session-item-row:focus-within .session-delete, .session-item.selected + .session-delete { opacity: 1; }
+.session-delete:hover:not(:disabled) { border-color: rgba(241, 139, 148, .42); background: rgba(241, 139, 148, .12); color: var(--danger); }
+.session-delete:focus-visible { outline: 2px solid var(--blue); outline-offset: 1px; opacity: 1; }
+.session-delete:disabled { cursor: wait; opacity: 1; }
 .status-dot { width: 8px; height: 8px; align-self: center; border-radius: 50%; display: inline-block; }
 .status-dot.running { background: var(--blue); box-shadow: 0 0 0 4px var(--blue-soft); animation: pulse 1.8s ease-in-out infinite; }
 .status-dot.success { background: var(--green); }
@@ -212,7 +219,7 @@ button:focus-visible, input:focus-visible, textarea:focus-visible, a:focus-visib
 .tool-summary { display: flex; align-items: center; gap: 8px; min-width: 0; }
 .tool-icon { width: 23px; height: 23px; display: grid; place-items: center; border-radius: 6px; background: rgba(168, 146, 255, .13); color: var(--violet); }
 .tool-name { max-width: 360px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.tool-status { color: var(--muted); font-size: 10px; }.tool-status.ok { color: var(--green); }
+.tool-status { color: var(--muted); font-size: 10px; }.tool-status.ok { color: var(--green); }.tool-status.rejected { color: var(--warning); }
 .tool-card pre { max-height: 265px; margin: 0; padding: 12px; overflow: auto; border-top: 1px solid var(--border); white-space: pre-wrap; color: var(--muted); font: 10px/1.6 "SFMono-Regular", Consolas, monospace; }
 .event-notice { display: flex; align-items: center; justify-content: center; gap: 8px; color: var(--muted); font-size: 10px; }
 .event-notice.error { color: var(--danger); }.event-notice.outcome { color: var(--green); }
@@ -220,6 +227,8 @@ button:focus-visible, input:focus-visible, textarea:focus-visible, a:focus-visib
 .typing-indicator { padding-left: 41px; display: flex; align-items: center; gap: 5px; color: var(--muted); font-size: 10px; }
 .typing-indicator span { width: 5px; height: 5px; border-radius: 50%; background: var(--blue); animation: bounce 1s infinite alternate; }
 .typing-indicator span:nth-child(2) { animation-delay: .18s; }.typing-indicator span:nth-child(3) { animation-delay: .36s; }.typing-indicator em { margin-left: 5px; font-style: normal; }
+.continuation-notice { margin-left: 41px; padding: 9px 11px; display: flex; align-items: center; gap: 7px; border: 1px solid rgba(138, 180, 248, .22); border-radius: 8px; background: rgba(138, 180, 248, .08); color: var(--blue); font-size: 10px; }
+.continuation-notice svg { flex: 0 0 auto; }
 .approval-card { padding: 13px; border: 1px solid rgba(105, 211, 162, .33); border-radius: 10px; background: rgba(105, 211, 162, .07); color: #c9eadb; font-size: 11px; }
 .approval-heading { display: flex; align-items: center; gap: 9px; }.approval-heading > svg { flex: 0 0 auto; color: var(--green); }.approval-heading > span { min-width: 0; display: flex; flex-direction: column; gap: 3px; }.approval-card strong { color: var(--text); font-size: 11px; }.approval-card small { color: var(--muted); font-size: 10px; }
 .approval-detail { margin-top: 11px; padding-top: 10px; display: grid; grid-template-columns: 42px minmax(0, 1fr); gap: 5px 9px; border-top: 1px solid rgba(105, 211, 162, .16); }.approval-detail span { color: var(--muted); font-size: 9px; }.approval-detail b { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--text-soft); font-size: 10px; font-weight: 550; }.approval-scope { cursor: help; }
@@ -591,6 +600,22 @@ button:not(:disabled):active { transform: translateY(1px); }
   .message-stack { gap: 22px; }
 }
 
+/* Ephemeral provider stream presentation.  The durable assistant event still
+ * replaces this node as soon as it is committed, so a refresh never depends
+ * on a transient browser-only message. */
+.streaming-message .message-content { min-height: 1.4em; }
+.streaming-cursor {
+  display: inline-block;
+  width: 7px;
+  height: 1.1em;
+  margin-left: 3px;
+  vertical-align: -2px;
+  border-radius: 2px;
+  background: var(--blue);
+  animation: streaming-cursor-blink 1s steps(2, start) infinite;
+}
+@keyframes streaming-cursor-blink { 50% { opacity: 0; } }
+
 /* Codex-inspired refinement: calm charcoal surfaces, restrained chrome, and
  * one clear blue action color. The runtime remains visible, but it should
  * read like a familiar editor instead of a neon monitoring dashboard. */
@@ -787,4 +812,404 @@ button:not(:disabled):active { transform: none; }
 
 @media (prefers-reduced-motion: reduce) {
   .brand-live { animation: none; }
+}
+
+/* DeepSeek Harness parity layer.
+ *
+ * The reference client treats the browser as a quiet workbench: navigation is
+ * a 280px column (56px rail when collapsed), the conversation owns the middle
+ * column, and observability lives in an edge-anchored right column.  Keep the
+ * existing Runtime markup and data flow, but make those geometry and focus
+ * rules explicit here so the visual layer can evolve without touching the
+ * durable execution protocol.
+ */
+:root {
+  color-scheme: dark;
+  --bg: #181818;
+  --surface: #202123;
+  --surface-raised: #2b2b2d;
+  --surface-hover: #303033;
+  --surface-soft: #232426;
+  --border: rgba(255, 255, 255, .10);
+  --border-strong: rgba(255, 255, 255, .18);
+  --text: #eeeeee;
+  --text-soft: #d2d2d2;
+  --muted: #969696;
+  --muted-2: #6f7073;
+  --blue: var(--dsw-static-deepseek-400, #8ab4f8);
+  --blue-strong: var(--dsw-static-deepseek-450, #3d7fe0);
+  --blue-soft: rgba(138, 180, 248, .14);
+  --violet: #b9a8df;
+  --cyan: #7ec9cb;
+  --green: #79c89e;
+  --danger: #ef9299;
+  --warning: #e4b26c;
+  --shadow-panel: 0 22px 70px rgba(0, 0, 0, .36);
+  --shadow-soft: 0 8px 24px rgba(0, 0, 0, .17);
+}
+
+:root[data-theme="light"] {
+  color-scheme: light;
+  --bg: #f7f7f8;
+  --surface: #f0f0f1;
+  --surface-raised: #ffffff;
+  --surface-hover: #e6e7e9;
+  --surface-soft: #ebeced;
+  --border: rgba(24, 29, 38, .12);
+  --border-strong: rgba(24, 29, 38, .20);
+  --text: #242424;
+  --text-soft: #4a4a4a;
+  --muted: #77787b;
+  --muted-2: #a0a1a4;
+  --blue: #3f78d4;
+  --blue-strong: #3475d6;
+  --blue-soft: rgba(63, 120, 212, .11);
+  --violet: #7866ac;
+  --cyan: #178f96;
+  --green: #278d61;
+  --danger: #bd5361;
+  --warning: #ad762a;
+  --shadow-panel: 0 22px 70px rgba(32, 39, 53, .18);
+  --shadow-soft: 0 8px 24px rgba(32, 39, 53, .10);
+}
+
+body { background: var(--bg); }
+
+.app-shell {
+  grid-template-columns: 280px minmax(0, 1fr) 360px;
+  background: var(--bg);
+  transition: grid-template-columns .18s ease;
+}
+.left-collapsed { grid-template-columns: 56px minmax(0, 1fr) 360px; }
+.right-collapsed { grid-template-columns: 280px minmax(0, 1fr) 0; }
+.left-collapsed.right-collapsed { grid-template-columns: 56px minmax(0, 1fr) 0; }
+
+.left-sidebar, .right-sidebar {
+  background: var(--surface);
+  box-shadow: none;
+  backdrop-filter: none;
+}
+.left-sidebar { width: auto; border-right-color: var(--border); }
+.right-sidebar { width: auto; border-left-color: var(--border); }
+.brand-row { height: 60px; padding: 0 14px 0 16px; border-bottom-color: var(--border); }
+.brand-mark { width: 30px; height: 30px; border-radius: 9px; box-shadow: 0 0 0 1px rgba(255, 255, 255, .16); }
+.brand-name { font-size: 15px; }
+.brand-live { margin-left: auto; }
+
+.sidebar-rail-tools { display: none; }
+.new-session-button {
+  width: calc(100% - 28px);
+  height: 38px;
+  margin: 12px 14px 8px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 7px;
+  border: 1px solid var(--border-strong);
+  border-radius: 9px;
+  background: var(--surface-raised);
+  color: var(--text-soft);
+  cursor: pointer;
+  font-size: 12px;
+  font-weight: 620;
+  transition: background .16s ease, border-color .16s ease;
+}
+.new-session-button:hover { background: var(--surface-hover); border-color: var(--border-strong); color: var(--text); }
+.new-session-button svg { color: var(--muted); }
+.workspace-switcher { margin-top: 4px; background: transparent; }
+.workspace-switcher:hover { background: var(--surface-hover); }
+.session-heading { height: 50px; padding-top: 8px; padding-bottom: 4px; }
+.session-heading-actions { display: flex; align-items: center; gap: 2px; }
+.session-heading-actions .icon-button { width: 27px; height: 27px; border-radius: 7px; }
+.session-search { height: 34px; margin-bottom: 10px; background: var(--surface-soft); }
+.session-list { scrollbar-gutter: stable; overscroll-behavior: contain; }
+.project-group { margin-bottom: 5px; }
+.project-group-header { min-height: 42px; padding-top: 7px; padding-bottom: 7px; border-radius: 8px; }
+.project-group-icon { background: var(--blue-soft); }
+.project-group-sessions { margin-left: 19px; padding-left: 6px; }
+.session-item { min-height: 52px; padding-top: 8px; padding-bottom: 8px; border-radius: 9px; }
+.session-item { padding-right: 34px; }
+.session-item.selected { border-color: rgba(138, 180, 248, .28); background: rgba(138, 180, 248, .12); box-shadow: inset 3px 0 var(--blue); }
+.sidebar-bottom { padding: 10px 12px 13px; }
+.project-chip { height: 35px; background: var(--surface-soft); }
+
+/* The reference keeps a useful icon rail mounted instead of removing the
+ * navigation column.  The existing floating expand control remains the
+ * keyboard/mouse escape hatch and is positioned below the brand mark. */
+.left-collapsed .left-sidebar {
+  width: 56px;
+  min-width: 56px;
+  overflow: hidden;
+  border-right: 1px solid var(--border);
+}
+.left-collapsed .left-sidebar > .workspace-switcher,
+.left-collapsed .left-sidebar > .new-session-button,
+.left-collapsed .left-sidebar > .session-heading,
+.left-collapsed .left-sidebar > .session-search,
+.left-collapsed .left-sidebar > .session-list { display: none; }
+.left-collapsed .brand-row { width: 56px; height: 56px; padding: 0; justify-content: center; border-bottom: 0; }
+.left-collapsed .brand-name, .left-collapsed .brand-live, .left-collapsed .brand-row .sidebar-menu { display: none; }
+.left-collapsed .sidebar-rail-tools { display: flex; flex-direction: column; align-items: center; gap: 6px; padding: 8px 8px 0; }
+.rail-tool { width: 40px; height: 34px; display: inline-flex; align-items: center; justify-content: center; border: 0; border-radius: 8px; background: transparent; color: var(--muted); cursor: pointer; }
+.rail-tool:hover { background: var(--surface-hover); color: var(--text); }
+.left-collapsed .sidebar-bottom { margin-top: auto; padding: 10px 8px 13px; border-top: 0; }
+.left-collapsed .sidebar-bottom .project-chip { display: none; }
+.left-collapsed .sidebar-actions { margin: 0; justify-content: center; }
+.left-collapsed .settings-button { width: 40px; height: 34px; padding: 0; justify-content: center; }
+.left-collapsed .settings-button span, .left-collapsed .collapse-button { display: none; }
+.left-collapsed .expand-sidebar { display: none; }
+
+.main-panel { background: var(--bg); }
+.topbar { min-height: 60px; padding-left: 24px; padding-right: 18px; background: var(--surface); border-bottom-color: var(--border); }
+.topbar-title { font-size: 13px; }
+.topbar-actions { gap: 3px; }
+.topbar-icon { width: 31px; height: 31px; border-radius: 8px; }
+.conversation { padding: 24px 28px 12px; scrollbar-gutter: stable; overscroll-behavior: contain; }
+.conversation-inner { width: min(920px, 100%); }
+.message-stack { width: min(900px, 100%); gap: 25px; }
+.welcome-state { min-height: 430px; padding-top: 38px; }
+.welcome-orbit { width: 48px; height: 48px; border-radius: 14px; border-color: var(--border-strong); background: var(--surface-raised); color: var(--text-soft); }
+.welcome-orbit.small { width: 44px; height: 44px; border-radius: 13px; }
+.welcome-kicker { color: var(--muted); letter-spacing: .08em; }
+.welcome-state h1 { margin-top: 11px; font-size: clamp(26px, 3vw, 32px); letter-spacing: -.035em; }
+.welcome-state p { font-size: 12px; line-height: 1.7; }
+.suggestion-grid { width: min(720px, 100%); margin-top: 24px; gap: 8px; }
+.suggestion-grid button { min-height: 64px; border-radius: 9px; background: var(--surface); }
+.message-content { font-size: 13px; line-height: 1.72; }
+.user-message .message-content { border-radius: 15px 5px 15px 15px; background: var(--surface-raised); }
+.turn-process { margin-left: 41px; background: transparent; border-color: var(--border); }
+.turn-process-summary { min-height: 34px; }
+.tool-card { background: var(--surface); }
+
+.composer-wrap {
+  width: min(920px, calc(100% - 48px));
+  padding: 7px 0 12px;
+  flex-shrink: 0;
+  background: linear-gradient(180deg, transparent, var(--bg) 16px);
+}
+.composer-label-row { padding-left: 5px; padding-right: 5px; }
+.composer { min-height: 168px; border-radius: 18px; border-color: var(--border-strong); background: #2a2a2c; box-shadow: var(--shadow-soft); }
+:root[data-theme="light"] .composer { background: var(--surface-raised); }
+.composer:focus-within { border-color: rgba(138, 180, 248, .55); box-shadow: 0 0 0 2px var(--blue-soft), var(--shadow-soft); }
+.composer-toolbar { min-height: 43px; padding-left: 12px; padding-right: 12px; }
+.composer textarea { min-height: 80px; padding-left: 15px; padding-right: 15px; font-size: 13px; }
+.composer-footer { min-height: 46px; padding-left: 14px; padding-right: 12px; }
+.permission-trigger { border-radius: 8px; }
+.send-button { width: 40px; min-height: 40px; padding: 0; border-radius: 999px; }
+.send-button span { display: none; }
+.stop-button, .secondary-button.compact { min-height: 38px; border-radius: 999px; }
+.command-palette, .permission-menu { border-radius: 12px; background: var(--surface-raised); box-shadow: var(--shadow-panel); }
+
+.bottom-statusbar { min-height: 34px; padding: 0 18px; background: var(--surface); border-top-color: var(--border); }
+.status-item, .model-status span, .model-status strong { font-size: 10px; }
+.context-ring.compact { box-shadow: none; }
+
+.right-sidebar { background: var(--surface); }
+.inspector-header { min-height: 60px; padding-left: 18px; padding-right: 14px; background: var(--surface); border-bottom-color: var(--border); }
+.inspector-scroll { padding: 14px; scrollbar-gutter: stable; overscroll-behavior: contain; }
+.inspector-card { margin-bottom: 11px; padding: 14px; border-radius: 12px; background: var(--surface); border-color: var(--border); }
+.runtime-state { margin-top: 15px; }
+.live-status-summary { border-radius: 10px; background: var(--surface-soft); }
+.runtime-timeline { scrollbar-gutter: stable; }
+.runtime-timeline-row { padding: 4px 6px; border-radius: 7px; }
+.runtime-timeline-row:hover { background: var(--surface-hover); }
+.inspector-model { min-height: 58px; background: var(--surface); }
+.capability-note p { margin: 8px 0 10px; color: var(--muted); font-size: 10px; line-height: 1.55; }
+.capability-row { display: flex; align-items: baseline; justify-content: space-between; gap: 10px; padding: 7px 0; border-top: 1px solid var(--border); font-size: 10px; }
+.capability-row strong { color: var(--warning); font-weight: 600; }
+.capability-row span { color: var(--muted); text-align: right; }
+
+.modal-backdrop { background: rgba(0, 0, 0, .58); backdrop-filter: blur(6px); }
+.settings-modal { width: min(720px, calc(100% - 32px)); border-radius: 16px; background: var(--surface-raised); box-shadow: var(--shadow-panel); }
+.settings-modal input:not([type=checkbox]) { background: var(--surface-soft); }
+.toast { border-radius: 10px; box-shadow: var(--shadow-panel); }
+
+@media (max-width: 1280px) {
+  .app-shell { grid-template-columns: 256px minmax(0, 1fr) 320px; }
+  .left-collapsed { grid-template-columns: 56px minmax(0, 1fr) 320px; }
+  .right-collapsed { grid-template-columns: 256px minmax(0, 1fr) 0; }
+  .left-collapsed.right-collapsed { grid-template-columns: 56px minmax(0, 1fr) 0; }
+}
+@media (max-width: 1080px) {
+  .app-shell { grid-template-columns: 240px minmax(0, 1fr) 0; }
+  .left-collapsed, .right-collapsed, .left-collapsed.right-collapsed { grid-template-columns: 56px minmax(0, 1fr) 0; }
+  .right-sidebar { display: none; }
+}
+@media (max-width: 720px) {
+  body { min-width: 0; }
+  .app-shell, .left-collapsed, .right-collapsed, .left-collapsed.right-collapsed { grid-template-columns: minmax(0, 1fr); }
+  .left-sidebar { display: none; }
+  .topbar { min-height: 56px; padding: 0 14px; }
+  .conversation { padding: 18px 14px 10px; }
+  .composer-wrap { width: calc(100% - 28px); }
+  .bottom-statusbar { padding: 0 12px; }
+  .created-by { display: none; }
+}
+
+/* Runtime-owned loading and diagnosis states. These are deliberately quiet
+ * and information-dense, following the Codex/DeepSeek Harness baseline rather
+ * than adding a decorative dashboard layer. */
+.session-loading {
+  min-height: 360px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 12px;
+  color: var(--text-soft);
+  text-align: left;
+}
+.session-loading svg { color: var(--blue); flex: 0 0 auto; }
+.session-loading div { display: grid; gap: 4px; }
+.session-loading strong { color: var(--text); font-size: 14px; font-weight: 620; }
+.session-loading span { color: var(--muted); font-size: 12px; }
+.diagnosis-card { position: relative; overflow: hidden; }
+.diagnosis-card::before { content: ''; position: absolute; inset: 0 auto 0 0; width: 3px; background: var(--blue); }
+.diagnosis-card.error::before { background: var(--danger); }
+.diagnosis-card.warning::before { background: var(--warning); }
+.diagnosis-card.info::before { background: var(--blue); }
+.diagnosis-heading { display: flex; align-items: flex-start; gap: 9px; }
+.diagnosis-icon { width: 26px; height: 26px; display: inline-flex; align-items: center; justify-content: center; flex: 0 0 auto; border-radius: 8px; color: var(--blue); background: var(--blue-soft); }
+.diagnosis-card.error .diagnosis-icon { color: var(--danger); background: rgba(189, 83, 97, .12); }
+.diagnosis-card.warning .diagnosis-icon { color: var(--warning); background: rgba(173, 118, 42, .13); }
+.diagnosis-heading > div { display: grid; gap: 3px; min-width: 0; }
+.diagnosis-heading strong { color: var(--text); font-size: 13px; font-weight: 650; }
+.diagnosis-card p { margin: 11px 0 0; color: var(--text-soft); font-size: 12px; line-height: 1.62; }
+.diagnosis-action { display: grid; gap: 2px; margin-top: 11px; padding-top: 10px; border-top: 1px solid var(--border); color: var(--muted); font-size: 11px; line-height: 1.55; }
+.diagnosis-action span { color: var(--text-soft); font-weight: 620; }
+.diagnosis-source { display: block; margin-top: 10px; color: var(--muted-2); font-size: 10px; }
+
+/* DeepSeek Harness empty-stage parity.
+ * The reference client does not pin a fresh conversation to the bottom of
+ * the viewport.  It removes the conversation chrome and composes the hero
+ * and input as one centered stage.  Keep the Runtime status strip mounted so
+ * cc-harness still exposes model/connection state, while active sessions use
+ * the normal transcript layout above.
+ */
+.empty-state-panel .topbar { display: none; }
+.empty-state-panel .conversation {
+  position: relative;
+  display: flex;
+  align-items: stretch;
+  justify-content: center;
+  padding: 0 28px;
+}
+.empty-state-panel .conversation-inner {
+  position: absolute;
+  top: 42%;
+  left: 28px;
+  right: 28px;
+  width: auto;
+  min-height: 0;
+  margin: 0;
+  justify-content: center;
+  transform: translateY(-50%);
+}
+.empty-state-panel .welcome-state {
+  min-height: 0;
+  padding: 0 14px;
+  margin: 0;
+}
+.empty-state-panel .welcome-orbit {
+  width: 44px;
+  height: 44px;
+  border-radius: 50%;
+  background: var(--surface-raised);
+  box-shadow: none;
+}
+.empty-state-panel .welcome-orbit.small { width: 42px; height: 42px; border-radius: 50%; }
+.empty-state-panel .welcome-kicker { margin-top: 13px; color: var(--muted); font-size: 9px; }
+.empty-state-panel .welcome-state h1 {
+  margin: 0;
+  font-size: 26px;
+  line-height: 32px;
+  font-weight: 520;
+  letter-spacing: -.025em;
+}
+.empty-state-panel .welcome-title-line {
+  display: flex;
+  align-items: flex-start;
+  justify-content: center;
+  gap: 7px;
+  margin: 8px 0;
+}
+.empty-state-panel .preview-badge {
+  align-self: flex-start;
+  margin-top: 1px;
+  padding: 1px 7px 0;
+  border: 1px solid rgba(138, 180, 248, .24);
+  border-radius: 999px;
+  background: rgba(138, 180, 248, .16);
+  color: var(--blue);
+  font-size: 10px;
+  line-height: 18px;
+  white-space: nowrap;
+}
+.empty-state-panel .welcome-state p { max-width: 560px; font-size: 12px; line-height: 1.65; }
+.empty-state-panel .welcome-actions { margin-top: 18px; }
+.empty-state-panel .welcome-note { margin-top: 18px; }
+.empty-state-panel .suggestion-grid { margin-top: 18px; }
+.empty-state-panel .composer-wrap {
+  position: absolute;
+  z-index: 6;
+  left: 50%;
+  /* The reference card sits just below the centered headline (about 51% of
+     a 1080px viewport).  The transform keeps the card's own height out of
+     the positioning math, so the same relationship holds on smaller views. */
+  top: 53%;
+  width: min(920px, calc(100% - 56px));
+  margin: 0;
+  padding: 0;
+  transform: translate(-50%, -50%);
+  background: transparent;
+}
+.empty-state-panel .composer-label-row { display: none; }
+.empty-state-panel .composer {
+  min-height: 116px;
+  gap: 4px;
+  padding-top: 8px;
+  border: 0;
+  border-radius: 22px;
+  background: #2b2b2d;
+  box-shadow: var(--shadow-soft);
+}
+:root[data-theme="light"] .empty-state-panel .composer { background: var(--surface-raised); }
+.empty-state-panel .composer-toolbar { min-height: 30px; padding: 0 12px; }
+.empty-state-panel .composer-project {
+  min-height: 28px;
+  border-radius: 16px;
+  background: transparent;
+}
+.empty-state-panel .composer textarea {
+  height: 38px;
+  min-height: 38px;
+  max-height: 38px;
+  padding-top: 3px;
+  padding-bottom: 0;
+  resize: none;
+  font-size: 13px;
+}
+.empty-state-panel .composer-footer { min-height: 34px; padding: 0 12px; }
+.empty-state-panel .send-button { width: 34px; min-height: 34px; }
+
+/* The no-project hero has two explicit folder actions in addition to the
+ * composer trigger. Give that taller copy block its own lower composer seat
+ * so the buttons remain clickable instead of being covered by the card. */
+.empty-no-project .composer-wrap { top: 69%; }
+
+@media (max-width: 1080px) {
+  .empty-state-panel .conversation-inner { left: 18px; right: 18px; }
+  .empty-state-panel .composer-wrap { width: calc(100% - 36px); }
+}
+
+@media (max-width: 720px) {
+  .empty-state-panel .conversation { padding: 0 14px; }
+  .empty-state-panel .conversation-inner { left: 14px; right: 14px; }
+  .empty-state-panel .composer-wrap { width: calc(100% - 28px); }
+}
+
+@media (max-height: 960px) {
+  /* Keep the title block clear of the composer on laptop-sized viewports;
+     the reference also compresses its hero vertically instead of allowing
+     the input card to cover content. */
+  .empty-state-panel .conversation-inner { top: 37%; }
 }

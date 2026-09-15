@@ -66,6 +66,12 @@ class BenchmarkFinalModel:
         return ModelSegment(text="task addressed")
 
 
+class ConversationModel:
+    async def complete(self, messages, tools):
+        del messages, tools
+        return ModelSegment(text="真实模型回复已持久化。")
+
+
 async def _success(request):
     return ActionExecutionResult(ActionStatus.SUCCEEDED, read_paths=(request.arguments["path"],))
 
@@ -101,6 +107,37 @@ async def test_model_sees_only_committed_observation_in_same_segment(tmp_path) -
             "ToolObservationCommitted"
         )
         assert event_types.index("ToolObservationCommitted") < event_types.index("ActionSucceeded")
+    finally:
+        await store.close()
+
+
+@pytest.mark.asyncio
+async def test_conversation_completion_requires_durable_assistant_response(tmp_path) -> None:
+    project = tmp_path / "project"
+    project.mkdir()
+    store = RunStore(project, data_root=tmp_path / "data")
+    await store.open()
+    try:
+        handle = await RunCoordinator(store).submit(
+            RunRequest(
+                "你是谁",
+                ("conversation response delivered",),
+                interaction_mode="conversation",
+            )
+        )
+        worker = RunWorker(
+            store,
+            ReActKernel(ConversationModel()),
+            worker_id="conversation-worker",
+        )
+        await worker.execute(await worker.claim(handle.run_id))
+
+        projection = await store.load_projection(handle.run_id)
+        assert projection.status.value == "completed"
+        events = (await store.read(handle.run_id)).events
+        assert any(event.event_type == "AssistantMessageCommitted" for event in events)
+        accepted = next(event for event in events if event.event_type == "CompletionAccepted")
+        assert accepted.payload["evidence"][0]["kind"] == EvidenceKind.ASSISTANT_RESPONSE.value
     finally:
         await store.close()
 

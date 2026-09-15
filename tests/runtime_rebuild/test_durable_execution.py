@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 
 import pytest
 
@@ -11,6 +12,7 @@ from cc_harness.run_kernel import ModelSegment, ReActKernel
 from cc_harness.run_model import ActionStatus, EvidenceKind, EvidenceRef, PlanNode
 from cc_harness.run_store import RunStore
 from cc_harness.supervisor import LocalSupervisor
+from cc_harness.tool_observation import make_observation
 from cc_harness.worker import ActionExecutionResult, RunWorker
 
 
@@ -406,5 +408,152 @@ async def test_granted_approval_resumes_persisted_action_without_replanning(tmp_
             assert event_types.count("ActionSucceeded") == 1
         finally:
             await supervisor.stop()
+    finally:
+        await store.close()
+
+
+@pytest.mark.asyncio
+async def test_rejected_approval_cancels_only_tool_and_continues_model_loop(tmp_path) -> None:
+    project = tmp_path / "project"
+    project.mkdir()
+    store = RunStore(project, data_root=tmp_path / "data")
+    await store.open()
+    executor_calls = 0
+
+    async def must_not_execute(_request):
+        nonlocal executor_calls
+        executor_calls += 1
+        raise AssertionError("a rejected approval must never reach the executor")
+
+    class RejectionAwareModel(TwoStepModel):
+        def __init__(self) -> None:
+            super().__init__("run_command", {"command": "echo rejected"})
+            self.message_batches = []
+
+        async def complete(self, messages, tools):
+            self.message_batches.append(tuple(dict(message) for message in messages))
+            return await super().complete(messages, tools)
+
+    try:
+        coordinator = RunCoordinator(store)
+        handle = await coordinator.submit(RunRequest("rejected task", ("done",)))
+        model = RejectionAwareModel()
+
+        def factory(_run_id):
+            return RunWorker(
+                store,
+                ReActKernel(model),
+                worker_id="rejection-worker",
+                action_executor=must_not_execute,
+            )
+
+        supervisor = LocalSupervisor(store, factory, max_workers=1, poll_interval=0.01)
+        try:
+            await supervisor.tick()
+            view = await _wait_for_status(supervisor, store, handle.run_id, "awaiting_approval")
+            assert view.status.value == "awaiting_approval"
+            approval = view.approvals[0]
+
+            decision = await coordinator.reject(
+                run_id=handle.run_id,
+                approval_id=approval.approval_id,
+                reason="not needed for this task",
+            )
+            assert decision.status == "rejected"
+
+            status = await _wait_for_terminal(supervisor, store, handle.run_id)
+            assert status == "completed"
+            events = (await store.read(handle.run_id)).events
+            event_types = [event.event_type for event in events]
+            assert event_types.count("ActionPlanned") == 1
+            assert event_types.count("ActionCancelled") == 1
+            assert event_types.count("ToolObservationCommitted") == 1
+            assert "ActionStarted" not in event_types
+            assert "ActionSucceeded" not in event_types
+            assert executor_calls == 0
+            assert model.calls == 2
+            assert any(
+                message.get("role") == "tool"
+                and "user_rejected" in str(message.get("content", ""))
+                for message in model.message_batches[-1]
+            )
+            projection = await store.load_projection(handle.run_id)
+            assert projection.status.value == "completed"
+            assert projection.working_state.unresolved_errors == ()
+        finally:
+            await supervisor.stop()
+    finally:
+        await store.close()
+
+
+@pytest.mark.asyncio
+async def test_rejected_approval_reuses_observation_after_boundary_crash(tmp_path) -> None:
+    """A crash between observation and cancellation must remain idempotent."""
+
+    project = tmp_path / "project"
+    project.mkdir()
+    store = RunStore(project, data_root=tmp_path / "data")
+    await store.open()
+    try:
+        coordinator = RunCoordinator(store)
+        handle = await coordinator.submit(RunRequest("rejected recovery", ("done",)))
+        model = TwoStepModel("run_command", {"command": "echo rejected"})
+
+        def factory(_run_id):
+            return RunWorker(
+                store,
+                ReActKernel(model),
+                worker_id="rejection-boundary-worker",
+                action_executor=_success,
+            )
+
+        supervisor = LocalSupervisor(store, factory, max_workers=1, poll_interval=0.01)
+        await supervisor.tick()
+        view = await _wait_for_status(supervisor, store, handle.run_id, "awaiting_approval")
+        approval = view.approvals[0]
+        await coordinator.reject(
+            run_id=handle.run_id,
+            approval_id=approval.approval_id,
+            reason="skip this action",
+        )
+        # Simulate the first worker dying after its observation append but
+        # before ActionCancelled.  The retrying worker must reuse that event.
+        worker = RunWorker(
+            store,
+            ReActKernel(model),
+            worker_id="rejection-boundary-retry",
+            action_executor=_success,
+        )
+        lease = await worker.claim(handle.run_id)
+        try:
+            projection = await store.load_projection(handle.run_id)
+            action = projection.actions[0]
+            observation = make_observation(
+                action_id=action.action_id,
+                attempt=action.attempt,
+                tool_name=action.tool_name,
+                status="cancelled",
+                effect_class=str(action.effect_class),
+                text="用户拒绝了本次工具调用，因此该动作未执行。",
+                error_kind="user_rejected",
+                recovery="policy",
+                provenance=("test",),
+            )
+            artifact = store.artifacts.put_text(
+                json.dumps(observation.to_dict(), ensure_ascii=False, sort_keys=True),
+                media_type="application/json; purpose=tool-observation-approval",
+            )
+            await worker._append_observation_event(lease, observation, artifact.digest)
+            await worker._record_rejected_actions(
+                lease,
+                await store.load_projection(handle.run_id),
+            )
+        finally:
+            await worker.lease_manager.release(lease)
+        events = (await store.read(handle.run_id)).events
+        assert sum(event.event_type == "ToolObservationCommitted" for event in events) == 1
+        assert sum(event.event_type == "ActionCancelled" for event in events) == 1
+        assert (await store.load_projection(handle.run_id)).actions[0].status is ActionStatus.CANCELLED
+        await supervisor.stop(drain=False)
     finally:
         await store.close()

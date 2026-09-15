@@ -178,6 +178,7 @@ class GoalContractService:
         excluded_scope: Iterable[str] = (),
         required_evidence: Iterable[str] = (),
         human_review: Iterable[str] = (),
+        interaction_mode: str = "coding",
     ) -> GoalContract:
         return GoalContract(
             objective=objective,
@@ -187,6 +188,7 @@ class GoalContractService:
             excluded_scope=tuple(excluded_scope),
             required_evidence=tuple(required_evidence),
             human_review=tuple(human_review),
+            interaction_mode=interaction_mode,
         )
 
     def assess(

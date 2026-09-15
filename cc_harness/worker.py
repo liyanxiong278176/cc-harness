@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import inspect
 import json
 import os
 import traceback
@@ -70,6 +71,7 @@ ChildCompletionCallback = Callable[[str, CompletionCandidate], Awaitable[None]]
 ChildCancellationCallback = Callable[[str, str], Awaitable[None]]
 ChildFailureCallback = Callable[[str, str], Awaitable[None]]
 WorkingDirectoryResolver = Callable[[str], Awaitable[Path]]
+StreamEmitter = Callable[[Mapping[str, Any]], Awaitable[None]]
 
 
 class ModelInvocationTimeout(RuntimeError):
@@ -272,6 +274,7 @@ class RunWorker:
         permission_mode: str = "default",
         action_timeout_seconds: float | None = None,
         model_timeout_seconds: float | None = None,
+        stream_emitter: StreamEmitter | None = None,
     ) -> None:
         self.store = store
         self.kernel = kernel
@@ -314,6 +317,7 @@ class RunWorker:
             else os.getenv("CC_HARNESS_MODEL_TIMEOUT_SECONDS"),
             default=300.0,
         )
+        self.stream_emitter = stream_emitter
         self.working_directory: Path = self.store.project_root
         self._active_node_id: str | None = None
         self._event_lock = asyncio.Lock()
@@ -380,6 +384,14 @@ class RunWorker:
             had_progress = False
             approved = await self._execute_granted_actions(current_lease, projection)
             had_action = approved
+            # A rejected approval is itself a terminal action outcome.  Do
+            # not execute the planned action during generic recovery; write a
+            # cancelled observation first so the next model invocation has a
+            # provider-valid tool result and can continue with another plan.
+            await self._record_rejected_actions(
+                current_lease,
+                await self.store.load_projection(lease.run_id),
+            )
             recovered_action, recovery_blocked = await self._recover_inflight_actions(
                 current_lease,
                 await self.store.load_projection(lease.run_id),
@@ -596,7 +608,7 @@ class RunWorker:
                 invocation_error: str | None = None
                 outcome = None
                 try:
-                    outcome = await self._execute_model_segment(context)
+                    outcome = await self._execute_model_segment(context, segment=segment)
                     invocation_status = "succeeded"
                 except asyncio.CancelledError as exc:
                     invocation_status = "cancelled"
@@ -926,28 +938,104 @@ class RunWorker:
                     execution_task.cancel()
                 return
 
-    async def _execute_model_segment(self, context: SegmentContext):
+    async def _execute_model_segment(
+        self,
+        context: SegmentContext,
+        *,
+        segment: int | None = None,
+    ):
         """Run one provider segment behind a bounded, cancellation-safe task."""
 
+        chunk = 0
+        terminal_emitted = False
+
+        async def emit_stream(payload: Mapping[str, Any]) -> None:
+            """Best-effort bridge from a provider chunk to the WebUI hub."""
+
+            nonlocal chunk, terminal_emitted
+            if self.stream_emitter is None:
+                return
+            if str(payload.get("kind") or "") == "done":
+                terminal_emitted = True
+            chunk += 1
+            envelope = {
+                "type": "stream_delta",
+                "run_id": context.run_id,
+                "segment": segment if segment is not None else 0,
+                "chunk": chunk,
+                **dict(payload),
+            }
+            # A disconnected browser or a full in-memory queue must never
+            # turn a successful provider call into a failed Durable segment.
+            try:
+                await self.stream_emitter(envelope)
+            except Exception:
+                return
+
+        async def emit_terminal(reason: str, *, error: str | None = None) -> None:
+            """Emit a terminal presentation marker without affecting the worker."""
+
+            if terminal_emitted:
+                return
+            payload: dict[str, Any] = {"kind": "done", "finish_reason": reason}
+            if error:
+                payload["error"] = error[:300]
+            with contextlib.suppress(BaseException):
+                await emit_stream(payload)
+
+        async def execute_kernel() -> Any:
+            execute = self.kernel.execute_segment
+            supports_callback = False
+            try:
+                signature = inspect.signature(execute)
+                supports_callback = (
+                    "stream_callback" in signature.parameters
+                    or any(
+                        parameter.kind is inspect.Parameter.VAR_KEYWORD
+                        for parameter in signature.parameters.values()
+                    )
+                )
+            except (TypeError, ValueError):
+                supports_callback = False
+            if self.stream_emitter is not None and supports_callback:
+                return await execute(context, stream_callback=emit_stream)
+            return await execute(context)
+
         if self.model_timeout_seconds == 0:
-            return await self.kernel.execute_segment(context)
+            try:
+                result = await execute_kernel()
+            except asyncio.CancelledError:
+                await emit_terminal("cancelled")
+                raise
+            except Exception as exc:
+                await emit_terminal("error", error=f"{type(exc).__name__}: {exc}")
+                raise
+            await emit_terminal(str(getattr(result, "stop_reason", "model_stop")))
+            return result
         task = asyncio.create_task(
-            self.kernel.execute_segment(context),
+            execute_kernel(),
             name=f"cc-harness-model-{context.run_id}-{context.lease_epoch}",
         )
         try:
-            return await asyncio.wait_for(asyncio.shield(task), self.model_timeout_seconds)
+            result = await asyncio.wait_for(asyncio.shield(task), self.model_timeout_seconds)
+            await emit_terminal(str(getattr(result, "stop_reason", "model_stop")))
+            return result
         except asyncio.TimeoutError as exc:
             # Give cooperative adapters a short opportunity to close their HTTP
             # stream.  A non-cooperative provider is intentionally left as an
             # orphan task: the durable worker is failed/recoverable and will
             # never replay its model result as an action without a new segment.
             await _cancel_task_bounded(task)
+            await emit_terminal("timeout", error=str(exc))
             raise ModelInvocationTimeout(
                 f"model segment timed out after {self.model_timeout_seconds:.3f}s"
             ) from exc
         except asyncio.CancelledError:
             await _cancel_task_bounded(task)
+            await emit_terminal("cancelled")
+            raise
+        except Exception as exc:
+            await emit_terminal("error", error=f"{type(exc).__name__}: {exc}")
             raise
 
     async def _finalize_interruption(self, lease: Lease, reason: str) -> None:
@@ -1066,6 +1154,121 @@ class RunWorker:
                     {"reason": "approved action outcome is unknown"},
                 )
                 return True
+        return bool(actions)
+
+    async def _record_rejected_actions(
+        self,
+        lease: Lease,
+        projection: RunProjection,
+    ) -> bool:
+        """Close rejected/expired approval calls without invoking executor.
+
+        ``ApprovalRejected`` moves a run back to the durable queue.  The
+        original ``ActionPlanned`` record must then be closed explicitly;
+        otherwise ``_recover_inflight_actions`` would treat it as work that
+        never crossed the execution boundary and run it on the next claim.
+        A ``RunCancelled`` boundary expires an unanswered approval for the
+        same reason: if the user later resumes the Run, the planned action is
+        closed as not executed rather than being replayed without consent.
+        Persisting a normal provider-neutral tool observation also preserves
+        the assistant/tool message pairing required by providers on resume.
+        """
+
+        rejected = {
+            approval.action_id: approval
+            for approval in projection.approvals
+            if approval.status.value in {"rejected", "expired"}
+        }
+        if not rejected:
+            return False
+
+        actions = [
+            action
+            for action in projection.actions
+            if action.action_id in rejected
+            and action.status in {ActionStatus.PLANNED, ActionStatus.PREPARED}
+        ]
+        for action in actions:
+            approval = rejected[action.action_id]
+            expired = approval.status.value == "expired"
+            cancellation_reason = "approval_expired" if expired else "user_rejected"
+            decision_label = "expired" if expired else "rejected"
+            observation_text = (
+                "运行在该工具调用获得批准前已停止，因此该动作未执行。"
+                "不要自动重试同一调用；请继续处理任务中其他可执行步骤。"
+                if expired
+                else "用户拒绝了本次工具调用，因此该动作未执行。"
+                "不要自动重试同一调用；请继续处理任务中其他可执行步骤。"
+            )
+            # The observation and ActionCancelled events are deliberately
+            # separate durable boundaries.  If the process dies between
+            # them, reuse the already-committed observation instead of
+            # writing a duplicate (the projection keys observations by
+            # action_id/attempt and rejects a second record).
+            observation, observation_artifact = await self._find_action_observation(
+                lease.run_id,
+                action.action_id,
+                action.attempt,
+            )
+            if observation is None:
+                effect = (
+                    action.effect_class.value
+                    if isinstance(action.effect_class, EffectClass)
+                    else str(action.effect_class)
+                )
+                observation = make_observation(
+                    action_id=action.action_id,
+                    attempt=action.attempt,
+                    tool_name=action.tool_name,
+                    status="cancelled",
+                    effect_class=effect,
+                    text=observation_text,
+                    error_kind="user_rejected",
+                    recovery="policy",
+                    provenance=("durable-worker", "approval"),
+                    metadata={
+                        "approval_id": approval.approval_id,
+                        "decision": decision_label,
+                        "continue": True,
+                    },
+                )
+                observation_ref = self.store.artifacts.put_text(
+                    json.dumps(
+                        observation.to_dict(),
+                        ensure_ascii=False,
+                        sort_keys=True,
+                        separators=(",", ":"),
+                    ),
+                    media_type="application/json; purpose=tool-observation-approval",
+                )
+                observation_artifact = observation_ref.digest
+                await self._append_observation_event(
+                    lease,
+                    observation,
+                    observation_artifact,
+                )
+            elif (
+                observation.status != "cancelled"
+                or observation.error_kind != "user_rejected"
+                or not observation_artifact
+            ):
+                # A same-attempt observation with a different terminal
+                # meaning is inconsistent with a rejected, never-started
+                # action.  Fail closed; do not guess whether an effect ran.
+                raise RunStoreError(
+                    "rejected approval has an incompatible durable observation"
+                )
+            await self._append(
+                lease,
+                "ActionCancelled",
+                {
+                    "action_id": action.action_id,
+                    "attempt": action.attempt,
+                    "observation_artifact": observation_artifact,
+                    "cancellation_reason": cancellation_reason,
+                },
+                artifact_refs=((observation_artifact,) if observation_artifact else ()),
+            )
         return bool(actions)
 
     async def _recover_inflight_actions(
@@ -1630,7 +1833,14 @@ class RunWorker:
         if (
             candidate is not None
             and self.completion_verifier is None
-            and not await self._candidate_evidence_is_durable(lease.run_id, candidate)
+            and not await self._candidate_evidence_is_durable(
+                lease.run_id,
+                candidate,
+                allow_assistant_response=(
+                    projection.goal is not None
+                    and projection.goal.interaction_mode == "conversation"
+                ),
+            )
         ):
             await self._append(
                 lease,
@@ -1839,6 +2049,8 @@ class RunWorker:
         self,
         run_id: str,
         candidate: CompletionCandidate,
+        *,
+        allow_assistant_response: bool = False,
     ) -> bool:
         """Reject fabricated full digests while preserving legacy short refs.
 
@@ -1860,6 +2072,11 @@ class RunWorker:
             return True
         durable: set[str] = set()
         for event in await self._read_all_events(run_id):
+            if allow_assistant_response and event.event_type == "AssistantMessageCommitted":
+                message_artifact = str(event.payload.get("message_artifact") or "")
+                if message_artifact and self.store.artifacts.exists(message_artifact):
+                    durable.add(message_artifact)
+                continue
             if (
                 event.event_type != "ToolObservationCommitted"
                 or event.payload.get("status") != "succeeded"
@@ -2021,6 +2238,45 @@ class RunWorker:
             return None
 
         events = await self._read_all_events(lease.run_id)
+
+        # Conversational runs use an explicit interaction contract. Their
+        # completion proof is a non-empty assistant artifact committed by this
+        # Runtime, not an untrusted final sentence. Coding runs continue to
+        # the stricter tool/verification evidence path below.
+        if goal.interaction_mode == "conversation":
+            for event in reversed(events):
+                if event.event_type != "AssistantMessageCommitted":
+                    continue
+                artifact = str(event.payload.get("message_artifact") or "")
+                if not artifact or not self.store.artifacts.exists(artifact):
+                    continue
+                try:
+                    message = json.loads(self.store.artifacts.read_text(artifact))
+                except (OSError, TypeError, ValueError, json.JSONDecodeError):
+                    continue
+                content = (
+                    str(message.get("content") or "").strip()
+                    if isinstance(message, Mapping)
+                    else ""
+                )
+                if not content:
+                    continue
+                return CompletionCandidate(
+                    acceptance_criteria=tuple(goal.acceptance_criteria),
+                    evidence=(EvidenceRef(
+                        evidence_id=f"runtime-response-{event.sequence}",
+                        kind=EvidenceKind.ASSISTANT_RESPONSE,
+                        digest=artifact,
+                        source="durable assistant response",
+                        recorded_at=time.time(),
+                        confidence=1.0,
+                        metadata={
+                            "event_sequence": event.sequence,
+                            "response_persisted": True,
+                        },
+                    ),),
+                )
+            return None
 
         evidence: list[EvidenceRef] = []
         verification_evidence: list[EvidenceRef] = []

@@ -639,6 +639,21 @@ class ProjectionBuilder:
             # projection; a fresh terminal boundary will record a new one.
             if event.event_type == "RunResumed":
                 state.outcome = None
+            elif event.event_type == "RunCancelled":
+                # ApprovalRequested is immutable audit evidence, but a
+                # requested decision cannot remain actionable after the Run
+                # has been stopped.  Derive an expired status from the
+                # cancellation fact so a later resume can close the planned
+                # action safely instead of silently executing it or leaving a
+                # provider-invalid pending approval in the context.
+                for approval_id, approval in tuple(state.approvals.items()):
+                    if approval.status is ApprovalStatus.REQUESTED:
+                        state.approvals[approval_id] = replace(
+                            approval,
+                            status=ApprovalStatus.EXPIRED,
+                            decided_by=event.actor.actor_id,
+                            decided_at=event.occurred_at,
+                        )
         elif event.event_type == "PlanCreated" or event.event_type == "PlanRevised":
             state.plan = PlanGraph.from_dict(payload["plan"])
         elif event.event_type == "ToolObservationCommitted":
@@ -791,7 +806,16 @@ class ProjectionBuilder:
             updates["error_kind"] = str(payload["error_kind"])
             self._observe_action_paths(event, state, is_error=True)
         elif next_status is ActionStatus.CANCELLED:
-            self._observe_action_paths(event, state, is_error=True)
+            # A user rejection is an intentional policy decision, not an
+            # execution error.  Keep it in the action/event ledger without
+            # poisoning the run's unresolved-error set; the model receives a
+            # cancelled tool observation and can continue with other work.
+            self._observe_action_paths(
+                event,
+                state,
+                is_error=event.payload.get("cancellation_reason")
+                not in {"user_rejected", "approval_expired"},
+            )
         elif next_status is ActionStatus.OUTCOME_UNKNOWN:
             updates["error_kind"] = str(payload.get("reason", "unknown"))
         state.actions[key] = action.advance(next_status, **updates)

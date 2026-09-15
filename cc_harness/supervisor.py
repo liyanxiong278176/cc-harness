@@ -68,6 +68,10 @@ class LocalSupervisor:
         self._worker_tasks: set[asyncio.Task] = set()
         self._loop_task: asyncio.Task | None = None
         self._stopping = False
+        # Control-plane decisions (approval, rejection, resume) should wake
+        # the scheduler immediately.  The polling timeout remains as a
+        # fallback for crash recovery and for work created by another process.
+        self._wake_event = asyncio.Event()
         self._lease_manager = LeaseManager(store)
         self.supervisor_id = f"supervisor-{uuid4().hex}"
         self._supervisor_lease_manager = SupervisorLeaseManager(
@@ -80,6 +84,12 @@ class LocalSupervisor:
             ttl_seconds=self.lease_ttl_seconds,
         )
         self._followups = FollowUpService(store)
+        # A damaged projection must be isolated to its own Run.  The event log
+        # remains authoritative, but rebuilding one historical Run can fail
+        # (for example after a manually copied/corrupted snapshot).  Keep the
+        # last diagnostic so a bad terminal Run does not spam the scheduler
+        # log on every poll while healthy siblings continue to dispatch.
+        self._projection_errors: dict[str, str] = {}
 
     async def start(self) -> None:
         if self._loop_task is not None and not self._loop_task.done():
@@ -92,7 +102,24 @@ class LocalSupervisor:
                 self._loop_task.exception()
         self._stopping = False
         await self._ensure_supervisor_lease()
+        self._wake_event.clear()
         self._loop_task = asyncio.create_task(self._run_loop(), name="cc-harness-supervisor")
+
+    @property
+    def is_running(self) -> bool:
+        """Whether the detached scheduling loop is alive and dispatching."""
+
+        return (
+            not self._stopping
+            and self._loop_task is not None
+            and not self._loop_task.done()
+        )
+
+    def wake(self) -> None:
+        """Request an immediate scheduling tick from a control-plane caller."""
+
+        if not self._stopping:
+            self._wake_event.set()
 
     async def tick(self) -> SupervisorStats:
         await self._ensure_supervisor_lease()
@@ -240,11 +267,29 @@ class LocalSupervisor:
         if not records:
             return ()
         all_records = await self.store.list_runs()
-        projections = {
-            record.run_id: await self.store.load_projection(record.run_id)
-            for record in all_records
-            if record.run_id not in self._active
+        # Only projections that can affect a queued candidate are needed for
+        # this scheduling decision.  Loading every historical Run made an
+        # unrelated terminal snapshot failure abort (or at least slow) the
+        # whole project tick.  Metadata for all records is still retained
+        # below for child-concurrency checks; projection replay is demand-led.
+        needed_projection_ids = {
+            run_id
+            for record in records
+            for run_id in (record.run_id, record.parent_run_id, record.predecessor_run_id)
+            if run_id is not None
         }
+        projections = {}
+        for record in all_records:
+            if record.run_id in self._active or record.run_id not in needed_projection_ids:
+                continue
+            try:
+                projections[record.run_id] = await self.store.load_projection(record.run_id)
+            except Exception as exc:  # noqa: BLE001 - isolate one corrupt Run
+                self._record_projection_error(record.run_id, exc)
+                # A queued Run without a readable projection is not safe to
+                # claim.  Terminal/blocked history is simply omitted from the
+                # dependency map so it cannot starve unrelated queued Runs.
+                continue
         selected = []
         selected_child_paths: list[str] = []
         for record in records:
@@ -253,6 +298,11 @@ class LocalSupervisor:
             if record.run_id in self._active:
                 continue
             projection = projections.get(record.run_id)
+            if projection is None:
+                # The Run itself is corrupt/unreadable.  Leave it queued for
+                # an explicit repair/reconciliation path, but never let it
+                # abort scheduling of healthy siblings.
+                continue
             if projection is not None and projection.discovery_status == "awaiting":
                 continue
             if record.parent_run_id is None:
@@ -270,11 +320,41 @@ class LocalSupervisor:
             selected_child_paths.extend(node_paths)
         return tuple(selected)
 
+    def _record_projection_error(self, run_id: str, error: BaseException) -> None:
+        """Record one projection failure without taking down the scheduler."""
+
+        message = f"{type(error).__name__}: {error}"
+        previous = self._projection_errors.get(run_id)
+        if previous == message:
+            return
+        self._projection_errors[run_id] = message
+        _LOGGER.warning(
+            "run projection unavailable; isolating run_id=%s (%s)",
+            run_id,
+            message,
+        )
+
+    async def _selection_projection(self, run_id: str, projections):
+        """Return a dependency projection or ``None`` when it is unreadable."""
+
+        projection = projections.get(run_id)
+        if projection is not None:
+            self._projection_errors.pop(run_id, None)
+            return projection
+        try:
+            projection = await self.store.load_projection(run_id)
+        except Exception as exc:  # noqa: BLE001 - one dependency cannot starve siblings
+            self._record_projection_error(run_id, exc)
+            return None
+        projections[run_id] = projection
+        self._projection_errors.pop(run_id, None)
+        return projection
+
     async def _record_is_ready(self, record, *, all_records, projections, selected_child_paths) -> bool:
         if record.predecessor_run_id:
-            predecessor = projections.get(record.predecessor_run_id)
+            predecessor = await self._selection_projection(record.predecessor_run_id, projections)
             if predecessor is None:
-                predecessor = await self.store.load_projection(record.predecessor_run_id)
+                return False
             if predecessor.status not in {
                 RunStatus.COMPLETED,
                 RunStatus.CANCELLED,
@@ -298,9 +378,9 @@ class LocalSupervisor:
                 )
                 if not bypassed:
                     return False
-        parent = projections.get(record.parent_run_id)
+        parent = await self._selection_projection(record.parent_run_id, projections)
         if parent is None:
-            parent = await self.store.load_projection(record.parent_run_id)
+            return False
         if parent.discovery_status == "awaiting":
             return False
         child = next(
@@ -344,9 +424,9 @@ class LocalSupervisor:
     async def _record_owned_paths(self, record, projections) -> tuple[str, ...]:
         if not record.parent_run_id:
             return ()
-        parent = projections.get(record.parent_run_id)
+        parent = await self._selection_projection(record.parent_run_id, projections)
         if parent is None:
-            parent = await self.store.load_projection(record.parent_run_id)
+            return ()
         child = next((item for item in parent.children if item.child_run_id == record.run_id), None)
         if child is None:
             return ()
@@ -356,9 +436,9 @@ class LocalSupervisor:
     async def _record_worktree(self, record, projections) -> str | None:
         if not record.parent_run_id:
             return None
-        parent = projections.get(record.parent_run_id)
+        parent = await self._selection_projection(record.parent_run_id, projections)
         if parent is None:
-            parent = await self.store.load_projection(record.parent_run_id)
+            return None
         child = next((item for item in parent.children if item.child_run_id == record.run_id), None)
         if child is None:
             return None
@@ -368,9 +448,9 @@ class LocalSupervisor:
     async def _record_effect_class(self, record, projections) -> str:
         if not record.parent_run_id:
             return "read_only"
-        parent = projections.get(record.parent_run_id)
+        parent = await self._selection_projection(record.parent_run_id, projections)
         if parent is None:
-            parent = await self.store.load_projection(record.parent_run_id)
+            return "unknown"
         child = next((item for item in parent.children if item.child_run_id == record.run_id), None)
         if child is None:
             return "unknown"
@@ -379,6 +459,7 @@ class LocalSupervisor:
 
     async def stop(self, drain: bool = True) -> None:
         self._stopping = True
+        self._wake_event.set()
         if self._loop_task is not None:
             self._loop_task.cancel()
             with contextlib.suppress(asyncio.CancelledError):
@@ -411,7 +492,7 @@ class LocalSupervisor:
                     "supervisor tick timed out after %.1fs; retrying",
                     self.tick_timeout,
                 )
-                await asyncio.sleep(self.poll_interval)
+                await self._wait_for_next_tick()
             except (SupervisorLeaseConflict, SupervisorLeaseFenceError):
                 # Leadership is exclusive.  A replacement supervisor owns
                 # recovery now; this process must not continue dispatching.
@@ -426,9 +507,22 @@ class LocalSupervisor:
                 # poll; the exception is retained in supervisor logs for
                 # diagnosis while durable run state remains authoritative.
                 _LOGGER.exception("supervisor tick failed; retrying")
-                await asyncio.sleep(self.poll_interval)
+                await self._wait_for_next_tick()
             else:
-                await asyncio.sleep(self.poll_interval)
+                await self._wait_for_next_tick()
+
+    async def _wait_for_next_tick(self) -> None:
+        """Sleep until the next poll or an explicit control-plane wake-up."""
+
+        try:
+            await asyncio.wait_for(self._wake_event.wait(), timeout=self.poll_interval)
+        except asyncio.TimeoutError:
+            return
+        finally:
+            # A wake arriving during the wait is consumed by this iteration.
+            # A wake racing immediately after ``clear`` is harmless because
+            # the bounded poll still provides a recovery path.
+            self._wake_event.clear()
 
 __all__ = ["LocalSupervisor", "SupervisorStats"]
 

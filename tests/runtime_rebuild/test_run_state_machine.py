@@ -43,7 +43,7 @@ def test_lifecycle_whitelist_covers_normal_long_running_path() -> None:
     [
         (RunStatus.RUNNING, "ApprovalRequested", RunStatus.AWAITING_APPROVAL),
         (RunStatus.AWAITING_APPROVAL, "ApprovalGranted", RunStatus.QUEUED),
-        (RunStatus.AWAITING_APPROVAL, "ApprovalRejected", RunStatus.BLOCKED),
+        (RunStatus.AWAITING_APPROVAL, "ApprovalRejected", RunStatus.QUEUED),
         (RunStatus.AWAITING_APPROVAL, "RunCancelled", RunStatus.CANCELLED),
         (RunStatus.RUNNING, "RunStalled", RunStatus.STALLED),
         (RunStatus.RUNNING, "InterruptRequested", RunStatus.CANCEL_REQUESTED),
@@ -79,6 +79,12 @@ def test_unknown_or_terminal_transitions_are_rejected() -> None:
         machine.transition(RunStatus.COMPLETED, "RunResumed")
     with pytest.raises(InvalidRunTransition):
         machine.transition(RunStatus.CANCELLED, "RunQueued")
+
+
+def test_duplicate_resume_is_idempotent_while_already_queued() -> None:
+    """A retried control request must replay as a no-op, not corrupt a Run."""
+
+    assert RunStateMachine().transition(RunStatus.QUEUED, "RunResumed") is RunStatus.QUEUED
 
 
 def test_outcome_vocabulary_maps_lifecycle_without_model_prose() -> None:
