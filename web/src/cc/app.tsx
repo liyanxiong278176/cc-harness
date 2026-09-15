@@ -976,6 +976,7 @@ function App() {
   const [sessionLoading, setSessionLoading] = useState(false)
   const [sending, setSending] = useState(false)
   const [deletingSession, setDeletingSession] = useState<string | null>(null)
+  const [deleteCandidate, setDeleteCandidate] = useState<string | null>(null)
   const [error, setError] = useState<string | null>(null)
   const [toast, setToast] = useState<string | null>(null)
   const [settingsOpen, setSettingsOpen] = useState(false)
@@ -1564,12 +1565,19 @@ function App() {
     setCollapsedProjects((current) => ({ ...current, [root]: !(current[root] ?? false) }))
   }
 
+  function requestDeleteSession(session: Session) {
+    if (deletingSession) return
+    setError(null)
+    setDeleteCandidate((current) => current === session.run_id ? null : session.run_id)
+  }
+
   async function activateSession(session: Session) {
     const generation = ++selectionGeneration.current
     const previousSession = activeSessionRef.current
     const previousDraftKey = draftKeyRef.current
     const sameProject = !session.project_root || project?.root === session.project_root
     setError(null)
+    setDeleteCandidate(null)
 
     selectionAbort.current?.abort()
     selectionAbort.current = null
@@ -1742,11 +1750,8 @@ function App() {
 
   async function deleteSession(session: Session) {
     if (deletingSession) return
-    const confirmed = window.confirm(
-      `从会话列表删除“${session.title}”？\n\n运行证据会保留在本地审计存储中，之后可由审计工具恢复查看。`,
-    )
-    if (!confirmed) return
     const runId = session.run_id
+    setDeleteCandidate(null)
     // Invalidate any timeline/list request that is already in flight. Without
     // this guard an old response could arrive after DELETE and put the
     // conversation back into the sidebar.
@@ -1917,6 +1922,7 @@ function App() {
   }
 
   function startNewSession() {
+    setDeleteCandidate(null)
     switchDraft(draftKeyForSession(null, project?.root))
     setActiveSession(null)
     setEvents([])
@@ -2027,7 +2033,7 @@ function App() {
               {!collapsed && <div className="project-group-sessions">
                 {groupSessions.length === 0
                   ? <div className="project-group-empty">暂无会话</div>
-                  : groupSessions.map((session) => <div className="session-item-row" key={session.run_id}><button className={'session-item ' + (activeSession === session.run_id ? 'selected' : '')} onClick={() => void activateSession(session)}><StatusDot status={session.status} /><span className="session-title">{session.title}</span><span className="session-status">{statusLabels[session.status] ?? session.status}<span className="session-sequence"> · {session.sequence} 事件</span></span></button><button type="button" className="session-delete" onClick={(event) => { event.stopPropagation(); void deleteSession(session) }} disabled={deletingSession === session.run_id} aria-label={'删除会话 ' + session.title} title="删除会话">{deletingSession === session.run_id ? <LoaderCircle size={14} className="spin" /> : <Trash2 size={14} />}</button></div>)}
+                   : groupSessions.map((session) => <div className="session-item-row" key={session.run_id}><button className={'session-item ' + (activeSession === session.run_id ? 'selected' : '')} onClick={() => void activateSession(session)}><StatusDot status={session.status} /><span className="session-title">{session.title}</span><span className="session-status">{statusLabels[session.status] ?? session.status}<span className="session-sequence"> · {session.sequence} 事件</span></span></button>{deleteCandidate === session.run_id ? <span className="session-delete-confirm" role="group" aria-label={'确认删除会话 ' + session.title}><span className="session-delete-confirm-label">删除？</span><button type="button" className="session-delete-confirm-yes" onClick={(event) => { event.stopPropagation(); void deleteSession(session) }}>确定</button><button type="button" className="session-delete-confirm-no" onClick={(event) => { event.stopPropagation(); setDeleteCandidate(null) }}>取消</button></span> : <button type="button" className="session-delete" onClick={(event) => { event.stopPropagation(); requestDeleteSession(session) }} disabled={deletingSession === session.run_id} aria-label={'删除会话 ' + session.title} title="删除会话">{deletingSession === session.run_id ? <LoaderCircle size={14} className="spin" /> : <Trash2 size={14} />}</button>}</div>)}
               </div>}
             </section>
           })}

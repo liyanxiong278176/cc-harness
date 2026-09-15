@@ -132,6 +132,13 @@ button:focus-visible, input:focus-visible, textarea:focus-visible, a:focus-visib
 .session-delete:hover:not(:disabled) { border-color: rgba(241, 139, 148, .42); background: rgba(241, 139, 148, .12); color: var(--danger); }
 .session-delete:focus-visible { outline: 2px solid var(--blue); outline-offset: 1px; opacity: 1; }
 .session-delete:disabled { cursor: wait; opacity: 1; }
+.session-delete-confirm { position: absolute; z-index: 3; top: 4px; right: 5px; min-height: 44px; padding: 4px 5px; display: inline-flex; align-items: center; gap: 4px; border: 1px solid rgba(241, 139, 148, .38); border-radius: 8px; background: var(--surface-raised); box-shadow: var(--shadow-soft); }
+.session-delete-confirm-label { color: var(--text-soft); font-size: 9px; white-space: nowrap; }
+.session-delete-confirm button { height: 25px; padding: 0 7px; border: 1px solid var(--border-strong); border-radius: 6px; cursor: pointer; font-size: 9px; }
+.session-delete-confirm-yes { border-color: rgba(241, 139, 148, .48) !important; background: rgba(241, 139, 148, .15); color: var(--danger); }
+.session-delete-confirm-yes:hover { background: rgba(241, 139, 148, .25); }
+.session-delete-confirm-no { background: var(--surface-soft); color: var(--muted); }
+.session-delete-confirm-no:hover { background: var(--surface-hover); color: var(--text); }
 .status-dot { width: 8px; height: 8px; align-self: center; border-radius: 50%; display: inline-block; }
 .status-dot.running { background: var(--blue); box-shadow: 0 0 0 4px var(--blue-soft); animation: pulse 1.8s ease-in-out infinite; }
 .status-dot.success { background: var(--green); }
