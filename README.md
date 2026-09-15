@@ -148,34 +148,24 @@ cc-harness 适配边界记录在 [`docs/deepseek-harness-ui-observations.md`](do
 审阅过的源码快照固定在仓库内 [`vendor/deepseek-ui/`](vendor/deepseek-ui/)，不会在构建时
 联网拉取，也不会启动上游 Runtime。
 
-## 评测访问路径
+## 当前评测结果访问路径
 
-评测命令均从仓库根目录 `D:\agent_learning\cc-harness` 执行。正式评测产生的任务、状态、
-事件流和报告保存在本机 `eval/result/`，该目录已加入 `.gitignore`，不会随代码提交。
-需要在浏览器观察运行过程时，先启动 WebUI：
+下面是本机已经完成的三套真实模型评测结果。命令行从仓库根目录
+`D:\agent_learning\cc-harness` 执行；每个结果目录中的 `report.md` 是人工阅读版，
+`summary.json` 是机器可读汇总，`state.json`、`progress.jsonl`、`raw/` 和
+`integrity.json` 用于复核。`eval/result/` 已加入 `.gitignore`，因此这些大体积评测产物
+只保存在本机，不会随代码提交。
 
-```powershell
-cc-harness --no-open --port 3080
-# 浏览器打开；若端口被占用，以终端打印的实际地址为准
-http://127.0.0.1:3080/
-```
+| 评测套件 | 已完成结果目录（本机） | 直接查看 |
+| --- | --- | --- |
+| Terminal-Bench 2.1（89 个任务，5 trials/task） | `D:\agent_learning\cc-harness\eval\result\cc-only\terminal-bench-2.1\deepseek-v4-flash\full-new-260905220633\` | [`report.md`](eval/result/cc-only/terminal-bench-2.1/deepseek-v4-flash/full-new-260905220633/report.md) · [`summary.json`](eval/result/cc-only/terminal-bench-2.1/deepseek-v4-flash/full-new-260905220633/summary.json) |
+| LoCoMo memory（1,986 QA） | `D:\agent_learning\cc-harness\eval\result\cc-only\locomo-memory\deepseek-v4-flash\full\` | [`report.md`](eval/result/cc-only/locomo-memory/deepseek-v4-flash/full/report.md) · [`summary.json`](eval/result/cc-only/locomo-memory/deepseek-v4-flash/full/summary.json) |
+| AgentDojo v1.2.2 balanced（500 trials） | `D:\agent_learning\cc-harness\eval\result\cc-only\agentdojo-v1.2.2-balanced-500\deepseek-v4-flash\portfolio\` | [`report.md`](eval/result/cc-only/agentdojo-v1.2.2-balanced-500/deepseek-v4-flash/portfolio/report.md) · [`summary.json`](eval/result/cc-only/agentdojo-v1.2.2-balanced-500/deepseek-v4-flash/portfolio/summary.json) |
 
-实时观察使用 `GET /api/web/v1/sessions` 获取会话列表，使用
-`GET /api/web/v1/sessions/{run_id}/events` 订阅可重放的 SSE 事件流；健康检查地址为
-`http://127.0.0.1:3080/api/health`。会话时间线和上下文明细分别位于
-`/api/web/v1/sessions/{run_id}/timeline` 与 `/api/web/v1/sessions/{run_id}/context`。
-
-| 评测套件 | 权威数据/说明 | 检查与正式入口 | 本地结果访问路径 |
-| --- | --- | --- | --- |
-| Terminal-Bench 2.1（89 个任务） | [Harbor 数据集](https://hub.harborframework.com/datasets/terminal-bench/terminal-bench-2-1/latest) · [Terminal-Bench 版本列表](https://www.tbench.ai/benchmarks) | `scripts\run_eval_terminal_bench_2_1.cmd --check`；`scripts\run_eval_terminal_bench_2_1.cmd --profile full --confirm-live` | `eval/result/cc-only/terminal-bench-2.1/deepseek-v4-flash/full-single-pass/` |
-| SWE-bench Verified（500 个任务） | [SWE-bench 官方仓库](https://github.com/SWE-bench/SWE-bench) · [Verified 数据集](https://huggingface.co/datasets/princeton-nlp/SWE-bench_Verified) | `scripts\run_eval_swebench_verified.cmd --check`；`scripts\run_eval_swebench_verified.cmd` | `eval/result/cc-only/swe-bench-verified/deepseek-v4-flash/portfolio/` |
-
-Terminal-Bench 的正式运行会在同一 `full-single-pass` 目录中断点续跑，已完成任务不会重放。
-需要 SWE-bench Verified 的 cc-harness/Claude Code 配对结果时，使用
-`scripts\run_harbor_verified500.cmd --check` 和 `scripts\run_harbor_verified500.cmd`，其
-结果目录为 `eval/result/harbor-verified500-deepseek-v4-flash/`。完整套件索引与协议说明见
-[`docs/eval/cc-only-benchmark-portfolio.md`](docs/eval/cc-only-benchmark-portfolio.md)；配对评测
-说明见 [`docs/eval/run-claude-parity.md`](docs/eval/run-claude-parity.md)。
+评测协议、数据版本、断点续跑规则和启动命令分别见
+[`docs/eval/cc-only-benchmark-portfolio.md`](docs/eval/cc-only-benchmark-portfolio.md)。
+如果结果目录已被移动，请以该目录下的 `manifest.json` 和 `integrity.json` 校验运行身份，
+不要把其他 `check`、`archive` 或历史目录误当作正式成绩。
 
 ## TUI 兼容交互
 
