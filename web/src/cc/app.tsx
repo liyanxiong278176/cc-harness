@@ -38,6 +38,66 @@ type Session = {
   project_root?: string
   scheduler?: SchedulerState
 }
+type QueueProjection = {
+  follow_up_run_id: string
+  predecessor_run_id?: string | null
+  message_artifact?: string
+  gate?: string
+  status?: string
+  queued_sequence?: number
+}
+type QueuedMessage = QueueProjection & {
+  /** The artifact digest is intentionally not shown; text comes from the public event. */
+  content: string
+  optimistic?: boolean
+}
+type GoalContractView = {
+  objective: string
+  acceptance_criteria: string[]
+  constraints: string[]
+  allowed_scope: string[]
+  excluded_scope: string[]
+  required_evidence: string[]
+  human_review: string[]
+  contract_version?: number
+  interaction_mode?: string
+}
+type PlanNodeView = {
+  node_id: string
+  kind: string
+  depth: number
+  depends_on: string[]
+  owned_paths: string[]
+  child_run_id?: string | null
+  worktree_id?: string | null
+  required?: boolean
+  effect_class?: string
+  acceptance_criteria: string[]
+  timeout_seconds?: number
+  max_retries?: number
+}
+type PlanGraphView = {
+  nodes: PlanNodeView[]
+  revision?: number
+  max_concurrent_children?: number
+  max_child_depth?: number
+}
+type TodoView = {
+  todo_id: string
+  title: string
+  status: string
+  active_sessions: string[]
+  updated_sequence?: number
+  evidence_count: number
+}
+type RunFacts = {
+  goal: GoalContractView | null
+  plan: PlanGraphView | null
+  todos: TodoView[]
+  discovery_status?: string
+  mutation_gate?: string
+}
+const emptyRunFacts: RunFacts = { goal: null, plan: null, todos: [] }
 type SchedulerState = {
   mode: 'local' | 'external' | 'idle' | string
   running: boolean
@@ -458,6 +518,81 @@ function statusTone(status: string): 'running' | 'success' | 'error' | 'muted' {
   return 'muted'
 }
 
+/**
+ * Build the visible follow-up queue from public, durable events.  The browser
+ * never treats a local timer or an optimistic counter as the source of truth:
+ * a queued message is visible only after the Runtime has emitted
+ * ``FollowUpQueued``.  ``FollowUpStarted`` and terminal child events remove it
+ * from the pending list without touching the immutable transcript.
+ */
+function deriveQueuedMessages(events: EventItem[]): QueuedMessage[] {
+  const queue = new Map<string, QueuedMessage>()
+  const ordered = [...events].sort((left, right) => {
+    const time = eventTime(left) - eventTime(right)
+    return time || left.sequence - right.sequence
+  })
+  for (const event of ordered) {
+    const payload = event.payload ?? {}
+    if (event.event_type === 'FollowUpQueued') {
+      const followUpId = String(payload.follow_up_run_id ?? '')
+      if (!followUpId) continue
+      queue.set(followUpId, {
+        follow_up_run_id: followUpId,
+        predecessor_run_id: payload.predecessor_run_id ? String(payload.predecessor_run_id) : null,
+        message_artifact: payload.message_artifact ? String(payload.message_artifact) : undefined,
+        gate: payload.gate ? String(payload.gate) : 'waiting',
+        status: 'queued',
+        queued_sequence: event.sequence,
+        content: normalizedUserContent(event.content) || '已排队的后续消息',
+      })
+      continue
+    }
+    if (event.event_type === 'FollowUpStarted') {
+      const followUpId = String(payload.follow_up_run_id ?? '')
+      const item = queue.get(followUpId)
+      if (item) queue.set(followUpId, { ...item, status: 'started' })
+      continue
+    }
+    if (event.event_type === 'PredecessorBypassed') {
+      const targetId = String(payload.follow_up_run_id ?? '')
+      const item = queue.get(targetId)
+      if (item) queue.set(targetId, { ...item, gate: 'bypassed' })
+      continue
+    }
+    // A child Run can finish without a corresponding root queue update.  It is
+    // safe to hide that queue row because the child transcript remains
+    // rendered from its own immutable events.
+    if (['RunOutcomeRecorded', 'RunCancelled', 'RunFailed'].includes(event.event_type)) {
+      queue.delete(event.run_id)
+    }
+  }
+  return [...queue.values()]
+    .filter((item) => item.status === 'queued')
+    .sort((left, right) => (left.queued_sequence ?? 0) - (right.queued_sequence ?? 0))
+}
+
+type RuntimeStage = 'context' | 'stream' | 'tool' | 'approval' | 'verify' | 'done'
+const runtimeStageLabels: Record<RuntimeStage, string> = {
+  context: '准备上下文',
+  stream: '流式回复',
+  tool: '工具调用',
+  approval: '等待审批',
+  verify: '验证结果',
+  done: '已完成',
+}
+const runtimeStages: RuntimeStage[] = ['context', 'stream', 'tool', 'approval', 'verify']
+
+function currentRuntimeStage(status: string, streaming: StreamingState | null, events: EventItem[], hasApproval: boolean): RuntimeStage {
+  if (status === 'completed') return 'done'
+  if (hasApproval || status === 'awaiting_approval') return 'approval'
+  if (['stalled', 'blocked', 'failed_recoverable', 'failed_terminal', 'cancel_requested'].includes(status)) return 'verify'
+  const latestSequence = events.length > 0 ? events[events.length - 1].sequence : 0
+  if (streaming?.phase === 'tool' || events.some((event) => event.event_type === 'ActionStarted' && event.sequence >= Math.max(0, latestSequence) - 3)) return 'tool'
+  if (streaming?.phase === 'done' || events.some((event) => event.event_type === 'CompletionCandidateSubmitted')) return 'verify'
+  if (status === 'running') return 'stream'
+  return 'context'
+}
+
 function StatusDot({ status }: { status: string }) {
   return <span className={'status-dot ' + statusTone(status)} aria-label={statusLabels[status] ?? status} />
 }
@@ -469,6 +604,145 @@ function renderMarkdown(source: string) {
 
 function formatTokens(value: number | null | undefined) {
   return value == null ? '—' : value.toLocaleString('en-US')
+}
+
+type UnknownRecord = Record<string, unknown>
+
+function recordOf(value: unknown): UnknownRecord | null {
+  return value !== null && typeof value === 'object' && !Array.isArray(value)
+    ? value as UnknownRecord
+    : null
+}
+
+function stringList(value: unknown) {
+  if (!Array.isArray(value)) return []
+  return value
+    .map((item) => typeof item === 'string' ? item.trim() : '')
+    .filter(Boolean)
+}
+
+function numberOrUndefined(value: unknown) {
+  if (value === null || value === undefined || value === '') return undefined
+  const number = typeof value === 'number' ? value : Number(value)
+  return Number.isFinite(number) ? number : undefined
+}
+
+function parseGoalContract(value: unknown): GoalContractView | null {
+  const record = recordOf(value)
+  if (!record) return null
+  const objective = typeof record.objective === 'string' ? record.objective.trim() : ''
+  const acceptanceCriteria = stringList(record.acceptance_criteria)
+  if (!objective || acceptanceCriteria.length === 0) return null
+  return {
+    objective,
+    acceptance_criteria: acceptanceCriteria,
+    constraints: stringList(record.constraints),
+    allowed_scope: stringList(record.allowed_scope),
+    excluded_scope: stringList(record.excluded_scope),
+    required_evidence: stringList(record.required_evidence),
+    human_review: stringList(record.human_review),
+    contract_version: numberOrUndefined(record.contract_version),
+    interaction_mode: typeof record.interaction_mode === 'string' ? record.interaction_mode : undefined,
+  }
+}
+
+function parsePlanNode(value: unknown): PlanNodeView | null {
+  const record = recordOf(value)
+  if (!record) return null
+  const nodeId = typeof record.node_id === 'string' ? record.node_id.trim() : ''
+  const kind = typeof record.kind === 'string' ? record.kind.trim() : ''
+  if (!nodeId || !kind) return null
+  return {
+    node_id: nodeId,
+    kind,
+    depth: numberOrUndefined(record.depth) ?? 0,
+    depends_on: stringList(record.depends_on),
+    owned_paths: stringList(record.owned_paths),
+    child_run_id: typeof record.child_run_id === 'string' ? record.child_run_id : null,
+    worktree_id: typeof record.worktree_id === 'string' ? record.worktree_id : null,
+    required: typeof record.required === 'boolean' ? record.required : undefined,
+    effect_class: typeof record.effect_class === 'string' ? record.effect_class : undefined,
+    acceptance_criteria: stringList(record.acceptance_criteria),
+    timeout_seconds: numberOrUndefined(record.timeout_seconds),
+    max_retries: numberOrUndefined(record.max_retries),
+  }
+}
+
+function parsePlanGraph(value: unknown): PlanGraphView | null {
+  const record = recordOf(value)
+  if (!record) return null
+  const nodes = Array.isArray(record.nodes)
+    ? record.nodes.map(parsePlanNode).filter((node): node is PlanNodeView => node !== null)
+    : []
+  return {
+    nodes,
+    revision: numberOrUndefined(record.revision),
+    max_concurrent_children: numberOrUndefined(record.max_concurrent_children),
+    max_child_depth: numberOrUndefined(record.max_child_depth),
+  }
+}
+
+function parseTodo(value: unknown): TodoView | null {
+  const record = recordOf(value)
+  if (!record) return null
+  const todoId = typeof record.todo_id === 'string'
+    ? record.todo_id.trim()
+    : typeof record.id === 'string' ? record.id.trim() : ''
+  if (!todoId) return null
+  const title = typeof record.title === 'string' && record.title.trim() ? record.title.trim() : todoId
+  const evidence = Array.isArray(record.evidence) ? record.evidence.length : 0
+  return {
+    todo_id: todoId,
+    title,
+    status: typeof record.status === 'string' ? record.status : 'pending',
+    active_sessions: stringList(record.active_sessions),
+    updated_sequence: numberOrUndefined(record.updated_sequence),
+    evidence_count: evidence,
+  }
+}
+
+function runFactsFromProjection(projection: unknown): RunFacts {
+  const record = recordOf(projection)
+  if (!record) return emptyRunFacts
+  const todos = Array.isArray(record.todos)
+    ? record.todos.map(parseTodo).filter((todo): todo is TodoView => todo !== null)
+    : []
+  return {
+    goal: parseGoalContract(record.goal),
+    plan: parsePlanGraph(record.plan),
+    todos,
+    discovery_status: typeof record.discovery_status === 'string' ? record.discovery_status : undefined,
+    mutation_gate: typeof record.mutation_gate === 'string' ? record.mutation_gate : undefined,
+  }
+}
+
+function reduceRunFacts(current: RunFacts, event: EventItem): RunFacts {
+  const payload = event.payload ?? {}
+  if (['RunCreated', 'GoalContractAccepted', 'GoalContractRevised'].includes(event.event_type)) {
+    const goal = parseGoalContract(payload.goal)
+    return goal ? { ...current, goal } : current
+  }
+  if (['PlanCreated', 'PlanRevised'].includes(event.event_type)) {
+    const plan = parsePlanGraph(payload.plan)
+    return plan ? { ...current, plan } : current
+  }
+  if (['TodoCreated', 'TodoUpdated'].includes(event.event_type)) {
+    const todo = parseTodo(payload.todo)
+    if (!todo) return current
+    const todos = current.todos.some((item) => item.todo_id === todo.todo_id)
+      ? current.todos.map((item) => item.todo_id === todo.todo_id ? { ...item, ...todo } : item)
+      : [...current.todos, todo]
+    return { ...current, todos }
+  }
+  if (event.event_type === 'TodoCompleted') {
+    const todoId = typeof payload.todo_id === 'string' ? payload.todo_id : ''
+    if (!todoId) return current
+    const todos = current.todos.some((item) => item.todo_id === todoId)
+      ? current.todos.map((item) => item.todo_id === todoId ? { ...item, status: 'done', updated_sequence: event.sequence } : item)
+      : [...current.todos, { todo_id: todoId, title: todoId, status: 'done', active_sessions: [], updated_sequence: event.sequence, evidence_count: 0 }]
+    return { ...current, todos }
+  }
+  return current
 }
 
 function ContextRing({ context, onClick, compact = false }: { context: ContextState; onClick: () => void; compact?: boolean }) {
@@ -883,7 +1157,7 @@ function toolStatusLabel(value: string | undefined) {
   return runtimeStatusLabels[value] ?? statusLabels[value] ?? value
 }
 
-function TurnProcess({ events, live, onCopy }: { events: EventItem[]; live: boolean; onCopy: (text: string) => void }) {
+const TurnProcess = memo(function TurnProcess({ events, live, onCopy }: { events: EventItem[]; live: boolean; onCopy: (text: string) => void }) {
   const [expanded, setExpanded] = useState(live)
   // Open the live process automatically, but do not force a user-collapsed
   // historical process back open on every SSE refresh.
@@ -910,7 +1184,7 @@ function TurnProcess({ events, live, onCopy }: { events: EventItem[]; live: bool
       </div>}
     </details>
   )
-}
+})
 
 const MessageCard = memo(function MessageCard({ event, onCopy }: { event: EventItem; onCopy: (text: string) => void }) {
   if (event.kind === 'user') {
@@ -948,10 +1222,271 @@ function ApprovalCard({ approval, onApprove, onReject, busy = false }: { approva
   const action = approval.actionId || '需要授权的动作'
   return (
     <div className="approval-card" role="region" aria-label="待处理审批">
-      <div className="approval-heading"><ShieldCheck size={17} /><span><strong>需要你的批准</strong><small>Runtime 正在等待这项本机操作</small></span></div>
+      <div className="approval-heading"><ShieldCheck size={17} /><span><strong>需要你的批准</strong><small>Runtime 正在等待这项本机操作；仍可输入消息，审批后按顺序发送</small></span></div>
       <div className="approval-detail"><span>动作</span><b>{action}</b>{approval.scope.length > 0 && <><span>范围</span><b className="approval-scope" title={approval.scope.join('\n')}>{approval.scope.join('、')}</b></>}</div>
       <div className="approval-actions"><button className="secondary-button" onClick={onReject} disabled={busy}>{busy ? '处理中…' : '拒绝'}</button><button className="primary-button" onClick={onApprove} disabled={busy}>{busy ? '处理中…' : '允许一次'}</button></div>
     </div>
+  )
+}
+
+const todoStatusLabels: Record<string, string> = {
+  pending: '待处理',
+  ready: '待处理',
+  in_progress: '执行中',
+  running: '执行中',
+  done: '已完成',
+  completed: '已完成',
+  blocked: '已阻塞',
+  failed: '失败',
+  cancelled: '已停止',
+}
+
+function todoStatusLabel(value: string | undefined) {
+  return todoStatusLabels[value ?? ''] ?? value ?? '待处理'
+}
+
+function interactionModeLabel(value: string | undefined) {
+  return value === 'conversation' ? '对话' : value === 'coding' ? '编码' : value || '未声明'
+}
+
+function ContractField({ label, values }: { label: string; values: string[] }) {
+  return (
+    <div className="runtime-contract-field">
+      <span>{label}</span>
+      {values.length === 0
+        ? <div className="runtime-contract-field-empty">未声明</div>
+        : <ul className="runtime-contract-field-list">{values.map((value, index) => <li key={label + index}>{value}</li>)}</ul>}
+    </div>
+  )
+}
+
+function RuntimeContractPopover({ facts, status, sequence, onClose }: { facts: RunFacts; status: string; sequence?: number; onClose: () => void }) {
+  const [detailsOpen, setDetailsOpen] = useState(false)
+  const [planExpanded, setPlanExpanded] = useState(false)
+  const [collapsedNodes, setCollapsedNodes] = useState<Record<string, boolean>>({})
+  const goal = facts.goal
+  const plan = facts.plan
+  const todoById = useMemo(() => new Map(facts.todos.map((todo) => [todo.todo_id, todo])), [facts.todos])
+  const planNodes = plan?.nodes ?? []
+  const parentByNode = useMemo(() => {
+    const stack: Array<{ depth: number; nodeId: string }> = []
+    const parents: Record<string, string | undefined> = {}
+    for (const node of planNodes) {
+      while (stack.length > 0 && stack[stack.length - 1].depth >= node.depth) stack.pop()
+      parents[node.node_id] = stack[stack.length - 1]?.nodeId
+      stack.push({ depth: node.depth, nodeId: node.node_id })
+    }
+    return parents
+  }, [planNodes])
+  const hasChildren = useMemo(() => new Set(Object.values(parentByNode).filter((value): value is string => Boolean(value))), [parentByNode])
+  const isHiddenByCollapsedParent = (nodeId: string) => {
+    let parent = parentByNode[nodeId]
+    while (parent) {
+      if (collapsedNodes[parent]) return true
+      parent = parentByNode[parent]
+    }
+    return false
+  }
+  const visibleNodes = (planExpanded ? planNodes : planNodes.slice(0, 6)).filter((node) => !isHiddenByCollapsedParent(node.node_id))
+  const completedTodos = planNodes.length > 0
+    ? planNodes.filter((node) => ['done', 'completed'].includes(todoById.get(node.node_id)?.status ?? '')).length
+    : facts.todos.filter((todo) => ['done', 'completed'].includes(todo.status)).length
+  const totalPlanItems = planNodes.length || facts.todos.length
+  const planStatus = planNodes.length > 0
+    ? `${completedTodos}/${totalPlanItems} 个 Todo 已完成`
+    : facts.todos.length > 0 ? `${completedTodos}/${facts.todos.length} 个 Todo 已完成` : '等待 Runtime 写入计划'
+  const knownNodeIds = new Set(planNodes.map((node) => node.node_id))
+  const extraTodos = planNodes.length > 0 ? facts.todos.filter((todo) => !knownNodeIds.has(todo.todo_id)) : []
+  return (
+    <section className="runtime-contract-popover" role="dialog" aria-label="目标契约与执行计划">
+      <div className="runtime-contract-popover-header">
+        <div>
+          <strong>目标契约与执行计划</strong>
+          <small>{statusLabels[status] ?? status}{sequence != null ? ` · 事件 #${sequence}` : ''}</small>
+        </div>
+        <button className="icon-button compact" type="button" onClick={onClose} aria-label="关闭目标契约" title="关闭"><X size={15} /></button>
+      </div>
+
+      <section className="runtime-contract-section">
+        <div className="runtime-contract-section-heading">
+          <span>目标契约</span>
+          <span className="runtime-contract-badge">{goal?.contract_version ? `v${goal.contract_version}` : '未知版本'}</span>
+        </div>
+        {goal
+          ? <>
+            <p className="runtime-contract-objective">{goal.objective}</p>
+            <ul className="runtime-contract-list">{goal.acceptance_criteria.map((item, index) => <li key={'acceptance-' + index}>{item}</li>)}</ul>
+            <button className="runtime-contract-toggle" type="button" aria-expanded={detailsOpen} onClick={() => setDetailsOpen((value) => !value)}>
+              <ChevronDown size={13} />{detailsOpen ? '收起约束与边界' : '展开约束与边界'}
+            </button>
+            {detailsOpen && <div className="runtime-contract-details">
+              <ContractField label="约束" values={goal.constraints} />
+              <ContractField label="允许范围" values={goal.allowed_scope} />
+              <ContractField label="排除范围" values={goal.excluded_scope} />
+              <ContractField label="所需证据" values={goal.required_evidence} />
+              <ContractField label="人工复核" values={goal.human_review} />
+              <div className="runtime-contract-field"><span>交互模式</span><div>{interactionModeLabel(goal.interaction_mode)}</div></div>
+            </div>}
+          </>
+          : <p className="runtime-contract-empty">Runtime 尚未在当前投影中写入目标契约。</p>}
+      </section>
+
+      <section className="runtime-contract-section">
+        <div className="runtime-contract-section-heading">
+          <span>PlanGraph / Todo</span>
+          {plan?.revision != null && <span className="runtime-contract-badge">修订 {plan.revision}</span>}
+        </div>
+        <div className="runtime-plan-summary">{planStatus}{plan?.max_concurrent_children ? ` · 并行上限 ${plan.max_concurrent_children}` : ''}</div>
+        {visibleNodes.length > 0
+          ? <div className="runtime-plan-list">
+            {visibleNodes.map((node) => {
+              const todo = todoById.get(node.node_id)
+              const nodeStatus = todo?.status ?? 'pending'
+              const classStatus = nodeStatus.replace(/[^a-z0-9_-]/gi, '-')
+              const title = todo?.title || node.kind + ' · ' + node.node_id
+              const metadata = [
+                todoStatusLabel(nodeStatus),
+                node.kind === 'child' ? '子任务' : '主任务',
+                node.required === false ? '可选' : '',
+                node.depends_on.length > 0 ? `${node.depends_on.length} 个依赖` : '',
+                node.acceptance_criteria.length > 0 ? `${node.acceptance_criteria.length} 条验收` : '',
+                node.owned_paths.length > 0 ? `${node.owned_paths.length} 个路径` : '',
+                todo?.evidence_count ? `${todo.evidence_count} 条证据` : '',
+              ].filter(Boolean).join(' · ')
+              return <div className={'runtime-plan-node todo-' + classStatus} key={node.node_id} style={{ paddingLeft: Math.min(4, Math.max(0, node.depth)) * 14 + 6 }}>
+                {hasChildren.has(node.node_id) && <button className="runtime-plan-node-toggle" type="button" onClick={() => setCollapsedNodes((current) => ({ ...current, [node.node_id]: !current[node.node_id] }))} aria-expanded={!collapsedNodes[node.node_id]} aria-label={collapsedNodes[node.node_id] ? '展开子任务' : '收起子任务'} title={collapsedNodes[node.node_id] ? '展开子任务' : '收起子任务'}><ChevronDown size={12} /></button>}
+                <span className="runtime-plan-node-mark" />
+                <div className="runtime-plan-node-copy">
+                  <strong className="runtime-plan-node-title" title={title}>{title}</strong>
+                  <span className="runtime-plan-node-meta">{metadata}</span>
+                </div>
+                {node.timeout_seconds != null && <span className="runtime-plan-node-extra" title="步骤超时上限">{node.timeout_seconds}s</span>}
+              </div>
+            })}
+          </div>
+          : facts.todos.length === 0
+            ? <p className="runtime-contract-empty">暂无 Runtime 执行计划数据。</p>
+            : <div className="runtime-plan-list">{facts.todos.map((todo) => <div className={'runtime-plan-node todo-' + todo.status.replace(/[^a-z0-9_-]/gi, '-')} key={todo.todo_id}><span className="runtime-plan-node-mark" /><div className="runtime-plan-node-copy"><strong className="runtime-plan-node-title" title={todo.title}>{todo.title}</strong><span className="runtime-plan-node-meta">{todoStatusLabel(todo.status)}{todo.evidence_count ? ` · ${todo.evidence_count} 条证据` : ''}</span></div></div>)}</div>}
+        {extraTodos.length > 0 && <div className="runtime-plan-extra">另有 {extraTodos.length} 个 Todo 未映射到当前计划节点</div>}
+        {planNodes.length > 6 && <button className="runtime-plan-expand" type="button" onClick={() => setPlanExpanded((value) => !value)}>{planExpanded ? '收起计划' : `展开全部 ${planNodes.length} 个节点`}</button>}
+      </section>
+
+      <div className="runtime-contract-source">只读 · 来源：Durable Runtime 投影 / 不可变事件流{facts.discovery_status ? ` · 拆解：${facts.discovery_status}` : ''}{facts.mutation_gate ? ` · 变更闸门：${facts.mutation_gate}` : ''}</div>
+    </section>
+  )
+}
+
+function RuntimeProgress({ status, sequence, streaming, events, hasApproval, facts }: { status: string; sequence?: number; streaming: StreamingState | null; events: EventItem[]; hasApproval: boolean; facts: RunFacts }) {
+  const [open, setOpen] = useState(false)
+  const rootRef = useRef<HTMLDivElement | null>(null)
+  const stage = currentRuntimeStage(status, streaming, events, hasApproval)
+  const activeIndex = stage === 'done' ? runtimeStages.length - 1 : Math.max(0, runtimeStages.indexOf(stage))
+  const progress = stage === 'done' ? 360 : ((activeIndex + 1) / runtimeStages.length) * 360
+  const stageCopy = status === 'queued'
+      ? '已接收，等待 Runtime 调度'
+      : status === 'waiting_on_predecessor'
+        ? '等待前序任务安全结束'
+      : status === 'cancel_requested'
+        ? '正在保存停止边界'
+        : status === 'cancelled'
+          ? '已保存停止边界，可继续发送新指令'
+        : status === 'stalled' || status === 'blocked' || status === 'failed_recoverable'
+          ? '可从当前检查点继续'
+          : runtimeStageLabels[stage]
+  const hasFacts = Boolean(facts.goal || facts.plan?.nodes.length || facts.todos.length)
+  const tone = statusTone(status)
+
+  useEffect(() => {
+    if (!open) return undefined
+    const onPointerDown = (event: PointerEvent) => {
+      if (!rootRef.current?.contains(event.target as Node)) setOpen(false)
+    }
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (event.key === 'Escape') setOpen(false)
+    }
+    document.addEventListener('pointerdown', onPointerDown)
+    document.addEventListener('keydown', onKeyDown)
+    return () => {
+      document.removeEventListener('pointerdown', onPointerDown)
+      document.removeEventListener('keydown', onKeyDown)
+    }
+  }, [open])
+
+  return (
+    <div ref={rootRef} className={'runtime-contract-anchor stage-' + stage + ' tone-' + tone}>
+      <div className="runtime-contract-trigger-row">
+        <button className="runtime-status-circle-button" type="button" onClick={() => setOpen((value) => !value)} aria-label="查看目标契约与执行计划" aria-haspopup="dialog" aria-expanded={open} title="查看目标契约与执行计划">
+          <span className="runtime-status-circle" style={{ '--runtime-progress': progress + 'deg' } as React.CSSProperties}>
+            <span>{stage === 'done' ? <Check size={15} /> : activeIndex + 1}</span>
+          </span>
+        </button>
+        <div className="runtime-contract-trigger-copy">
+          <span className="runtime-contract-status"><StatusDot status={status} /><strong>{statusLabels[status] ?? status}</strong><span className="runtime-contract-stage">· {runtimeStageLabels[stage]}</span></span>
+          <span className="runtime-contract-hint">{hasFacts ? `点击查看目标契约、PlanGraph 与 Todo · ${stageCopy}` : stageCopy}</span>
+        </div>
+        {sequence != null && <span className="runtime-contract-sequence">事件 #{sequence}</span>}
+      </div>
+      {open && <RuntimeContractPopover facts={facts} status={status} sequence={sequence} onClose={() => setOpen(false)} />}
+    </div>
+  )
+}
+
+function QueuePanel({ items }: { items: QueuedMessage[] }) {
+  if (items.length === 0) return null
+  return (
+    <section className="queue-panel" aria-live="polite" aria-label="排队中的消息">
+      <div className="queue-panel-heading">
+        <span><History size={14} />排队消息</span>
+        <strong>{items.length}</strong>
+        <small>按顺序处理</small>
+      </div>
+      <div className="queue-panel-list">
+        {items.slice(0, 3).map((item) => (
+          <div className="queue-panel-item" key={item.follow_up_run_id}>
+            <span className="queue-panel-dot" />
+            <span className="queue-panel-content">{item.content}</span>
+            <span className="queue-panel-gate">{item.gate === 'approval' ? '审批后发送' : item.gate === 'incomplete' ? '前序未完成' : item.gate === 'bypassed' ? '已转向' : '等待中'}</span>
+          </div>
+        ))}
+      </div>
+      {items.length > 3 && <div className="queue-panel-more">另有 {items.length - 3} 条消息等待处理</div>}
+    </section>
+  )
+}
+
+type CapabilityStatus = NonNullable<ContextState['capabilities']>['memory']
+
+function capabilityStatusLabel(value?: CapabilityStatus) {
+  if (!value) return '暂无数据'
+  if (value.enabled === false || value.details?.configured_enabled === false) return '已关闭'
+  if (!value.initialized) return '未初始化'
+  if (value.degraded_reason) return '已降级'
+  const degraded = value.details?.degraded_reasons
+  if (Array.isArray(degraded) && degraded.length > 0) return '部分降级'
+  return value.triggered ? '已启用' : '待触发'
+}
+
+function RuntimeContextCard({ context }: { context: ContextState }) {
+  const percent = context.ratio == null ? null : Math.min(100, Math.max(0, context.ratio * 100))
+  const categories = Object.entries(context.categories ?? {}).filter(([, value]) => value > 0).sort((left, right) => right[1] - left[1]).slice(0, 3)
+  const categoryLabels: Record<string, string> = { user_input: '对话消息', system_prompt: '系统提示词', tool_calls: '工具调用', tool_definitions: '工具定义', llm_output: '模型输出', summary: '压缩摘要' }
+  const compaction = context.compaction
+  const memoryDetails = context.capabilities?.memory?.details ?? {}
+  const retrievalPath = Array.isArray(memoryDetails.retrieval_path) ? memoryDetails.retrieval_path.join(' → ') : typeof memoryDetails.retrieval_path === 'string' ? memoryDetails.retrieval_path : null
+  return (
+    <section className="inspector-card context-inspector-card" aria-label="上下文与能力">
+      <div className="card-heading"><div><span className="card-eyebrow">上下文与能力</span><small>Runtime 最近一次请求</small></div>{percent != null && <span className="context-inspector-percent">{percent.toFixed(1)}%</span>}</div>
+      <div className="context-inspector-total"><strong>{formatTokens(context.used_tokens)}</strong><span>/ {formatTokens(context.window_tokens)}</span></div>
+      <div className="context-inspector-track"><span style={{ width: percent == null ? '0%' : percent + '%' }} /></div>
+      {categories.length > 0 && <div className="context-inspector-categories">{categories.map(([key, value]) => <div key={key}><span>{categoryLabels[key] ?? key}</span><b>{formatTokens(value)}</b></div>)}</div>}
+      <div className="context-inspector-facts">
+        <div><span>压缩</span><b>{compaction?.applied ? `已${compaction.tier === 'summarize' ? '总结' : compaction.tier === 'prune' ? '裁剪' : '缩减'}` : '未触发'}</b></div>
+        <div><span>记忆</span><b>{capabilityStatusLabel(context.capabilities?.memory)}</b></div>
+        <div><span>安全</span><b>{capabilityStatusLabel(context.capabilities?.safety)}</b></div>
+      </div>
+      {retrievalPath && <div className="context-inspector-retrieval"><span>记忆检索</span><strong>{retrievalPath}</strong></div>}
+      {!context.used_tokens && !context.capabilities?.context && <div className="context-inspector-empty"><Info size={14} />暂无 Runtime 上下文数据</div>}
+    </section>
   )
 }
 
@@ -964,10 +1499,12 @@ function App() {
   const [optimisticEvents, setOptimisticEvents] = useState<Record<string, EventItem[]>>({})
   const [streamingRuns, setStreamingRuns] = useState<Record<string, StreamingState>>({})
   const [context, setContext] = useState<ContextState>(emptyContext)
+  const [runFacts, setRunFacts] = useState<RunFacts>(emptyRunFacts)
   const [executor, setExecutor] = useState<ExecutorState>(emptyExecutor)
   const [scheduler, setScheduler] = useState<SchedulerState>(emptyScheduler)
   const [webCapabilities, setWebCapabilities] = useState<CapabilityManifest | null>(null)
   const [pendingApprovals, setPendingApprovals] = useState<PendingApproval[]>([])
+  const [optimisticQueue, setOptimisticQueue] = useState<Record<string, QueuedMessage[]>>({})
   const [approvalBusyId, setApprovalBusyId] = useState<string | null>(null)
   const [continuationNotice, setContinuationNotice] = useState<string | null>(null)
   const [draft, setDraft] = useState('')
@@ -1123,7 +1660,7 @@ function App() {
       // already visible instead of making a session switch wait for it.
       const [timeline, state] = await Promise.all([
         webApi<{ events: EventItem[] }>('/api/sessions/' + encodeURIComponent(runId) + '/timeline'),
-        webApi<{ project_root?: string; context: ContextState; status: string; executor?: ExecutorState; scheduler?: SchedulerState; projection?: { approvals?: Array<{ approval_id: string; run_id?: string; action_args_digest: string; action_id?: string; scope?: string[]; status: string }> } }>('/api/sessions/' + encodeURIComponent(runId)),
+        webApi<{ project_root?: string; context: ContextState; status: string; executor?: ExecutorState; scheduler?: SchedulerState; projection?: { goal?: unknown; plan?: unknown; todos?: unknown; discovery_status?: unknown; mutation_gate?: unknown; queue?: QueueProjection[]; approvals?: Array<{ approval_id: string; run_id?: string; action_args_digest: string; action_id?: string; scope?: string[]; status: string }> } }>('/api/sessions/' + encodeURIComponent(runId)),
       ])
       // A session can be switched while these two requests are in flight.
       // Never let a stale response replace the newly selected conversation.
@@ -1150,6 +1687,7 @@ function App() {
         setProject((current) => current?.root === state.project_root ? current : { root: state.project_root! })
       }
       setContext(state.context)
+      setRunFacts(runFactsFromProjection(state.projection))
       setExecutor(state.executor ?? emptyExecutor)
       setScheduler(state.scheduler ?? emptyScheduler)
       // ApprovalRequested remains immutable evidence even after a Run is
@@ -1158,6 +1696,34 @@ function App() {
       setPendingApprovals(state.status === 'awaiting_approval'
         ? (state.projection?.approvals ?? []).filter((item) => item.status === 'requested').map((item) => ({ approvalId: item.approval_id, digest: item.action_args_digest, actionId: item.action_id, scope: item.scope ?? [], runId: item.run_id }))
         : [])
+      // Optimistic queue rows are only a transport acknowledgement. Remove
+      // them as soon as the durable FollowUpQueued event is visible; if the
+      // timeline is truncated, keep the optimistic row until a later refresh
+      // rather than claiming that Runtime lost the message.
+      const durableQueueIds = new Set(timeline.events
+        .filter((event) => event.event_type === 'FollowUpQueued')
+        .map((event) => String(event.payload?.follow_up_run_id ?? ''))
+        .filter(Boolean))
+      const durableQueueContent = new Set(timeline.events
+        .filter((event) => event.event_type === 'FollowUpQueued')
+        .map((event) => normalizedUserContent(event.content))
+        .filter(Boolean))
+      setOptimisticQueue((current) => {
+        const pending = current[runId] ?? []
+        if (pending.length === 0 || (durableQueueIds.size === 0 && durableQueueContent.size === 0)) return current
+        const remaining = pending.filter((item) => {
+          if (durableQueueIds.has(item.follow_up_run_id)) return false
+          // Only the defensive client-generated id has no durable id to match.
+          // Content matching is restricted to that case so two identical user
+          // messages queued in one session are never collapsed together.
+          return !(item.optimistic && item.follow_up_run_id.startsWith('pending-') && durableQueueContent.has(item.content))
+        })
+        if (remaining.length === pending.length) return current
+        const next = { ...current }
+        if (remaining.length === 0) delete next[runId]
+        else next[runId] = remaining
+        return next
+      })
       setError(null)
       // Refresh the sidebar independently. A failure here must not blank the
       // selected transcript or turn a successful session load into an error.
@@ -1201,8 +1767,15 @@ function App() {
           delete next[runId]
           return next
         })
+        setOptimisticQueue((current) => {
+          if (!Object.prototype.hasOwnProperty.call(current, runId)) return current
+          const next = { ...current }
+          delete next[runId]
+          return next
+        })
         setStreamingRuns({})
         setPendingApprovals([])
+        setRunFacts(emptyRunFacts)
         setScheduler(emptyScheduler)
         setError('会话已不存在或已被其他窗口清理，请从左侧重新选择会话。')
         return
@@ -1319,6 +1892,7 @@ function App() {
     setContinuationNotice(null)
     continuationGeneration.current += 1
     setContext(emptyContext)
+    setRunFacts(emptyRunFacts)
     setShowNewMessages(false)
     stickToBottom.current = true
     streamOpened.current = false
@@ -1345,6 +1919,10 @@ function App() {
       try {
         const next = JSON.parse((message as MessageEvent).data) as EventItem
         enqueueRuntimeEvent(streamSession, next)
+        // Goal/plan/todo facts are root-run projections. Child Runtime events
+        // continue to appear in the activity stream but must not replace the
+        // parent contract shown by the status-circle inspector.
+        if (next.run_id === streamSession) setRunFacts((current) => reduceRunFacts(current, next))
         const terminalStreamEvent = ['AssistantMessageCommitted', 'RunCancelled', 'RunFailed'].includes(next.event_type)
         if (['AssistantMessageCommitted', 'RunOutcomeRecorded', 'RunStalled', 'RunCancelled', 'RunFailed'].includes(next.event_type)) {
           if (terminalStreamEvent) {
@@ -1520,6 +2098,20 @@ function App() {
     [displayEvents],
   )
   const conversationTurns = useMemo(() => groupConversationTurns(conversationEvents), [conversationEvents])
+  const durableQueue = useMemo(() => deriveQueuedMessages(displayEvents), [displayEvents])
+  const durableFollowUpIds = useMemo(
+    () => new Set(displayEvents.filter((event) => event.event_type === 'FollowUpQueued').map((event) => String(event.payload?.follow_up_run_id ?? '')).filter(Boolean)),
+    [displayEvents],
+  )
+  const queueItems = useMemo(() => {
+    const optimistic = activeSession ? optimisticQueue[activeSession] ?? [] : []
+    if (optimistic.length === 0) return durableQueue
+    const durableContent = new Set(durableQueue.map((item) => item.content))
+    return [
+      ...optimistic.filter((item) => !durableFollowUpIds.has(item.follow_up_run_id) && !(item.optimistic && item.follow_up_run_id.startsWith('pending-') && durableContent.has(item.content))),
+      ...durableQueue,
+    ]
+  }, [activeSession, durableFollowUpIds, durableQueue, optimisticQueue])
   const liveStatusEvents = useMemo(
     () => displayEvents.filter((event) => event.kind === 'status' || event.kind === 'outcome' || event.kind === 'error').slice(-8).reverse(),
     [displayEvents],
@@ -1623,6 +2215,7 @@ function App() {
         setActiveSession(null)
         setEvents([])
         setOptimisticEvents({})
+        setRunFacts(emptyRunFacts)
         setError(null)
         notify('已切换到 ' + (result.project?.root ?? '本地项目'))
       }
@@ -1644,6 +2237,7 @@ function App() {
         setActiveSession(null)
         setEvents([])
         setOptimisticEvents({})
+        setRunFacts(emptyRunFacts)
         setError(null)
         notify('已选择项目')
       }
@@ -1688,7 +2282,7 @@ function App() {
     setError(null)
     setStreamingRuns({})
     try {
-      const result = await webApi<{ session_id: string; sequence?: number; message_event_id?: string; continuation?: 'same_run' | 'child_run' }>('/api/messages', { method: 'POST', body: JSON.stringify({ text, session_id: requestedSession, project_root: project?.root ?? null }) })
+      const result = await webApi<{ session_id: string; sequence?: number; message_event_id?: string; follow_up_run_id?: string | null; continuation?: 'same_run' | 'child_run' }>('/api/messages', { method: 'POST', body: JSON.stringify({ text, session_id: requestedSession, project_root: project?.root ?? null }) })
       const sessionId = result.session_id
       // The Runtime is authoritative, but its event projection can arrive a
       // little after the command receipt.  Render the user's message now and
@@ -1712,6 +2306,24 @@ function App() {
         ...current,
         [sessionId]: mergeEventLists(current[sessionId] ?? [], [optimisticEvent]),
       }))
+      if (requestedSession && result.continuation === 'child_run') {
+        const followUpId = result.follow_up_run_id ?? 'pending-' + optimisticEvent.id
+        setOptimisticQueue((current) => ({
+          ...current,
+          [sessionId]: [
+            ...(current[sessionId] ?? []),
+            {
+              follow_up_run_id: followUpId,
+              predecessor_run_id: sessionId,
+              gate: pendingApprovals.length > 0 ? 'approval' : 'waiting',
+              status: 'queued',
+              queued_sequence: result.sequence ?? 0,
+              content: text,
+              optimistic: true,
+            },
+          ],
+        }))
+      }
       updateDraft('')
       setCursorPosition(0)
       // A first message materializes a new root Run. Move the composer key
@@ -1742,7 +2354,7 @@ function App() {
       await loadSession(activeSession)
       const list = await webApi<{ sessions: Session[] }>('/api/sessions')
       setSessions(visibleSessions(list.sessions))
-      notify('已请求停止当前运行')
+      notify('已保存停止边界；可以输入新指令转向')
     } catch (reason) {
       setError((reason as Error).message)
     }
@@ -1770,6 +2382,12 @@ function App() {
         delete next[runId]
         return next
       })
+      setOptimisticQueue((current) => {
+        if (!Object.prototype.hasOwnProperty.call(current, runId)) return current
+        const next = { ...current }
+        delete next[runId]
+        return next
+      })
       setStreamingRuns((current) => {
         const next = { ...current }
         delete next[runId]
@@ -1788,6 +2406,7 @@ function App() {
         setEvents([])
         setPendingApprovals([])
         setContext(emptyContext)
+        setRunFacts(emptyRunFacts)
         setExecutor(emptyExecutor)
         setScheduler(emptyScheduler)
         switchDraft(draftKeyForSession(null, project?.root), false)
@@ -1899,6 +2518,7 @@ function App() {
       setOptimisticEvents({})
       setPendingApprovals([])
       setContext(emptyContext)
+      setRunFacts(emptyRunFacts)
       setScheduler(emptyScheduler)
       notify('已准备新会话')
     } else if (item.id === 'project') {
@@ -1930,6 +2550,7 @@ function App() {
     setOptimisticEvents({})
     setPendingApprovals([])
     setContext(emptyContext)
+    setRunFacts(emptyRunFacts)
     setScheduler(emptyScheduler)
     setContinuationNotice(null)
     setError(null)
@@ -2063,11 +2684,13 @@ function App() {
 
         <footer className="composer-wrap">
           <div className="composer-label-row"><span>{sessionLoading ? '正在载入会话…' : active ? '继续与 cc-harness 协作' : '新的任务'}</span><span className="composer-shortcut"><Keyboard size={13} /> Enter 发送 · Shift+Enter 换行</span></div>
+          {active && <RuntimeProgress key={active.run_id} status={active.status} sequence={active.sequence} streaming={activeStreaming} events={displayEvents} hasApproval={pendingApprovals.length > 0} facts={runFacts} />}
+          <QueuePanel items={queueItems} />
           <div className="composer">
             {commandPaletteOpen && <CommandPalette items={visibleCommands} selectedIndex={commandIndex} onSelect={selectCommand} />}
             <div className="composer-toolbar"><button className={'composer-project ' + (!project ? 'needs-project' : '')} onClick={chooseProject}><FolderOpen size={16} /><span>{project ? projectName : '选择项目文件夹'}</span><ChevronDown size={14} /></button><div className="composer-toolbar-right"><span className="composer-mode"><ShieldCheck size={13} />本地 Runtime</span></div></div>
              <textarea ref={textareaRef} value={draft} onChange={(event) => { updateDraft(event.target.value); setCursorPosition(event.currentTarget.selectionStart ?? event.currentTarget.value.length); setCommandIndex(0) }} onKeyDown={handleComposerKeyDown} onClick={(event) => { syncCursorPosition(event); if (!project) notify('请先选择本地项目文件夹') }} onKeyUp={syncCursorPosition} onSelect={syncCursorPosition} disabled={!project || sending || sessionLoading} placeholder={sessionLoading ? '正在载入会话…' : project ? '描述要完成的任务，或输入 / 查看命令…' : '请先选择本地项目文件夹'} rows={3} aria-label="任务输入框" />
-           <div className="composer-footer"><div className="composer-footer-left"><PermissionSelector mode={settings.permission_mode} onChange={(mode) => void changePermissionMode(mode)} /><span className="privacy-note"><ShieldCheck size={13} />内容只在本机 Runtime 处理</span></div><div className="composer-actions">{active && ['running', 'queued', 'awaiting_approval'].includes(active.status) && <button className="stop-button" onClick={() => void stopSession()}><CircleStop size={15} />停止</button>}{active && ['cancelled', 'stalled', 'failed_recoverable', 'blocked'].includes(active.status) && <button className="secondary-button compact" onClick={() => void resumeSession()}><RotateCcw size={15} />{active.status === 'blocked' ? '确认继续' : '继续'}</button>}<button className="send-button" onClick={() => void sendMessage()} disabled={!project || !draft.trim() || sending || sessionLoading} aria-label="发送">{sending ? <LoaderCircle size={16} className="spin" /> : <Send size={16} />}<span>{sending ? '提交中' : '发送'}</span></button></div></div>
+           <div className="composer-footer"><div className="composer-footer-left"><PermissionSelector mode={settings.permission_mode} onChange={(mode) => void changePermissionMode(mode)} /><span className="privacy-note"><ShieldCheck size={13} />内容只在本机 Runtime 处理</span>{pendingApprovals.length > 0 && <span className="composer-queue-hint" title="这条消息会在当前工具审批完成后按顺序发送">审批后发送</span>}{active && ['running', 'queued', 'awaiting_approval'].includes(active.status) && pendingApprovals.length === 0 && <span className="composer-queue-hint">消息将排队</span>}</div><div className="composer-actions">{active && ['running', 'queued', 'awaiting_approval'].includes(active.status) && <button className="stop-button" onClick={() => void stopSession()} title="保存当前检查点并停止，随后可发送新指令"><CircleStop size={15} />停止并转向</button>}{active && ['cancelled', 'stalled', 'failed_recoverable', 'blocked'].includes(active.status) && <button className="secondary-button compact" onClick={() => void resumeSession()}><RotateCcw size={15} />{active.status === 'blocked' ? '确认继续' : '继续'}</button>}<button className="send-button" onClick={() => void sendMessage()} disabled={!project || !draft.trim() || sending || sessionLoading} aria-label="发送">{sending ? <LoaderCircle size={16} className="spin" /> : <Send size={16} />}<span>{sending ? '提交中' : active && pendingApprovals.length > 0 ? '排队' : active && ['running', 'queued'].includes(active.status) ? '排队' : '发送'}</span></button></div></div>
           </div>
         </footer>
         <div className="bottom-statusbar">
@@ -2082,6 +2705,7 @@ function App() {
            <section className="inspector-card runtime-overview"><div className="card-eyebrow"><span className="pulse-dot" /> DURABLE RUNTIME</div><div className="runtime-state"><StatusDot status={status} /><div><strong>{status === 'idle' ? '等待输入' : statusLabels[status] ?? status}</strong><span>{active ? '事件序号 ' + active.sequence : '选择项目后开始'}</span></div></div><div className="inspector-row"><span>项目</span><strong>{project ? '已选择' : '未选择'}</strong></div><div className="inspector-row"><span>活动会话</span><strong>{active ? '已连接' : '—'}</strong></div><div className="inspector-row"><span>执行后端</span><strong className={executor.degraded ? 'warn-text' : ''}>{connectionLabel}</strong></div><div className="inspector-row"><span>调度器</span><strong className={scheduler.mode === 'external' ? 'warn-text' : ''}>{scheduler.label}</strong></div><div className="inspector-row"><span>审批</span><strong className={pendingApprovals.length > 0 ? 'warn-text' : ''}>{pendingApprovals.length > 0 ? pendingApprovals.length + ' 项待处理' : '无待处理'}</strong></div></section>
            {unsupportedControls.length > 0 && <section className="inspector-card capability-note"><div className="card-eyebrow">当前运行时能力</div><p>以下控制由服务端标记为不可用：</p>{unsupportedControls.map(([id, feature]) => <div className="capability-row" key={id}><strong>{id}</strong><span>{feature.reason ?? '当前环境未提供'}</span></div>)}</section>}
            {diagnosis && <RuntimeDiagnosisCard diagnosis={diagnosis} />}
+           {active && <RuntimeContextCard context={context} />}
            <section className="inspector-card live-status-card"><div className="card-heading"><div><span className="card-eyebrow">实时状态</span><small>{active ? active.title : '选择会话后显示'}</small></div><StatusDot status={status} /></div><div className="live-status-summary"><StatusDot status={status} /><div><strong>{status === 'idle' ? '等待输入' : statusLabels[status] ?? status}</strong><span>{active ? '事件序号 ' + active.sequence : '当前没有活动会话'}</span></div></div>{liveStatusEvents.length === 0 ? <div className="activity-empty"><Info size={15} /><span>任务运行后，这里会显示实时状态。</span></div> : <div className="runtime-timeline">{liveStatusEvents.map((event) => <div className={'runtime-timeline-row ' + event.kind} key={event.id}><span className="runtime-timeline-mark" /><div><strong>{runtimeEventLabel(event)}</strong><small>事件 #{event.sequence}</small></div></div>)}</div>}</section>
         </div>
         <div className="inspector-model"><div className="model-chip"><span className="model-chip-dot" /><div><small>当前模型</small><strong>{settings.model || '未配置'}</strong></div></div><button className="icon-button" onClick={() => setSettingsOpen(true)} title="设置"><Settings size={16} /></button></div>

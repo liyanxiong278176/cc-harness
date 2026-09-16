@@ -987,9 +987,13 @@ class WebRuntimeManager:
             raise ValueError("消息不能为空")
         if session_id:
             client = await self._client_for_run(session_id, start=True)
-            _root_view, _effective, head, approvals, _tree = await self._conversation_snapshot(client, session_id)
-            if approvals:
-                raise ValueError("当前会话有待处理审批，请先在运行面板中允许或拒绝该动作")
+            _root_view, _effective, head, _approvals, _tree = await self._conversation_snapshot(client, session_id)
+            # A pending approval is a tool-level boundary, not a conversation
+            # lock.  Keep accepting ordinary user messages and durable them in
+            # the FIFO follow-up queue; the queue's predecessor gate remains
+            # ``waiting`` until the approval decision is recorded.  This lets
+            # the user keep drafting/steering without accidentally authorizing
+            # the current tool or creating a second worker.
             # A plain assistant answer is intentionally not a successful coding
             # completion, so the worker may end at ``stalled``. Continue the
             # latest conversation head in-place in that case. When a child is

@@ -363,6 +363,62 @@ def test_webui_can_explicitly_resume_goal_review_block(tmp_path: Path) -> None:
     asyncio.run(exercise())
 
 
+def test_webui_queues_message_while_approval_is_pending(tmp_path: Path) -> None:
+    """An approval gate pauses one tool, not the conversation composer."""
+
+    async def exercise() -> None:
+        project = tmp_path / "project"
+        project.mkdir()
+        manager = WebRuntimeManager(initial_cwd=tmp_path, data_root=tmp_path / "runtime-data")
+        client = await DurableRuntimeClient.create(project, data_root=tmp_path / "runtime-data")
+        manager.selected_root = project.resolve()
+        manager._clients[str(project.resolve())] = client
+        client.start_supervisor = AsyncMock()  # type: ignore[method-assign]
+        try:
+            run_id = await client.submit("需要审批的任务")
+            lease = await LeaseManager(client.store).claim(run_id, "test-worker")
+            await client.coordinator._append(
+                run_id,
+                "ActionPlanned",
+                {
+                    "action_id": "approval-action",
+                    "tool_name": "run_command",
+                    "attempt": 1,
+                    "normalized_args_digest": "sha256:" + "a" * 64,
+                    "arguments_artifact": "sha256:" + "b" * 64,
+                    "contract_digest": "sha256:" + "c" * 64,
+                    "effect_class": "unknown",
+                    "worker_id": "test-worker",
+                },
+                EventActor("worker", "test-worker"),
+            )
+            await client.coordinator._append(
+                run_id,
+                "ApprovalRequested",
+                {
+                    "approval_id": "approval-action",
+                    "action_id": "approval-action",
+                    "action_args_digest": "sha256:" + "a" * 64,
+                    "scope": ["run_command"],
+                },
+                EventActor("worker", "test-worker"),
+            )
+            assert (await client.coordinator.inspect(run_id)).status is RunStatus.AWAITING_APPROVAL
+
+            result = await manager.send_message("审批完成后继续整理结果", session_id=run_id)
+            assert result["continuation"] == "child_run"
+            assert result["follow_up_run_id"]
+            root = await client.coordinator.inspect(run_id)
+            assert any(item.follow_up_run_id == result["follow_up_run_id"] for item in root.projection.queue)
+            events = (await client.store.read(run_id, limit=100)).events
+            assert any(event.event_type == "FollowUpQueued" for event in events)
+            await LeaseManager(client.store).release(lease)
+        finally:
+            await client.close()
+
+    asyncio.run(exercise())
+
+
 def test_webui_rejection_wakes_runtime_and_continues(tmp_path: Path) -> None:
     """Rejecting one approval must cancel only that action and resume the Run."""
 
