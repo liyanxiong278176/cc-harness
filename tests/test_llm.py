@@ -8,6 +8,7 @@ from cc_harness.llm import (
     LLMClient,
     PendingToolCall,
     StreamEvent,
+    ProviderStreamError,
     _thinking_replay_error,
     _retryable_provider_error,
     accumulate_delta,
@@ -46,6 +47,7 @@ def test_thinking_replay_error_requires_the_provider_protocol_message():
 def test_read_timeout_is_a_retryable_transport_error():
     assert _retryable_provider_error(RuntimeError("read timeout"))
     assert _retryable_provider_error(type("ReadTimeout", (Exception,), {})(""))
+    assert _retryable_provider_error(type("StatusError", (Exception,), {"status_code": "503"})())
     assert not _retryable_provider_error(RuntimeError("invalid api key"))
 
 def test_pending_tool_call_index_optional():
@@ -393,3 +395,27 @@ async def test_chat_retries_incomplete_provider_stream(monkeypatch):
     events = [event async for event in client.chat([], [])]
     assert attempts == 3
     assert events[-1].content == "recovered"
+
+
+@pytest.mark.asyncio
+async def test_chat_does_not_retry_after_first_visible_delta(monkeypatch):
+    client = LLMClient(api_key="sk-test", model="gpt-4o-mini", base_url=None)
+    attempts = 0
+
+    async def flaky_once(messages, tools):
+        nonlocal attempts
+        del messages, tools
+        attempts += 1
+        yield StreamEvent(kind="content", text="partial")
+        raise http.client.IncompleteRead(b"partial")
+
+    monkeypatch.setattr("cc_harness.llm._PROVIDER_RETRY_DELAYS", (0.0, 0.0))
+    monkeypatch.setattr(client, "_chat_once", flaky_once)
+    events = []
+    with pytest.raises(ProviderStreamError) as caught:
+        async for event in client.chat([], []):
+            events.append(event)
+    assert attempts == 1
+    assert [event.text for event in events] == ["partial"]
+    assert caught.value.partial_output is True
+    assert caught.value.attempts == 1

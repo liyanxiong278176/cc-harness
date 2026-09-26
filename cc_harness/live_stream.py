@@ -67,6 +67,9 @@ class LiveStreamHub:
         gap = {
             "type": "stream_gap",
             "run_id": envelope["run_id"],
+            "invocation_id": envelope.get("invocation_id"),
+            "segment": envelope.get("segment"),
+            "chunk": envelope.get("chunk"),
             "live_id": envelope["live_id"],
             "reason": "subscriber_queue_full",
             "ts": envelope.get("ts", time.time()),

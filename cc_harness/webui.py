@@ -14,6 +14,7 @@ import asyncio
 import contextlib
 import hashlib
 import json
+import logging
 import os
 import re
 import socket
@@ -41,12 +42,37 @@ from .permissions import normalize_permission_mode
 from .run_model import RunStatus
 from .run_store import RunNotFound, SequenceConflict, SupervisorLeaseConflict, SupervisorLeaseFenceError
 from .approvals import ApprovalDigestMismatchError, ApprovalNotFoundError
+from .stream_errors import StreamErrorDetails, classify_stream_error
+
+
+logger = logging.getLogger(__name__)
 
 
 _SECRET_KEY = re.compile(
     r"(?:api.?key|access.?token|authorization|cookie|credential|password|passwd|private.?key|secret)",
     re.IGNORECASE,
 )
+_SECRET_VALUE = re.compile(
+    r"""((?<![A-Za-z0-9])(?:api[_ -]?key|access[_ -]?token|cookie|credential|password|passwd|private[_ -]?key|secret)[A-Za-z0-9_]*[\"']?\s*[:=]\s*[\"']?)([^\s,;\"']+)([\"']?)""",
+    re.IGNORECASE | re.VERBOSE,
+)
+_AUTHORIZATION_VALUE = re.compile(
+    r"""((?<![A-Za-z0-9])authorization[\"']?\s*[:=]\s*[\"']?(?:[A-Za-z][A-Za-z0-9_-]*\s+)?[\"']?)([^\s,;\"']+)([\"']?)""",
+    re.IGNORECASE | re.VERBOSE,
+)
+_BARE_AUTH_SECRET = re.compile(
+    r"""(\b(?:bearer|basic)(?:\s+|\s*[:=]\s*)[\"']?)((?=[A-Za-z0-9_./+=-]*[\d_./+=-])[A-Za-z0-9_./+=-]{12,})([\"']?)""",
+    re.IGNORECASE | re.VERBOSE,
+)
+_SAFE_ERROR_CODE = re.compile(r"^[a-zA-Z0-9_.-]{1,96}$")
+_SAFE_ERROR_PHASES = {
+    "connection",
+    "model",
+    "tool",
+    "approval",
+    "persistence",
+    "sse",
+}
 _MODEL_FIELDS = ("base_url", "model", "api_key")
 _PERMISSION_FIELD = "permission_mode"
 _COMPLETION_BLOCK = re.compile(
@@ -107,9 +133,133 @@ def _redact(value: Any, *, key: str = "") -> Any:
         return {str(k): _redact(v, key=str(k)) for k, v in value.items()}
     if isinstance(value, (list, tuple)):
         return [_redact(item, key=key) for item in value]
-    if isinstance(value, (str, int, float, bool)) or value is None:
+    if isinstance(value, str):
+        redacted = _AUTHORIZATION_VALUE.sub(r"\1<redacted>\3", value)
+        redacted = _SECRET_VALUE.sub(r"\1<redacted>\3", redacted)
+        return _BARE_AUTH_SECRET.sub(r"\1<redacted>\3", redacted)
+    if isinstance(value, (int, float, bool)) or value is None:
         return value
     return str(value)
+
+
+def _public_stream_error(value: Any) -> dict[str, Any] | None:
+    """Project an error mapping onto the browser-safe stream contract.
+
+    Durable records may contain legacy strings, provider diagnostics, or
+    future fields that are useful to local operators but unsafe for a browser.
+    Whitelist the contract fields instead of recursively forwarding an
+    arbitrary mapping.  This also keeps old events compatible with the new
+    UI without exposing a traceback or response body.
+    """
+
+    if not isinstance(value, Mapping):
+        return None
+
+    raw_code = str(value.get("code") or "runtime_error").strip()
+    code = raw_code if _SAFE_ERROR_CODE.fullmatch(raw_code) else "runtime_error"
+    raw_phase = str(value.get("phase") or "model").strip().casefold()
+    phase = raw_phase if raw_phase in _SAFE_ERROR_PHASES else "model"
+
+    def bounded_text(raw: Any, fallback: str) -> str:
+        if not isinstance(raw, str) or not raw.strip():
+            return fallback
+        text = str(_redact(raw)).replace("\r", " ").replace("\n", " ").strip()
+        lowered = text.casefold()
+        if "traceback" in lowered or "file \"" in lowered or "file '" in lowered:
+            return fallback
+        return text[:240] or fallback
+
+    def nonnegative_int(raw: Any) -> int | None:
+        if raw is None or isinstance(raw, bool):
+            return None
+        try:
+            parsed = int(raw)
+        except (TypeError, ValueError):
+            return None
+        return max(0, parsed)
+
+    def nonnegative_float(raw: Any) -> float | None:
+        if raw is None or isinstance(raw, bool):
+            return None
+        try:
+            parsed = float(raw)
+        except (TypeError, ValueError):
+            return None
+        return parsed if parsed >= 0 and parsed != float("inf") else None
+
+    request_id = value.get("request_id")
+    safe_request_id = (
+        _redact(request_id)[:128]
+        if isinstance(request_id, str) and request_id.strip()
+        else None
+    )
+    details = StreamErrorDetails(
+        code=code,
+        phase=phase,
+        retryable=value.get("retryable") if isinstance(value.get("retryable"), bool) else False,
+        partial_output=value.get("partial_output") if isinstance(value.get("partial_output"), bool) else False,
+        attempt=nonnegative_int(value.get("attempt")),
+        retry_after=nonnegative_float(value.get("retry_after")),
+        next_action=bounded_text(value.get("next_action"), "查看错误详情后从最近检查点继续"),
+        message=bounded_text(value.get("message"), "Runtime 未能完成本轮响应"),
+        request_id=str(safe_request_id) if safe_request_id else None,
+    )
+    return details.to_dict()
+
+
+def _bounded_public_reason(value: Any, fallback: str = "") -> str:
+    """Keep a short, non-sensitive diagnostic suitable for an event card."""
+
+    if not isinstance(value, str) or not value.strip():
+        return fallback
+    text = str(_redact(value)).replace("\r", " ").replace("\n", " ").strip()
+    lowered = text.casefold()
+    if "traceback" in lowered or "file \"" in lowered or "file '" in lowered:
+        return fallback
+    return text[:240]
+
+
+def _public_run_outcome(value: Mapping[str, Any]) -> dict[str, Any]:
+    """Redact outcome reasons before returning immutable outcome events."""
+
+    public = _redact(value)
+    if not isinstance(public, dict):
+        return {}
+    primary_class = public.get("primary_class")
+    fallback = (
+        primary_class
+        if isinstance(primary_class, str) and _SAFE_ERROR_CODE.fullmatch(primary_class)
+        else "runtime_error"
+    )
+
+    def sanitize_reason(raw: Any) -> str:
+        return _bounded_public_reason(raw, fallback)
+
+    if "reason" in value:
+        public["reason"] = sanitize_reason(value.get("reason"))
+    raw_failure = value.get("failure_evidence")
+    safe_failure = public.get("failure_evidence")
+    if isinstance(raw_failure, Mapping) and isinstance(safe_failure, Mapping):
+        safe_failure = dict(safe_failure)
+        if "reason" in raw_failure:
+            safe_failure["reason"] = sanitize_reason(raw_failure.get("reason"))
+        public["failure_evidence"] = safe_failure
+
+    raw_details = value.get("details")
+    safe_details = public.get("details")
+    if isinstance(raw_details, Mapping) and isinstance(safe_details, Mapping):
+        safe_details = dict(safe_details)
+        if "reason" in raw_details:
+            safe_details["reason"] = sanitize_reason(raw_details.get("reason"))
+        raw_nested_failure = raw_details.get("failure_evidence")
+        safe_nested_failure = safe_details.get("failure_evidence")
+        if isinstance(raw_nested_failure, Mapping) and isinstance(safe_nested_failure, Mapping):
+            safe_nested_failure = dict(safe_nested_failure)
+            if "reason" in raw_nested_failure:
+                safe_nested_failure["reason"] = sanitize_reason(raw_nested_failure.get("reason"))
+            safe_details["failure_evidence"] = safe_nested_failure
+        public["details"] = safe_details
+    return public
 
 
 def _public_capability_details(
@@ -327,9 +477,81 @@ def _public_event(
         result["action_id"] = payload.get("action_id")
         if event_type == "ActionFailed":
             result["kind"] = "error"
+            # Action failure payloads historically carried an unbounded
+            # executor reason. Keep only the fields needed to identify the
+            # action and a short, redacted diagnostic; raw stderr/tracebacks
+            # stay in the local artifact/audit boundary.
+            result["payload"] = {
+                key: value
+                for key, value in result["payload"].items()
+                if key in {"action_id", "attempt", "error_kind", "status"}
+            }
+            if payload.get("error_kind"):
+                result["payload"]["error_kind"] = _bounded_public_reason(
+                    payload.get("error_kind"), "工具执行失败"
+                )
+        elif event_type == "ActionOutcomeUnknown":
+            result["payload"] = {
+                key: value
+                for key, value in result["payload"].items()
+                if key in {"action_id", "attempt", "status"}
+            }
+            reason = _bounded_public_reason(payload.get("reason"))
+            if reason:
+                result["payload"]["reason"] = reason
     elif event_type == "RunOutcomeRecorded":
         result["kind"] = "outcome"
-        result["outcome"] = _redact(payload)
+        safe_outcome = _public_run_outcome(payload)
+        result["payload"] = safe_outcome
+        result["outcome"] = safe_outcome
+    elif event_type in {"RunFailed", "ModelInvocationFinished"}:
+        # Keep the public failure contract bounded and actionable.  Durable
+        # audit payloads may contain additional local diagnostics, but the
+        # browser receives only the structured code/phase/recovery fields.
+        details = payload.get("error_details") or payload.get("error")
+        safe_details = _public_stream_error(details)
+        if safe_details is not None:
+            result["error"] = safe_details
+            message = safe_details.get("message")
+            if isinstance(message, str) and message.strip():
+                result["content"] = message
+        if event_type == "RunFailed" or payload.get("status") == "failed":
+            if "error" not in result:
+                safe_details = StreamErrorDetails(
+                    code="runtime_error",
+                    phase="model",
+                    retryable=False,
+                    next_action="保留当前检查点，查看本地诊断后继续",
+                    message="Runtime 未能完成本轮响应",
+                ).to_dict()
+                result["error"] = safe_details
+                result["content"] = safe_details["message"]
+            # ``reason`` and legacy string errors can contain a provider body
+            # or traceback.  Keep the durable record intact, but never expose
+            # those fields through the browser-facing payload.
+            result["payload"] = {
+                key: value
+                for key, value in result["payload"].items()
+                if key in {
+                    "invocation_id",
+                    "status",
+                    "duration_ms",
+                    "stop_reason",
+                    "target_status",
+                    "attempt",
+                }
+            }
+            # The UI diagnosis helper reads from bounded public payload fields.
+            # Keep the already-sanitized classification code reachable without
+            # exposing the durable free-text reason or provider response body.
+            error_view = result.get("error")
+            if isinstance(error_view, Mapping) and error_view.get("code"):
+                diagnosis = error_view.get("message")
+                result["payload"]["diagnosis"] = (
+                    diagnosis if isinstance(diagnosis, str) and diagnosis.strip()
+                    else error_view["code"]
+                )
+            result["kind"] = "error"
     return result
 
 
@@ -1591,26 +1813,105 @@ class RejectRequest(BaseModel):
 
 
 def _http_error(exc: Exception) -> HTTPException:
+    def detail(
+        code: str,
+        message: str,
+        *,
+        phase: str,
+        retryable: bool = False,
+        next_action: str = "查看错误详情后从最近检查点继续",
+        status_code: int,
+    ) -> HTTPException:
+        payload = StreamErrorDetails(
+            code=code,
+            phase=phase,
+            retryable=retryable,
+            next_action=next_action,
+            message=message,
+        ).to_dict()
+        return HTTPException(status_code=status_code, detail=payload)
+
     if isinstance(exc, ConfigError):
-        return HTTPException(status_code=400, detail={"code": "configuration_required", "message": str(exc)})
+        message = str(_redact(str(exc)))[:240].strip() or "模型配置不可用"
+        configuration_in_use = "旧配置" in message
+        return detail(
+            "configuration_in_use" if configuration_in_use else "configuration_required",
+            message,
+            phase="connection",
+            next_action=(
+                "等待当前运行结束后，再创建新会话以使用新配置"
+                if configuration_in_use
+                else "打开设置，填写 Base URL、API Key 和模型名称"
+            ),
+            status_code=400,
+        )
     if isinstance(exc, RunNotFound):
-        return HTTPException(status_code=404, detail={"code": "session_not_found", "message": "会话不存在或已被清理"})
+        return detail(
+            "session_not_found",
+            "会话不存在或已被清理",
+            phase="persistence",
+            next_action="刷新会话列表并选择仍存在的会话",
+            status_code=404,
+        )
     if isinstance(exc, SessionDeleteConflict):
-        return HTTPException(status_code=409, detail={"code": "session_delete_pending", "message": str(exc)})
+        return detail(
+            "session_delete_pending",
+            "会话正在安全停止，请稍后重试删除",
+            phase="persistence",
+            retryable=True,
+            next_action="等待当前停止边界落盘后再次删除",
+            status_code=409,
+        )
     if isinstance(exc, ApprovalStaleError):
-        return HTTPException(status_code=409, detail={"code": "approval_stale", "message": str(exc)})
+        return detail(
+            "approval_stale",
+            str(exc),
+            phase="approval",
+            next_action="刷新会话状态后再决定新的动作",
+            status_code=409,
+        )
     if isinstance(exc, ApprovalDigestMismatchError):
-        return HTTPException(status_code=409, detail={"code": "approval_digest_mismatch", "message": str(exc)})
+        return detail(
+            "approval_digest_mismatch",
+            "审批内容已变化，请刷新后重新确认",
+            phase="approval",
+            next_action="刷新审批卡片，核对动作后再允许",
+            status_code=409,
+        )
     if isinstance(exc, (ValueError, KeyError)):
-        return HTTPException(status_code=400, detail={"code": "invalid_request", "message": str(exc)})
-    # Preserve a concise, sanitized diagnostic for local setup failures (for
-    # example Docker/OpenSandbox not installed).  The browser needs the actual
-    # remediation hint, while secret-shaped values are still redacted.
+        return detail(
+            "invalid_request",
+            str(_redact(str(exc)))[:240],
+            phase="model",
+            next_action="修正请求后重试，不会改变已落盘事件",
+            status_code=400,
+        )
+    # Keep the browser copy actionable and Chinese.  The concrete exception
+    # name/message remains in the local server log and durable audit boundary;
+    # returning it here would turn a provider body or traceback into UI text.
     error_name = type(exc).__name__
-    detail = _redact(f"{error_name}: {exc}")
+    diagnostic = str(_redact(f"{error_name}: {exc}")).replace("\r", " ").replace("\n", " ").strip()
+    logger.warning("WebUI request failed: %s", diagnostic[:500])
     if error_name in {"SandboxUnavailableError", "SandboxStartupError"}:
-        return HTTPException(status_code=503, detail={"code": "environment_not_ready", "message": detail})
-    return HTTPException(status_code=500, detail={"code": "runtime_error", "message": detail})
+        return detail(
+            "environment_not_ready",
+            "执行环境暂时不可用，任务状态已保留",
+            phase="tool",
+            retryable=True,
+            next_action="修复沙箱或使用受控本机后端后，从当前检查点继续",
+            status_code=503,
+        )
+    # Keep the browser's phase label aligned with the shared stream/runtime
+    # classifier, including lease and projection conflicts that are not named
+    # *StoreError but are still durable-state failures.
+    error_phase = classify_stream_error(exc).phase
+    return detail(
+        "runtime_error",
+        "Runtime 处理失败，任务状态已保留",
+        phase=error_phase,
+        next_action="保留当前检查点，查看错误详情后继续",
+        status_code=500,
+    )
 
 
 def _static_root() -> Path | None:
@@ -1667,7 +1968,16 @@ def create_web_app(manager: WebRuntimeManager | None = None) -> FastAPI:
     @app.post("/api/settings")
     async def save_settings(payload: SettingsRequest) -> dict[str, Any]:
         if payload.project_scoped and manager.selected_root is None:
-            raise HTTPException(status_code=409, detail={"code": "project_required", "message": "选择项目后才能保存项目级配置"})
+            raise HTTPException(
+                status_code=409,
+                detail=StreamErrorDetails(
+                    code="project_required",
+                    phase="persistence",
+                    retryable=False,
+                    next_action="先选择本地项目文件夹，再保存项目级配置",
+                    message="选择项目后才能保存项目级配置",
+                ).to_dict(),
+            )
         root = manager.selected_root if payload.project_scoped else None
         values = {field: getattr(payload, field) for field in _MODEL_FIELDS}
         if payload.permission_mode is not None:
@@ -1676,12 +1986,27 @@ def create_web_app(manager: WebRuntimeManager | None = None) -> FastAPI:
             except ValueError as exc:
                 raise HTTPException(
                     status_code=400,
-                    detail={"code": "invalid_permission_mode", "message": str(exc)},
+                    detail=StreamErrorDetails(
+                        code="invalid_permission_mode",
+                        phase="tool",
+                        retryable=False,
+                        next_action="选择请求批准、帮我批准或完全访问权限",
+                        message=str(exc),
+                    ).to_dict(),
                 ) from exc
         if payload.base_url is not None:
             parsed = urlparse(payload.base_url.strip())
             if parsed.scheme not in {"http", "https"} or not parsed.netloc:
-                raise HTTPException(status_code=400, detail={"code": "invalid_base_url", "message": "Base URL 必须是 http(s) 地址"})
+                raise HTTPException(
+                    status_code=400,
+                    detail=StreamErrorDetails(
+                        code="invalid_base_url",
+                        phase="connection",
+                        retryable=False,
+                        next_action="填写包含协议和主机的 http(s) Base URL",
+                        message="Base URL 必须是 http(s) 地址",
+                    ).to_dict(),
+                )
         try:
             await manager.settings.update(values, project_root=root)
         except Exception as exc:
@@ -1696,10 +2021,28 @@ def create_web_app(manager: WebRuntimeManager | None = None) -> FastAPI:
             if value is not None and value.strip():
                 values[field] = value.strip()
         if not values["base_url"] or not values["api_key"]:
-            raise HTTPException(status_code=400, detail={"code": "configuration_required", "message": "测试连接需要 Base URL 和 API key"})
+            raise HTTPException(
+                status_code=400,
+                detail=StreamErrorDetails(
+                    code="configuration_required",
+                    phase="connection",
+                    retryable=False,
+                    next_action="填写 Base URL 和 API Key 后再测试连接",
+                    message="测试连接需要 Base URL 和 API key",
+                ).to_dict(),
+            )
         parsed = urlparse(values["base_url"])
         if parsed.scheme not in {"http", "https"} or not parsed.netloc:
-            raise HTTPException(status_code=400, detail={"code": "invalid_base_url", "message": "Base URL 必须是 http(s) 地址"})
+            raise HTTPException(
+                status_code=400,
+                detail=StreamErrorDetails(
+                    code="invalid_base_url",
+                    phase="connection",
+                    retryable=False,
+                    next_action="填写包含协议和主机的 http(s) Base URL",
+                    message="Base URL 必须是 http(s) 地址",
+                ).to_dict(),
+            )
 
         def request_models() -> tuple[int, int]:
             import requests
@@ -1747,7 +2090,16 @@ def create_web_app(manager: WebRuntimeManager | None = None) -> FastAPI:
 
     async def send_message(payload: MessageRequest) -> dict[str, Any]:
         if manager.selected_root is None and not payload.project_root:
-            raise HTTPException(status_code=409, detail={"code": "project_required", "message": "请先选择本地项目文件夹"})
+            raise HTTPException(
+                status_code=409,
+                detail=StreamErrorDetails(
+                    code="project_required",
+                    phase="tool",
+                    retryable=False,
+                    next_action="点击输入框左下角的项目按钮，选择本地文件夹",
+                    message="请先选择本地项目文件夹",
+                ).to_dict(),
+            )
         try:
             return await manager.send_message(
                 payload.text,
@@ -1810,24 +2162,105 @@ def create_web_app(manager: WebRuntimeManager | None = None) -> FastAPI:
 
         async def events() -> AsyncIterator[str]:
             cursors: dict[str, int] = {run_id: cursor}
+            consecutive_projection_errors = 0
+            projection_degraded = False
+            retry_sent = False
             # Register before the first Durable read so a chunk emitted while
             # the browser is loading its timeline cannot be lost.  The hub is
             # best-effort; a detached supervisor in another process simply
             # produces no live messages and is still covered by polling.
             async with manager.live_stream.subscription() as live_queue:
-                tree_ids = set(await client.run_tree(run_id))
+                try:
+                    tree_ids = set(await client.run_tree(run_id))
+                except Exception as exc:
+                    # A transient tree read must not prevent the connection
+                    # from being established.  Start with the root and let
+                    # the normal reconciliation loop repair the child set.
+                    projection_degraded = True
+                    details = classify_stream_error(
+                        exc,
+                        phase="sse",
+                        attempt=1,
+                    )
+                    payload = details.to_dict()
+                    payload.update(
+                        {
+                            "code": "sse_reconcile_error",
+                            "phase": "sse",
+                            "retryable": True,
+                            "next_action": "正在重连并从 Durable 事件游标对账",
+                            "message": "实时连接暂时无法读取运行状态，任务仍在后台继续",
+                        }
+                    )
+                    yield f"event: stream_error\ndata: {json.dumps(payload, ensure_ascii=False)}\n\n"
+                    tree_ids = {run_id}
                 last_tree_refresh = time.monotonic()
                 while not await request.is_disconnected():
                     try:
                         items, cursors = await manager.tree_events(run_id, cursors=cursors)
-                    except Exception:
-                        break
+                        recovered_projection = projection_degraded or consecutive_projection_errors > 0
+                        projection_degraded = False
+                        consecutive_projection_errors = 0
+                    except RunNotFound:
+                        details = StreamErrorDetails(
+                            code="session_not_found",
+                            phase="persistence",
+                            retryable=False,
+                            next_action="刷新会话列表并选择仍存在的会话",
+                            message="会话不存在或已被清理",
+                        ).to_dict()
+                        yield f"event: stream_error\ndata: {json.dumps(details, ensure_ascii=False)}\n\n"
+                        return
+                    except Exception as exc:
+                        projection_degraded = True
+                        consecutive_projection_errors += 1
+                        details = classify_stream_error(
+                            exc,
+                            phase="sse",
+                            attempt=consecutive_projection_errors,
+                        )
+                        # A projection/read failure is a connection problem,
+                        # not a reason to stop the underlying Run.  Keep this
+                        # SSE connection alive with bounded backoff so a
+                        # repaired projection can recover without a manual
+                        # restart; the browser also has a durable refresh
+                        # fallback if the connection is eventually closed.
+                        payload = details.to_dict()
+                        payload.update(
+                            {
+                                "code": "sse_reconcile_error",
+                                "phase": "sse",
+                                "retryable": True,
+                                "next_action": "正在重连并从 Durable 事件游标对账",
+                                "message": "实时连接暂时无法读取运行状态，任务仍在后台继续",
+                            }
+                        )
+                        yield f"event: stream_error\ndata: {json.dumps(payload, ensure_ascii=False)}\n\n"
+                        await asyncio.sleep(min(5.0, 0.25 * (2 ** min(consecutive_projection_errors - 1, 4))))
+                        if not await request.is_disconnected():
+                            yield ": heartbeat\n\n"
+                        continue
+                    if recovered_projection:
+                        # A comment heartbeat keeps the HTTP connection alive
+                        # but is invisible to EventSource listeners. Send one
+                        # explicit recovery signal only after the durable
+                        # projection read succeeds, so the UI never guesses
+                        # that an ongoing reconcile failure is healthy.
+                        yield "event: heartbeat\ndata: {}\n\n"
                     for item in items:
                         # Keep root IDs numeric for old clients; child IDs are
                         # composite but still stable and are de-duplicated by
                         # the browser using the public event envelope.
                         stream_id = item["sequence"] if item["run_id"] == run_id else item["id"]
                         yield f"id: {stream_id}\nevent: runtime\ndata: {json.dumps(item, ensure_ascii=False)}\n\n"
+
+                    # Ask EventSource to reconnect quickly after an
+                    # infrastructure disconnect.  Emit this control line
+                    # after the first Durable item so older clients that read
+                    # one initial chunk still see the replay before metadata.
+                    if not retry_sent:
+                        yield "retry: 1000\n\n"
+                        retry_sent = True
 
                     # Child Runs can be created after the stream starts.  A
                     # small refresh window lets their live chunks enter the
@@ -1864,7 +2297,15 @@ def create_web_app(manager: WebRuntimeManager | None = None) -> FastAPI:
         return StreamingResponse(
             events(),
             media_type="text/event-stream",
-            headers={"Cache-Control": "no-cache", "Connection": "keep-alive", "X-Accel-Buffering": "no"},
+            headers={
+                # Proxies must not buffer or transform token batches; the
+                # server-side 40ms coalescing window is the only intentional
+                # batching boundary.
+                "Cache-Control": "no-cache, no-transform",
+                "Connection": "keep-alive",
+                "X-Accel-Buffering": "no",
+                "X-Content-Type-Options": "nosniff",
+            },
         )
 
     @app.post("/api/sessions/{run_id}/stop")
@@ -1893,7 +2334,16 @@ def create_web_app(manager: WebRuntimeManager | None = None) -> FastAPI:
     @app.post("/api/sessions/{run_id}/approvals/{approval_id}/approve")
     async def approve(run_id: str, approval_id: str, payload: ApprovalRequest) -> dict[str, Any]:
         if not payload.action_args_digest:
-            raise HTTPException(status_code=400, detail={"code": "digest_required", "message": "缺少 action_args_digest"})
+            raise HTTPException(
+                status_code=400,
+                detail=StreamErrorDetails(
+                    code="digest_required",
+                    phase="approval",
+                    retryable=False,
+                    next_action="刷新审批卡片后再次选择允许或拒绝",
+                    message="缺少 action_args_digest",
+                ).to_dict(),
+            )
         try:
             result = await manager.approve(run_id, approval_id, payload.action_args_digest)
         except Exception as exc:

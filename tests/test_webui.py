@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import uuid
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
 import pytest
@@ -147,6 +148,77 @@ def test_webui_permission_mode_is_persisted_and_validated(tmp_path: Path) -> Non
     finally:
         client.__exit__(None, None, None)
         assert manager._clients == {}
+
+
+def test_public_failure_event_whitelists_stream_error_fields(tmp_path: Path) -> None:
+    """Legacy diagnostic payloads cannot leak a traceback or provider secret."""
+
+    event = SimpleNamespace(
+        event_type="RunFailed",
+        run_id=str(uuid.uuid4()),
+        sequence=2,
+        event_id="event-2",
+        occurred_at="2026-09-17T00:00:00Z",
+        actor=EventActor("worker", "worker-1"),
+        payload={
+            "reason": 'Traceback (most recent call last): api_key=sk-live-secret',
+            "traceback": "Traceback (most recent call last): File 'worker.py', line 1",
+            "provider_body": {"detail": "internal response"},
+            "error_details": {
+                "code": "provider_transport_error",
+                "phase": "connection",
+                "retryable": False,
+                "partial_output": True,
+                "attempt": 1,
+                "retry_after": None,
+                "next_action": "连接恢复后继续",
+                "message": 'Traceback: Authorization: Bearer sk-live-secret',
+                "traceback": "File 'worker.py', line 1",
+                "provider_body": {"secret": "sk-live-secret"},
+            },
+        },
+    )
+    public = _public_event(None, event)  # type: ignore[arg-type]
+    assert public is not None
+    error = public["error"]
+    assert set(error) == {
+        "code",
+        "phase",
+        "retryable",
+        "partial_output",
+        "attempt",
+        "retry_after",
+        "next_action",
+        "message",
+    }
+    assert "Traceback" not in str(public)
+    assert "sk-live-secret" not in str(public)
+    assert "reason" not in public["payload"]
+    assert "traceback" not in public["payload"]
+    assert "provider_body" not in public["payload"]
+
+
+def test_public_action_failure_payload_is_bounded(tmp_path: Path) -> None:
+    """Tool failure cards do not forward raw executor diagnostics."""
+
+    event = SimpleNamespace(
+        event_type="ActionFailed",
+        run_id=str(uuid.uuid4()),
+        sequence=2,
+        event_id="event-2",
+        occurred_at="2026-09-17T00:00:00Z",
+        actor=EventActor("worker", "worker-1"),
+        payload={
+            "action_id": "action-1",
+            "attempt": 1,
+            "error_kind": "Traceback (most recent call last): File 'tool.py', line 1",
+            "stderr": "secret provider response",
+        },
+    )
+    public = _public_event(None, event)  # type: ignore[arg-type]
+    assert public is not None
+    assert public["payload"] == {"action_id": "action-1", "attempt": 1, "error_kind": "工具执行失败"}
+    assert "stderr" not in str(public)
 
 
 def test_webui_treats_existing_supervisor_as_control_plane_owner(tmp_path: Path) -> None:

@@ -10,7 +10,7 @@ import {
   PanelRightClose, PanelRightOpen, Play, RefreshCw, RotateCcw, Search,
   Send, Settings, ShieldCheck, Sparkles, Sun, Trash2, X,
 } from 'lucide-react'
-import { webApi, webEventsUrl } from './api'
+import { webApi, webEventsUrl, type ApiError, type StreamErrorDetail } from './api'
 // The application is kept under `cc/` so the Web entry point remains a small
 // adapter.  Visual tokens and layout styles live at the Vite root and are
 // shared by the migrated DeepSeek-style shell.
@@ -29,6 +29,15 @@ type PermissionModeSpec = {
   label: string
   description: string
 }
+const SSE_STALE_RETRY_THRESHOLD = 5
+const SSE_COPY = {
+  reconnecting: '实时连接暂时中断，正在重连…',
+  reconnectingAfterDisconnect: '实时连接中断，正在重连；任务仍在后台运行',
+  stale: '实时连接多次中断，当前数据可能滞后；任务仍在后台运行',
+  staleBadge: '实时数据可能滞后',
+  connectingBadge: '实时连接中…',
+  reconcileError: '实时连接暂时无法读取运行状态，任务仍在后台继续',
+} as const
 type Session = {
   run_id: string
   title: string
@@ -114,6 +123,7 @@ type EventItem = {
   content?: string
   tool_name?: string | null
   status?: string
+  error?: StreamErrorDetail
   payload?: Record<string, unknown>
   outcome?: Record<string, unknown>
   optimistic?: boolean
@@ -121,12 +131,13 @@ type EventItem = {
   ack_event_id?: string
 }
 type StreamItem = {
-  type: 'stream_delta' | 'stream_gap'
-  run_id: string
+  type: 'stream_delta' | 'stream_gap' | 'stream_error'
+  run_id?: string
   root_run_id?: string
+  invocation_id?: string
   segment?: number
   chunk?: number
-  kind?: 'content' | 'tool_call_delta' | 'done'
+  kind?: 'content' | 'tool_call_delta' | 'done' | 'error'
   text?: string
   tool_name?: string | null
   finish_reason?: string | null
@@ -134,11 +145,13 @@ type StreamItem = {
   usage?: { input_tokens?: number; output_tokens?: number; total_tokens?: number } | null
   live_id?: number
   reason?: string
+  error?: StreamErrorDetail
   ts?: number
 }
 type StreamingState = {
   run_id: string
   root_run_id: string
+  invocation_id?: string
   segment: number
   chunk: number
   text: string
@@ -147,6 +160,7 @@ type StreamingState = {
   finish_reason?: string | null
   updated_at: number
   frozen?: boolean
+  error?: StreamErrorDetail
 }
 
 function reduceStreamItem(
@@ -157,34 +171,68 @@ function reduceStreamItem(
 ) {
   if (!next.run_id) return current
   const previous = current[next.run_id]
-  const segment = Number(next.segment ?? previous?.segment ?? 0)
-  const chunk = Number(next.chunk ?? previous?.chunk ?? 0)
-  if (previous && segment === previous.segment && chunk > 0 && chunk <= previous.chunk) return current
-  const base: StreamingState = previous ?? {
+  const attemptChanged = Boolean(
+    previous
+    && next.invocation_id
+    && previous.invocation_id !== next.invocation_id,
+  )
+  const previousAttempt = attemptChanged ? undefined : previous
+  const segment = Number(next.segment ?? previousAttempt?.segment ?? 0)
+  const chunk = Number(next.chunk ?? previousAttempt?.chunk ?? 0)
+  if (next.type === 'stream_delta' && previousAttempt && segment === previousAttempt.segment && chunk > 0 && chunk <= previousAttempt.chunk) return current
+  const sameSegment = previousAttempt?.segment === segment
+  const base: StreamingState = previousAttempt ?? {
     run_id: next.run_id,
     root_run_id: next.root_run_id ?? streamSession,
+    invocation_id: next.invocation_id,
     segment,
     chunk: 0,
     text: '',
     phase: 'content',
     updated_at: now,
   }
+  // A queue gap or provider error means the visible text is no longer a
+  // complete prefix.  Keep the temporary node frozen until a durable
+  // AssistantMessageCommitted/terminal Runtime event reconciles it; appending
+  // later deltas would make an incomplete answer look authoritative.
+  if (previousAttempt?.frozen && previousAttempt.phase === 'gap' && sameSegment && next.type === 'stream_delta') return current
   if (next.type === 'stream_gap') {
     const gap: StreamingState = { ...base, segment, chunk, phase: 'gap', updated_at: now, frozen: true }
     return { ...current, [next.run_id]: gap }
   }
-  const phase: StreamingState['phase'] = next.kind === 'tool_call_delta' ? 'tool' : next.kind === 'done' ? (next.tool_call_count ? 'tool' : 'done') : 'content'
+  if (next.type === 'stream_error' || next.kind === 'error') {
+    const failed: StreamingState = {
+      ...base,
+      segment,
+      chunk,
+      phase: 'gap',
+      updated_at: now,
+      frozen: true,
+      error: next.error,
+    }
+    return { ...current, [next.run_id]: failed }
+  }
+  let phase: StreamingState['phase'] = 'content'
+  if (next.kind === 'tool_call_delta' || (next.kind === 'done' && next.tool_call_count)) phase = 'tool'
+  else if (next.kind === 'done') phase = 'done'
+  let text = sameSegment ? base.text : ''
+  if (next.kind === 'content') text += next.text ?? ''
   const updated: StreamingState = {
     ...base,
     root_run_id: next.root_run_id ?? base.root_run_id,
+    invocation_id: next.invocation_id ?? base.invocation_id,
     segment,
     chunk,
     phase,
-    tool_name: next.tool_name ?? base.tool_name,
-    finish_reason: next.finish_reason ?? base.finish_reason,
-    text: next.kind === 'content' ? base.text + (next.text ?? '') : base.text,
+    tool_name: sameSegment ? next.tool_name ?? base.tool_name : next.tool_name,
+    finish_reason: sameSegment ? next.finish_reason ?? base.finish_reason : next.finish_reason,
+    // A fresh segment is a new provider attempt. Do not concatenate it with a
+    // frozen prefix from a failed segment, otherwise an explicit retry would
+    // render the model's restarted answer twice.
+    text,
     updated_at: now,
     frozen: false,
+    error: sameSegment ? base.error : undefined,
   }
   return {
     ...current,
@@ -999,8 +1047,14 @@ function CommandPalette({ items, selectedIndex, onSelect }: { items: CommandItem
 }
 
 function friendlyError(event: EventItem) {
+  const structured = event.error?.message?.trim()
   const raw = String(event.payload?.error_kind ?? event.payload?.reason ?? '').trim()
-  const detail = raw && raw !== event.event_type ? ': ' + raw : ''
+  let detail = ''
+  if (structured) detail = ': ' + structured
+  else if (raw && raw !== event.event_type) {
+    const safe = runtimeDiagnosisDetail(raw)
+    if (safe) detail = ': ' + safe
+  }
   switch (event.event_type) {
     case 'ActionFailed': return '工具执行失败' + detail
     case 'ActionOutcomeUnknown': return '工具结果待确认' + detail
@@ -1227,6 +1281,45 @@ function ApprovalCard({ approval, onApprove, onReject, busy = false }: { approva
       <div className="approval-actions"><button className="secondary-button" onClick={onReject} disabled={busy}>{busy ? '处理中…' : '拒绝'}</button><button className="primary-button" onClick={onApprove} disabled={busy}>{busy ? '处理中…' : '允许一次'}</button></div>
     </div>
   )
+}
+
+function streamingHint(state?: StreamingState | null): string {
+  if (state?.error) return '本轮输出已冻结，正在从 Runtime 对账'
+  switch (state?.phase) {
+    case 'tool': return '正在准备工具调用'
+    case 'done': return '正在整理回复'
+    case 'gap': return '实时流暂时中断，正在从 Runtime 对账'
+    default: return 'Runtime 正在工作'
+  }
+}
+
+function displayApiError(reason: unknown): string {
+  const error = reason as ApiError
+  let fallback = '请求失败'
+  if (typeof reason === 'string' && reason.trim()) fallback = reason
+  else if (reason instanceof Error && typeof reason.message === 'string' && reason.message.trim()) fallback = reason.message
+  const message = typeof error?.message === 'string' && error.message.trim()
+    ? error.message
+    : fallback
+  const details: string[] = []
+  if (typeof error?.next_action === 'string' && error.next_action.trim()) details.push(error.next_action)
+  if (error?.retryable) details.push('可重试')
+  if (error?.partial_output) details.push('已保留部分输出，未自动重放')
+  if (typeof error?.retry_after === 'number' && Number.isFinite(error.retry_after) && error.retry_after > 0) {
+    details.push(`${Math.ceil(error.retry_after)} 秒后可重试`)
+  }
+  if (typeof error?.attempt === 'number' && Number.isFinite(error.attempt) && error.attempt > 0) {
+    details.push(`第 ${error.attempt} 次尝试`)
+  }
+  const phaseLabels: Record<string, string> = {
+    connection: '连接阶段', model: '模型阶段', tool: '工具阶段',
+    approval: '审批阶段', persistence: '状态存储阶段', sse: '实时连接阶段',
+  }
+  if (typeof error?.phase === 'string' && Object.prototype.hasOwnProperty.call(phaseLabels, error.phase)) {
+    details.push(phaseLabels[error.phase])
+  }
+  if (typeof error?.request_id === 'string' && error.request_id.trim()) details.push(`请求编号 ${error.request_id}`)
+  return [message, ...details].join(' · ')
 }
 
 const todoStatusLabels: Record<string, string> = {
@@ -1507,6 +1600,8 @@ function App() {
   const [optimisticQueue, setOptimisticQueue] = useState<Record<string, QueuedMessage[]>>({})
   const [approvalBusyId, setApprovalBusyId] = useState<string | null>(null)
   const [continuationNotice, setContinuationNotice] = useState<string | null>(null)
+  const [sseStatus, setSseStatus] = useState<'connected' | 'reconnecting' | 'stale'>('connected')
+  const [sseNotice, setSseNotice] = useState<string | null>(null)
   const [draft, setDraft] = useState('')
   const [loading, setLoading] = useState(true)
   const [legacyEvents, setLegacyEvents] = useState(false)
@@ -1535,6 +1630,7 @@ function App() {
   })
   const eventSource = useRef<EventSource | null>(null)
   const activeSessionRef = useRef<string | null>(null)
+  const sseHealthReasonRef = useRef<string | null>(null)
   const loadGeneration = useRef(0)
   // Project selection can read a large historical event store. Keep the
   // conversation switch responsive while that request is in flight and make
@@ -1559,6 +1655,7 @@ function App() {
   const continuationGeneration = useRef(0)
   const conversationRef = useRef<HTMLElement | null>(null)
   const streamOpened = useRef(false)
+  const sseRetryCount = useRef(0)
   const stickToBottom = useRef(true)
   const bottomRef = useRef<HTMLDivElement | null>(null)
   const textareaRef = useRef<HTMLTextAreaElement | null>(null)
@@ -1642,7 +1739,7 @@ function App() {
         // selection or send will retry the authoritative sidebar refresh.
       })
     } catch (reason) {
-      setError((reason as Error).message)
+      setError(displayApiError(reason))
     } finally {
       setLoading(false)
     }
@@ -1780,7 +1877,7 @@ function App() {
         setError('会话已不存在或已被其他窗口清理，请从左侧重新选择会话。')
         return
       }
-      setError((reason as Error).message)
+      setError(displayApiError(reason))
     } finally {
       // Only the latest selected session may clear its loading indicator. A
       // stale timeline/state response must not make a newer session look ready.
@@ -1890,6 +1987,10 @@ function App() {
     setPendingApprovals([])
     setApprovalBusyId(null)
     setContinuationNotice(null)
+    setSseStatus(activeSession ? 'reconnecting' : 'connected')
+    setSseNotice(null)
+    sseHealthReasonRef.current = null
+    sseRetryCount.current = 0
     continuationGeneration.current += 1
     setContext(emptyContext)
     setRunFacts(emptyRunFacts)
@@ -1905,19 +2006,59 @@ function App() {
     eventSource.current?.close()
     const source = new EventSource(webEventsUrl(streamSession, undefined, legacyEvents))
     eventSource.current = source
-    source.onopen = () => { streamOpened.current = true }
+    const markSseHealthy = (durableSignal = false) => {
+      if (sseHealthReasonRef.current === 'sse_reconcile_error' && !durableSignal) return
+      sseHealthReasonRef.current = null
+      setSseStatus('connected')
+      setSseNotice(null)
+    }
+    source.onopen = () => {
+      const reconnected = streamOpened.current
+      streamOpened.current = true
+      sseRetryCount.current = 0
+      markSseHealthy()
+      // Reconcile the durable cursor after every reconnect.  Ephemeral chunks
+      // are deliberately not replayed as if they were committed messages. The
+      // initial open already overlaps the effect's loadSession request.
+      if (reconnected) scheduleSessionRefresh(streamSession)
+    }
     source.addEventListener('stream', (message) => {
       try {
         const next = JSON.parse((message as MessageEvent).data) as StreamItem
+        markSseHealthy()
         if (!next.run_id) return
         enqueueStreamItem(streamSession, next)
       } catch {
         setError('实时流式数据格式不可用，已等待下一条消息。')
       }
     })
+    source.addEventListener('heartbeat', () => markSseHealthy(true))
+    source.addEventListener('stream_error', (message) => {
+      try {
+        const details = JSON.parse((message as MessageEvent).data) as StreamErrorDetail
+        if (details.code === 'sse_reconcile_error') {
+          sseHealthReasonRef.current = 'sse_reconcile_error'
+        }
+        if (details.code === 'session_not_found') {
+          source.close()
+          void loadSession(streamSession)
+          return
+        }
+        const notice = details.code === 'sse_reconcile_error'
+          ? details.message || SSE_COPY.reconcileError
+          : details.message || SSE_COPY.reconnecting
+        setSseStatus('reconnecting')
+        setSseNotice(notice)
+        scheduleSessionRefresh(streamSession)
+      } catch {
+        setSseStatus('reconnecting')
+        setSseNotice(SSE_COPY.reconnecting)
+      }
+    })
     source.addEventListener('runtime', (message) => {
       try {
         const next = JSON.parse((message as MessageEvent).data) as EventItem
+        markSseHealthy(true)
         enqueueRuntimeEvent(streamSession, next)
         // Goal/plan/todo facts are root-run projections. Child Runtime events
         // continue to appear in the activity stream but must not replace the
@@ -1976,14 +2117,30 @@ function App() {
         setLegacyEvents(true)
         return
       }
-      // EventSource retries with Last-Event-ID automatically. Mark the
-      // transient stream as a gap and immediately reconcile the durable
-      // projection so a disconnect never leaves the composer/status stale.
+      // EventSource retries with Last-Event-ID automatically.  A browser
+      // disconnect is non-blocking: keep the partial composer text and let
+      // the durable timeline reconcile it once the connection opens again.
+      // Live chunks are ephemeral, so freeze the visible prefix below instead
+      // of appending across a gap that EventSource cannot replay.
+      const attempt = ++sseRetryCount.current
+      setSseStatus(attempt >= SSE_STALE_RETRY_THRESHOLD ? 'stale' : 'reconnecting')
+      setSseNotice(attempt >= SSE_STALE_RETRY_THRESHOLD
+        ? SSE_COPY.stale
+        : SSE_COPY.reconnectingAfterDisconnect)
       setStreamingRuns((current) => {
+        let changed = false
         const next = { ...current }
-        const candidate = Object.values(next).find((item) => item.root_run_id === streamSession || item.run_id === streamSession)
-        if (candidate) next[candidate.run_id] = { ...candidate, phase: 'gap', frozen: true, updated_at: Date.now() }
-        return next
+        for (const [runId, state] of Object.entries(current)) {
+          if (
+            (state.root_run_id === streamSession || state.run_id === streamSession)
+            && ['content', 'tool'].includes(state.phase)
+            && !state.frozen
+          ) {
+            next[runId] = { ...state, phase: 'gap', frozen: true, updated_at: Date.now() }
+            changed = true
+          }
+        }
+        return changed ? next : current
       })
       scheduleSessionRefresh(streamSession)
     }
@@ -2198,7 +2355,7 @@ function App() {
       if (controller.signal.aborted || selectionGeneration.current !== generation) return
       switchDraft(previousDraftKey)
       if (activeSessionRef.current === session.run_id) setActiveSession(previousSession)
-      setError((reason as Error).message)
+      setError(displayApiError(reason))
     } finally {
       if (selectionGeneration.current === generation) selectionAbort.current = null
     }
@@ -2220,7 +2377,7 @@ function App() {
         notify('已切换到 ' + (result.project?.root ?? '本地项目'))
       }
     } catch (reason) {
-      setError((reason as Error).message)
+      setError(displayApiError(reason))
     }
   }
 
@@ -2242,7 +2399,7 @@ function App() {
         notify('已选择项目')
       }
     } catch (reason) {
-      setError((reason as Error).message)
+      setError(displayApiError(reason))
     }
   }
 
@@ -2261,7 +2418,7 @@ function App() {
         : '已切换为 ' + (permissionModeSpecs.find((item) => item.mode === mode)?.label ?? mode))
     } catch (reason) {
       setSettings((current) => ({ ...current, permission_mode: previous }))
-      setError((reason as Error).message)
+      setError(displayApiError(reason))
     }
   }
 
@@ -2341,7 +2498,7 @@ function App() {
         }
       }).catch(() => scheduleSessionRefresh(sessionId))
     } catch (reason) {
-      setError((reason as Error).message)
+      setError(displayApiError(reason))
     } finally {
       setSending(false)
     }
@@ -2356,7 +2513,7 @@ function App() {
       setSessions(visibleSessions(list.sessions))
       notify('已保存停止边界；可以输入新指令转向')
     } catch (reason) {
-      setError((reason as Error).message)
+      setError(displayApiError(reason))
     }
   }
 
@@ -2426,7 +2583,7 @@ function App() {
         return
       }
       hiddenSessionsRef.current.delete(runId)
-      setError(apiReason.message || '删除会话失败，请稍后重试')
+      setError(displayApiError(apiReason))
       // The request may have invalidated the selected session's load. Restore
       // the authoritative view after a recoverable delete conflict.
       if (activeSessionRef.current === runId) void loadSession(runId)
@@ -2437,13 +2594,37 @@ function App() {
 
   async function resumeSession() {
     if (!activeSession) return
+    const runId = activeSession
+    const resumableStream = Object.fromEntries(
+      Object.entries(streamingRuns).filter(([, state]) => state.root_run_id === runId || state.run_id === runId),
+    )
     finalizedStreamRunsRef.current.clear()
+    if (streamBatchRef.current?.sessionId === runId) streamBatchRef.current = null
+    if (streamFrameRef.current !== null) {
+      window.cancelAnimationFrame(streamFrameRef.current)
+      streamFrameRef.current = null
+    }
+    // A resumed worker may reuse the same run/segment identifiers and restart
+    // its chunk counter at one. Drop the old frozen ephemeral prefix before
+    // the resume command so its first new delta is not mistaken for a replay.
+    setStreamingRuns((current) => Object.fromEntries(
+      Object.entries(current).filter(([, state]) => state.root_run_id !== runId && state.run_id !== runId),
+    ))
     try {
-      await webApi('/api/sessions/' + encodeURIComponent(activeSession) + '/resume', { method: 'POST' })
-      await loadSession(activeSession)
+      await webApi('/api/sessions/' + encodeURIComponent(runId) + '/resume', { method: 'POST' })
+      await loadSession(runId)
       notify('已从最近检查点继续')
     } catch (reason) {
-      setError((reason as Error).message)
+      setStreamingRuns((current) => {
+        const restore = Object.fromEntries(
+          Object.entries(resumableStream).filter(([id]) =>
+            !finalizedStreamRunsRef.current.has(id)
+            && !Object.prototype.hasOwnProperty.call(current, id),
+          ),
+        )
+        return { ...restore, ...current }
+      })
+      setError(displayApiError(reason))
     }
   }
 
@@ -2461,7 +2642,7 @@ function App() {
       if (isStaleApprovalError(reason)) {
         await refreshAfterStaleApproval(runId)
       } else {
-        setError((reason as Error).message)
+        setError(displayApiError(reason))
         setContinuationNotice(null)
         // Keep the durable state visible after an unexpected control-plane
         // error; a later poll/SSE event can still reconcile the card.
@@ -2486,7 +2667,7 @@ function App() {
       if (isStaleApprovalError(reason)) {
         await refreshAfterStaleApproval(runId)
       } else {
-        setError((reason as Error).message)
+        setError(displayApiError(reason))
         setContinuationNotice(null)
         // See approve(): refresh the authoritative snapshot after an
         // unexpected decision error and clear terminal approvals from the
@@ -2669,14 +2850,14 @@ function App() {
       <main className={mainClass}>
         <header className="topbar">
           <div className="breadcrumb"><span className="topbar-project">{projectName}</span><ChevronRight size={14} /><span className="topbar-title">{sessionLoading ? '正在载入会话…' : active ? active.title : '新会话'}</span></div>
-          <div className="topbar-actions"><span className="topbar-live"><span className="pulse-dot" />本地 Runtime</span><button className="topbar-icon" onClick={() => setTheme((value) => value === 'dark' ? 'light' : 'dark')} title={theme === 'dark' ? '切换浅色主题' : '切换深色主题'}>{theme === 'dark' ? <Sun size={16} /> : <Moon size={16} />}</button><button className="topbar-icon" onClick={() => setRightCollapsed((value) => !value)} title={rightCollapsed ? '打开运行面板' : '收起运行面板'}>{rightCollapsed ? <PanelRightOpen size={17} /> : <PanelRightClose size={17} />}</button><button className="topbar-icon" onClick={() => setSettingsOpen(true)} title="设置"><Settings size={16} /></button></div>
+          <div className="topbar-actions">{sseStatus !== 'connected' && <span className={'topbar-stream-state ' + sseStatus}><span className="sse-status-dot" />{sseStatus === 'stale' ? SSE_COPY.staleBadge : SSE_COPY.connectingBadge}</span>}<span className="topbar-live"><span className="pulse-dot" />本地 Runtime</span><button className="topbar-icon" onClick={() => setTheme((value) => value === 'dark' ? 'light' : 'dark')} title={theme === 'dark' ? '切换浅色主题' : '切换深色主题'}>{theme === 'dark' ? <Sun size={16} /> : <Moon size={16} />}</button><button className="topbar-icon" onClick={() => setRightCollapsed((value) => !value)} title={rightCollapsed ? '打开运行面板' : '收起运行面板'}>{rightCollapsed ? <PanelRightOpen size={17} /> : <PanelRightClose size={17} />}</button><button className="topbar-icon" onClick={() => setSettingsOpen(true)} title="设置"><Settings size={16} /></button></div>
         </header>
               <section ref={conversationRef} className="conversation" aria-live="polite" onScroll={handleConversationScroll}>
             <div className="conversation-inner">
               {!project && <div className="welcome-state no-project"><div className="welcome-orbit"><Sparkles size={25} /></div><span className="welcome-kicker">LOCAL AGENT WORKSPACE</span><div className="welcome-title-line"><h1>把你的项目交给 cc-harness</h1><span className="preview-badge">预览版</span></div><p>先选择一个本机项目文件夹，主 Agent 才能在安全边界内读取和修改代码。<br />浏览器关闭不会停止已提交的 Durable Run。</p><div className="welcome-actions"><button className="primary-button" onClick={chooseProject}><FolderOpen size={16} />选择项目文件夹</button><button className="text-button" onClick={chooseProjectManually}>手动输入路径</button></div><div className="welcome-note"><ShieldCheck size={14} />本地处理 · 可恢复检查点 · 可审计事件</div></div>}
               {project && sessionLoading && <div className="session-loading" role="status" aria-live="polite"><LoaderCircle className="spin" size={22} /><div><strong>正在载入会话</strong><span>正在从 Durable Runtime 对账事件、状态和检查点…</span></div></div>}
               {project && !sessionLoading && conversationTurns.length === 0 && <div className="welcome-state project-ready"><div className="welcome-orbit small"><Bot size={23} /></div><span className="welcome-kicker">项目已就绪 · {projectName}</span><div className="welcome-title-line"><h1>今天要完成什么？</h1><span className="preview-badge">预览版</span></div><p>描述目标，cc-harness 会先读取项目状态，再由 Durable Runtime 编排执行。</p></div>}
-              <div className="message-stack">{conversationTurns.map((turn, index) => <section className="conversation-turn" key={turn.id}>{turn.user && <MessageCard event={turn.user} onCopy={copyText} />}<TurnProcess events={turn.process} live={active != null && ['running', 'awaiting_approval'].includes(active.status) && index === conversationTurns.length - 1} onCopy={copyText} />{turn.assistants.map((event) => <MessageCard event={event} key={event.id} onCopy={copyText} />)}</section>)}{active && ['running', 'queued', 'awaiting_approval'].includes(active.status) && <div className="typing-indicator"><span /><span /><span /><em>{activeStreaming?.phase === 'tool' ? '正在准备工具调用' : activeStreaming?.phase === 'done' ? '正在整理回复' : activeStreaming?.phase === 'gap' ? '实时流暂时中断，正在从 Runtime 对账' : 'Runtime 正在工作'}</em></div>}{activeStreaming?.phase === 'stopped' && activeStreaming.text && <div className="event-notice"><CircleStop size={15} /><span>已停止，保留已生成的内容</span></div>}{activeStreaming?.phase === 'failed' && activeStreaming.text && <div className="event-notice error"><CircleAlert size={15} /><span>本轮失败，保留已生成的内容</span></div>}{continuationNotice && <div className="continuation-notice" role="status"><LoaderCircle size={14} className="spin" /><span>{continuationNotice}</span></div>}{pendingApprovals.length > 0 && <ApprovalCard approval={pendingApprovals[0]} busy={approvalBusyId === pendingApprovals[0].approvalId} onApprove={() => void approve(pendingApprovals[0])} onReject={() => void reject(pendingApprovals[0])} />}<div ref={bottomRef} /></div>
+              <div className="message-stack">{conversationTurns.map((turn, index) => <section className="conversation-turn" key={turn.id}>{turn.user && <MessageCard event={turn.user} onCopy={copyText} />}<TurnProcess events={turn.process} live={active != null && ['running', 'awaiting_approval'].includes(active.status) && index === conversationTurns.length - 1} onCopy={copyText} />{turn.assistants.map((event) => <MessageCard event={event} key={event.id} onCopy={copyText} />)}</section>)}{active && ['running', 'queued', 'awaiting_approval'].includes(active.status) && <div className="typing-indicator"><span /><span /><span /><em>{streamingHint(activeStreaming)}</em></div>}{activeStreaming?.error && <div className="stream-error-notice" role="status"><CircleAlert size={15} /><div><strong>{activeStreaming.error.message}</strong><span>{activeStreaming.error.next_action}</span></div></div>}{activeStreaming?.phase === 'stopped' && activeStreaming.text && <div className="event-notice"><CircleStop size={15} /><span>已停止，保留已生成的内容</span></div>}{activeStreaming?.phase === 'failed' && activeStreaming.text && <div className="event-notice error"><CircleAlert size={15} /><span>本轮失败，保留已生成的内容</span></div>}{continuationNotice && <div className="continuation-notice" role="status"><LoaderCircle size={14} className="spin" /><span>{continuationNotice}</span></div>}{sseNotice && <div className={'continuation-notice sse-notice ' + sseStatus} role="status"><span className="sse-status-dot" />{sseNotice}</div>}{pendingApprovals.length > 0 && <ApprovalCard approval={pendingApprovals[0]} busy={approvalBusyId === pendingApprovals[0].approvalId} onApprove={() => void approve(pendingApprovals[0])} onReject={() => void reject(pendingApprovals[0])} />}<div ref={bottomRef} /></div>
             </div>
             {showNewMessages && <button className="jump-to-latest" onClick={jumpToLatest}><ChevronDown size={14} />跳到最新消息</button>}
           </section>

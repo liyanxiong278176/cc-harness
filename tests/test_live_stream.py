@@ -151,8 +151,18 @@ async def test_durable_adapter_stream_callback_redacts_provider_private_fields()
 class CallbackKernel:
     async def execute_segment(self, context, *, stream_callback=None):
         del context
-        await stream_callback({"kind": "content", "text": "partial"})
+        # Adjacent content chunks should be coalesced before the browser sees
+        # them; the terminal marker remains a hard ordering boundary.
+        await stream_callback({"kind": "content", "text": "par"})
+        await stream_callback({"kind": "content", "text": "tial"})
         return ModelSegment(text="complete", stop_reason="model_stop")
+
+
+class FailingCallbackKernel:
+    async def execute_segment(self, context, *, stream_callback=None):
+        del context
+        await stream_callback({"kind": "content", "text": "partial"})
+        raise RuntimeError("read timeout")
 
 
 @pytest.mark.asyncio
@@ -179,4 +189,31 @@ async def test_worker_adds_run_segment_chunk_and_terminal_envelope(tmp_path) -> 
     ]
     assert observed[0]["text"] == "partial"
     assert observed[1]["kind"] == "done"
+    await store.close()
+
+
+@pytest.mark.asyncio
+async def test_worker_freezes_partial_stream_and_emits_structured_error(tmp_path) -> None:
+    project = tmp_path / "project"
+    project.mkdir()
+    store = await RunStore(project, data_root=tmp_path / "runtime-data").open()
+    observed: list[dict] = []
+
+    async def collect(item: dict) -> None:
+        observed.append(item)
+
+    worker = RunWorker(
+        store,
+        FailingCallbackKernel(),
+        worker_id="stream-error-worker",
+        model_timeout_seconds=0,
+        stream_emitter=collect,
+    )
+    with pytest.raises(RuntimeError, match="read timeout"):
+        await worker._execute_model_segment(_context(), segment=4)
+    assert [item["kind"] for item in observed] == ["content", "error"]
+    assert observed[-1]["type"] == "stream_error"
+    assert observed[-1]["error"]["code"] == "provider_transport_error"
+    assert observed[-1]["error"]["partial_output"] is True
+    assert observed[-1]["error"]["retryable"] is False
     await store.close()

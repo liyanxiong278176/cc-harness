@@ -8,6 +8,7 @@ import pytest
 from cc_harness.coordinator import RunCoordinator, RunRequest
 from cc_harness.durable_runtime import DurableModelAdapter
 from cc_harness.llm import PendingToolCall, ProviderProtocolError, StreamEvent
+from cc_harness import worker as worker_module
 from cc_harness.run_kernel import ModelSegment, ReActKernel
 from cc_harness.run_model import ActionStatus, EvidenceKind, EvidenceRef, PlanNode
 from cc_harness.run_store import RunStore
@@ -325,6 +326,53 @@ async def test_unhandled_worker_exception_is_persisted_as_recoverable_failure(tm
             assert failure.payload["reason"].startswith(
                 "unhandled worker exception: OSError: simulated artifact publication failure | "
             )
+            assert failure.payload["target_status"] == "failed_recoverable"
+        finally:
+            await supervisor.stop()
+    finally:
+        await store.close()
+
+
+@pytest.mark.asyncio
+async def test_failure_classifier_error_does_not_skip_durable_run_failed(tmp_path, monkeypatch) -> None:
+    project = tmp_path / "project"
+    project.mkdir()
+    store = RunStore(project, data_root=tmp_path / "data")
+    await store.open()
+
+    def broken_classifier(_exc, **_kwargs):
+        raise RuntimeError("classifier unavailable")
+
+    monkeypatch.setattr(worker_module, "classify_stream_error", broken_classifier)
+
+    class FailingWorker(RunWorker):
+        async def _execute_model_segment(self, context, *, segment=None, invocation_id=None):
+            del context, segment, invocation_id
+            raise OSError("simulated worker failure")
+
+    try:
+        handle = await RunCoordinator(store).submit(RunRequest("durable task", ("done",)))
+
+        def factory(_run_id):
+            return FailingWorker(
+                store,
+                ReActKernel(ExplodingModel()),
+                worker_id="classifier-failing-worker",
+                action_executor=_success,
+            )
+
+        supervisor = LocalSupervisor(store, factory, max_workers=1, poll_interval=0.01)
+        try:
+            view = await _wait_for_status(
+                supervisor,
+                store,
+                handle.run_id,
+                "failed_recoverable",
+            )
+            assert view.status.value == "failed_recoverable"
+            events = (await store.read(handle.run_id)).events
+            failure = next(event for event in events if event.event_type == "RunFailed")
+            assert failure.payload["error"]["code"] == "runtime_error"
             assert failure.payload["target_status"] == "failed_recoverable"
         finally:
             await supervisor.stop()

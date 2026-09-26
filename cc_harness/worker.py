@@ -11,8 +11,8 @@ import contextlib
 import inspect
 import json
 import os
-import traceback
 import re
+import traceback
 import time
 import uuid
 from dataclasses import dataclass, replace
@@ -32,6 +32,7 @@ from .loop_control import (
     _text_digest,
 )
 from .llm import ProviderProtocolError
+from .stream_errors import StreamErrorDetails, classify_stream_error
 from .run_events import EventActor, RunEvent
 from .run_kernel import ActionRequest, AgentKernel, SegmentContext
 from .run_model import (
@@ -76,6 +77,49 @@ StreamEmitter = Callable[[Mapping[str, Any]], Awaitable[None]]
 
 class ModelInvocationTimeout(RuntimeError):
     """The provider did not finish one model segment before its watchdog."""
+
+
+def _worker_failure_contract(
+    exc: BaseException,
+    *,
+    fallback_code: str,
+    fallback_phase: str,
+    fallback_message: str,
+) -> tuple[StreamErrorDetails, dict[str, Any]]:
+    """Build a durable failure summary without letting classification block it."""
+
+    try:
+        candidate = getattr(exc, "stream_error", None)
+        details = (
+            candidate
+            if isinstance(candidate, StreamErrorDetails)
+            else classify_stream_error(exc)
+        )
+        payload = details.to_dict()
+        if isinstance(payload, dict):
+            return details, payload
+    except Exception:
+        # Durable RunFailed is more important than the optional diagnostic
+        # taxonomy. Fall through to a small, locally constructed contract.
+        pass
+
+    fallback = StreamErrorDetails(
+        code=fallback_code,
+        phase=fallback_phase,
+        retryable=False,
+        next_action="检查 Runtime 错误详情后从最近检查点继续",
+        message=fallback_message,
+    )
+    return fallback, {
+        "code": fallback.code,
+        "phase": fallback.phase,
+        "retryable": fallback.retryable,
+        "partial_output": fallback.partial_output,
+        "attempt": fallback.attempt,
+        "retry_after": fallback.retry_after,
+        "next_action": fallback.next_action,
+        "message": fallback.message,
+    }
 
 
 def _bounded_timeout(value: float | int | None, *, default: float, minimum: float = 0.1) -> float:
@@ -606,16 +650,30 @@ class RunWorker:
                 invocation_started = time.monotonic()
                 invocation_status = "failed"
                 invocation_error: str | None = None
+                invocation_error_details: dict[str, Any] | None = None
                 outcome = None
                 try:
-                    outcome = await self._execute_model_segment(context, segment=segment)
+                    outcome = await self._execute_model_segment(
+                        context,
+                        segment=segment,
+                        invocation_id=invocation_id,
+                    )
                     invocation_status = "succeeded"
-                except asyncio.CancelledError as exc:
+                except asyncio.CancelledError:
                     invocation_status = "cancelled"
-                    invocation_error = f"{type(exc).__name__}: {exc}"[:600]
+                    invocation_error = "模型调用已取消"
                     raise
                 except Exception as exc:
-                    invocation_error = f"{type(exc).__name__}: {exc}"[:600]
+                    details, invocation_error_details = _worker_failure_contract(
+                        exc,
+                        fallback_code="runtime_error",
+                        fallback_phase="model",
+                        fallback_message="Runtime 未能完成本轮响应",
+                    )
+                    # Keep a concrete, bounded local diagnostic in the durable
+                    # usage fact. The browser projection exposes only the
+                    # separately stored structured error contract.
+                    invocation_error = f"{type(exc).__name__}: {details.code}"[:240]
                     raise
                 finally:
                     if self.capability_runtime is not None and context_build is not None:
@@ -648,6 +706,8 @@ class RunWorker:
                         )
                     if invocation_error:
                         finished_payload["error"] = invocation_error
+                    if invocation_error_details is not None:
+                        finished_payload["error_details"] = invocation_error_details
                     with contextlib.suppress(Exception):
                         await self._append_runtime_event(
                             lease.run_id,
@@ -840,42 +900,61 @@ class RunWorker:
             # Protocol failures are deterministic and must be visible in the
             # durable stream.  Never retry by fabricating provider fields or
             # spending another model call on the same malformed replay.
+            details, error_payload = _worker_failure_contract(
+                exc,
+                fallback_code="provider_protocol_error",
+                fallback_phase="model",
+                fallback_message="模型返回的数据格式无法安全重放",
+            )
+            failure_payload = {
+                "reason": f"{exc.code}: {str(exc)[:600]}",
+                "error": error_payload,
+                "target_status": RunStatus.FAILED_RECOVERABLE.value,
+            }
             with contextlib.suppress(Exception):
                 await self._append(
                     current_lease,
                     "RunFailed",
-                    {
-                        "reason": f"{exc.code}: {str(exc)[:600]}",
-                        "target_status": RunStatus.FAILED_RECOVERABLE.value,
-                    },
+                    failure_payload,
                 )
             if self.child_failure_callback is not None:
                 with contextlib.suppress(Exception):
-                    await self.child_failure_callback(current_lease.run_id, f"{exc.code}: {exc}")
+                    await self.child_failure_callback(
+                        current_lease.run_id,
+                        f"{details.code}: {details.message}",
+                    )
             raise
         except Exception as exc:
             # A worker exception must become durable state before its lease is
             # released.  Otherwise the supervisor has neither an active task
             # nor an expired lease to reclaim and the run appears to hang in
             # RUNNING forever.
+            details, error_payload = _worker_failure_contract(
+                exc,
+                fallback_code="runtime_error",
+                fallback_phase="model",
+                fallback_message="Runtime 未能完成本轮响应",
+            )
+            failure_payload = {
+                "reason": (
+                    f"unhandled worker exception: {type(exc).__name__}: "
+                    f"{str(exc)[:300]} | "
+                    f"{traceback.format_exc(limit=4).replace(chr(10), ' ')[:900]}"
+                ),
+                "error": error_payload,
+                "target_status": RunStatus.FAILED_RECOVERABLE.value,
+            }
             with contextlib.suppress(Exception):
                 await self._append(
                     current_lease,
                     "RunFailed",
-                    {
-                        "reason": (
-                            f"unhandled worker exception: {type(exc).__name__}: "
-                            f"{str(exc)[:300]} | "
-                            f"{traceback.format_exc(limit=4).replace(chr(10), ' ')[:900]}"
-                        ),
-                        "target_status": RunStatus.FAILED_RECOVERABLE.value,
-                    },
+                    failure_payload,
                 )
             if self.child_failure_callback is not None:
                 with contextlib.suppress(Exception):
                     await self.child_failure_callback(
                         lease.run_id,
-                        f"{type(exc).__name__}: {str(exc)[:300]}",
+                        f"{details.code}: {details.message}",
                     )
             raise
         finally:
@@ -943,26 +1022,36 @@ class RunWorker:
         context: SegmentContext,
         *,
         segment: int | None = None,
+        invocation_id: str | None = None,
     ):
         """Run one provider segment behind a bounded, cancellation-safe task."""
 
         chunk = 0
         terminal_emitted = False
+        stream_started = False
+        pending_content: list[str] = []
+        pending_chars = 0
+        emit_lock = asyncio.Lock()
+        flush_task: asyncio.Task[None] | None = None
+        # A small server-side coalescing window keeps token-heavy providers
+        # from turning the browser into a render loop while preserving strict
+        # ordering around tool/error/done boundaries.
+        stream_flush_seconds = 0.04
+        stream_max_chars = 4096
 
-        async def emit_stream(payload: Mapping[str, Any]) -> None:
-            """Best-effort bridge from a provider chunk to the WebUI hub."""
+        async def publish(payload: Mapping[str, Any]) -> None:
+            """Publish one already-ordered envelope to the best-effort sink."""
 
-            nonlocal chunk, terminal_emitted
+            nonlocal chunk
             if self.stream_emitter is None:
                 return
-            if str(payload.get("kind") or "") == "done":
-                terminal_emitted = True
             chunk += 1
             envelope = {
                 "type": "stream_delta",
                 "run_id": context.run_id,
                 "segment": segment if segment is not None else 0,
                 "chunk": chunk,
+                "invocation_id": invocation_id,
                 **dict(payload),
             }
             # A disconnected browser or a full in-memory queue must never
@@ -972,15 +1061,96 @@ class RunWorker:
             except Exception:
                 return
 
-        async def emit_terminal(reason: str, *, error: str | None = None) -> None:
+        async def flush_content_locked() -> None:
+            nonlocal pending_chars
+            if not pending_content:
+                return
+            text = "".join(pending_content)
+            pending_content.clear()
+            pending_chars = 0
+            await publish({"kind": "content", "text": text})
+
+        async def delayed_flush() -> None:
+            try:
+                await asyncio.sleep(stream_flush_seconds)
+                async with emit_lock:
+                    await flush_content_locked()
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                # The stream sink is presentation-only.  A timer failure must
+                # never affect the provider/worker result.
+                return
+
+        async def stop_flush_task() -> None:
+            """Cancel the coalescing timer once a segment reaches a boundary."""
+
+            nonlocal flush_task
+            task = flush_task
+            flush_task = None
+            if task is None or task.done() or task is asyncio.current_task():
+                return
+            task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await task
+
+        async def emit_stream(payload: Mapping[str, Any]) -> None:
+            """Best-effort bridge from a provider chunk to the WebUI hub."""
+
+            nonlocal terminal_emitted, stream_started, flush_task, pending_chars
+            if self.stream_emitter is None or terminal_emitted:
+                return
+            kind = str(payload.get("kind") or "")
+            content_text = str(payload.get("text") or "") if kind == "content" else ""
+            if content_text:
+                stream_started = True
+                async with emit_lock:
+                    pending_content.append(content_text)
+                    pending_chars += len(content_text)
+                    if pending_chars >= stream_max_chars:
+                        await flush_content_locked()
+                    elif flush_task is None or flush_task.done():
+                        flush_task = asyncio.create_task(
+                            delayed_flush(),
+                            name=f"cc-harness-stream-flush-{context.run_id}",
+                        )
+                return
+
+            # Tool deltas and terminal markers are hard ordering boundaries:
+            # flush any buffered text before publishing them.
+            async with emit_lock:
+                await flush_content_locked()
+                if kind == "tool_call_delta":
+                    stream_started = True
+                if kind == "done":
+                    terminal_emitted = True
+                await publish(payload)
+
+        async def emit_terminal(
+            reason: str,
+            *,
+            error_details: StreamErrorDetails | None = None,
+        ) -> None:
             """Emit a terminal presentation marker without affecting the worker."""
 
+            nonlocal terminal_emitted
             if terminal_emitted:
                 return
-            payload: dict[str, Any] = {"kind": "done", "finish_reason": reason}
-            if error:
-                payload["error"] = error[:300]
             with contextlib.suppress(BaseException):
+                if error_details is not None:
+                    terminal_emitted = True
+                    async with emit_lock:
+                        await flush_content_locked()
+                        await publish(
+                            {
+                                "type": "stream_error",
+                                "kind": "error",
+                                "finish_reason": reason,
+                                "error": error_details.to_dict(),
+                            }
+                        )
+                    return
+                payload: dict[str, Any] = {"kind": "done", "finish_reason": reason}
                 await emit_stream(payload)
 
         async def execute_kernel() -> Any:
@@ -1006,11 +1176,17 @@ class RunWorker:
                 result = await execute_kernel()
             except asyncio.CancelledError:
                 await emit_terminal("cancelled")
+                await stop_flush_task()
                 raise
             except Exception as exc:
-                await emit_terminal("error", error=f"{type(exc).__name__}: {exc}")
+                details = classify_stream_error(exc, partial_output=stream_started)
+                with contextlib.suppress(Exception):
+                    setattr(exc, "stream_error", details)
+                await emit_terminal("error", error_details=details)
+                await stop_flush_task()
                 raise
             await emit_terminal(str(getattr(result, "stop_reason", "model_stop")))
+            await stop_flush_task()
             return result
         task = asyncio.create_task(
             execute_kernel(),
@@ -1019,23 +1195,37 @@ class RunWorker:
         try:
             result = await asyncio.wait_for(asyncio.shield(task), self.model_timeout_seconds)
             await emit_terminal(str(getattr(result, "stop_reason", "model_stop")))
+            await stop_flush_task()
             return result
         except asyncio.TimeoutError as exc:
             # Give cooperative adapters a short opportunity to close their HTTP
             # stream.  A non-cooperative provider is intentionally left as an
             # orphan task: the durable worker is failed/recoverable and will
             # never replay its model result as an action without a new segment.
-            await _cancel_task_bounded(task)
-            await emit_terminal("timeout", error=str(exc))
-            raise ModelInvocationTimeout(
+            timeout_error = ModelInvocationTimeout(
                 f"model segment timed out after {self.model_timeout_seconds:.3f}s"
-            ) from exc
+            )
+            details = classify_stream_error(timeout_error, partial_output=stream_started)
+            with contextlib.suppress(Exception):
+                setattr(timeout_error, "stream_error", details)
+            # Publish the structured timeout before cancelling the kernel: a
+            # cooperative provider may emit its own cancellation terminal
+            # while unwinding, which would otherwise preempt this diagnosis.
+            await emit_terminal("timeout", error_details=details)
+            await _cancel_task_bounded(task)
+            await stop_flush_task()
+            raise timeout_error from exc
         except asyncio.CancelledError:
             await _cancel_task_bounded(task)
             await emit_terminal("cancelled")
+            await stop_flush_task()
             raise
         except Exception as exc:
-            await emit_terminal("error", error=f"{type(exc).__name__}: {exc}")
+            details = classify_stream_error(exc, partial_output=stream_started)
+            with contextlib.suppress(Exception):
+                setattr(exc, "stream_error", details)
+            await emit_terminal("error", error_details=details)
+            await stop_flush_task()
             raise
 
     async def _finalize_interruption(self, lease: Lease, reason: str) -> None:

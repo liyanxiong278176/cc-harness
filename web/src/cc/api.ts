@@ -6,7 +6,19 @@
  */
 export const WEB_API_BASE = '/api/web/v1'
 
-export type ApiError = Error & { status?: number; code?: string }
+export type StreamErrorDetail = {
+  message?: string
+  code?: string
+  phase?: 'connection' | 'model' | 'tool' | 'approval' | 'persistence' | 'sse'
+  retryable?: boolean
+  partial_output?: boolean
+  attempt?: number | null
+  retry_after?: number | null
+  next_action?: string
+  request_id?: string
+}
+
+export type ApiError = Error & StreamErrorDetail & { status?: number }
 
 // During a rolling update an already-running Python process may still serve
 // only the legacy `/api` routes.  Remember that capability decision once the
@@ -38,12 +50,19 @@ export async function webApi<T>(path: string, options?: RequestInit): Promise<T>
   }
   if (!response.ok) {
     const body = await response.json().catch(() => ({})) as { detail?: unknown }
-    const detail: { message?: string; code?: string } = typeof body.detail === 'object' && body.detail !== null
-      ? (body.detail as { message?: string; code?: string })
+    const detail: StreamErrorDetail = typeof body.detail === 'object' && body.detail !== null
+      ? (body.detail as StreamErrorDetail)
       : { message: typeof body.detail === 'string' ? body.detail : undefined }
     const error = new Error(detail.message || `请求失败 (${response.status})`) as ApiError
     error.status = response.status
     if (detail.code) error.code = String(detail.code)
+    if (detail.phase) error.phase = detail.phase
+    if (typeof detail.retryable === 'boolean') error.retryable = detail.retryable
+    if (typeof detail.partial_output === 'boolean') error.partial_output = detail.partial_output
+    if (detail.attempt !== undefined) error.attempt = detail.attempt
+    if (detail.retry_after !== undefined) error.retry_after = detail.retry_after
+    if (detail.next_action) error.next_action = String(detail.next_action)
+    if (detail.request_id) error.request_id = String(detail.request_id)
     throw error
   }
   return response.json() as Promise<T>

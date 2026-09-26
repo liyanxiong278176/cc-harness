@@ -11,6 +11,7 @@ from typing import Any, Literal
 from openai import AsyncOpenAI
 
 from cc_harness.model_identity import canonical_model_identity
+from cc_harness.stream_errors import ProviderStreamError
 from cc_harness.tokens import UsageRecord
 
 
@@ -22,6 +23,10 @@ def _retryable_provider_error(exc: BaseException) -> bool:
     """Classify transport/provider overload errors as safe stream retries."""
 
     status = getattr(exc, "status_code", None)
+    try:
+        status = int(status) if status is not None else None
+    except (TypeError, ValueError):
+        status = None
     if status in {408, 409, 429, 500, 502, 503, 504}:
         return True
     # httpx/httpcore expose read timeouts as ``ReadTimeout`` (sometimes
@@ -320,20 +325,36 @@ class LLMClient:
     ) -> AsyncIterator[StreamEvent]:
         """Stream a chat turn with bounded recovery for transport failures.
 
-        A provider can close an HTTP chunked response after sending only part
-        of a turn.  Retrying the same request is safe here because tool calls
-        are not dispatched until a complete ``done`` event is received by the
-        agent loop.
+        Retries are limited to the pre-delta boundary.  Once a content or tool
+        delta has reached the caller, replaying the same request could produce
+        duplicate text or a duplicated side effect, so the partial turn is
+        surfaced as ``ProviderStreamError`` and the Runtime freezes it.
         """
 
         for attempt in range(_PROVIDER_RETRY_ATTEMPTS):
+            stream_started = False
             try:
                 async for event in self._chat_once(messages, tools):
+                    if event.kind in {"content", "tool_call_delta"}:
+                        stream_started = True
                     yield event
                 return
             except Exception as exc:
-                if attempt + 1 >= _PROVIDER_RETRY_ATTEMPTS or not _retryable_provider_error(exc):
+                retryable = _retryable_provider_error(exc)
+                if not retryable:
                     raise
+                if stream_started:
+                    raise ProviderStreamError(
+                        exc,
+                        attempts=attempt + 1,
+                        partial_output=True,
+                    ) from exc
+                if attempt + 1 >= _PROVIDER_RETRY_ATTEMPTS:
+                    raise ProviderStreamError(
+                        exc,
+                        attempts=attempt + 1,
+                        partial_output=False,
+                    ) from exc
                 await asyncio.sleep(_PROVIDER_RETRY_DELAYS[attempt])
 
     async def _chat_once(
