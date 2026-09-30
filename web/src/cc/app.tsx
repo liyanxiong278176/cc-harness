@@ -1481,15 +1481,20 @@ function ProjectArtifacts({
   projectRoot,
   onChooseProject,
   onCopy,
+  compact = false,
+  reloadKey = 0,
 }: {
   projectRoot: string | null
   onChooseProject: () => void
   onCopy: (value: string) => void
+  compact?: boolean
+  reloadKey?: number
 }) {
   const [files, setFiles] = useState<ProjectArtifact[]>([])
   const [selectedPath, setSelectedPath] = useState<string | null>(null)
   const [preview, setPreview] = useState<ArtifactPreview | null>(null)
   const [query, setQuery] = useState('')
+  const [viewMode, setViewMode] = useState<'preview' | 'code'>('code')
   const [loading, setLoading] = useState(false)
   const [previewLoading, setPreviewLoading] = useState(false)
   const [error, setError] = useState<string | null>(null)
@@ -1525,7 +1530,7 @@ function ProjectArtifacts({
     }
   }, [projectRoot])
 
-  useEffect(() => { void reload() }, [reload])
+  useEffect(() => { void reload() }, [reload, reloadKey])
 
   useEffect(() => {
     const generation = ++previewGeneration.current
@@ -1554,9 +1559,14 @@ function ProjectArtifacts({
   }, [files, query])
   const selected = files.find((item) => item.path === selectedPath) ?? null
   const Icon = selected ? artifactIcon(selected.path) : File
+  const supportsDocumentPreview = Boolean(selectedPath && /\.(md|html?)$/i.test(selectedPath))
+
+  useEffect(() => {
+    setViewMode(supportsDocumentPreview ? 'preview' : 'code')
+  }, [selectedPath, supportsDocumentPreview])
 
   return (
-    <section className="artifact-page">
+    <section className={'artifact-page' + (compact ? ' compact-artifact-page' : '')}>
       <header className="artifact-page-header">
         <div className="artifact-title-group">
           <span className="eyebrow">PROJECT FILES</span>
@@ -1600,7 +1610,13 @@ function ProjectArtifacts({
               <>
                 <header className="artifact-preview-header">
                   <div className="artifact-preview-heading"><Icon size={18} /><div><strong title={selected.path}>{selected.path}</strong><span>{selected.exists ? `${artifactSize(selected.size_bytes)} · 当前文件` : '当前文件不存在'}</span></div></div>
-                  {preview?.content != null && <button className="text-button artifact-copy" onClick={() => onCopy(preview.content ?? '')}><Copy size={14} />复制</button>}
+                  <div className="artifact-preview-actions">
+                    {supportsDocumentPreview && <div className="artifact-view-switch" role="tablist" aria-label="产物视图">
+                      <button role="tab" aria-selected={viewMode === 'preview'} className={viewMode === 'preview' ? 'selected' : ''} onClick={() => setViewMode('preview')}>预览</button>
+                      <button role="tab" aria-selected={viewMode === 'code'} className={viewMode === 'code' ? 'selected' : ''} onClick={() => setViewMode('code')}>代码</button>
+                    </div>}
+                    {preview?.content != null && <button className="text-button artifact-copy" onClick={() => onCopy(preview.content ?? '')}><Copy size={14} />复制</button>}
+                  </div>
                 </header>
                 <div className="artifact-provenance">
                   <span>最近由任务修改</span><strong title={selected.latest_task_id}>{selected.latest_task_title}</strong>
@@ -1609,7 +1625,9 @@ function ProjectArtifacts({
                 <div className="artifact-code-view">
                   {previewLoading && <div className="artifact-preview-message"><LoaderCircle size={18} className="spin" />读取当前文件…</div>}
                   {!previewLoading && preview && !preview.previewable && <div className="artifact-preview-message"><FileText size={20} /><strong>无法预览此文件</strong><span>{preview.reason ?? '当前路径不可安全预览'}</span></div>}
-                  {!previewLoading && preview?.previewable && <pre><code>{preview.content}</code></pre>}
+                  {!previewLoading && preview?.previewable && viewMode === 'preview' && supportsDocumentPreview
+                    ? <article className="artifact-rendered-view" dangerouslySetInnerHTML={renderMarkdown(preview.content ?? '')} />
+                    : !previewLoading && preview?.previewable && <pre><code>{preview.content}</code></pre>}
                   {!previewLoading && !preview && !selected.exists && <div className="artifact-preview-message"><FileText size={20} /><strong>当前文件不存在</strong><span>预览只读取项目当前内容，不保留旧版本。</span></div>}
                   {!previewLoading && !preview && selected.exists && <div className="artifact-preview-message"><FileText size={20} /><strong>文件预览暂不可用</strong><span>检查项目选择后重试，产物预览不会读取其他项目或历史快照。</span></div>}
                 </div>
@@ -1661,6 +1679,8 @@ function RuntimeContextCard({ context }: { context: ContextState }) {
 
 function App() {
   const [mainPage, setMainPage] = useState<'chat' | 'artifacts'>('chat')
+  const [rightPane, setRightPane] = useState<'runtime' | 'artifacts'>('runtime')
+  const [artifactRefreshKey, setArtifactRefreshKey] = useState(0)
   const [project, setProject] = useState<{ root: string } | null>(null)
   const [settings, setSettings] = useState<SettingsState>({ base_url: '', model: '', permission_mode: 'default', has_api_key: false, api_key_masked: '' })
   const [sessions, setSessions] = useState<Session[]>([])
@@ -2156,6 +2176,15 @@ function App() {
         const next = JSON.parse((message as MessageEvent).data) as EventItem
         markSseHealthy(true)
         enqueueRuntimeEvent(streamSession, next)
+        if (
+          next.event_type === 'ActionSucceeded'
+          && Array.isArray(next.payload?.modified_paths)
+          && next.payload.modified_paths.length > 0
+        ) {
+          setArtifactRefreshKey((value) => value + 1)
+          setRightPane('artifacts')
+          setRightCollapsed(false)
+        }
         // Goal/plan/todo facts are root-run projections. Child Runtime events
         // continue to appear in the activity stream but must not replace the
         // parent contract shown by the status-circle inspector.
@@ -2989,11 +3018,11 @@ function App() {
       </aside>
       <main className={mainClass}>
         {mainPage === 'artifacts'
-          ? <ProjectArtifacts key={project?.root ?? 'no-project'} projectRoot={project?.root ?? null} onChooseProject={() => void chooseProject()} onCopy={(text) => void copyText(text)} />
+          ? <ProjectArtifacts key={project?.root ?? 'no-project'} projectRoot={project?.root ?? null} onChooseProject={() => void chooseProject()} onCopy={(text) => void copyText(text)} reloadKey={artifactRefreshKey} />
           : <>
         <header className="topbar">
           <div className="breadcrumb"><span className="topbar-project">{projectName}</span><ChevronRight size={14} /><span className="topbar-title">{sessionLoading ? '正在载入会话…' : active ? active.title : '新会话'}</span></div>
-          <div className="topbar-actions">{sseStatus !== 'connected' && <span className={'topbar-stream-state ' + sseStatus}><span className="sse-status-dot" />{sseStatus === 'stale' ? SSE_COPY.staleBadge : SSE_COPY.connectingBadge}</span>}<span className="topbar-live"><span className="pulse-dot" />本地 Runtime</span><button className="topbar-icon" onClick={() => setTheme((value) => value === 'dark' ? 'light' : 'dark')} title={theme === 'dark' ? '切换浅色主题' : '切换深色主题'}>{theme === 'dark' ? <Sun size={16} /> : <Moon size={16} />}</button><button className="topbar-icon" onClick={() => setRightCollapsed((value) => !value)} title={rightCollapsed ? '打开运行面板' : '收起运行面板'}>{rightCollapsed ? <PanelRightOpen size={17} /> : <PanelRightClose size={17} />}</button><button className="topbar-icon" onClick={() => setSettingsOpen(true)} title="设置"><Settings size={16} /></button></div>
+          <div className="topbar-actions">{sseStatus !== 'connected' && <span className={'topbar-stream-state ' + sseStatus}><span className="sse-status-dot" />{sseStatus === 'stale' ? SSE_COPY.staleBadge : SSE_COPY.connectingBadge}</span>}<span className="topbar-live"><span className="pulse-dot" />本地 Runtime</span><button className="topbar-icon" onClick={() => setTheme((value) => value === 'dark' ? 'light' : 'dark')} title={theme === 'dark' ? '切换浅色主题' : '切换深色主题'}>{theme === 'dark' ? <Sun size={16} /> : <Moon size={16} />}</button><button className="topbar-icon" onClick={() => { setRightPane('artifacts'); setRightCollapsed(false) }} title="打开项目产物" aria-label="打开项目产物"><FileCode2 size={17} /></button><button className="topbar-icon" onClick={() => { if (rightCollapsed) { setRightPane('runtime'); setRightCollapsed(false) } else if (rightPane === 'runtime') { setRightCollapsed(true) } else { setRightPane('runtime') } }} title={rightCollapsed || rightPane === 'artifacts' ? '打开运行面板' : '收起运行面板'} aria-label="运行面板">{rightCollapsed ? <PanelRightOpen size={17} /> : <PanelRightClose size={17} />}</button><button className="topbar-icon" onClick={() => setSettingsOpen(true)} title="设置"><Settings size={16} /></button></div>
         </header>
               <section ref={conversationRef} className="conversation" aria-live="polite" onScroll={handleConversationScroll}>
             <div className="conversation-inner">
@@ -3025,9 +3054,21 @@ function App() {
           </>}
       </main>
 
-      {!rightCollapsed && <div className="inspector-backdrop" onClick={() => setRightCollapsed(true)} aria-hidden="true" />}
-      <aside className="right-sidebar">
-        <div className="inspector-header"><div><span>运行面板</span><small>可观测状态</small></div><button className="icon-button" onClick={() => setRightCollapsed(true)} title="收起运行面板"><PanelRightClose size={16} /></button></div>
+      {!rightCollapsed && rightPane === 'runtime' && <div className="inspector-backdrop" onClick={() => setRightCollapsed(true)} aria-hidden="true" />}
+      <aside className={'right-sidebar' + (rightPane === 'artifacts' ? ' artifact-inspector' : '')}>
+        <div className="inspector-header">
+          <div><span>{rightPane === 'artifacts' ? '项目产物' : '运行面板'}</span><small>{rightPane === 'artifacts' ? '文件由 Runtime 工具变更记录驱动' : '可观测状态'}</small></div>
+          <div className="inspector-header-actions">
+            <nav className="inspector-pane-tabs" aria-label="右侧面板" role="tablist">
+              <button role="tab" aria-selected={rightPane === 'runtime'} className={rightPane === 'runtime' ? 'selected' : ''} onClick={() => setRightPane('runtime')}>运行</button>
+              <button role="tab" aria-selected={rightPane === 'artifacts'} className={rightPane === 'artifacts' ? 'selected' : ''} onClick={() => setRightPane('artifacts')}>产物</button>
+            </nav>
+            <button className="icon-button" onClick={() => setRightCollapsed(true)} title="收起右侧面板" aria-label="收起右侧面板"><PanelRightClose size={16} /></button>
+          </div>
+        </div>
+        {rightPane === 'artifacts'
+          ? <ProjectArtifacts key={project?.root ?? 'no-project'} projectRoot={project?.root ?? null} onChooseProject={() => void chooseProject()} onCopy={(text) => void copyText(text)} compact reloadKey={artifactRefreshKey} />
+          : <>
         <div className="inspector-scroll">
            <section className="inspector-card runtime-overview"><div className="card-eyebrow"><span className="pulse-dot" /> DURABLE RUNTIME</div><div className="runtime-state"><StatusDot status={status} /><div><strong>{status === 'idle' ? '等待输入' : statusLabels[status] ?? status}</strong><span>{active ? '事件序号 ' + active.sequence : '选择项目后开始'}</span></div></div><div className="inspector-row"><span>项目</span><strong>{project ? '已选择' : '未选择'}</strong></div><div className="inspector-row"><span>活动会话</span><strong>{active ? '已连接' : '—'}</strong></div><div className="inspector-row"><span>执行后端</span><strong className={executor.degraded ? 'warn-text' : ''}>{connectionLabel}</strong></div><div className="inspector-row"><span>调度器</span><strong className={scheduler.mode === 'external' ? 'warn-text' : ''}>{scheduler.label}</strong></div><div className="inspector-row"><span>审批</span><strong className={pendingApprovals.length > 0 ? 'warn-text' : ''}>{pendingApprovals.length > 0 ? pendingApprovals.length + ' 项待处理' : '无待处理'}</strong></div></section>
            {unsupportedControls.length > 0 && <section className="inspector-card capability-note"><div className="card-eyebrow">当前运行时能力</div><p>以下控制由服务端标记为不可用：</p>{unsupportedControls.map(([id, feature]) => <div className="capability-row" key={id}><strong>{id}</strong><span>{feature.reason ?? '当前环境未提供'}</span></div>)}</section>}
@@ -3036,6 +3077,7 @@ function App() {
            <section className="inspector-card live-status-card"><div className="card-heading"><div><span className="card-eyebrow">实时状态</span><small>{active ? active.title : '选择会话后显示'}</small></div><StatusDot status={status} /></div><div className="live-status-summary"><StatusDot status={status} /><div><strong>{status === 'idle' ? '等待输入' : statusLabels[status] ?? status}</strong><span>{active ? '事件序号 ' + active.sequence : '当前没有活动会话'}</span></div></div>{liveStatusEvents.length === 0 ? <div className="activity-empty"><Info size={15} /><span>任务运行后，这里会显示实时状态。</span></div> : <div className="runtime-timeline">{liveStatusEvents.map((event) => <div className={'runtime-timeline-row ' + event.kind} key={event.id}><span className="runtime-timeline-mark" /><div><strong>{runtimeEventLabel(event)}</strong><small>事件 #{event.sequence}</small></div></div>)}</div>}</section>
         </div>
         <div className="inspector-model"><div className="model-chip"><span className="model-chip-dot" /><div><small>当前模型</small><strong>{settings.model || '未配置'}</strong></div></div><button className="icon-button" onClick={() => setSettingsOpen(true)} title="设置"><Settings size={16} /></button></div>
+          </>}
       </aside>
       {settingsOpen && <SettingsModal initial={settings} onClose={() => setSettingsOpen(false)} onSaved={(value) => setSettings(value)} />}
       {toast && <div className="toast" role="status"><Check size={15} />{toast}</div>}

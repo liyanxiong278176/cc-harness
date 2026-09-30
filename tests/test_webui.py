@@ -76,6 +76,47 @@ def test_webui_returns_not_found_for_stale_session_id(tmp_path: Path) -> None:
         assert manager._clients == {}
 
 
+def test_webui_artifact_preview_is_project_scoped_and_rejects_path_escape(tmp_path: Path) -> None:
+    project = tmp_path / "project"
+    project.mkdir()
+    (project / "README.md").write_text("# Local artifact\n", encoding="utf-8")
+    (tmp_path / "outside.txt").write_text("private", encoding="utf-8")
+    manager, client = _client(tmp_path)
+    try:
+        selected = client.post("/api/projects/select", json={"path": str(project)})
+        assert selected.status_code == 200
+
+        preview = client.get(
+            "/api/artifacts/preview",
+            params={"path": "README.md", "project_root": str(project)},
+        )
+        assert preview.status_code == 200
+        assert preview.json()["content"].replace("\r\n", "\n") == "# Local artifact\n"
+
+        traversal = client.get(
+            "/api/artifacts/preview",
+            params={"path": "../outside.txt", "project_root": str(project)},
+        )
+        assert traversal.status_code == 403
+        assert traversal.json()["detail"]["code"] == "artifact_path_forbidden"
+
+        absolute = client.get(
+            "/api/artifacts/preview",
+            params={"path": str(tmp_path / "outside.txt"), "project_root": str(project)},
+        )
+        assert absolute.status_code == 403
+
+        stale_project = client.get(
+            "/api/artifacts/preview",
+            params={"path": "README.md", "project_root": str(tmp_path)},
+        )
+        assert stale_project.status_code == 409
+        assert stale_project.json()["detail"]["code"] == "artifact_project_changed"
+    finally:
+        client.__exit__(None, None, None)
+        assert manager._clients == {}
+
+
 def test_webui_delete_session_hides_tree_and_retains_audit_events(tmp_path: Path) -> None:
     """The sidebar delete action tombstones a run instead of rewriting facts."""
 

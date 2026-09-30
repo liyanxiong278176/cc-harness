@@ -5,9 +5,9 @@
 
 ## 结论
 
-当前实现完成了双主题视觉、空状态建议卡片、内存态流式 reducer、独立 reasoning UI，以及现有 Runtime 到 SSE 的增量桥接。Windows 浏览器中已查看两种主题，并用真实 provider 完成了纯文本回合；直连 SSE 收到 3 个 content 增量、1 个 `done`、1 个 `AssistantMessageCommitted` 和 1 个 `RunOutcomeRecorded`。对应提交答案在 WebUI 时间线中可见。
+当前实现完成了双主题视觉、空状态建议卡片、内存态流式 reducer、独立 reasoning UI、现有 Runtime 到 SSE 的增量桥接，以及根据带 `modified_paths` 的 `ActionSucceeded` 展开 Artifact 右栏。Artifact 面板提供项目文件列表、受限文件读取和 Markdown/HTML 消毒预览/代码切换。Windows 浏览器中已查看两种主题，并用真实 provider 完成了纯文本回合；直连 SSE 收到 3 个 content 增量、1 个 `done`、1 个 `AssistantMessageCommitted` 和 1 个 `RunOutcomeRecorded`。对应提交答案在 WebUI 时间线中可见。
 
-这不是原始任务的全量验收通过：没有完成右侧自动 Artifact 面板、完整工具卡片交互、按日期分组、完整目录拆分、虚拟列表，也没有实际跑完工具、停止、审批、断线与长会话 8 条浏览器 E2E。真实 provider 这轮没有输出 reasoning delta，因此独立 thinking UI 由 reducer 单测覆盖，未由真实 reasoning 流截图证明。
+这不是原始任务的全量验收通过：Artifact 右栏还缺少多标签/全屏/在文件中打开，完整工具卡片交互、按日期分组、完整目录拆分和虚拟列表也未完成；没有实际跑完工具、停止、审批、断线与长会话等浏览器 E2E。真实 provider 这轮没有输出 reasoning delta，因此独立 thinking UI 由 reducer 单测覆盖，未由真实 reasoning 流截图证明。
 
 另有一项硬约束冲突：现有 worker 会把 `reasoning_content` 写进 assistant-message artifact，工具回放依赖它；provider 无 content 时还会将 reasoning 用作最终正文兜底。此次只增加易失 live `reasoning` 包络，未更改该 Runtime 消息契约，因此“reasoning 原文在整个系统绝不持久化”仍未满足。证据见 [`worker.py`](../../cc_harness/worker.py#L1920)、[`interaction_history.py`](../../cc_harness/interaction_history.py#L144)、[`llm.py`](../../cc_harness/llm.py#L499)。
 
@@ -22,7 +22,7 @@
 | 3b | 消息居中、用户气泡、assistant 无底色、Markdown 消毒、发送输入框固定在底部 | [`app.tsx`](../../web/src/cc/app.tsx#L1134)、[`StreamingMessage.tsx`](../../web/src/components/chat/StreamingMessage.tsx#L9)、[`styles.css`](../../web/src/styles.css#L246) | 最终实机回合截图 `03-real-model-stream.png`；复制可见。赞/踩、分支、重新生成操作未补齐。 |
 | 3c | textarea 单行起步并自动增高；Enter/Shift+Enter 沿用现有快捷键；发送与停止操作走既有 API | [`app.tsx`](../../web/src/cc/app.tsx#L1739)、[`app.tsx`](../../web/src/cc/app.tsx#L2637)、[`app.tsx`](../../web/src/cc/app.tsx#L3016) | 代码和界面已查看；无麦克风和通用附件交互；停止状态没有独立实机 E2E。 |
 | 3d | 首轮空状态包含通用问候和 2×2 中文建议；建议项调用现有 composer prompt 流程 | [`WelcomeSuggestions.tsx`](../../web/src/components/chat/WelcomeSuggestions.tsx#L4)、[`app.tsx`](../../web/src/cc/app.tsx#L3019) | 暗/亮空状态截图；卡片位于输入框下方，以匹配实机 Claude 的视觉顺序。 |
-| 3e | 保留产物页、文件列表与预览能力 | [`app.tsx`](../../web/src/cc/app.tsx#L1559)、[`app.tsx`](../../web/src/cc/app.tsx#L2991) | 没有验证产物回合；当前是独立“产物”视图，未实现生成代码后右侧自动滑出、多 tab、全屏/在文件中打开的完整流程。 |
+| 3e | 保留独立产物页，并新增 Runtime 工具成功修改文件后自动展开右侧 Artifact 栏；文件列表、复制、项目内受限读取与 Markdown/HTML 消毒预览/代码切换 | [`app.tsx`](../../web/src/cc/app.tsx#L1480)、[`app.tsx`](../../web/src/cc/app.tsx#L2181)、[`app.tsx`](../../web/src/cc/app.tsx#L3054)、[`styles.css`](../../web/src/styles.css#L372)、[`webui.py`](../../cc_harness/webui.py#L2345) | API 路径边界由 `tests/test_webui.py` 覆盖；前端构建通过。没有真实文件写入回合来验证自动展开；多 tab、全屏和在文件中打开仍缺失。 |
 | 3f | 保留已有设置、权限、Toast 与操作确认入口 | [`app.tsx`](../../web/src/cc/app.tsx#L822)、[`app.tsx`](../../web/src/cc/app.tsx#L2771) | 未执行完整的键盘可达、Escape、焦点陷阱及 Ctrl+/ 快捷键 E2E。设置分页和快捷键弹窗没有按原规格全量验收。 |
 | 4a | LLM provider 的 reasoning/content/tool-call delta 进入独立 `StreamEvent`；worker 透传为带 run/segment/chunk 的内存包络 | [`llm.py`](../../cc_harness/llm.py#L470)、[`worker.py`](../../cc_harness/worker.py#L1039)、[`durable_runtime.py`](../../cc_harness/durable_runtime.py#L293) | Python 单测覆盖分离与顺序；真实 SSE 收到 3 content + done，但本轮未见 reasoning/tool delta。 |
 | 4b | SSE 先登记 live 订阅，再从 Durable 事件树对账；保留 `Last-Event-ID` 对 Durable cursor 续读 | [`webui.py`](../../cc_harness/webui.py#L2476)、[`webui.py`](../../cc_harness/webui.py#L2481)、[`webui.py`](../../cc_harness/webui.py#L2501)、[`webui.py`](../../cc_harness/webui.py#L2584) | `tests/test_web_sse.py` 覆盖 Durable 事件先回放；真实直连 SSE 用 query cursor 观察一次消息提交。浏览器断线 3 秒、header 续传与刷新去重未实测；live history ring 未接入恢复回放。 |
@@ -46,7 +46,7 @@
 | ② 简单问答增量、reasoning 独立与自动折叠 | 部分 | 真实 SSE 观察到内容增量及权威 commit；provider 未返回 reasoning，所以 reasoning 显示/折叠只由单测覆盖。 |
 | ③ 两步工具任务，卡片实时出现/折叠/展开 | 未完成 | 真实模型只读提示未触发工具；工具结果参数树、退出码和有界结果 UI 未实现完整。 |
 | ④ 中途停止、保留半截并可重新生成 | 未完成 | 没有发送/停止中的浏览器 E2E；重新生成入口未实现。 |
-| ⑤ 代码/文档输出自动打开 Artifact | 未完成 | 当前产物页可浏览，但右侧自动滑出与多视图流程缺失。 |
+| ⑤ 代码/文档输出自动打开 Artifact | 部分 | 带 `modified_paths` 的成功工具事件会展开右栏，支持 Markdown/HTML 预览与代码切换；本轮没有真实写文件工具回合验证自动展开，且多视图流程不完整。 |
 | ⑥ 审批允许和拒绝 | 未完成 | 没有产生真实待审批动作；未触碰 digest 路径。 |
 | ⑦ 断网 3 秒恢复、刷新后 Last-Event-ID 无重/丢 | 未完成 | 服务端代码保留 Durable cursor，单测覆盖 Durable 回放；没有真实浏览器断网/刷新测试，临时 live delta 本身不可重放。 |
 | ⑧ 5000+ 事件长会话、虚拟滚动与回到底部 | 未完成 | 当前没有虚拟列表，也未准备此 fixture。 |
@@ -56,7 +56,7 @@
 | 未完成项 | 根因/影响 | 建议 |
 |---|---|---|
 | 全部 reasoning 原文不持久化 | `worker.py`/`interaction_history.py` 的既有 artifact 存 provider 字段用于工具重放；LLM 还有 reasoning-only fallback。刷新/重放可能读取该数据，不能满足原硬约束。 | 先定 Runtime 兼容策略：例如将 provider replay payload 与可见 assistant artifact 分层存储/加密或删改保留策略，再实现迁移、重放回归和数据处理测试；这会超出“保持 Runtime 语义不变”。 |
-| Artifact 自动面板/多 tab/全屏/在文件中打开 | 当前产物采用独立工作区，未和 assistant 增量建立自动动作。 | 新增右面板状态和 artifact 投影接口契约，先覆盖路径边界、Markdown 消毒和打开工作区文件的浏览器验收。 |
+| Artifact 多 tab/全屏/在文件中打开与真实 E2E | 右栏已能响应 `ActionSucceeded.modified_paths` 并显示受限项目文件；本轮没有真实写文件工具回合验证自动展开，也没有多 tab/全屏/打开工作区文件。 | 补充工具真实输出场景及浏览器验收，再完善标签、全屏和打开文件动作；继续只经项目内文件 API 访问。 |
 | 工具结果细节卡片 | live 工具事件目前仅名称/索引提示；审批投影保持参数 digest/安全摘要。 | 使用 Durable action/result 投影补齐结果，不从 live delta 暴露原始工具参数；定义有界输出预览与文件路径动作。 |
 | 停止/重试/重新生成的 E2E | 当前没有浏览器自动化；重新生成 API 也未定义为无副作用动作。 | 先明确可安全重试条件与副作用边界，分别测试 stop、resume 和 retry；不要直接重放可能已执行工具的回合。 |
 | 断线和长会话 E2E | 无 5000+ fixture/虚拟化；EventSource 当前采用 Durable 续读，临时 delta 不保证补发。 | 加 Playwright 场景和性能阈值；用既有 Durable fixture 测 run/segment/chunk 去重及回到底部按钮。 |
@@ -73,8 +73,8 @@
 | `cd web; npm test` | PASS，3/3 Node 原生 reducer 测试通过。 |
 | `python -m pytest tests/runtime_rebuild -q` | PASS，exit 0；收集到的测试全部通过。 |
 | `python -m pytest tests/test_live_stream.py tests/test_web_sse.py tests/test_llm.py -q` | PASS，exit 0；相关测试全部通过。 |
-| `python -m pytest tests/test_webui.py -q` | PASS，exit 0；WebUI 路由回归通过。 |
-| `ruff check cc_harness/llm.py cc_harness/worker.py cc_harness/durable_runtime.py cc_harness/webui.py cc_harness/run_store.py tests/test_live_stream.py tests/test_llm.py` | PASS，`All checks passed!`。 |
+| `python -m pytest tests/test_webui.py -q` | PASS，exit 0；项目内文件预览成功，越界/绝对路径返回 403，切换项目后的旧 root 返回 409。 |
+| `ruff check cc_harness/llm.py cc_harness/worker.py cc_harness/durable_runtime.py cc_harness/webui.py cc_harness/run_store.py tests/test_live_stream.py tests/test_llm.py tests/test_webui.py` | PASS，`All checks passed!`。 |
 | `python scripts/build_webui.py` | PASS，exit 0；重建 FastAPI 静态 bundle，既有 `mascot.png` 保留。 |
 
 ## 截图索引
