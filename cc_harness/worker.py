@@ -1933,7 +1933,6 @@ class RunWorker:
         message = assistant_message(
             outcome.model_text,
             calls,
-            reasoning_content=str(getattr(outcome, "reasoning_content", "") or ""),
             refusal=(
                 str(getattr(outcome, "refusal"))
                 if getattr(outcome, "refusal", None) is not None

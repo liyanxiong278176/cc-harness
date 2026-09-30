@@ -26,7 +26,7 @@ from .credential_broker import ActionScopedCapabilityBroker, CredentialBrokerErr
 from .interaction_history import materialize_interaction_messages
 from .project_instructions import load_project_instructions
 from .tool_bundles import parse_tool_bundles, select_tool_specs
-from .llm import LLMClient, ProviderProtocolError, normalize_thinking_mode
+from .llm import LLMClient, normalize_thinking_mode
 from .mcp_client import MCPClient, ToolResult
 from .native_tools import NATIVE_FILE_TOOLS
 from .policy import Action
@@ -200,10 +200,9 @@ class DurableModelAdapter(ModelAdapter):
         """Build provider messages without changing replay semantics.
 
         Durable event metadata is deliberately removed at this boundary, but
-        provider-owned fields are copied verbatim.  Thinking-mode providers
-        require the original ``reasoning_content`` next to an assistant tool
-        call; when that field is required, a missing value is a protocol error
-        rather than an opportunity to synthesize an empty string.
+        provider-owned fields on legacy messages are copied verbatim. New
+        assistant artifacts omit private reasoning; providers that require it
+        can use the bounded thinking-disabled fallback in :class:`LLMClient`.
         """
 
         allowed = {
@@ -216,30 +215,6 @@ class DurableModelAdapter(ModelAdapter):
             "refusal",
         }
         mode = normalize_thinking_mode(thinking_mode)
-        strict_reasoning = mode == "enabled" or (
-            mode == "auto" and reasoning_content_required
-        )
-        if strict_reasoning:
-            # Validate the authoritative assistant artifacts before repairing
-            # malformed tool turns.  A missing provider-owned reasoning field
-            # is a deterministic replay error and must remain visible rather
-            # than being hidden by dropping the incomplete tool call.
-            for index, message in enumerate(messages):
-                if message.get("role") != "assistant" or not message.get("tool_calls"):
-                    continue
-                if "reasoning_content" not in message:
-                    raise ProviderProtocolError(
-                        "assistant tool-call replay is missing reasoning_content",
-                        field="reasoning_content",
-                        message_index=index,
-                    )
-                if not isinstance(message["reasoning_content"], str):
-                    raise ProviderProtocolError(
-                        "assistant tool-call reasoning_content must be a string",
-                        field="reasoning_content",
-                        message_index=index,
-                    )
-
         result: list[dict[str, Any]] = []
         # This is a final provider-boundary guard.  Durable projections already
         # normalize turns, but custom message providers and restored legacy
@@ -297,10 +272,8 @@ class DurableModelAdapter(ModelAdapter):
                 if stream_callback is not None:
                     # Stream callbacks are presentation-only: these live
                     # envelopes never enter Durable events or artifacts.
-                    # Separately, the existing assistant-message artifact may
-                    # preserve provider reasoning_content for tool replay.
-                    # Raw tool arguments remain private until the existing
-                    # approval projection.
+                    # Reasoning and raw tool arguments remain transient/private;
+                    # only the approved durable projection is persisted.
                     envelope: dict[str, Any] = {"kind": event.kind}
                     if event.kind == "content":
                         envelope["text"] = event.text

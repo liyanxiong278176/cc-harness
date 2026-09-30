@@ -331,13 +331,43 @@ class LLMClient:
         surfaced as ``ProviderStreamError`` and the Runtime freezes it.
         """
 
-        for attempt in range(_PROVIDER_RETRY_ATTEMPTS):
+        attempt = 0
+        reasoning_fallback_used = False
+        while attempt < _PROVIDER_RETRY_ATTEMPTS:
             stream_started = False
+            retry_without_thinking = False
             try:
-                async for event in self._chat_once(messages, tools):
-                    if event.kind in {"content", "reasoning", "tool_call_delta"}:
-                        stream_started = True
-                    yield event
+                provider_stream = self._chat_once(messages, tools)
+                try:
+                    async for event in provider_stream:
+                        if (
+                            event.kind == "done"
+                            and not event.content
+                            and not event.pending
+                            and event.reasoning_content
+                            and self.thinking_mode != "disabled"
+                            and not reasoning_fallback_used
+                        ):
+                            # Some providers return only private reasoning. Never
+                            # reinterpret it as an answer. Retry once with thinking
+                            # disabled so the visible response channel can produce
+                            # an actual answer; the reasoning deltas stay transient.
+                            reasoning_fallback_used = True
+                            self.thinking_mode = "disabled"
+                            self.thinking_fallback_used = True
+                            self._reasoning_content_seen = False
+                            self.reasoning_effort_supported = False
+                            retry_without_thinking = True
+                            break
+                        if event.kind in {"content", "reasoning", "tool_call_delta"}:
+                            stream_started = True
+                        yield event
+                finally:
+                    close_stream = getattr(provider_stream, "aclose", None)
+                    if close_stream is not None:
+                        await close_stream()
+                if retry_without_thinking:
+                    continue
                 return
             except Exception as exc:
                 retryable = _retryable_provider_error(exc)
@@ -356,6 +386,7 @@ class LLMClient:
                         partial_output=False,
                     ) from exc
                 await asyncio.sleep(_PROVIDER_RETRY_DELAYS[attempt])
+                attempt += 1
 
     async def _chat_once(
         self,
@@ -460,9 +491,8 @@ class LLMClient:
             if delta_refusal:
                 refusal = str(delta_refusal)
 
-            # DeepSeek reasoning models (e.g. deepseek-v4-flash) emit
-            # delta.reasoning_content separately from delta.content. Capture it
-            # so we can fall back when content ends up empty (see done event).
+            # Reasoning remains separate from visible content. It may be sent
+            # transiently to the UI, but is never promoted to the answer.
             reasoning = getattr(delta, "reasoning_content", None)
             if reasoning:
                 reasoning_parts.append(reasoning)
@@ -496,13 +526,6 @@ class LLMClient:
                 finish_reason = choice.finish_reason
 
         content_str = "".join(content_parts)
-        if not content_str and reasoning_parts:
-            # DeepSeek reasoning models sometimes emit the entire answer in
-            # reasoning_content with empty content (non-deterministic, more
-            # often with tools). Without this fallback the turn looks 'empty'
-            # and the agent gives up / retries into the same wall. When content
-            # is absent, the reasoning IS the answer — surface it.
-            content_str = "".join(reasoning_parts)
         yield StreamEvent(
             kind="done",
             finish_reason=finish_reason,

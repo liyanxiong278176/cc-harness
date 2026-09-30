@@ -143,6 +143,33 @@ def _redact(value: Any, *, key: str = "") -> Any:
     return str(value)
 
 
+def _bounded_public_value(value: Any, *, depth: int = 0) -> Any:
+    """Bound a redacted tool-argument preview before returning it to the UI."""
+
+    safe = _redact(value)
+    if depth >= 4 and isinstance(safe, (Mapping, list)):
+        return "（已达到预览深度上限）"
+    if isinstance(safe, Mapping):
+        entries = list(safe.items())[:24]
+        bounded = {
+            str(key)[:120]: _bounded_public_value(item, depth=depth + 1)
+            for key, item in entries
+        }
+        if len(safe) > len(entries):
+            bounded["…"] = f"另有 {len(safe) - len(entries)} 项"
+        return "（已达到预览深度上限）" if depth >= 4 else bounded
+    if isinstance(safe, list):
+        if depth >= 4:
+            return "（已达到预览深度上限）"
+        values = [_bounded_public_value(item, depth=depth + 1) for item in safe[:20]]
+        if len(safe) > len(values):
+            values.append(f"…另有 {len(safe) - len(values)} 项")
+        return values
+    if isinstance(safe, str) and len(safe) > 600:
+        return safe[:600] + "…（预览已截断）"
+    return safe
+
+
 def _public_stream_error(value: Any) -> dict[str, Any] | None:
     """Project an error mapping onto the browser-safe stream contract.
 
@@ -404,8 +431,8 @@ def _public_event(
 
     The durable event remains the authority.  Only committed assistant text,
     committed tool observations, and explicit user follow-up text are enriched;
-    prompts, hidden rules, raw reasoning, credentials, and tool arguments are
-    never sent to the browser.
+    prompts, hidden rules, raw reasoning, and credentials are never sent to the
+    browser. Tool arguments are available only as bounded, redacted previews.
     """
 
     event_type = str(event.event_type)
@@ -472,11 +499,84 @@ def _public_event(
                     )
                 else:
                     content = blocks or ""
-            result["content"] = str(content)
+            content_text = str(_redact(content))
+            lines = content_text.splitlines()
+            preview_text = "\n".join(lines[:80])
+            if len(preview_text) > 12_000:
+                preview_text = preview_text[:12_000] + "…（预览已截断）"
+            result["content"] = preview_text
+            result["result_lines_total"] = len(lines)
+            result["result_lines_shown"] = len(preview_text.splitlines())
+            result["result_lines_unit"] = "行"
+            result["result_truncated"] = (
+                len(lines) > 80 or len(content_text) > 12_000
+            )
+            result["complete"] = bool(observation.get("complete", True))
+            observation_id = observation.get("observation_id")
+            if isinstance(observation_id, str) and observation_id:
+                result["observation_id"] = observation_id[:128]
+            next_cursor = observation.get("next_cursor")
+            if isinstance(next_cursor, (str, int)) and str(next_cursor):
+                result["next_cursor"] = str(next_cursor)[:128]
+            for field in ("read_paths", "modified_paths"):
+                values = observation.get(field)
+                if isinstance(values, (list, tuple)):
+                    result[field] = [str(_redact(item))[:1000] for item in values[:40]]
+            metadata = observation.get("metadata")
+            metadata = metadata if isinstance(metadata, Mapping) else {}
+            structured = metadata.get("structured_preview")
+            structured = structured if isinstance(structured, Mapping) else {}
+            total_lines = structured.get("total_lines")
+            line_start = structured.get("line_start")
+            line_end = structured.get("line_end")
+            if (
+                isinstance(total_lines, int)
+                and not isinstance(total_lines, bool)
+                and total_lines >= 0
+                and isinstance(line_start, int)
+                and isinstance(line_end, int)
+                and line_start > 0
+                and line_end >= line_start
+            ):
+                result["result_lines_total"] = total_lines
+                result["result_lines_shown"] = min(80, line_end - line_start + 1)
+            else:
+                total_matches = structured.get("total_matches")
+                matches = structured.get("matches")
+                if (
+                    isinstance(total_matches, int)
+                    and not isinstance(total_matches, bool)
+                    and total_matches >= 0
+                    and isinstance(matches, list)
+                ):
+                    result["result_lines_total"] = total_matches
+                    result["result_lines_shown"] = len(matches)
+                    result["result_lines_unit"] = "项"
+            exit_code = metadata.get("exit_code")
+            if isinstance(exit_code, int) and not isinstance(exit_code, bool):
+                result["exit_code"] = exit_code
+            duration_ms = metadata.get("duration_ms")
+            if isinstance(duration_ms, (int, float)) and not isinstance(duration_ms, bool):
+                if 0 <= float(duration_ms) < float("inf"):
+                    result["duration_ms"] = duration_ms
+            result["payload"] = {
+                key: _redact(payload[key])
+                for key in ("action_id", "attempt", "tool_name", "status", "complete", "recovery")
+                if key in payload
+            }
     elif event_type in {"ActionPlanned", "ActionStarted", "ActionSucceeded", "ActionFailed", "ActionCancelled", "ActionOutcomeUnknown"}:
         result["tool_name"] = payload.get("tool_name")
         result["action_id"] = payload.get("action_id")
-        if event_type == "ActionFailed":
+        if event_type == "ActionPlanned":
+            arguments = _read_json_artifact(client, payload.get("arguments_artifact"))
+            if arguments is not None:
+                result["tool_arguments"] = _bounded_public_value(arguments)
+            result["payload"] = {
+                key: _redact(payload[key])
+                for key in ("action_id", "attempt", "tool_name", "effect_class")
+                if key in payload
+            }
+        elif event_type == "ActionFailed":
             result["kind"] = "error"
             # Action failure payloads historically carried an unbounded
             # executor reason. Keep only the fields needed to identify the
@@ -500,6 +600,16 @@ def _public_event(
             reason = _bounded_public_reason(payload.get("reason"))
             if reason:
                 result["payload"]["reason"] = reason
+        else:
+            result["payload"] = {
+                key: _redact(payload[key])
+                for key in ("action_id", "attempt", "tool_name", "status")
+                if key in payload
+            }
+            for field in ("read_paths", "modified_paths"):
+                values = payload.get(field)
+                if isinstance(values, (list, tuple)):
+                    result["payload"][field] = [str(_redact(item))[:1000] for item in values[:40]]
     elif event_type == "RunOutcomeRecorded":
         result["kind"] = "outcome"
         safe_outcome = _public_run_outcome(payload)
@@ -1138,6 +1248,22 @@ class WebRuntimeManager:
                     continue
                 objective = _root_view.projection.goal.objective if _root_view.projection.goal else "新会话"
                 sequence = max((item.sequence for item in _tree), default=view.sequence)
+                root_times: list[str] = []
+                activity_times: list[str] = []
+                for tree_run in _tree:
+                    try:
+                        first_page = await client.store.read(tree_run.run_id, limit=1)
+                        last_page = await client.store.read(
+                            tree_run.run_id,
+                            after=max(0, tree_run.sequence - 1),
+                            limit=1,
+                        )
+                    except Exception:
+                        continue
+                    if first_page.events and tree_run.run_id == record.run_id:
+                        root_times.append(str(first_page.events[0].occurred_at))
+                    if last_page.events:
+                        activity_times.append(str(last_page.events[-1].occurred_at))
                 result.append(
                     {
                         "run_id": record.run_id,
@@ -1146,6 +1272,8 @@ class WebRuntimeManager:
                         "sequence": sequence,
                         "active_worker_id": view.projection.active_worker_id,
                         "updated_sequence": sequence,
+                        "created_at": min(root_times) if root_times else None,
+                        "updated_at": max(activity_times) if activity_times else None,
                         "project_root": str(root),
                         "scheduler": self._scheduler_status(client),
                     }
@@ -1349,6 +1477,18 @@ class WebRuntimeManager:
             }
 
         return await asyncio.to_thread(read_preview)
+
+    async def open_artifact(self, relative_path: str) -> dict[str, Any]:
+        """Open a selected-project regular file with the host's default app."""
+
+        root = self._require_root().resolve(strict=True)
+        target = _current_project_file(root, relative_path)
+        start_file = getattr(os, "startfile", None)
+        if callable(start_file):
+            await asyncio.to_thread(start_file, str(target))
+        else:
+            await asyncio.to_thread(webbrowser.open, target.as_uri())
+        return {"opened": True, "path": target.relative_to(root).as_posix()}
 
     async def _conversation_snapshot(
         self,
@@ -2050,6 +2190,11 @@ class MessageRequest(BaseModel):
     interaction_mode: str = "auto"
 
 
+class ArtifactOpenRequest(BaseModel):
+    path: str = Field(min_length=1, max_length=4096)
+    project_root: str = Field(min_length=1, max_length=4096)
+
+
 class SettingsRequest(BaseModel):
     base_url: str | None = None
     model: str | None = None
@@ -2417,6 +2562,63 @@ def create_web_app(manager: WebRuntimeManager | None = None) -> FastAPI:
         except Exception as exc:
             raise _http_error(exc) from exc
 
+    @app.post("/api/artifacts/open")
+    async def open_artifact(payload: ArtifactOpenRequest) -> dict[str, Any]:
+        if manager.selected_root is None:
+            raise HTTPException(
+                status_code=409,
+                detail=StreamErrorDetails(
+                    code="project_required",
+                    phase="persistence",
+                    retryable=False,
+                    next_action="先从侧栏选择本地项目文件夹，再打开产物",
+                    message="请先选择本地项目文件夹",
+                ).to_dict(),
+            )
+        try:
+            requested_root = Path(payload.project_root).expanduser().resolve(strict=True)
+            selected_root = manager.selected_root.resolve(strict=True)
+        except (OSError, ValueError):
+            requested_root = None
+            selected_root = manager.selected_root
+        if requested_root != selected_root:
+            raise HTTPException(
+                status_code=409,
+                detail=StreamErrorDetails(
+                    code="artifact_project_changed",
+                    phase="persistence",
+                    retryable=True,
+                    next_action="刷新产物列表后再打开文件",
+                    message="当前选中的项目已变化，请刷新产物列表",
+                ).to_dict(),
+            )
+        try:
+            return await manager.open_artifact(payload.path)
+        except (FileNotFoundError, NotADirectoryError) as exc:
+            raise HTTPException(
+                status_code=404,
+                detail=StreamErrorDetails(
+                    code="artifact_missing",
+                    phase="persistence",
+                    retryable=False,
+                    next_action="刷新产物列表以读取项目当前文件",
+                    message="该路径当前没有可打开的文件",
+                ).to_dict(),
+            ) from exc
+        except PermissionError as exc:
+            raise HTTPException(
+                status_code=403,
+                detail=StreamErrorDetails(
+                    code="artifact_path_forbidden",
+                    phase="persistence",
+                    retryable=False,
+                    next_action="选择当前项目中的普通文件",
+                    message="该路径不允许在项目产物中打开",
+                ).to_dict(),
+            ) from exc
+        except Exception as exc:
+            raise _http_error(exc) from exc
+
     async def send_message(payload: MessageRequest) -> dict[str, Any]:
         if manager.selected_root is None and not payload.project_root:
             raise HTTPException(
@@ -2461,7 +2663,7 @@ def create_web_app(manager: WebRuntimeManager | None = None) -> FastAPI:
     @app.get("/api/sessions/{run_id}/timeline")
     async def get_timeline(run_id: str, limit: int = 500) -> dict[str, Any]:
         try:
-            return {"events": await manager.timeline(run_id, limit=max(1, min(limit, 2000)))}
+            return {"events": await manager.timeline(run_id, limit=max(1, min(limit, 10000)))}
         except Exception as exc:
             raise _http_error(exc) from exc
 

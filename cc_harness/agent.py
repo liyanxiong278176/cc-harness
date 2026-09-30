@@ -1513,8 +1513,6 @@ async def run_turn(
                 "content": content if content else None,
                 "tool_calls": [_pending_to_openai_tc(p, tc_id) for p, tc_id in zip(pending, tc_ids)],
             }
-            if reasoning_content:
-                assistant_msg["reasoning_content"] = reasoning_content
             messages.append(assistant_msg)
             # 记录到 _tool_retry_log(放在 append 之后,下次再遇同 sig 才计数)
             for p in pending:

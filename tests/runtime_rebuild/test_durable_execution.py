@@ -7,7 +7,7 @@ import pytest
 
 from cc_harness.coordinator import RunCoordinator, RunRequest
 from cc_harness.durable_runtime import DurableModelAdapter
-from cc_harness.llm import PendingToolCall, ProviderProtocolError, StreamEvent
+from cc_harness.llm import PendingToolCall, StreamEvent
 from cc_harness import worker as worker_module
 from cc_harness.run_kernel import ModelSegment, ReActKernel
 from cc_harness.run_model import ActionStatus, EvidenceKind, EvidenceRef, PlanNode
@@ -142,7 +142,7 @@ async def test_durable_model_adapter_keeps_malformed_completion_for_repair() -> 
     assert "not-an-evidence-ref" in segment.text
 
 
-def test_durable_model_adapter_preserves_provider_fields_and_rejects_lossy_reasoning_replay():
+def test_durable_model_adapter_preserves_legacy_provider_fields_and_allows_new_reasoning_free_replay():
     messages = [
         {
             "role": "assistant",
@@ -157,11 +157,16 @@ def test_durable_model_adapter_preserves_provider_fields_and_rejects_lossy_reaso
     )
     assert replay[0]["reasoning_content"] == "provider trace"
     assert "_durable_event_id" not in replay[0]
-    with pytest.raises(ProviderProtocolError, match="reasoning_content"):
-        DurableModelAdapter._provider_messages(
-            [{"role": "assistant", "content": None, "tool_calls": [{"id": "call-1"}]}],
-            thinking_mode="enabled",
-        )
+    new_artifact_replay = DurableModelAdapter._provider_messages(
+        [
+            {"role": "assistant", "content": None, "tool_calls": [{"id": "call-1"}]},
+            {"role": "tool", "tool_call_id": "call-1", "content": "done"},
+        ],
+        thinking_mode="enabled",
+        reasoning_content_required=True,
+    )
+    assert new_artifact_replay[0]["tool_calls"] == [{"id": "call-1"}]
+    assert "reasoning_content" not in new_artifact_replay[0]
     disabled = DurableModelAdapter._provider_messages(
         messages, thinking_mode="disabled", reasoning_content_required=True
     )
@@ -205,25 +210,24 @@ def test_provider_messages_reorder_parallel_tool_results_and_drop_incomplete_cal
     assert [item.get("id") for item in partial[0].get("tool_calls", [])] == ["complete"]
 
 
-def test_assistant_message_preserves_explicit_empty_reasoning_content():
+def test_new_assistant_messages_never_persist_provider_reasoning():
     from cc_harness.interaction_history import assistant_message
 
     omitted = assistant_message("plain")
     assert "reasoning_content" not in omitted
 
-    preserved = assistant_message(
+    stored = assistant_message(
         "tool call",
         ({"id": "call-1", "name": "run_command", "arguments": {}},),
-        reasoning_content="",
     )
-    assert preserved["reasoning_content"] == ""
+    assert "reasoning_content" not in stored
 
     accepted = DurableModelAdapter._provider_messages(
-        [preserved],
+        [stored],
         thinking_mode="enabled",
         reasoning_content_required=True,
     )
-    assert accepted[0]["reasoning_content"] == ""
+    assert "reasoning_content" not in accepted[0]
 
 
 def test_durable_message_round_trip_preserves_provider_fields_and_tool_pairing():

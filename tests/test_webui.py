@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import os
 import uuid
 from pathlib import Path
 from types import SimpleNamespace
@@ -76,6 +77,19 @@ def test_webui_returns_not_found_for_stale_session_id(tmp_path: Path) -> None:
         assert manager._clients == {}
 
 
+def test_timeline_route_allows_virtualized_long_history_limit(tmp_path: Path) -> None:
+    """The transcript can request enough durable events to fill a long scroll."""
+    manager, client = _client(tmp_path)
+    manager.timeline = AsyncMock(return_value=[])
+    try:
+        response = client.get("/api/sessions/synthetic-run/timeline?limit=10000")
+        assert response.status_code == 200
+        manager.timeline.assert_awaited_once_with("synthetic-run", limit=10000)
+    finally:
+        client.__exit__(None, None, None)
+        assert manager._clients == {}
+
+
 def test_webui_artifact_preview_is_project_scoped_and_rejects_path_escape(tmp_path: Path) -> None:
     project = tmp_path / "project"
     project.mkdir()
@@ -115,6 +129,168 @@ def test_webui_artifact_preview_is_project_scoped_and_rejects_path_escape(tmp_pa
     finally:
         client.__exit__(None, None, None)
         assert manager._clients == {}
+
+
+def test_webui_open_artifact_uses_only_the_selected_project(tmp_path: Path, monkeypatch) -> None:
+    project = tmp_path / "project"
+    project.mkdir()
+    artifact = project / "notes.md"
+    artifact.write_text("# safe local artifact\n", encoding="utf-8")
+    outside = tmp_path / "outside.md"
+    outside.write_text("private\n", encoding="utf-8")
+    opened: list[str] = []
+    monkeypatch.setattr(os, "startfile", lambda path: opened.append(str(path)), raising=False)
+    manager, client = _client(tmp_path)
+    try:
+        selected = client.post("/api/projects/select", json={"path": str(project)})
+        assert selected.status_code == 200
+
+        response = client.post(
+            "/api/artifacts/open",
+            json={"path": "notes.md", "project_root": str(project)},
+        )
+        assert response.status_code == 200
+        assert response.json() == {"opened": True, "path": "notes.md"}
+        assert opened == [str(artifact.resolve())]
+
+        traversal = client.post(
+            "/api/artifacts/open",
+            json={"path": "../outside.md", "project_root": str(project)},
+        )
+        assert traversal.status_code == 403
+        assert opened == [str(artifact.resolve())]
+
+        stale_project = client.post(
+            "/api/artifacts/open",
+            json={"path": "notes.md", "project_root": str(tmp_path)},
+        )
+        assert stale_project.status_code == 409
+    finally:
+        client.__exit__(None, None, None)
+        assert manager._clients == {}
+
+
+def test_public_tool_events_include_bounded_redacted_previews() -> None:
+    import json
+
+    artifacts = {
+        "args-digest": json.dumps(
+            {"path": "README.md", "api_key": "sk-private", "large": "x" * 700}
+        ),
+        "observation-digest": json.dumps(
+            {
+                "tool_name": "Read",
+                "status": "succeeded",
+                "complete": False,
+                "next_cursor": "cursor-1",
+                "observation_id": "observation-read-1",
+                "read_paths": ["README.md"],
+                "modified_paths": [],
+                "content": [{"kind": "text", "text": "\n".join(f"line-{i}" for i in range(100))}],
+                "metadata": {
+                    "exit_code": 0,
+                    "duration_ms": 27,
+                    "structured_preview": {"line_start": 1, "line_end": 100, "total_lines": 100},
+                },
+            }
+        ),
+    }
+
+    class ArtifactReader:
+        def read_text(self, digest):
+            return artifacts[digest]
+
+    runtime_client = SimpleNamespace(store=SimpleNamespace(artifacts=ArtifactReader()))
+    actor = SimpleNamespace(to_dict=lambda: {"kind": "worker"})
+
+    planned = _public_event(
+        runtime_client,
+        SimpleNamespace(
+            run_id="run-tools",
+            sequence=1,
+            event_id="event-planned",
+            event_type="ActionPlanned",
+            occurred_at="2026-09-30T00:00:00Z",
+            actor=actor,
+            payload={
+                "action_id": "action-1",
+                "attempt": 1,
+                "tool_name": "Read",
+                "effect_class": "read_only",
+                "arguments_artifact": "args-digest",
+                "contract_digest": "private-digest",
+            },
+        ),
+    )
+    assert planned is not None
+    assert planned["tool_arguments"]["path"] == "README.md"
+    assert planned["tool_arguments"]["api_key"] == "<redacted>"
+    assert planned["tool_arguments"]["large"].endswith("（预览已截断）")
+    assert "arguments_artifact" not in planned["payload"]
+    assert "contract_digest" not in planned["payload"]
+
+    observation = _public_event(
+        runtime_client,
+        SimpleNamespace(
+            run_id="run-tools",
+            sequence=2,
+            event_id="event-observation",
+            event_type="ToolObservationCommitted",
+            occurred_at="2026-09-30T00:00:01Z",
+            actor=actor,
+            payload={
+                "action_id": "action-1",
+                "attempt": 1,
+                "tool_name": "Read",
+                "status": "succeeded",
+                "observation_artifact": "observation-digest",
+            },
+        ),
+    )
+    assert observation is not None
+    assert observation["result_lines_total"] == 100
+    assert observation["result_lines_shown"] == 80
+    assert observation["result_truncated"] is True
+    assert observation["complete"] is False
+    assert observation["next_cursor"] == "cursor-1"
+    assert observation["observation_id"] == "observation-read-1"
+    assert observation["exit_code"] == 0
+    assert observation["duration_ms"] == 27
+    assert "observation_artifact" not in observation["payload"]
+
+    artifacts["observation-digest"] = json.dumps(
+        {
+            "tool_name": "Glob",
+            "status": "succeeded",
+            "complete": False,
+            "next_cursor": "3",
+            "observation_id": "observation-glob-1",
+            "content": [{"kind": "text", "text": '{"matches":["a.md","b.md","c.md"],"truncated":true}'}],
+            "metadata": {
+                "structured_preview": {
+                    "matches": [{"path": "a.md"}, {"path": "b.md"}, {"path": "c.md"}],
+                    "total_matches": 1370,
+                }
+            },
+        }
+    )
+    glob = _public_event(
+        runtime_client,
+        SimpleNamespace(
+            run_id="run-tools",
+            sequence=3,
+            event_id="event-glob-observation",
+            event_type="ToolObservationCommitted",
+            occurred_at="2026-09-30T00:00:02Z",
+            actor=actor,
+            payload={"action_id": "action-2", "attempt": 1, "tool_name": "Glob", "status": "succeeded", "observation_artifact": "observation-digest"},
+        ),
+    )
+    assert glob is not None
+    assert glob["result_lines_total"] == 1370
+    assert glob["result_lines_shown"] == 3
+    assert glob["result_lines_unit"] == "项"
+    assert glob["next_cursor"] == "3"
 
 
 def test_webui_delete_session_hides_tree_and_retains_audit_events(tmp_path: Path) -> None:
@@ -318,6 +494,28 @@ def test_project_selection_lists_empty_durable_sessions(tmp_path: Path) -> None:
     finally:
         client.__exit__(None, None, None)
         assert manager._clients == {}
+
+
+def test_session_date_projection_reads_event_timestamps(tmp_path: Path) -> None:
+    """Session grouping timestamps come from events, not RunView fields."""
+
+    async def exercise() -> None:
+        project = tmp_path / "project"
+        project.mkdir()
+        manager = WebRuntimeManager(initial_cwd=tmp_path, data_root=tmp_path / "runtime-data")
+        await manager.select_project(str(project))
+        client = manager._clients[str(project.resolve())]
+        try:
+            await client.submit("会话时间戳测试")
+            sessions = await manager.sessions(all_projects=False)
+            assert len(sessions) == 1
+            assert sessions[0]["created_at"]
+            assert sessions[0]["updated_at"]
+            assert sessions[0]["updated_at"] >= sessions[0]["created_at"]
+        finally:
+            await manager.shutdown()
+
+    asyncio.run(exercise())
 
 
 def test_completion_candidate_is_not_rendered_as_chat_text() -> None:

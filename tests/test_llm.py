@@ -267,24 +267,44 @@ async def test_chat_usage_none_when_no_usage_chunk():
 
 
 @pytest.mark.asyncio
-async def test_chat_reasoning_content_used_when_content_empty():
-    """DeepSeek reasoning models (e.g. deepseek-v4-flash) sometimes emit the
-    whole answer in delta.reasoning_content with empty delta.content. Without
-    a fallback the turn looks 'empty' and the agent gives up. The done event
-    must surface reasoning_content as content in that case."""
-    chunks = [
+async def test_chat_reasoning_only_response_retries_without_exposing_reasoning():
+    """A reasoning-only response is never promoted to user-visible content."""
+    reasoning_chunks = [
         _FakeChunk(_FakeChoiceDelta(reasoning="你好！我是 cc-harness")),
         _FakeChunk(_FakeChoiceDelta(reasoning="，一个编程代理")),
         _FakeChunk(_FakeChoiceDelta(), finish_reason="stop"),
         _FakeUsageChunk(_FakeUsage(100, 50, 150)),
     ]
-    client = _make_client(chunks)
-    final = None
-    async for ev in client.chat(messages=[{"role": "user", "content": "hello"}], tools=[]):
-        if ev.kind == "done":
-            final = ev
-    assert final is not None
-    assert final.content == "你好！我是 cc-harness，一个编程代理"
+    answer_chunks = [_FakeChunk(_FakeChoiceDelta(content="VISIBLE ANSWER"), finish_reason="stop")]
+    client = LLMClient(
+        api_key="sk-test",
+        model="deepseek-v4-flash",
+        base_url=None,
+        thinking_mode="auto",
+        reasoning_effort="high",
+    )
+    mock = MagicMock()
+    mock.chat.completions.create = AsyncMock(
+        side_effect=[aiter(reasoning_chunks), aiter(answer_chunks)]
+    )
+    client._client = mock
+
+    events = [
+        event
+        async for event in client.chat(messages=[{"role": "user", "content": "hello"}], tools=[])
+    ]
+
+    assert [event.kind for event in events] == ["reasoning", "reasoning", "content", "done"]
+    assert "".join(event.text for event in events if event.kind == "reasoning") == (
+        "你好！我是 cc-harness，一个编程代理"
+    )
+    assert events[-1].content == "VISIBLE ANSWER"
+    assert client.thinking_mode == "disabled"
+    assert client.thinking_fallback_used is True
+    assert mock.chat.completions.create.await_count == 2
+    retry_kwargs = mock.chat.completions.create.await_args_list[1].kwargs
+    assert retry_kwargs["extra_body"] == {"thinking": {"type": "disabled"}}
+    assert "reasoning_effort" not in retry_kwargs
 
 
 @pytest.mark.asyncio

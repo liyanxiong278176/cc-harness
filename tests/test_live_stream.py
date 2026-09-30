@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import asyncio
+import json
+from types import SimpleNamespace
 
 import pytest
 
@@ -151,6 +153,44 @@ async def test_durable_adapter_stream_callback_keeps_reasoning_transient_and_sep
         "output_tokens": 2,
         "total_tokens": 6,
     }
+
+
+@pytest.mark.asyncio
+async def test_worker_assistant_artifact_never_contains_raw_reasoning(tmp_path) -> None:
+    project = tmp_path / "project"
+    project.mkdir()
+    store = await RunStore(project, data_root=tmp_path / "runtime-data").open()
+    worker = RunWorker(store, LegacyModel(), worker_id="reasoning-privacy-worker")
+    appended: list[tuple[str, dict]] = []
+
+    async def capture_append(lease, event_type, payload, *, artifact_refs=()):
+        del lease, artifact_refs
+        appended.append((event_type, dict(payload)))
+
+    worker._append = capture_append
+    await worker._commit_assistant_message(
+        SimpleNamespace(run_id="run-reasoning-privacy"),
+        segment=1,
+        round_index=1,
+        outcome=SimpleNamespace(
+            model_text="Visible response",
+            action_requests=(),
+            stop_reason="model_stop",
+            usage={},
+            reasoning_content="private provider reasoning",
+            refusal=None,
+            provider_metadata={},
+        ),
+    )
+
+    assert len(appended) == 1
+    event_type, payload = appended[0]
+    assert event_type == "AssistantMessageCommitted"
+    stored = json.loads(store.artifacts.read_text(payload["message_artifact"]))
+    assert stored["content"] == "Visible response"
+    assert "reasoning_content" not in stored
+    assert "private provider reasoning" not in json.dumps(stored)
+    await store.close()
 
 
 class CallbackKernel:
