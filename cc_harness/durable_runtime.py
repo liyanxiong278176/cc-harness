@@ -295,12 +295,16 @@ class DurableModelAdapter(ModelAdapter):
                     usage = event.usage
                     provider_metadata = dict(event.provider_metadata or {})
                 if stream_callback is not None:
-                    # Stream callbacks are presentation-only.  Do not pass
-                    # provider-private reasoning text or raw tool arguments to
-                    # the WebUI; the durable assistant/tool artifacts remain
-                    # the only authoritative replay source.
+                    # Stream callbacks are presentation-only: these live
+                    # envelopes never enter Durable events or artifacts.
+                    # Separately, the existing assistant-message artifact may
+                    # preserve provider reasoning_content for tool replay.
+                    # Raw tool arguments remain private until the existing
+                    # approval projection.
                     envelope: dict[str, Any] = {"kind": event.kind}
                     if event.kind == "content":
+                        envelope["text"] = event.text
+                    elif event.kind == "reasoning":
                         envelope["text"] = event.text
                     elif event.kind == "tool_call_delta":
                         tool_call = event.tool_call
@@ -717,9 +721,14 @@ class DurableRuntimeClient:
         except Exception:
             pass
 
-    async def run_tree(self, root_run_id: str) -> tuple[str, ...]:
+    async def run_tree(
+        self,
+        root_run_id: str,
+        *,
+        include_tombstoned: bool = False,
+    ) -> tuple[str, ...]:
         """Return a root Run plus all persisted descendants in stable order."""
-        records = await self.store.list_runs()
+        records = await self.store.list_runs(include_tombstoned=include_tombstoned)
         children: dict[str, list[str]] = {}
         for record in records:
             if record.parent_run_id:

@@ -1120,7 +1120,7 @@ class RunWorker:
             # flush any buffered text before publishing them.
             async with emit_lock:
                 await flush_content_locked()
-                if kind == "tool_call_delta":
+                if kind in {"reasoning", "tool_call_delta"}:
                     stream_started = True
                 if kind == "done":
                     terminal_emitted = True

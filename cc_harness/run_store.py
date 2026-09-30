@@ -807,20 +807,28 @@ class RunStore:
                 values = tuple(int(row[0]) for row in await cursor.fetchall())
                 return values
 
-    async def list_runs(self, statuses: set[str] | None = None) -> tuple[RunRecordView, ...]:
+    async def list_runs(
+        self,
+        statuses: set[str] | None = None,
+        *,
+        include_tombstoned: bool = False,
+    ) -> tuple[RunRecordView, ...]:
         query = (
             "SELECT run_id, status, last_sequence, runtime_contract_digest, "
             "parent_run_id, predecessor_run_id "
-            "FROM run_record "
-            "WHERE NOT EXISTS ("
-            "SELECT 1 FROM run_tombstone hidden WHERE hidden.run_id = run_record.run_id"
-            ")"
+            "FROM run_record"
         )
+        if not include_tombstoned:
+            query += (
+                " WHERE NOT EXISTS ("
+                "SELECT 1 FROM run_tombstone hidden WHERE hidden.run_id = run_record.run_id"
+                ")"
+            )
         params: tuple[Any, ...] = ()
         if statuses:
             ordered = tuple(sorted(statuses))
             placeholders = ",".join("?" for _ in ordered)
-            query += f" AND status IN ({placeholders})"
+            query += f" {'AND' if not include_tombstoned else 'WHERE'} status IN ({placeholders})"
             params = ordered
         query += " ORDER BY updated_at, run_id"
         db = self._require_db()

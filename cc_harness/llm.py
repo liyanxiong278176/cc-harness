@@ -174,7 +174,7 @@ class PendingToolCall:
 class StreamEvent:
     """One event yielded by LLMClient.chat()."""
 
-    kind: Literal["content", "tool_call_delta", "done"]
+    kind: Literal["content", "reasoning", "tool_call_delta", "done"]
     text: str = ""
     tool_call: PendingToolCall | None = None
     finish_reason: str | None = None
@@ -335,7 +335,7 @@ class LLMClient:
             stream_started = False
             try:
                 async for event in self._chat_once(messages, tools):
-                    if event.kind in {"content", "tool_call_delta"}:
+                    if event.kind in {"content", "reasoning", "tool_call_delta"}:
                         stream_started = True
                     yield event
                 return
@@ -456,10 +456,6 @@ class LLMClient:
             choice = chunk.choices[0]
             delta = choice.delta
 
-            if delta.content:
-                content_parts.append(delta.content)
-                yield StreamEvent(kind="content", text=delta.content)
-
             delta_refusal = getattr(delta, "refusal", None)
             if delta_refusal:
                 refusal = str(delta_refusal)
@@ -471,6 +467,11 @@ class LLMClient:
             if reasoning:
                 reasoning_parts.append(reasoning)
                 self._reasoning_content_seen = True
+                yield StreamEvent(kind="reasoning", text=str(reasoning))
+
+            if delta.content:
+                content_parts.append(delta.content)
+                yield StreamEvent(kind="content", text=delta.content)
 
             if delta.tool_calls:
                 for tc in delta.tool_calls:

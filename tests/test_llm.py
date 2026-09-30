@@ -289,19 +289,22 @@ async def test_chat_reasoning_content_used_when_content_empty():
 
 @pytest.mark.asyncio
 async def test_chat_content_preferred_over_reasoning_when_both_present():
-    """When both content and reasoning_content are present, content wins
-    (reasoning is internal thinking and must not pollute the answer)."""
+    """Reasoning is emitted on its own ephemeral channel, not in answer text."""
     chunks = [
         _FakeChunk(_FakeChoiceDelta(reasoning="(internal thinking...)", content="ANSWER")),
         _FakeChunk(_FakeChoiceDelta(), finish_reason="stop"),
     ]
     client = _make_client(chunks)
-    final = None
+    events = []
     async for ev in client.chat(messages=[{"role": "user", "content": "x"}], tools=[]):
-        if ev.kind == "done":
-            final = ev
+        events.append(ev)
+    final = events[-1]
     assert final is not None
     assert final.content == "ANSWER"
+    assert [(event.kind, event.text) for event in events[:-1]] == [
+        ("reasoning", "(internal thinking...)"),
+        ("content", "ANSWER"),
+    ]
 
 
 @pytest.mark.asyncio
