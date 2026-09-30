@@ -1,5 +1,7 @@
 # Durable WebUI 流式设计
 
+> **更新说明（2026-09-30）：** 本文件记录 Durable 事件和错误边界。当前前端增量、独立 reasoning 和 SSE 对账以 [`webui-streaming.md`](webui-streaming.md) 为准。live envelope 可含 `kind=reasoning`；它只进入进程内 hub 和浏览器内存，不新增 Durable 流式事件。provider 的既有 `reasoning_content` 消息/artifact 重放语义仍存在，不能据此宣称全系统 reasoning 永不持久化。
+
 ## 数据路径
 
 ```text
@@ -33,7 +35,7 @@ LiveStreamHub  -- ephemeral -->  /api/sessions/{run_id}/events (SSE)
 }
 ```
 
-允许的 `kind` 为 `content`、`tool_call_delta`、`done`；工具阶段只携带名称/索引，终态可携带结束原因和非敏感 token 用量。禁止 `reasoning_content`、原始工具参数和 provider 凭据。发生模型流错误时，SSE 的 `stream` 事件使用同一 envelope 但 `type` 为 `stream_error`：
+Durable 正文事件保持既有契约。当前易失 SSE `kind` 还允许 `reasoning`；此类片段不进入 run_events。工具阶段只携带名称/索引，终态可携带结束原因和非敏感 token 用量。SSE 不暴露原始工具参数和 provider 凭据。发生模型流错误时，SSE 的 `stream` 事件使用同一 envelope 但 `type` 为 `stream_error`：
 
 ```json
 {
