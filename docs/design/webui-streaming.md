@@ -48,9 +48,13 @@ RunWorker -------------------------> Durable run_events / artifacts
 
 `reasoning` 是独立的内存态。前端按 `run_id/segment/chunk` 去重，写入 reasoning 字段，不拼入正文。收到正文时折叠 thinking 区块，并显示本回合已观察到的思考秒数。仅刷新后，live reasoning 不会重放。
 
-### 现有 reasoning artifact 限制
+### reasoning 持久化边界
 
-必须区分“WebUI 新增的易失流”和“Runtime 既有模型重放数据”。当前 `cc_harness/llm.py` 仍会将 provider 的 `reasoning_content` 保存在 assistant 消息中，以满足 DeepSeek 工具调用重放；对于没有独立 `content` 的 provider 流，适配器还会以已收集的 reasoning 作为最终正文兜底。这些是现有 Runtime 消息/artifact 语义，不由 `LiveStreamHub` 持久化。本次没有改写该语义，因此不能宣称 reasoning 原文在整个系统中永不落盘。详情见 `docs/audits/webui-redesign-decisions.md`。
+新写入的 assistant-message artifact 和旧 agent 会话消息不包含 raw `reasoning_content`。`assistant_message` 构造器不接受该字段，worker 只提交模型可见正文、工具调用和现有 provider metadata。原始 reasoning 只在 provider 流与浏览器内存 reducer 中暂存，不进入 Durable 事件、artifact 或会话检查点。
+
+对于只返回 reasoning、没有可见正文或工具调用的响应，LLM client 不再把 reasoning 充当答案；它会暂缓第一次 `done`，并以 thinking-disabled 模式重试一次。旧 provider 也可能因旧 artifact 的 reasoning 回放字段缺失而报协议错误；现有一次性降级会移除该字段后再请求。
+
+在 ADR-0089 决策期间写入的历史 assistant artifact 可能仍含 raw reasoning。它们保持不可变并可被旧会话读取，没有做未经请求的数据改写。新持久化路径及回放行为见 [ADR-0090](../adr/0090-keep-raw-model-reasoning-transient.md)。
 
 ## SSE 与重连
 
@@ -61,6 +65,13 @@ RunWorker -------------------------> Durable run_events / artifacts
 5. SSE 错误或 gap 时前端冻结当前临时前缀、显示对账提示并刷新 Durable timeline。reconnect 后正文由持久投影校准；未提交 reasoning 可能丢失，不能自动重发模型请求。
 
 因此 `Last-Event-ID` 保证的是 Durable 事件游标继续推进，不保证临时 token 被补发。用户刷新/重连后不会把临时文本当成事实；live history ring 当前没有被接入 SSE 回放端点。
+
+## 长历史与工具结果边界
+
+- 浏览器最多请求 10,000 个已投影 timeline event，再以 conversation turn 为单位用 TanStack Virtual 测量并挂载视口附近的行。顶部阅读时，新事件只显示“跳到最新消息”，不改变当前 scrollTop；大跨度跳转立即落到底部，近距离移动保留平滑过渡。
+- 工具卡片只读取后端安全投影的预览、数量、`observation_id` 和 `next_cursor`。`ContinueToolResult` 从当前 Run 的持久观察记录中解析来源；它不会跨 Run 查找旧 observation。
+- 因此只在源 observation 属于当前可恢复 Run 且没有更后的 `FollowUpQueued` 时显示续读按钮。Run 已完成、或消息已排进新 child Run 后，卡片说明该 Runtime 不支持跨 Run 续读，不触发一个必然失败的子 Run。
+- stop 保留临时正文。只有最后用户消息之后没有 `ActionStarted`、`ActionSucceeded`、`ActionFailed`、`ToolObservationCommitted` 或 `ApprovalDecided` 时，前端才提供同文本安全重试；检查点恢复仍走 Runtime 现有 resume API。
 
 ## 状态机
 
@@ -79,7 +90,7 @@ stateDiagram-v2
   failed --> [*]
 ```
 
-`stream_gap` 本身不等于 Run 失败：`gap` 是已冻结临时前缀、等待权威对账的 UI 状态。Run 是否继续运行以 Durable 状态为准。停止操作使用既有 stop API，并保留已显示前缀；需要从检查点继续时走既有 resume API。
+`stream_gap` 本身不等于 Run 失败：`gap` 是已冻结临时前缀、等待权威对账的 UI 状态。Run 是否继续运行以 Durable 状态为准。停止操作使用既有 stop API，并保留已显示前缀；没有工具副作用的停止回合允许安全重试，有副作用或需要检查点继续时走既有 resume API。
 
 ## 前端 reducer 约束
 
