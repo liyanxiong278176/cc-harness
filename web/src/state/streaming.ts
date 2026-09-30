@@ -89,7 +89,7 @@ export function reduceStreamItem(
       ...base,
       segment,
       chunk,
-      phase: 'gap',
+      phase: 'failed',
       updated_at: now,
       frozen: true,
       error: next.error,

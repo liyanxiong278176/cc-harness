@@ -41,6 +41,19 @@ test('重复 chunk 去重，缺口后冻结临时前缀', () => {
   assert.equal(apply(gap, delta(1, 6, 'content', 'late'), 1_300)['run-a'], gap)
 })
 
+test('模型流终态错误保留已生成前缀并显示失败态', () => {
+  const partial = apply(undefined, delta(1, 1, 'content', '已生成内容'), 1_000)['run-a']
+  const failed = apply(partial, {
+    type: 'stream_error', run_id: 'run-a', root_run_id: 'root-a', segment: 1, chunk: 2,
+    error: { message: '服务暂时不可用', retryable: true, next_action: '重试本轮' },
+  }, 1_100)['run-a']
+
+  assert.equal(failed.phase, 'failed')
+  assert.equal(failed.text, '已生成内容')
+  assert.equal(failed.frozen, true)
+  assert.equal(failed.error?.retryable, true)
+})
+
 test('工具调用显示为工具阶段，下一段不拼接上一段的输出', () => {
   let current = apply(undefined, delta(2, 1, 'tool_call_delta'), 1_000)['run-a']
   current = reduceStreamItem(current ? { 'run-a': current } : {}, {

@@ -1,18 +1,20 @@
 import { memo, useCallback, useEffect, useMemo, useRef, useState } from 'react'
+import { useVirtualizer } from '@tanstack/react-virtual'
 import DOMPurify from 'dompurify'
 import { marked } from 'marked'
 import type { LucideIcon } from 'lucide-react'
 import {
-  AlertCircle, Bot, Check, ChevronDown, ChevronRight, File, FileCode2, FileText,
+  AlertCircle, Bot, Check, ChevronDown, ChevronRight, ExternalLink, File, FileCode2, FileText,
   CircleAlert, CircleCheck, CircleStop, Command, Copy, Eye, EyeOff,
   Folder, FolderOpen, History, Info, Keyboard, LoaderCircle,
-  MessageSquarePlus, Moon, PanelLeftClose, PanelLeftOpen,
+  Maximize2, MessageSquarePlus, Minimize2, Moon, PanelLeftClose, PanelLeftOpen,
   PanelRightClose, PanelRightOpen, Play, RefreshCw, RotateCcw, Search,
   Send, Settings, ShieldCheck, Sparkles, Sun, Trash2, X,
 } from 'lucide-react'
 import { webApi, webEventsUrl, type ApiError, type StreamErrorDetail } from './api'
 import { StreamingMessage } from '../components/chat/StreamingMessage'
 import { WelcomeSuggestions } from '../components/chat/WelcomeSuggestions'
+import { SyntaxCode } from '../components/right-panel/SyntaxCode'
 import { reduceStreamBatch, type StreamItem, type StreamingState } from '../state/streaming'
 // The conversation surface and Runtime projection remain separate from the
 // shared visual system in the Vite entry stylesheet.
@@ -45,6 +47,8 @@ type Session = {
   title: string
   status: string
   sequence: number
+  created_at?: string | null
+  updated_at?: string | null
   active_worker_id?: string | null
   project_root?: string
   scheduler?: SchedulerState
@@ -124,7 +128,19 @@ type EventItem = {
   kind: 'user' | 'assistant' | 'tool' | 'error' | 'outcome' | 'status'
   content?: string
   tool_name?: string | null
+  tool_arguments?: Record<string, unknown>
   status?: string
+  read_paths?: string[]
+  modified_paths?: string[]
+  result_lines_total?: number
+  result_lines_shown?: number
+  result_lines_unit?: string
+  result_truncated?: boolean
+  complete?: boolean
+  next_cursor?: string
+  observation_id?: string
+  exit_code?: number
+  duration_ms?: number
   error?: StreamErrorDetail
   payload?: Record<string, unknown>
   outcome?: Record<string, unknown>
@@ -449,6 +465,17 @@ function statusTone(status: string): 'running' | 'success' | 'error' | 'muted' {
   if (status === 'completed') return 'success'
   if (['failed_terminal', 'failed_recoverable', 'blocked', 'stalled'].includes(status)) return 'error'
   return 'muted'
+}
+
+function sessionTimeGroup(session: Session, now = new Date()): 'today' | 'week' | 'older' {
+  const updated = Date.parse(session.updated_at ?? session.created_at ?? '')
+  if (!Number.isFinite(updated)) return 'older'
+  const activity = new Date(updated)
+  const today = new Date(now.getFullYear(), now.getMonth(), now.getDate()).getTime()
+  const activityDay = new Date(activity.getFullYear(), activity.getMonth(), activity.getDate()).getTime()
+  if (activityDay >= today) return 'today'
+  if (today - activityDay < 7 * 24 * 60 * 60 * 1000) return 'week'
+  return 'older'
 }
 
 /**
@@ -819,7 +846,49 @@ function PermissionSelector({
   )
 }
 
+function useModalFocusTrap(dialogRef: { current: HTMLElement | null }, onClose: () => void) {
+  const closeRef = useRef(onClose)
+  useEffect(() => { closeRef.current = onClose }, [onClose])
+  useEffect(() => {
+    const dialog = dialogRef.current
+    if (!dialog) return undefined
+    const previous = document.activeElement instanceof HTMLElement ? document.activeElement : null
+    const selector = 'button:not([disabled]), input:not([disabled]), textarea:not([disabled]), select:not([disabled]), a[href], [tabindex]:not([tabindex="-1"])'
+    const focusable = () => [...dialog.querySelectorAll<HTMLElement>(selector)].filter((item) => item.offsetParent !== null)
+    focusable()[0]?.focus()
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (event.key === 'Escape') {
+        event.preventDefault()
+        closeRef.current()
+        return
+      }
+      if (event.key !== 'Tab') return
+      const items = focusable()
+      if (items.length === 0) {
+        event.preventDefault()
+        return
+      }
+      const first = items[0]
+      const last = items[items.length - 1]
+      if (event.shiftKey && (document.activeElement === first || !dialog.contains(document.activeElement))) {
+        event.preventDefault()
+        last.focus()
+      } else if (!event.shiftKey && (document.activeElement === last || !dialog.contains(document.activeElement))) {
+        event.preventDefault()
+        first.focus()
+      }
+    }
+    document.addEventListener('keydown', onKeyDown)
+    return () => {
+      document.removeEventListener('keydown', onKeyDown)
+      previous?.focus()
+    }
+  }, [dialogRef])
+}
+
 function SettingsModal({ initial, onClose, onSaved }: { initial: SettingsState; onClose: () => void; onSaved: (settings: SettingsState) => void }) {
+  const dialogRef = useRef<HTMLElement | null>(null)
+  useModalFocusTrap(dialogRef, onClose)
   const [baseUrl, setBaseUrl] = useState(initial.base_url)
   const [model, setModel] = useState(initial.model)
   const [apiKey, setApiKey] = useState('')
@@ -895,7 +964,7 @@ function SettingsModal({ initial, onClose, onSaved }: { initial: SettingsState; 
 
   return (
     <div className="modal-backdrop" onMouseDown={(event) => { if (event.target === event.currentTarget) onClose() }}>
-      <section className="settings-modal" role="dialog" aria-modal="true" aria-label="设置">
+      <section ref={dialogRef} className="settings-modal" role="dialog" aria-modal="true" aria-label="设置">
         <div className="modal-heading">
           <div><span className="eyebrow">WORKSPACE SETTINGS</span><h2>连接与模型</h2></div>
           <button className="icon-button" onClick={onClose} aria-label="关闭"><X size={19} /></button>
@@ -916,6 +985,27 @@ function SettingsModal({ initial, onClose, onSaved }: { initial: SettingsState; 
       </section>
     </div>
   )
+}
+
+function KeyboardShortcutsModal({ onClose }: { onClose: () => void }) {
+  const dialogRef = useRef<HTMLElement | null>(null)
+  useModalFocusTrap(dialogRef, onClose)
+  const shortcuts = [
+    ['Ctrl + N', '新建会话'],
+    ['Ctrl + K', '搜索会话'],
+    ['Ctrl + ,', '打开设置'],
+    ['Ctrl + /', '查看快捷键'],
+    ['Enter', '发送消息'],
+    ['Shift + Enter', '在输入框内换行'],
+    ['Esc', '关闭弹窗或菜单'],
+  ]
+  return <div className="modal-backdrop" onMouseDown={(event) => { if (event.target === event.currentTarget) onClose() }}>
+    <section ref={dialogRef} className="shortcuts-modal" role="dialog" aria-modal="true" aria-label="键盘快捷键" tabIndex={-1}>
+      <div className="modal-heading"><div><span className="eyebrow">KEYBOARD SHORTCUTS</span><h2>键盘快捷键</h2></div><button className="icon-button" onClick={onClose} aria-label="关闭快捷键"><X size={19} /></button></div>
+      <div className="shortcut-list">{shortcuts.map(([keys, label]) => <div className="shortcut-row" key={keys}><span>{label}</span><kbd>{keys}</kbd></div>)}</div>
+      <p className="modal-intro">Windows 使用 Ctrl；macOS 使用 Command。</p>
+    </section>
+  </div>
 }
 
 function CommandPalette({ items, selectedIndex, onSelect }: { items: CommandItem[]; selectedIndex: number; onSelect: (item: CommandItem) => void }) {
@@ -1096,7 +1186,104 @@ function toolStatusLabel(value: string | undefined) {
   return runtimeStatusLabels[value] ?? statusLabels[value] ?? value
 }
 
-const TurnProcess = memo(function TurnProcess({ events, live, onCopy }: { events: EventItem[]; live: boolean; onCopy: (text: string) => void }) {
+const toolLifecycleTypes = new Set([
+  'ActionPlanned', 'ActionPrepared', 'ActionStarted', 'ActionSucceeded',
+  'ActionFailed', 'ActionCancelled', 'ActionOutcomeUnknown', 'ToolObservationCommitted',
+])
+
+function actionIdOf(event: EventItem) {
+  const value = event.payload?.action_id
+  return typeof value === 'string' && value ? value : null
+}
+
+function publicStringArray(value: unknown) {
+  return Array.isArray(value) ? value.filter((item): item is string => typeof item === 'string') : []
+}
+
+function toolArgumentSummary(value: Record<string, unknown> | undefined) {
+  if (!value) return ''
+  const preferred = Object.entries(value).find(([key]) => /path|file|url|command/i.test(key))
+  const entry = preferred ?? Object.entries(value)[0]
+  if (!entry) return ''
+  const [key, raw] = entry
+  const text = typeof raw === 'string' ? raw : JSON.stringify(raw)
+  return `${key}: ${String(text ?? '').replace(/\s+/g, ' ').slice(0, 92)}`
+}
+
+function ToolActivityCard({ events, live, onCopy, onOpenPath, onContinueResult, canContinueResult }: {
+  events: EventItem[]
+  live: boolean
+  onCopy: (text: string) => void
+  onOpenPath: (path: string) => void
+  onContinueResult: (observationId: string, cursor: string) => void
+  canContinueResult: (observation: EventItem) => boolean
+}) {
+  const [expanded, setExpanded] = useState(live)
+  const planned = events.find((event) => event.event_type === 'ActionPlanned')
+  const observation = events.find((event) => event.event_type === 'ToolObservationCommitted')
+  const canContinue = observation ? canContinueResult(observation) : false
+  const terminal = [...events].reverse().find((event) => [
+    'ActionSucceeded', 'ActionFailed', 'ActionCancelled', 'ActionOutcomeUnknown',
+  ].includes(event.event_type))
+  const status = observation?.status === 'rejected'
+    ? 'rejected'
+    : terminal?.event_type === 'ActionSucceeded' || observation?.status === 'succeeded'
+      ? 'succeeded'
+      : terminal?.event_type === 'ActionFailed' || observation?.status === 'failed'
+        ? 'failed'
+        : terminal?.event_type === 'ActionOutcomeUnknown' || observation?.status === 'unknown'
+          ? 'unknown'
+          : terminal?.event_type === 'ActionCancelled' || observation?.status === 'cancelled'
+            ? 'cancelled'
+            : events.some((event) => event.event_type === 'ActionStarted') ? 'started' : 'planned'
+  const toolName = planned?.tool_name ?? observation?.tool_name ?? '工具调用'
+  const args = planned?.tool_arguments
+  const argumentSummary = toolArgumentSummary(args)
+  const output = observation?.content ?? ''
+  const paths = [...new Set([
+    ...publicStringArray(observation?.read_paths),
+    ...publicStringArray(observation?.modified_paths),
+  ])]
+  const started = events.find((event) => event.event_type === 'ActionStarted')
+  const startedAt = started ? Date.parse(started.occurred_at) : NaN
+  const endedAt = terminal ? Date.parse(terminal.occurred_at) : NaN
+  const measuredDuration = observation?.duration_ms
+    ?? (Number.isFinite(startedAt) && Number.isFinite(endedAt) ? Math.max(0, endedAt - startedAt) : undefined)
+  const active = status === 'planned' || status === 'started'
+  useEffect(() => {
+    if (live && active) setExpanded(true)
+    else if (!live && !active) setExpanded(false)
+  }, [active, live])
+  const lifecycle = events.filter((event) => toolLifecycleTypes.has(event.event_type))
+
+  return (
+    <details className={'tool-card tool-activity ' + status} open={expanded} onToggle={(event) => setExpanded(event.currentTarget.open)}>
+      <summary>
+        <span className="tool-summary">
+          <span className="tool-icon">{active ? <LoaderCircle size={13} className="spin" /> : status === 'succeeded' ? <Check size={13} /> : status === 'failed' || status === 'unknown' ? <CircleAlert size={13} /> : <Play size={13} />}</span>
+          <span className="tool-name">{toolName}</span>
+          {argumentSummary && <span className="tool-argument-summary" title={argumentSummary}>{argumentSummary}</span>}
+          <span className={'tool-status ' + (status === 'succeeded' ? 'ok' : status === 'failed' || status === 'unknown' ? 'failed' : status === 'rejected' || status === 'cancelled' ? 'rejected' : '')}>{toolStatusLabel(status)}</span>
+        </span>
+        <ChevronDown size={15} />
+      </summary>
+      {expanded && <div className="tool-activity-body">
+        <div className="tool-activity-meta">
+          {measuredDuration != null && <span>{Math.max(0, measuredDuration) < 1000 ? `${Math.round(measuredDuration)} 毫秒` : `${(measuredDuration / 1000).toFixed(1)} 秒`}</span>}
+          {observation?.exit_code != null && <span>退出码 {observation.exit_code}</span>}
+          {observation?.complete === false && <span>结果未完整读取</span>}
+        </div>
+        {args && <section className="tool-activity-section"><div><strong>参数</strong><button className="text-button" onClick={(event) => { event.stopPropagation(); onCopy(JSON.stringify(args, null, 2)) }}><Copy size={12} />复制</button></div><pre>{JSON.stringify(args, null, 2)}</pre></section>}
+        {paths.length > 0 && <div className="tool-path-list">{paths.map((path) => <button key={path} className="tool-path-chip" onClick={() => onOpenPath(path)} title="在产物面板中打开">{path}</button>)}</div>}
+        {(output || observation?.result_truncated) && <section className="tool-activity-section"><div><strong>结果</strong>{observation?.result_lines_total != null && <span>{observation.result_lines_shown ?? 0} / {observation.result_lines_total} {observation.result_lines_unit ?? '行'}</span>}<button className="text-button" onClick={(event) => { event.stopPropagation(); onCopy(output) }} disabled={!output}><Copy size={12} />复制</button></div>{output && <pre>{output}</pre>}{(observation?.result_truncated || observation?.complete === false) && <div className="tool-result-continuation"><small>{observation?.complete === false ? `完整结果已落盘；续读游标 ${observation.next_cursor ?? '可用'}。` : '当前只显示有界预览，完整输出已保存在 Runtime 工具结果中。'}</small>{observation?.complete === false && observation.observation_id && observation.next_cursor && canContinue && <button className="text-button" onClick={(event) => { event.stopPropagation(); onContinueResult(observation.observation_id!, observation.next_cursor!) }}><RotateCcw size={12} />继续读取完整结果</button>}{observation?.complete === false && !canContinue && <small>源运行已结束；当前 Runtime 不接受跨运行续读。</small>}</div>}</section>}
+        {!output && !args && <small className="tool-activity-empty">Runtime 仅返回了工具状态，没有额外结果内容。</small>}
+        <div className="tool-activity-trace">{lifecycle.map((event) => <span key={event.id}>{runtimeEventLabels[event.event_type] ?? event.event_type}</span>)}</div>
+      </div>}
+    </details>
+  )
+}
+
+const TurnProcess = memo(function TurnProcess({ events, live, onCopy, onOpenPath, onContinueResult, canContinueResult }: { events: EventItem[]; live: boolean; onCopy: (text: string) => void; onOpenPath: (path: string) => void; onContinueResult: (observationId: string, cursor: string) => void; canContinueResult: (observation: EventItem) => boolean }) {
   const [expanded, setExpanded] = useState(live)
   // Open the live process automatically, but do not force a user-collapsed
   // historical process back open on every SSE refresh.
@@ -1104,7 +1291,8 @@ const TurnProcess = memo(function TurnProcess({ events, live, onCopy }: { events
     if (live) setExpanded(true)
   }, [live])
   if (events.length === 0) return null
-  const toolCount = events.filter((event) => event.kind === 'tool').length
+  const toolCount = new Set(events.filter((event) => toolLifecycleTypes.has(event.event_type)).map(actionIdOf).filter(Boolean)).size
+    + events.filter((event) => event.kind === 'tool' && !actionIdOf(event)).length
   const messageCount = events.filter((event) => event.kind === 'assistant').length
   const summary = [
     '已思考',
@@ -1119,7 +1307,19 @@ const TurnProcess = memo(function TurnProcess({ events, live, onCopy }: { events
         {live && <span className="turn-process-live">进行中</span>}
       </summary>
       {expanded && <div className="turn-process-body">
-        {events.map((event) => <MessageCard event={event} key={event.id} onCopy={onCopy} />)}
+        {(() => {
+          const renderedActions = new Set<string>()
+          return events.map((event) => {
+            const actionId = actionIdOf(event)
+            if (actionId && toolLifecycleTypes.has(event.event_type)) {
+              if (renderedActions.has(actionId)) return null
+              renderedActions.add(actionId)
+              const related = events.filter((candidate) => actionIdOf(candidate) === actionId && toolLifecycleTypes.has(candidate.event_type))
+              return <ToolActivityCard key={'action-' + actionId} events={related} live={live && related.some((item) => ['ActionPlanned', 'ActionStarted'].includes(item.event_type))} onCopy={onCopy} onOpenPath={onOpenPath} onContinueResult={onContinueResult} canContinueResult={canContinueResult} />
+            }
+            return <MessageCard event={event} key={event.id} onCopy={onCopy} />
+          })
+        })()}
       </div>}
     </details>
   )
@@ -1159,12 +1359,13 @@ type PendingApproval = {
   runId?: string
 }
 
-function ApprovalCard({ approval, onApprove, onReject, busy = false }: { approval: PendingApproval; onApprove: () => void; onReject: () => void; busy?: boolean }) {
+function ApprovalCard({ approval, onApprove, onReject, busy = false, toolArguments }: { approval: PendingApproval; onApprove: () => void; onReject: () => void; busy?: boolean; toolArguments?: Record<string, unknown> }) {
   const action = approval.actionId || '需要授权的动作'
   return (
     <div className="approval-card" role="region" aria-label="待处理审批">
       <div className="approval-heading"><ShieldCheck size={17} /><span><strong>需要你的批准</strong><small>Runtime 正在等待这项本机操作；仍可输入消息，审批后按顺序发送</small></span></div>
       <div className="approval-detail"><span>动作</span><b>{action}</b>{approval.scope.length > 0 && <><span>范围</span><b className="approval-scope" title={approval.scope.join('\n')}>{approval.scope.join('、')}</b></>}</div>
+      {toolArguments && <details className="approval-arguments"><summary>查看已脱敏的参数</summary><pre>{JSON.stringify(toolArguments, null, 2)}</pre></details>}
       <div className="approval-actions"><button className="secondary-button" onClick={onReject} disabled={busy}>{busy ? '处理中…' : '拒绝'}</button><button className="primary-button" onClick={onApprove} disabled={busy}>{busy ? '处理中…' : '允许一次'}</button></div>
     </div>
   )
@@ -1481,31 +1682,41 @@ function ProjectArtifacts({
   projectRoot,
   onChooseProject,
   onCopy,
+  onOpen,
   compact = false,
   reloadKey = 0,
+  initialPath = null,
 }: {
   projectRoot: string | null
   onChooseProject: () => void
   onCopy: (value: string) => void
+  onOpen: (path: string, projectRoot: string) => Promise<void>
   compact?: boolean
   reloadKey?: number
+  initialPath?: string | null
 }) {
   const [files, setFiles] = useState<ProjectArtifact[]>([])
   const [selectedPath, setSelectedPath] = useState<string | null>(null)
+  const [openPaths, setOpenPaths] = useState<string[]>([])
   const [preview, setPreview] = useState<ArtifactPreview | null>(null)
   const [query, setQuery] = useState('')
   const [viewMode, setViewMode] = useState<'preview' | 'code'>('code')
   const [loading, setLoading] = useState(false)
   const [previewLoading, setPreviewLoading] = useState(false)
   const [error, setError] = useState<string | null>(null)
+  const [fullscreen, setFullscreen] = useState(false)
+  const [openBusyPath, setOpenBusyPath] = useState<string | null>(null)
   const listGeneration = useRef(0)
   const previewGeneration = useRef(0)
+  const selectedPathRef = useRef<string | null>(null)
 
   const reload = useCallback(async () => {
     const generation = ++listGeneration.current
     if (!projectRoot) {
       setFiles([])
       setSelectedPath(null)
+      selectedPathRef.current = null
+      setOpenPaths([])
       setPreview(null)
       setError(null)
       return
@@ -1518,17 +1729,29 @@ function ProjectArtifacts({
       if (result.project_root !== projectRoot) {
         setFiles([])
         setSelectedPath(null)
+        selectedPathRef.current = null
+        setOpenPaths([])
         setError('当前选中的项目已变化，请重新打开产物列表。')
         return
       }
       setFiles(result.files)
-      setSelectedPath((current) => result.files.some((item) => item.path === current) ? current : result.files[0]?.path ?? null)
+      const next = result.files.some((item) => item.path === initialPath)
+        ? initialPath
+        : result.files.some((item) => item.path === selectedPathRef.current)
+          ? selectedPathRef.current
+        : result.files[0]?.path ?? null
+      selectedPathRef.current = next
+      setSelectedPath(next)
+      setOpenPaths((paths) => {
+        const available = paths.filter((path) => result.files.some((item) => item.path === path))
+        return next && !available.includes(next) ? [...available, next].slice(-8) : available
+      })
     } catch (reason) {
       if (generation === listGeneration.current) setError(displayApiError(reason))
     } finally {
       if (generation === listGeneration.current) setLoading(false)
     }
-  }, [projectRoot])
+  }, [initialPath, projectRoot])
 
   useEffect(() => { void reload() }, [reload, reloadKey])
 
@@ -1565,8 +1788,37 @@ function ProjectArtifacts({
     setViewMode(supportsDocumentPreview ? 'preview' : 'code')
   }, [selectedPath, supportsDocumentPreview])
 
+  function selectArtifact(path: string) {
+    selectedPathRef.current = path
+    setSelectedPath(path)
+    setOpenPaths((current) => current.includes(path) ? current : [...current, path].slice(-8))
+  }
+
+  function closeArtifactTab(path: string) {
+    const remaining = openPaths.filter((item) => item !== path)
+    setOpenPaths(remaining)
+    if (selectedPath === path) {
+      const next = remaining[remaining.length - 1] ?? null
+      selectedPathRef.current = next
+      setSelectedPath(next)
+    }
+  }
+
+  async function openArtifactFile(path: string) {
+    if (!projectRoot) return
+    setOpenBusyPath(path)
+    setError(null)
+    try {
+      await onOpen(path, projectRoot)
+    } catch (reason) {
+      setError(displayApiError(reason))
+    } finally {
+      setOpenBusyPath(null)
+    }
+  }
+
   return (
-    <section className={'artifact-page' + (compact ? ' compact-artifact-page' : '')}>
+    <section className={'artifact-page' + (compact ? ' compact-artifact-page' : '') + (fullscreen ? ' artifact-fullscreen' : '')}>
       <header className="artifact-page-header">
         <div className="artifact-title-group">
           <span className="eyebrow">PROJECT FILES</span>
@@ -1575,6 +1827,7 @@ function ProjectArtifacts({
         </div>
         <div className="artifact-header-actions">
           {projectRoot && <span className="artifact-count">{files.length} 个文件</span>}
+          <button className="icon-button artifact-fullscreen-button" onClick={() => setFullscreen((value) => !value)} title={fullscreen ? '退出全屏' : '全屏'} aria-label={fullscreen ? '退出产物全屏' : '产物全屏'}>{fullscreen ? <Minimize2 size={15} /> : <Maximize2 size={15} />}</button>
           <button className="icon-button" onClick={() => void reload()} disabled={loading || !projectRoot} title="刷新产物列表" aria-label="刷新产物列表"><RefreshCw size={16} className={loading ? 'spin' : ''} /></button>
         </div>
       </header>
@@ -1595,7 +1848,7 @@ function ProjectArtifacts({
               {visibleFiles.map((item) => {
                 const ItemIcon = artifactIcon(item.path)
                 return (
-                  <button key={item.path} className={'artifact-file-row' + (selectedPath === item.path ? ' selected' : '')} onClick={() => setSelectedPath(item.path)}>
+                  <button key={item.path} className={'artifact-file-row' + (selectedPath === item.path ? ' selected' : '')} onClick={() => selectArtifact(item.path)}>
                     <ItemIcon size={16} />
                     <span className="artifact-file-copy"><strong title={item.path}>{item.path.split('/').pop()}</strong><small title={item.path}>{item.path.includes('/') ? item.path.slice(0, item.path.lastIndexOf('/')) : '项目根目录'}</small></span>
                     {item.unsafe ? <span className="artifact-file-missing">路径受限</span> : !item.exists && <span className="artifact-file-missing">已删除</span>}
@@ -1606,11 +1859,18 @@ function ProjectArtifacts({
             <div className="artifact-list-footnote">汇总此项目的全部历史任务 · 路径去重</div>
           </aside>
           <section className="artifact-preview-pane" aria-label="产物预览">
+            {openPaths.length > 0 && <nav className="artifact-tabs" role="tablist" aria-label="已打开的产物">
+              {openPaths.map((path) => <div className={'artifact-tab' + (selectedPath === path ? ' selected' : '')} key={path}>
+                <button role="tab" aria-selected={selectedPath === path} title={path} onClick={() => selectArtifact(path)}>{path.split('/').pop()}</button>
+                <button className="artifact-tab-close" aria-label={'关闭 ' + path} onClick={() => closeArtifactTab(path)}><X size={12} /></button>
+              </div>)}
+            </nav>}
             {selected ? (
               <>
                 <header className="artifact-preview-header">
                   <div className="artifact-preview-heading"><Icon size={18} /><div><strong title={selected.path}>{selected.path}</strong><span>{selected.exists ? `${artifactSize(selected.size_bytes)} · 当前文件` : '当前文件不存在'}</span></div></div>
                   <div className="artifact-preview-actions">
+                    {selected.exists && projectRoot && <button className="text-button artifact-open-file" onClick={() => void openArtifactFile(selected.path)} disabled={openBusyPath === selected.path} title="使用本机默认程序打开"><ExternalLink size={14} />{openBusyPath === selected.path ? '正在打开…' : '在文件中打开'}</button>}
                     {supportsDocumentPreview && <div className="artifact-view-switch" role="tablist" aria-label="产物视图">
                       <button role="tab" aria-selected={viewMode === 'preview'} className={viewMode === 'preview' ? 'selected' : ''} onClick={() => setViewMode('preview')}>预览</button>
                       <button role="tab" aria-selected={viewMode === 'code'} className={viewMode === 'code' ? 'selected' : ''} onClick={() => setViewMode('code')}>代码</button>
@@ -1627,7 +1887,7 @@ function ProjectArtifacts({
                   {!previewLoading && preview && !preview.previewable && <div className="artifact-preview-message"><FileText size={20} /><strong>无法预览此文件</strong><span>{preview.reason ?? '当前路径不可安全预览'}</span></div>}
                   {!previewLoading && preview?.previewable && viewMode === 'preview' && supportsDocumentPreview
                     ? <article className="artifact-rendered-view" dangerouslySetInnerHTML={renderMarkdown(preview.content ?? '')} />
-                    : !previewLoading && preview?.previewable && <pre><code>{preview.content}</code></pre>}
+                    : !previewLoading && preview?.previewable && <SyntaxCode content={preview.content ?? ''} />}
                   {!previewLoading && !preview && !selected.exists && <div className="artifact-preview-message"><FileText size={20} /><strong>当前文件不存在</strong><span>预览只读取项目当前内容，不保留旧版本。</span></div>}
                   {!previewLoading && !preview && selected.exists && <div className="artifact-preview-message"><FileText size={20} /><strong>文件预览暂不可用</strong><span>检查项目选择后重试，产物预览不会读取其他项目或历史快照。</span></div>}
                 </div>
@@ -1681,6 +1941,7 @@ function App() {
   const [mainPage, setMainPage] = useState<'chat' | 'artifacts'>('chat')
   const [rightPane, setRightPane] = useState<'runtime' | 'artifacts'>('runtime')
   const [artifactRefreshKey, setArtifactRefreshKey] = useState(0)
+  const [artifactTargetPath, setArtifactTargetPath] = useState<string | null>(null)
   const [project, setProject] = useState<{ root: string } | null>(null)
   const [settings, setSettings] = useState<SettingsState>({ base_url: '', model: '', permission_mode: 'default', has_api_key: false, api_key_masked: '' })
   const [sessions, setSessions] = useState<Session[]>([])
@@ -1709,6 +1970,7 @@ function App() {
   const [error, setError] = useState<string | null>(null)
   const [toast, setToast] = useState<string | null>(null)
   const [settingsOpen, setSettingsOpen] = useState(false)
+  const [shortcutsOpen, setShortcutsOpen] = useState(false)
   const [contextOpen, setContextOpen] = useState(false)
   const [contextAnchor, setContextAnchor] = useState<'bottom' | null>(null)
   const [leftCollapsed, setLeftCollapsed] = useState(false)
@@ -1871,7 +2133,7 @@ function App() {
       // replays every project root), so fetch it after the conversation is
       // already visible instead of making a session switch wait for it.
       const [timeline, state] = await Promise.all([
-        webApi<{ events: EventItem[] }>('/api/sessions/' + encodeURIComponent(runId) + '/timeline'),
+        webApi<{ events: EventItem[] }>('/api/sessions/' + encodeURIComponent(runId) + '/timeline?limit=10000'),
         webApi<{ project_root?: string; context: ContextState; status: string; executor?: ExecutorState; scheduler?: SchedulerState; projection?: { goal?: unknown; plan?: unknown; todos?: unknown; discovery_status?: unknown; mutation_gate?: unknown; queue?: QueueProjection[]; approvals?: Array<{ approval_id: string; run_id?: string; action_args_digest: string; action_id?: string; scope?: string[]; status: string }> } }>('/api/sessions/' + encodeURIComponent(runId)),
       ])
       // A session can be switched while these two requests are in flight.
@@ -2181,6 +2443,8 @@ function App() {
           && Array.isArray(next.payload?.modified_paths)
           && next.payload.modified_paths.length > 0
         ) {
+          const firstChangedPath = next.payload.modified_paths.find((path): path is string => typeof path === 'string')
+          if (firstChangedPath) setArtifactTargetPath(firstChangedPath.replace(/\\/g, '/'))
           setArtifactRefreshKey((value) => value + 1)
           setRightPane('artifacts')
           setRightCollapsed(false)
@@ -2350,8 +2614,21 @@ function App() {
       setShowNewMessages(true)
       return
     }
-    window.requestAnimationFrame(() => bottomRef.current?.scrollIntoView({ behavior: activeStreaming ? 'auto' : 'smooth', block: 'end' }))
+    window.requestAnimationFrame(() => scrollConversationToLatest(activeStreaming ? 'auto' : 'smooth'))
   }, [activeStreaming, displayEvents.length])
+
+  function scrollConversationToLatest(behavior: ScrollBehavior) {
+    const element = conversationRef.current
+    if (!element) return
+    const distance = element.scrollHeight - element.clientHeight - element.scrollTop
+    // A smooth scroll across a multi-thousand-turn virtual history can take
+    // minutes and feels like a broken jump control. Keep short movements
+    // animated, but place the reader immediately when the gap is large.
+    const effectiveBehavior = behavior === 'smooth' && distance > Math.max(1600, element.clientHeight * 2)
+      ? 'instant'
+      : behavior
+    element.scrollTo({ top: element.scrollHeight, behavior: effectiveBehavior })
+  }
 
   function handleConversationScroll() {
     const element = conversationRef.current
@@ -2365,7 +2642,7 @@ function App() {
   function jumpToLatest() {
     stickToBottom.current = true
     setShowNewMessages(false)
-    bottomRef.current?.scrollIntoView({ behavior: 'smooth', block: 'end' })
+    scrollConversationToLatest('smooth')
   }
 
   useEffect(() => {
@@ -2375,10 +2652,19 @@ function App() {
         event.preventDefault()
         searchRef.current?.focus()
       }
+      if (modifier && event.key.toLowerCase() === 'n') {
+        event.preventDefault()
+        startNewSession()
+      }
+      if (modifier && (event.key === '/' || event.key === '?')) {
+        event.preventDefault()
+        setShortcutsOpen(true)
+      }
       if (modifier && event.key === ',') {
         event.preventDefault()
         setSettingsOpen(true)
       }
+      if (event.key === 'Escape' && shortcutsOpen) setShortcutsOpen(false)
       if (event.key === 'Escape' && contextOpen) {
         setContextOpen(false)
         setContextAnchor(null)
@@ -2386,7 +2672,7 @@ function App() {
     }
     window.addEventListener('keydown', onShortcut)
     return () => window.removeEventListener('keydown', onShortcut)
-  }, [contextOpen])
+  }, [contextOpen, shortcutsOpen])
 
   const active = sessions.find((session) => session.run_id === activeSession) ?? null
   const filteredSessions = useMemo(() => {
@@ -2401,13 +2687,42 @@ function App() {
       groups.set(root, [...(groups.get(root) ?? []), session])
     })
     if (project && !sessionQuery.trim() && !groups.has(project.root)) groups.set(project.root, [])
-    return [...groups.entries()].map(([root, groupSessions]) => ({ root, sessions: groupSessions }))
+    return [...groups.entries()].map(([root, groupSessions]) => ({
+      root,
+      sessions: [...groupSessions].sort((left, right) => (
+        Date.parse(right.updated_at ?? right.created_at ?? '') || 0
+      ) - (
+        Date.parse(left.updated_at ?? left.created_at ?? '') || 0
+      )),
+    }))
   }, [filteredSessions, project, sessionQuery])
   const conversationEvents = useMemo(
-    () => displayEvents.filter((event) => event.kind === 'user' || event.kind === 'assistant' || event.kind === 'tool'),
+    () => displayEvents.filter((event) => event.kind === 'user' || event.kind === 'assistant' || event.kind === 'tool' || toolLifecycleTypes.has(event.event_type)),
     [displayEvents],
   )
   const conversationTurns = useMemo(() => groupConversationTurns(conversationEvents), [conversationEvents])
+  const retryableTurn = useMemo(() => {
+    if (!active || !['cancelled', 'stalled', 'failed_recoverable', 'blocked'].includes(active.status)) return null
+    let lastUserIndex = -1
+    conversationEvents.forEach((event, index) => {
+      if (event.kind === 'user' && Boolean(event.content?.trim())) lastUserIndex = index
+    })
+    if (lastUserIndex < 0) return null
+    const laterEvents = conversationEvents.slice(lastUserIndex + 1)
+    const mayHaveExecutedAction = laterEvents.some((event) => [
+      'ActionStarted', 'ActionSucceeded', 'ActionFailed', 'ToolObservationCommitted', 'ApprovalDecided',
+    ].includes(event.event_type))
+    if (mayHaveExecutedAction) return null
+    const lastUser = conversationEvents[lastUserIndex]
+    return lastUser.content ? { text: lastUser.content, id: lastUser.id } : null
+  }, [active, conversationEvents])
+  const conversationVirtualizer = useVirtualizer({
+    count: conversationTurns.length,
+    getScrollElement: () => conversationRef.current,
+    estimateSize: () => 360,
+    getItemKey: (index) => conversationTurns[index]?.id ?? index,
+    overscan: 6,
+  })
   const durableQueue = useMemo(() => deriveQueuedMessages(displayEvents), [displayEvents])
   const durableFollowUpIds = useMemo(
     () => new Set(displayEvents.filter((event) => event.event_type === 'FollowUpQueued').map((event) => String(event.payload?.follow_up_run_id ?? '')).filter(Boolean)),
@@ -2451,6 +2766,44 @@ function App() {
 
   function notify(message: string) {
     setToast(message)
+  }
+
+  async function openArtifactFile(path: string, projectRoot: string) {
+    await webApi<{ opened: boolean }>('/api/artifacts/open', {
+      method: 'POST',
+      body: JSON.stringify({ path, project_root: projectRoot }),
+    })
+    notify('已使用本机默认程序打开文件')
+  }
+
+  function continueToolResult(observationId: string, cursor: string) {
+    if (!observationId || !cursor || observationId.length > 128 || cursor.length > 128) return
+    const prompt = `请调用 ContinueToolResult 继续读取这个只读结果，参数 observation_id=${JSON.stringify(observationId)}、next_cursor=${JSON.stringify(cursor)}。不要重新执行原工具，也不要修改文件。`
+    void sendMessage(prompt)
+  }
+
+  function canContinueToolResult(observation: EventItem) {
+    if (!active || !['cancelled', 'stalled', 'failed_recoverable', 'blocked'].includes(active.status)) return false
+    if (observation.run_id !== active.run_id) return false
+    // Follow-up messages run in a child Run. ContinueToolResult deliberately
+    // reads only observations committed by its own Run, so an older cursor
+    // cannot be offered after the conversation has moved to a child.
+    return !displayEvents.some((event) => event.event_type === 'FollowUpQueued'
+      && event.run_id === observation.run_id
+      && event.sequence > observation.sequence)
+  }
+
+  function inspectArtifactPath(path: string) {
+    const relative = path.replace(/\\/g, '/').replace(/^\.\//, '')
+    if (!relative || relative.startsWith('/') || /^[a-z]:\//i.test(relative) || relative.split('/').includes('..')) {
+      notify('该路径不属于当前项目文件列表')
+      return
+    }
+    setArtifactTargetPath(relative)
+    setMainPage('chat')
+    setRightPane('artifacts')
+    setRightCollapsed(false)
+    setArtifactRefreshKey((value) => value + 1)
   }
 
   function toggleContext(anchor: 'bottom') {
@@ -2578,13 +2931,13 @@ function App() {
     }
   }
 
-  async function sendMessage() {
+  async function sendMessage(retryText?: string) {
     if (!project) {
       setError('请先选择本地项目文件夹')
       notify('选择项目后才能开始工作')
       return
     }
-    const text = draftRef.current.trim()
+    const text = (retryText ?? draftRef.current).trim()
     if (!text || sending) return
     const requestedSession = activeSession
     // A stalled/cancelled run may be resumed in-place. Allow its next
@@ -2996,6 +3349,14 @@ function App() {
           {projectGroups.length === 0 && <div className="empty-sessions"><History size={18} /><p>{sessionQuery ? '没有匹配的会话' : '还没有会话'}</p><span>{sessionQuery ? '换个关键词试试' : '发送第一条任务开始工作'}</span></div>}
           {projectGroups.map(({ root, sessions: groupSessions }) => {
             const collapsed = collapsedProjects[root] ?? false
+            const dateGroups = [
+              { label: '今天', key: 'today' as const },
+              { label: '近 7 天', key: 'week' as const },
+              { label: '更早', key: 'older' as const },
+            ].map((group) => ({
+              ...group,
+              sessions: groupSessions.filter((session) => sessionTimeGroup(session) === group.key),
+            })).filter((group) => group.sessions.length > 0)
             return <section className="project-group" key={root}>
               <button className="project-group-header" onClick={() => toggleProjectGroup(root)} title={root} aria-expanded={!collapsed}>
                 <span className="project-group-icon"><Folder size={14} /></span>
@@ -3006,7 +3367,10 @@ function App() {
               {!collapsed && <div className="project-group-sessions">
                 {groupSessions.length === 0
                   ? <div className="project-group-empty">暂无会话</div>
-                   : groupSessions.map((session) => <div className="session-item-row" key={session.run_id}><button className={'session-item ' + (activeSession === session.run_id ? 'selected' : '')} onClick={() => void activateSession(session)}><StatusDot status={session.status} /><span className="session-title">{session.title}</span><span className="session-status">{statusLabels[session.status] ?? session.status}<span className="session-sequence"> · {session.sequence} 事件</span></span></button>{deleteCandidate === session.run_id ? <span className="session-delete-confirm" role="group" aria-label={'确认删除会话 ' + session.title}><span className="session-delete-confirm-label">删除？</span><button type="button" className="session-delete-confirm-yes" onClick={(event) => { event.stopPropagation(); void deleteSession(session) }}>确定</button><button type="button" className="session-delete-confirm-no" onClick={(event) => { event.stopPropagation(); setDeleteCandidate(null) }}>取消</button></span> : <button type="button" className="session-delete" onClick={(event) => { event.stopPropagation(); requestDeleteSession(session) }} disabled={deletingSession === session.run_id} aria-label={'删除会话 ' + session.title} title="删除会话">{deletingSession === session.run_id ? <LoaderCircle size={14} className="spin" /> : <Trash2 size={14} />}</button>}</div>)}
+                  : dateGroups.map((dateGroup) => <section className="session-time-group" key={dateGroup.key}>
+                    <h3>{dateGroup.label}</h3>
+                    {dateGroup.sessions.map((session) => <div className="session-item-row" key={session.run_id}><button className={'session-item ' + (activeSession === session.run_id ? 'selected' : '')} onClick={() => void activateSession(session)}><StatusDot status={session.status} /><span className="session-title">{session.title}</span><span className="session-status">{statusLabels[session.status] ?? session.status}<span className="session-sequence"> · {session.sequence} 事件</span></span></button>{deleteCandidate === session.run_id ? <span className="session-delete-confirm" role="group" aria-label={'确认删除会话 ' + session.title}><span className="session-delete-confirm-label">删除？</span><button type="button" className="session-delete-confirm-yes" onClick={(event) => { event.stopPropagation(); void deleteSession(session) }}>确定</button><button type="button" className="session-delete-confirm-no" onClick={(event) => { event.stopPropagation(); setDeleteCandidate(null) }}>取消</button></span> : <button type="button" className="session-delete" onClick={(event) => { event.stopPropagation(); requestDeleteSession(session) }} disabled={deletingSession === session.run_id} aria-label={'删除会话 ' + session.title} title="删除会话">{deletingSession === session.run_id ? <LoaderCircle size={14} className="spin" /> : <Trash2 size={14} />}</button>}</div>)}
+                  </section>)}
               </div>}
             </section>
           })}
@@ -3018,7 +3382,7 @@ function App() {
       </aside>
       <main className={mainClass}>
         {mainPage === 'artifacts'
-          ? <ProjectArtifacts key={project?.root ?? 'no-project'} projectRoot={project?.root ?? null} onChooseProject={() => void chooseProject()} onCopy={(text) => void copyText(text)} reloadKey={artifactRefreshKey} />
+          ? <ProjectArtifacts key={project?.root ?? 'no-project'} projectRoot={project?.root ?? null} onChooseProject={() => void chooseProject()} onCopy={(text) => void copyText(text)} onOpen={openArtifactFile} initialPath={artifactTargetPath} reloadKey={artifactRefreshKey} />
           : <>
         <header className="topbar">
           <div className="breadcrumb"><span className="topbar-project">{projectName}</span><ChevronRight size={14} /><span className="topbar-title">{sessionLoading ? '正在载入会话…' : active ? active.title : '新会话'}</span></div>
@@ -3029,21 +3393,62 @@ function App() {
               {!project && <div className="welcome-state no-project"><div className="welcome-orbit"><Sparkles size={25} /></div><span className="welcome-kicker">本地工作空间</span><div className="welcome-title-line"><h1>把你的项目交给 cc-harness</h1></div><p>先选择一个本机项目文件夹，主 Agent 才能在安全边界内读取和修改代码。<br />浏览器关闭不会停止已提交的 Durable Run。</p><div className="welcome-actions"><button className="primary-button" onClick={chooseProject}><FolderOpen size={16} />选择项目文件夹</button><button className="text-button" onClick={chooseProjectManually}>手动输入路径</button></div><div className="welcome-note"><ShieldCheck size={14} />本地处理 · 可恢复检查点 · 可审计事件</div></div>}
               {project && sessionLoading && <div className="session-loading" role="status" aria-live="polite"><LoaderCircle className="spin" size={22} /><div><strong>正在载入会话</strong><span>正在从 Durable Runtime 对账事件、状态和检查点…</span></div></div>}
               {project && !sessionLoading && conversationTurns.length === 0 && <div className="welcome-state project-ready"><div className="welcome-orbit small"><Bot size={23} /></div><span className="welcome-kicker">项目已就绪 · {projectName}</span><div className="welcome-title-line"><h1>有什么可以帮你的？</h1></div><p>描述你希望完成的事，或从下面选一个开始。</p></div>}
-              <div className="message-stack">{conversationTurns.map((turn, index) => <section className="conversation-turn" key={turn.id}>{turn.user && <MessageCard event={turn.user} onCopy={copyText} />}<TurnProcess events={turn.process} live={active != null && ['running', 'awaiting_approval'].includes(active.status) && index === conversationTurns.length - 1} onCopy={copyText} />{turn.assistants.map((event) => <MessageCard event={event} key={event.id} onCopy={copyText} />)}</section>)}{active && ['running', 'queued', 'awaiting_approval'].includes(active.status) && <div className="typing-indicator"><span /><span /><span /><em>{streamingHint(activeStreaming)}</em></div>}{activeStreaming?.error && <div className="stream-error-notice" role="status"><CircleAlert size={15} /><div><strong>{activeStreaming.error.message}</strong><span>{activeStreaming.error.next_action}</span></div></div>}{activeStreaming?.phase === 'stopped' && (activeStreaming.text || activeStreaming.reasoning) && <div className="event-notice"><CircleStop size={15} /><span>已停止，保留已生成的内容</span></div>}{activeStreaming?.phase === 'failed' && (activeStreaming.text || activeStreaming.reasoning) && <div className="event-notice error"><CircleAlert size={15} /><span>本轮失败，保留已生成的内容</span></div>}{continuationNotice && <div className="continuation-notice" role="status"><LoaderCircle size={14} className="spin" /><span>{continuationNotice}</span></div>}{sseNotice && <div className={'continuation-notice sse-notice ' + sseStatus} role="status"><span className="sse-status-dot" />{sseNotice}</div>}{pendingApprovals.length > 0 && <ApprovalCard approval={pendingApprovals[0]} busy={approvalBusyId === pendingApprovals[0].approvalId} onApprove={() => void approve(pendingApprovals[0])} onReject={() => void reject(pendingApprovals[0])} />}<div ref={bottomRef} /></div>
+              <div className="message-stack" style={{ height: conversationVirtualizer.getTotalSize() }}>
+                {conversationVirtualizer.getVirtualItems().map((item) => {
+                  const turn = conversationTurns[item.index]
+                  if (!turn) return null
+                  return <section
+                    className="conversation-turn"
+                    key={turn.id}
+                    data-index={item.index}
+                    ref={conversationVirtualizer.measureElement}
+                    style={{ transform: `translateY(${item.start}px)` }}
+                  >
+                  {turn.user && <MessageCard event={turn.user} onCopy={copyText} />}
+                  <TurnProcess
+                    events={turn.process}
+                    live={active != null && ['running', 'awaiting_approval'].includes(active.status) && item.index === conversationTurns.length - 1}
+                    onCopy={copyText}
+                    onOpenPath={inspectArtifactPath}
+                    onContinueResult={continueToolResult}
+                    canContinueResult={canContinueToolResult}
+                  />
+                  {turn.assistants.map((event) => <MessageCard event={event} key={event.id} onCopy={copyText} />)}
+                  </section>
+                })}
+              </div>
+              <div className="conversation-live-tail">
+                {activeStreaming?.phase === 'tool' && <div className="live-tool-card" role="status"><LoaderCircle size={14} className="spin" /><span>正在调用 <strong>{activeStreaming.tool_name || '工具'}</strong></span></div>}
+                {active && ['running', 'queued', 'awaiting_approval'].includes(active.status) && <div className="typing-indicator"><span /><span /><span /><em>{streamingHint(activeStreaming)}</em></div>}
+                {activeStreaming?.error && <div className="stream-error-notice" role="status"><CircleAlert size={15} /><div><strong>{activeStreaming.error.message}</strong><span>{activeStreaming.error.next_action}</span></div></div>}
+                {activeStreaming?.phase === 'stopped' && (activeStreaming.text || activeStreaming.reasoning) && <div className="event-notice"><CircleStop size={15} /><span>已停止，保留已生成的内容</span></div>}
+                {activeStreaming?.phase === 'failed' && (activeStreaming.text || activeStreaming.reasoning) && <div className="event-notice error"><CircleAlert size={15} /><span>本轮失败，保留已生成的内容</span></div>}
+                {retryableTurn && <div className="retry-turn-notice" role="status"><div><strong>本轮尚未执行工具，可以安全重试</strong><span>已保留原始消息；继续操作仍由 Runtime 检查点管理。</span></div><button className="secondary-button compact" onClick={() => void sendMessage(retryableTurn.text)}><RotateCcw size={14} />重试本轮</button></div>}
+                {continuationNotice && <div className="continuation-notice" role="status"><LoaderCircle size={14} className="spin" /><span>{continuationNotice}</span></div>}
+                {sseNotice && <div className={'continuation-notice sse-notice ' + sseStatus} role="status"><span className="sse-status-dot" />{sseNotice}</div>}
+                {pendingApprovals.length > 0 && <ApprovalCard
+                  approval={pendingApprovals[0]}
+                  busy={approvalBusyId === pendingApprovals[0].approvalId}
+                  toolArguments={displayEvents.find((event) => event.event_type === 'ActionPlanned' && String(event.payload?.action_id ?? '') === pendingApprovals[0].actionId)?.tool_arguments}
+                  onApprove={() => void approve(pendingApprovals[0])}
+                  onReject={() => void reject(pendingApprovals[0])}
+                />}
+                <div ref={bottomRef} />
+              </div>
             </div>
             {showNewMessages && <button className="jump-to-latest" onClick={jumpToLatest}><ChevronDown size={14} />跳到最新消息</button>}
           </section>
         {error && <div className="error-banner"><AlertCircle size={16} /><span>{error}</span><button onClick={() => setError(null)} aria-label="关闭错误"><X size={14} /></button></div>}
 
         <footer className="composer-wrap">
-          <div className="composer-label-row"><span>{sessionLoading ? '正在载入会话…' : active ? '继续与 cc-harness 协作' : '新的任务'}</span><span className="composer-shortcut"><Keyboard size={13} /> Enter 发送 · Shift+Enter 换行</span></div>
+          <div className="composer-label-row"><span>{sessionLoading ? '正在载入会话…' : active ? '继续与 cc-harness 协作' : '新的任务'}</span><span className="composer-shortcut"><Keyboard size={13} /> Enter 发送 · Shift+Enter 换行 · Ctrl+/ 快捷键</span></div>
           {active && <RuntimeProgress key={active.run_id} status={active.status} sequence={active.sequence} streaming={activeStreaming} events={displayEvents} hasApproval={pendingApprovals.length > 0} facts={runFacts} />}
           <QueuePanel items={queueItems} />
           <div className="composer">
             {commandPaletteOpen && <CommandPalette items={visibleCommands} selectedIndex={commandIndex} onSelect={selectCommand} />}
             <div className="composer-toolbar"><button className={'composer-project ' + (!project ? 'needs-project' : '')} onClick={chooseProject}><FolderOpen size={16} /><span>{project ? projectName : '选择项目文件夹'}</span><ChevronDown size={14} /></button><div className="composer-toolbar-right"><span className="composer-mode"><ShieldCheck size={13} />本地 Runtime</span></div></div>
              <textarea ref={textareaRef} value={draft} onChange={(event) => { updateDraft(event.target.value); setCursorPosition(event.currentTarget.selectionStart ?? event.currentTarget.value.length); setCommandIndex(0) }} onKeyDown={handleComposerKeyDown} onClick={(event) => { syncCursorPosition(event); if (!project) notify('请先选择本地项目文件夹') }} onKeyUp={syncCursorPosition} onSelect={syncCursorPosition} disabled={!project || sending || sessionLoading} placeholder={sessionLoading ? '正在载入会话…' : project ? '描述要完成的任务，或输入 / 查看命令…' : '请先选择本地项目文件夹'} rows={1} aria-label="任务输入框" />
-           <div className="composer-footer"><div className="composer-footer-left"><PermissionSelector mode={settings.permission_mode} onChange={(mode) => void changePermissionMode(mode)} /><span className="privacy-note"><ShieldCheck size={13} />内容只在本机 Runtime 处理</span>{pendingApprovals.length > 0 && <span className="composer-queue-hint" title="这条消息会在当前工具审批完成后按顺序发送">审批后发送</span>}{active && ['running', 'queued', 'awaiting_approval'].includes(active.status) && pendingApprovals.length === 0 && <span className="composer-queue-hint">消息将排队</span>}</div><div className="composer-actions">{active && ['running', 'queued', 'awaiting_approval'].includes(active.status) && <button className="stop-button" onClick={() => void stopSession()} title="保存当前检查点并停止，随后可发送新指令" aria-label="停止运行"><CircleStop size={15} /><span>停止并转向</span></button>}{active && ['cancelled', 'stalled', 'failed_recoverable', 'blocked'].includes(active.status) && <button className="secondary-button compact" onClick={() => void resumeSession()}><RotateCcw size={15} />{active.status === 'blocked' ? '确认继续' : '继续'}</button>}<button className="send-button" onClick={() => void sendMessage()} disabled={!project || !draft.trim() || sending || sessionLoading} aria-label={sending ? '正在提交' : '发送'} title={sending ? '正在提交' : '发送'}>{sending ? <LoaderCircle size={16} className="spin" /> : <Send size={16} />}<span>{sending ? '提交中' : active && pendingApprovals.length > 0 ? '排队' : active && ['running', 'queued'].includes(active.status) ? '排队' : '发送'}</span></button></div></div>
+          <div className="composer-footer"><div className="composer-footer-left"><PermissionSelector mode={settings.permission_mode} onChange={(mode) => void changePermissionMode(mode)} /><span className="privacy-note"><ShieldCheck size={13} />内容只在本机 Runtime 处理</span>{pendingApprovals.length > 0 && <span className="composer-queue-hint" title="这条消息会在当前工具审批完成后按顺序发送">审批后发送</span>}{active && ['running', 'queued', 'awaiting_approval'].includes(active.status) && pendingApprovals.length === 0 && <span className="composer-queue-hint">消息将排队</span>}</div><div className="composer-actions">{active && ['running', 'queued', 'awaiting_approval'].includes(active.status) && <button className="stop-button" onClick={() => void stopSession()} title="保存当前检查点并停止，随后可发送新指令" aria-label="停止运行"><CircleStop size={15} /><span>停止并转向</span></button>}{active && ['cancelled', 'stalled', 'failed_recoverable', 'blocked'].includes(active.status) && !retryableTurn && <button className="secondary-button compact" onClick={() => void resumeSession()}><RotateCcw size={15} />{active.status === 'blocked' ? '确认继续' : '继续'}</button>}<button className="send-button" onClick={() => void sendMessage()} disabled={!project || !draft.trim() || sending || sessionLoading} aria-label={sending ? '正在提交' : '发送'} title={sending ? '正在提交' : '发送'}>{sending ? <LoaderCircle size={16} className="spin" /> : <Send size={16} />}<span>{sending ? '提交中' : active && pendingApprovals.length > 0 ? '排队' : active && ['running', 'queued'].includes(active.status) ? '排队' : '发送'}</span></button></div></div>
           </div>
           {project && !sessionLoading && conversationTurns.length === 0 && <WelcomeSuggestions onChoose={usePrompt} />}
         </footer>
@@ -3067,7 +3472,7 @@ function App() {
           </div>
         </div>
         {rightPane === 'artifacts'
-          ? <ProjectArtifacts key={project?.root ?? 'no-project'} projectRoot={project?.root ?? null} onChooseProject={() => void chooseProject()} onCopy={(text) => void copyText(text)} compact reloadKey={artifactRefreshKey} />
+          ? <ProjectArtifacts key={project?.root ?? 'no-project'} projectRoot={project?.root ?? null} onChooseProject={() => void chooseProject()} onCopy={(text) => void copyText(text)} onOpen={openArtifactFile} initialPath={artifactTargetPath} compact reloadKey={artifactRefreshKey} />
           : <>
         <div className="inspector-scroll">
            <section className="inspector-card runtime-overview"><div className="card-eyebrow"><span className="pulse-dot" /> DURABLE RUNTIME</div><div className="runtime-state"><StatusDot status={status} /><div><strong>{status === 'idle' ? '等待输入' : statusLabels[status] ?? status}</strong><span>{active ? '事件序号 ' + active.sequence : '选择项目后开始'}</span></div></div><div className="inspector-row"><span>项目</span><strong>{project ? '已选择' : '未选择'}</strong></div><div className="inspector-row"><span>活动会话</span><strong>{active ? '已连接' : '—'}</strong></div><div className="inspector-row"><span>执行后端</span><strong className={executor.degraded ? 'warn-text' : ''}>{connectionLabel}</strong></div><div className="inspector-row"><span>调度器</span><strong className={scheduler.mode === 'external' ? 'warn-text' : ''}>{scheduler.label}</strong></div><div className="inspector-row"><span>审批</span><strong className={pendingApprovals.length > 0 ? 'warn-text' : ''}>{pendingApprovals.length > 0 ? pendingApprovals.length + ' 项待处理' : '无待处理'}</strong></div></section>
@@ -3080,6 +3485,7 @@ function App() {
           </>}
       </aside>
       {settingsOpen && <SettingsModal initial={settings} onClose={() => setSettingsOpen(false)} onSaved={(value) => setSettings(value)} />}
+      {shortcutsOpen && <KeyboardShortcutsModal onClose={() => setShortcutsOpen(false)} />}
       {toast && <div className="toast" role="status"><Check size={15} />{toast}</div>}
     </div>
   )
