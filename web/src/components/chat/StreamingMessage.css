@@ -1,0 +1,13 @@
+.stream-thinking { margin: 4px 0 14px; border-left: 2px solid var(--border-strong); color: var(--muted); }
+.stream-thinking.active { border-color: color-mix(in srgb, var(--accent) 62%, var(--border-strong)); }
+.stream-thinking-toggle { min-height: 28px; display: inline-flex; align-items: center; gap: 6px; padding: 2px 8px 2px 5px; border: 0; border-radius: 7px; background: transparent; color: inherit; cursor: pointer; font-size: 12px; transition: background .18s ease, color .18s ease; }
+.stream-thinking-toggle:hover { background: var(--surface-hover); color: var(--text-soft); }
+.stream-thinking-toggle > svg { transition: transform .18s ease; }
+.stream-thinking-toggle > svg.expanded { transform: rotate(90deg); }
+.stream-thinking.active .stream-thinking-toggle { color: var(--accent-strong); }
+.stream-thinking-glow { width: 6px; height: 6px; border-radius: 50%; background: var(--accent); box-shadow: 0 0 10px color-mix(in srgb, var(--accent) 65%, transparent); animation: thinking-breathe 1.6s ease-in-out infinite; }
+.stream-thinking-content { max-height: 260px; overflow: auto; padding: 2px 12px 8px 22px; color: var(--muted); font-size: 12px; line-height: 1.65; white-space: pre-wrap; overflow-wrap: anywhere; }
+.streaming-tool-card { width: fit-content; max-width: 100%; display: inline-flex; align-items: center; gap: 8px; margin: 2px 0 12px; padding: 8px 11px; border: 1px solid var(--border); border-radius: 10px; background: var(--surface); color: var(--text-soft); font-size: 11px; }
+.streaming-tool-card > svg { color: var(--accent-strong); }
+@keyframes thinking-breathe { 50% { opacity: .35; transform: scale(.82); } }
+@media (prefers-reduced-motion: reduce) { .stream-thinking-glow { animation: none; } }

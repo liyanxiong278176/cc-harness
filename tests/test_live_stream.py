@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import asyncio
+import json
+from types import SimpleNamespace
 
 import pytest
 
@@ -111,6 +113,8 @@ class StreamingLLM:
 
     async def chat(self, messages, tools):
         del messages, tools
+        yield StreamEvent(kind="reasoning", text="private ")
+        yield StreamEvent(kind="reasoning", text="provider reasoning")
         yield StreamEvent(kind="content", text="hello")
         yield StreamEvent(
             kind="tool_call_delta",
@@ -127,7 +131,7 @@ class StreamingLLM:
 
 
 @pytest.mark.asyncio
-async def test_durable_adapter_stream_callback_redacts_provider_private_fields() -> None:
+async def test_durable_adapter_stream_callback_keeps_reasoning_transient_and_separate() -> None:
     observed: list[dict] = []
 
     async def collect(item: dict) -> None:
@@ -138,7 +142,10 @@ async def test_durable_adapter_stream_callback_redacts_provider_private_fields()
     )
 
     assert segment.tool_calls[0]["name"] == "run_command"
-    assert [item["kind"] for item in observed] == ["content", "tool_call_delta", "done"]
+    assert [item["kind"] for item in observed] == [
+        "reasoning", "reasoning", "content", "tool_call_delta", "done"
+    ]
+    assert [item["text"] for item in observed[:2]] == ["private ", "provider reasoning"]
     assert all("reasoning_content" not in item for item in observed)
     assert all("arguments_json" not in item for item in observed)
     assert observed[-1]["usage"] == {
@@ -148,11 +155,50 @@ async def test_durable_adapter_stream_callback_redacts_provider_private_fields()
     }
 
 
+@pytest.mark.asyncio
+async def test_worker_assistant_artifact_never_contains_raw_reasoning(tmp_path) -> None:
+    project = tmp_path / "project"
+    project.mkdir()
+    store = await RunStore(project, data_root=tmp_path / "runtime-data").open()
+    worker = RunWorker(store, LegacyModel(), worker_id="reasoning-privacy-worker")
+    appended: list[tuple[str, dict]] = []
+
+    async def capture_append(lease, event_type, payload, *, artifact_refs=()):
+        del lease, artifact_refs
+        appended.append((event_type, dict(payload)))
+
+    worker._append = capture_append
+    await worker._commit_assistant_message(
+        SimpleNamespace(run_id="run-reasoning-privacy"),
+        segment=1,
+        round_index=1,
+        outcome=SimpleNamespace(
+            model_text="Visible response",
+            action_requests=(),
+            stop_reason="model_stop",
+            usage={},
+            reasoning_content="private provider reasoning",
+            refusal=None,
+            provider_metadata={},
+        ),
+    )
+
+    assert len(appended) == 1
+    event_type, payload = appended[0]
+    assert event_type == "AssistantMessageCommitted"
+    stored = json.loads(store.artifacts.read_text(payload["message_artifact"]))
+    assert stored["content"] == "Visible response"
+    assert "reasoning_content" not in stored
+    assert "private provider reasoning" not in json.dumps(stored)
+    await store.close()
+
+
 class CallbackKernel:
     async def execute_segment(self, context, *, stream_callback=None):
         del context
         # Adjacent content chunks should be coalesced before the browser sees
         # them; the terminal marker remains a hard ordering boundary.
+        await stream_callback({"kind": "reasoning", "text": "thinking"})
         await stream_callback({"kind": "content", "text": "par"})
         await stream_callback({"kind": "content", "text": "tial"})
         return ModelSegment(text="complete", stop_reason="model_stop")
@@ -186,9 +232,12 @@ async def test_worker_adds_run_segment_chunk_and_terminal_envelope(tmp_path) -> 
     assert [(item["run_id"], item["segment"], item["chunk"]) for item in observed] == [
         ("run-callback", 3, 1),
         ("run-callback", 3, 2),
+        ("run-callback", 3, 3),
     ]
-    assert observed[0]["text"] == "partial"
-    assert observed[1]["kind"] == "done"
+    assert observed[0]["kind"] == "reasoning"
+    assert observed[0]["text"] == "thinking"
+    assert observed[1]["text"] == "partial"
+    assert observed[2]["kind"] == "done"
     await store.close()
 
 

@@ -6,9 +6,11 @@
   "scripts": {
     "dev": "vite",
     "build": "tsc -b && vite build",
+    "test": "node --experimental-strip-types --test",
     "preview": "vite preview"
   },
   "dependencies": {
+    "@tanstack/react-virtual": "^3.14.13",
     "dompurify": "^3.4.8",
     "lucide-react": "^0.440.0",
     "marked": "^14.0.0",

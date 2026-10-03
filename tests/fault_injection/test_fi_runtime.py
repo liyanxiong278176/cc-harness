@@ -22,7 +22,7 @@ from cc_harness.approvals import ApprovalService
 from cc_harness.coordinator import RunCoordinator
 from cc_harness.durable_runtime import DurableModelAdapter
 from cc_harness.lease import LeaseManager
-from cc_harness.llm import LLMClient, ProviderProtocolError, StreamEvent
+from cc_harness.llm import LLMClient, StreamEvent
 from cc_harness.loop_control import (
     CompletionContract,
     CompletionVerifier,
@@ -157,7 +157,7 @@ async def test_a2_kernel_rejects_malformed_tool_protocol(call):
         await kernel.execute_segment(context)
 
 
-def test_a2_reasoning_replay_is_lossless_or_explicitly_recoverable():
+def test_a2_reasoning_replay_preserves_legacy_data_and_accepts_new_redacted_artifacts():
     messages = [
         {
             "role": "assistant",
@@ -170,11 +170,11 @@ def test_a2_reasoning_replay_is_lossless_or_explicitly_recoverable():
         messages, thinking_mode="enabled", reasoning_content_required=True
     )
     assert replay[0]["reasoning_content"] == "trace"
-    with pytest.raises(ProviderProtocolError):
-        DurableModelAdapter._provider_messages(
-            [{"role": "assistant", "content": None, "tool_calls": [{"id": "call"}]}],
-            thinking_mode="enabled",
-        )
+    redacted_replay = DurableModelAdapter._provider_messages(
+        [{"role": "assistant", "content": None, "tool_calls": [{"id": "call"}]}],
+        thinking_mode="enabled",
+    )
+    assert "reasoning_content" not in redacted_replay[0]
 
 
 @pytest.mark.asyncio

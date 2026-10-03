@@ -141,7 +141,6 @@ def assistant_message(
     text: str,
     tool_calls: tuple[Mapping[str, Any], ...] = (),
     *,
-    reasoning_content: str | None = None,
     refusal: str | None = None,
     stop_reason: str | None = None,
     provider_metadata: Mapping[str, Any] | None = None,
@@ -151,13 +150,6 @@ def assistant_message(
         "content": text,
         "_message_schema": MESSAGE_SCHEMA_VERSION,
     }
-    # Thinking-mode providers (notably DeepSeek) require the field to be
-    # present on every assistant tool-call replay, even when this response
-    # carried an empty reasoning stream. ``None`` means the producer did not
-    # provide the field at all; an explicit empty string is retained instead
-    # of being silently dropped.
-    if reasoning_content is not None:
-        message["reasoning_content"] = reasoning_content
     if refusal is not None:
         message["refusal"] = str(refusal)
     if stop_reason is not None:
