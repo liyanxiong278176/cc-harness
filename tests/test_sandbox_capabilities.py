@@ -1,10 +1,15 @@
-from cc_harness.sandbox_capabilities import CapabilityStatus, sandbox_capability_profile
+from cc_harness.sandbox_capabilities import (
+    CAPABILITY_PROFILE_SCHEMA,
+    REQUIRED_ISOLATION_CAPABILITIES,
+    CapabilityStatus,
+    sandbox_capability_profile,
+)
 
 
 def test_profile_withholds_isolated_claim_until_all_controls_are_proven():
     profile = sandbox_capability_profile()
 
-    assert profile["schema_version"] == 2
+    assert profile["schema_version"] == CAPABILITY_PROFILE_SCHEMA
     assert profile["security_label"] == "restricted-preview"
     assert profile["isolated_claim_allowed"] is False
     statuses = {item["status"] for item in profile["capabilities"].values()}
@@ -32,6 +37,12 @@ def test_every_incomplete_capability_names_its_blockers():
     for capability in profile["capabilities"].values():
         if capability["status"] != CapabilityStatus.ENFORCED.value:
             assert capability["blockers"]
+
+
+def test_profile_contains_every_release_gated_capability():
+    profile = sandbox_capability_profile()
+
+    assert tuple(profile["capabilities"]) == REQUIRED_ISOLATION_CAPABILITIES
 
 
 def test_profile_exposes_release_evidence_policy():

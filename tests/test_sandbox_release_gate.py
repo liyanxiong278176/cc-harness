@@ -1,6 +1,10 @@
 import subprocess
 from datetime import UTC, datetime, timedelta
 
+from cc_harness.sandbox_capabilities import (
+    CAPABILITY_PROFILE_SCHEMA,
+    REQUIRED_ISOLATION_CAPABILITIES,
+)
 from cc_harness.sandbox_evidence import (
     CONTROL_PATHS,
     REPORT_SCHEMA,
@@ -34,7 +38,18 @@ def _evaluate(reports: list[dict]) -> dict:
         target_commit="target-commit",
         target_control_digest="sha256:controls",
         now=NOW,
+        capability_profile=_enforced_profile(),
     )
+
+
+def _enforced_profile() -> dict:
+    return {
+        "schema_version": CAPABILITY_PROFILE_SCHEMA,
+        "capabilities": {
+            name: {"status": "enforced", "blockers": []}
+            for name in REQUIRED_ISOLATION_CAPABILITIES
+        },
+    }
 
 
 def test_release_gate_requires_two_clean_complete_runs_on_both_platforms():
@@ -48,6 +63,8 @@ def test_release_gate_requires_two_clean_complete_runs_on_both_platforms():
     result = _evaluate(reports)
 
     assert result["eligible"] is True
+    assert result["conformance_eligible"] is True
+    assert result["capability_gate"]["eligible"] is True
     assert result["security_label"] == "isolated"
     assert result["isolated_claim_allowed"] is True
 
@@ -97,6 +114,90 @@ def test_release_gate_ignores_wrong_commit_digest_and_stale_reports():
     assert result["eligible"] is False
     assert len(result["ignored_reports"]) == 3
     assert all(item["matching_runs"] == 0 for item in result["platforms"].values())
+
+
+def test_release_gate_withholds_isolated_claim_for_partial_capabilities():
+    reports = [
+        _report("Linux", 1),
+        _report("Linux", 2),
+        _report("Windows", 1),
+        _report("Windows", 2),
+    ]
+    profile = _enforced_profile()
+    profile["capabilities"]["network_egress"] = {
+        "status": "partial",
+        "blockers": ["DNS TOCTOU evidence is missing"],
+    }
+
+    result = evaluate_release_gate(
+        reports,
+        target_commit="target-commit",
+        target_control_digest="sha256:controls",
+        now=NOW,
+        capability_profile=profile,
+    )
+
+    assert result["conformance_eligible"] is True
+    assert result["capability_gate"]["eligible"] is False
+    assert result["eligible"] is False
+    assert result["security_label"] == "restricted-preview"
+    assert result["isolated_claim_allowed"] is False
+    assert any("capability network_egress" in blocker for blocker in result["blockers"])
+
+
+def test_release_gate_defaults_to_published_partial_profile():
+    reports = [
+        _report("Linux", 1),
+        _report("Linux", 2),
+        _report("Windows", 1),
+        _report("Windows", 2),
+    ]
+
+    result = evaluate_release_gate(
+        reports,
+        target_commit="target-commit",
+        target_control_digest="sha256:controls",
+        now=NOW,
+    )
+
+    assert result["conformance_eligible"] is True
+    assert result["capability_gate"]["eligible"] is False
+    assert result["eligible"] is False
+    assert result["isolated_claim_allowed"] is False
+
+
+def test_release_gate_rejects_unknown_capability_profile_schema():
+    profile = _enforced_profile()
+    profile["schema_version"] = 999
+
+    result = evaluate_release_gate(
+        [],
+        target_commit="target-commit",
+        target_control_digest="sha256:controls",
+        now=NOW,
+        capability_profile=profile,
+    )
+
+    assert result["capability_gate"]["eligible"] is False
+    assert result["capability_gate"]["profile_blockers"]
+    assert any("capability profile" in blocker for blocker in result["blockers"])
+
+
+def test_release_gate_fails_closed_for_missing_capability():
+    profile = _enforced_profile()
+    del profile["capabilities"]["cleanup"]
+
+    result = evaluate_release_gate(
+        [],
+        target_commit="target-commit",
+        target_control_digest="sha256:controls",
+        now=NOW,
+        capability_profile=profile,
+    )
+
+    cleanup = result["capability_gate"]["capabilities"]["cleanup"]
+    assert cleanup["status"] == "missing"
+    assert cleanup["eligible"] is False
 
 
 def test_control_digest_uses_committed_blobs_not_platform_line_endings(tmp_path):

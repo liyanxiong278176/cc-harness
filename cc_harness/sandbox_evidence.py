@@ -7,7 +7,7 @@ import subprocess
 from pathlib import Path
 
 REPORT_SCHEMA = "sandbox.conformance.v2"
-GATE_SCHEMA = "sandbox.release-gate.v1"
+GATE_SCHEMA = "sandbox.release-gate.v2"
 REQUIRED_PLATFORMS = ("Linux", "Windows")
 REQUIRED_TESTS = frozenset({
     "test_sensitive_workspace_paths_are_empty_overlays",

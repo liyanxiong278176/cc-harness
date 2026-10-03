@@ -5,12 +5,63 @@ from __future__ import annotations
 from collections import defaultdict
 from datetime import UTC, datetime, timedelta
 
+from cc_harness.sandbox_capabilities import (
+    CAPABILITY_PROFILE_SCHEMA,
+    REQUIRED_ISOLATION_CAPABILITIES,
+    CapabilityStatus,
+    sandbox_capability_profile,
+)
 from cc_harness.sandbox_evidence import (
     GATE_SCHEMA,
     REPORT_SCHEMA,
     REQUIRED_PLATFORMS,
     REQUIRED_TESTS,
 )
+
+
+def _evaluate_capability_gate(profile: dict) -> dict:
+    capabilities = profile.get("capabilities")
+    if not isinstance(capabilities, dict):
+        capabilities = {}
+
+    results: dict[str, dict] = {}
+    for name in REQUIRED_ISOLATION_CAPABILITIES:
+        capability = capabilities.get(name)
+        if not isinstance(capability, dict):
+            results[name] = {
+                "eligible": False,
+                "status": CapabilityStatus.MISSING.value,
+                "blockers": ["capability is absent from the published profile"],
+            }
+            continue
+
+        status = capability.get("status")
+        blockers = capability.get("blockers")
+        if not isinstance(blockers, list):
+            blockers = ["capability blockers are missing or malformed"]
+        elif not blockers and status != CapabilityStatus.ENFORCED.value:
+            blockers = ["capability is not enforced and names no blocking evidence"]
+        results[name] = {
+            "eligible": status == CapabilityStatus.ENFORCED.value and not blockers,
+            "status": status,
+            "blockers": blockers,
+        }
+
+    profile_schema = profile.get("schema_version")
+    profile_blockers = []
+    if profile_schema != CAPABILITY_PROFILE_SCHEMA:
+        profile_blockers.append(
+            f"unsupported capability profile schema: {profile_schema!r}"
+        )
+    return {
+        "eligible": (
+            not profile_blockers
+            and all(item["eligible"] for item in results.values())
+        ),
+        "capabilities": results,
+        "profile_schema_version": profile_schema,
+        "profile_blockers": profile_blockers,
+    }
 
 
 def _parse_timestamp(value: object) -> datetime | None:
@@ -31,6 +82,7 @@ def evaluate_release_gate(
     minimum_consecutive_runs: int = 2,
     max_age_days: int = 30,
     now: datetime | None = None,
+    capability_profile: dict | None = None,
 ) -> dict:
     now = now or datetime.now(UTC)
     cutoff = now - timedelta(days=max_age_days)
@@ -100,10 +152,27 @@ def evaluate_release_gate(
             "evaluated_runs": run_results,
         }
 
-    eligible = not blockers
+    conformance_eligible = not blockers
+    capability_gate = _evaluate_capability_gate(
+        capability_profile if capability_profile is not None else sandbox_capability_profile()
+    )
+    if not capability_gate["eligible"]:
+        blockers.extend(
+            f"capability profile: {blocker}"
+            for blocker in capability_gate["profile_blockers"]
+        )
+        for name, result in capability_gate["capabilities"].items():
+            if not result["eligible"]:
+                blockers.append(
+                    f"capability {name}: status={result['status']}; "
+                    + "; ".join(result["blockers"])
+                )
+    eligible = conformance_eligible and capability_gate["eligible"]
     return {
         "schema_version": GATE_SCHEMA,
         "eligible": eligible,
+        "conformance_eligible": conformance_eligible,
+        "capability_gate": capability_gate,
         "security_label": "isolated" if eligible else "restricted-preview",
         "isolated_claim_allowed": eligible,
         "target_commit": target_commit,

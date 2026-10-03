@@ -18,30 +18,32 @@ The OpenSandbox backend is labeled `restricted-preview`; `isolated_claim_allowed
 
 | Capability | Status | Current evidence | Blocking evidence |
 |---|---|---|---|
-| Filesystem scope | Partial | Project-root host allowlist, read-only mount, empty nested overlays and Windows Docker verification | Linux/Kubernetes overlay and working-directory conformance |
-| Process isolation | Partial | Windows HostConfig, capability, seccomp, syscall, PID and daemon probes | Linux/Kubernetes and runtime-daemon-restart conformance |
-| Resource limits | Partial | SDK wiring plus Windows Docker cgroup/OOM verification | Linux-host and repeated-load conformance |
-| Network egress | Partial | Default-deny `dns+nft`, external config attestation, public-IP DNS preflight and Windows probes | Linux/Kubernetes, DNS TOCTOU and cryptographic remote attestation |
-| Credential isolation | Partial | Host exclusion, overlays, scoped Vault injection, wrong-target denial, replay rejection and revocation on Windows | Linux/Kubernetes broker evidence |
+| Filesystem scope | Partial | Project-root host allowlist, read-only mount, empty nested overlays and Windows/Linux Docker verification | Kubernetes overlay and working-directory conformance |
+| Process isolation | Partial | Windows/Linux HostConfig, capability, seccomp, syscall, PID and daemon probes | Kubernetes and runtime-daemon-restart conformance |
+| Resource limits | Partial | SDK wiring plus Windows/Linux Docker cgroup/OOM verification | Repeated-load conformance |
+| Network egress | Partial | Default-deny `dns+nft`, external config attestation, public-IP DNS preflight and Windows/Linux probes | Kubernetes, DNS TOCTOU and cryptographic remote attestation |
+| Credential isolation | Partial | Host exclusion, overlays, scoped Vault injection, wrong-target denial, replay rejection and revocation on Windows/Linux | Kubernetes broker evidence |
 | Command cancellation | Partial | Wall timeout destroys the sandbox | Explicit process-cancellation conformance |
-| Cleanup | Partial | Session shutdown, timeout destruction and Windows container/daemon removal | Linux orphan and daemon-restart conformance |
+| Cleanup | Partial | Session shutdown, timeout destruction and Windows/Linux container/daemon removal | Daemon-restart orphan cleanup conformance |
 
 `partial` is not an alias for secure. A control becomes `enforced` only after the
 runtime wiring and a platform conformance test both exist. Filesystem, process, resource, network,
 credential, cancellation and cleanup must all be enforced before changing the security label or
 allowing isolated benchmark claims.
 
-The gated real-runtime suite is documented in `docs/sandbox-conformance.md`. Local evidence from
-`20260805T011438Z` passed all 19 probes on Windows 11 with Docker 29.2.0, OpenSandbox 0.1.15 and
-OpenSandbox Server 0.2.2. It used an existing image and a dirty worktree, so it is diagnostic
-evidence, not release-eligible evidence.
+The gated real-runtime suite is documented in `docs/sandbox-conformance.md`. Commit `d34a0c3`
+has two clean, newly built 19/19 runs on both Windows 11 and Linux/WSL2 with Docker 29.2.0,
+OpenSandbox 0.1.15 and OpenSandbox Server 0.2.2. Those runs establish cross-platform Docker
+conformance, but do not satisfy the remaining capability blockers above.
 
 ## Release Gate
 
 Promotion to `isolated` requires two consecutive, complete runs on both Linux and Windows for the
 same commit and control-bundle digest. Every run must use clean source, build its runtime image in
-that run, pass all required probes and be no older than 30 days. Missing or failed evidence leaves
-the label at `restricted-preview`; details are emitted in a versioned `release-gate.json`.
+that run, pass all required probes and be no older than 30 days. Passing those runs establishes
+cross-platform Docker conformance, but promotion also requires every capability above to be
+`enforced` with no unresolved blocker. Missing capability or conformance evidence leaves the label
+at `restricted-preview`; details are emitted in a versioned `release-gate.json`.
 
 ## Fail-Closed Command Rules
 

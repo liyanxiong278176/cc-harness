@@ -12,10 +12,22 @@ class CapabilityStatus(str, Enum):
     UNVERIFIED = "unverified"
 
 
+CAPABILITY_PROFILE_SCHEMA = 2
+REQUIRED_ISOLATION_CAPABILITIES = (
+    "filesystem_scope",
+    "process_isolation",
+    "resource_limits",
+    "network_egress",
+    "credential_isolation",
+    "command_cancellation",
+    "cleanup",
+)
+
+
 def sandbox_capability_profile() -> dict:
     """Return conservative claims derived from currently wired controls."""
     return {
-        "schema_version": 2,
+        "schema_version": CAPABILITY_PROFILE_SCHEMA,
         "backend": "opensandbox",
         "security_label": "restricted-preview",
         "isolated_claim_allowed": False,
@@ -26,10 +38,10 @@ def sandbox_capability_profile() -> dict:
                     "server host-path allowlist is restricted to the project root",
                     "the project root is mounted read-only",
                     "sensitive workspace paths receive nested empty read-only overlays",
-                    "Windows Docker conformance verified empty credential overlays",
+                    "Windows and Linux Docker conformance verified empty credential overlays",
                 ],
                 "blockers": [
-                    "nested overlay behavior lacks Linux-host and Kubernetes conformance evidence",
+                    "nested overlay behavior lacks Kubernetes conformance evidence",
                     "sandbox working-directory behavior lacks conformance evidence",
                 ],
             },
@@ -37,20 +49,20 @@ def sandbox_capability_profile() -> dict:
                 "status": CapabilityStatus.PARTIAL.value,
                 "evidence": [
                     "owned Docker servers pin dropped capabilities, no-new-privileges and PID limits",
-                    "Windows Docker conformance verified HostConfig, seccomp, privileged syscall denial, fork-bomb bounding and daemon cleanup",
+                    "Windows and Linux Docker conformance verified HostConfig, seccomp, privileged syscall denial, fork-bomb bounding and daemon cleanup",
                 ],
                 "blockers": [
-                    "Linux-host, Kubernetes and runtime-daemon-restart escape conformance has not run"
+                    "Kubernetes and runtime-daemon-restart escape conformance has not run"
                 ],
             },
             "resource_limits": {
                 "status": CapabilityStatus.PARTIAL.value,
                 "evidence": [
                     "configured CPU and memory limits are passed to Sandbox.create",
-                    "Windows Docker conformance verified cgroup limits and OOM rejection",
+                    "Windows and Linux Docker conformance verified cgroup limits and OOM rejection",
                 ],
                 "blockers": [
-                    "Linux-host and repeated-load resource conformance has not run"
+                    "repeated-load resource conformance has not run"
                 ],
             },
             "network_egress": {
@@ -58,12 +70,12 @@ def sandbox_capability_profile() -> dict:
                 "evidence": [
                     "Sandbox.create receives a default-deny domain allowlist policy",
                     "owned servers are configured for dns+nft egress enforcement",
-                    "Windows Docker conformance verified allow, deny and direct-IP blocking",
+                    "Windows and Linux Docker conformance verified allow, deny and direct-IP blocking",
                     "allowed domains resolving to non-public addresses fail DNS preflight",
                     "external servers require a matching local security configuration attestation",
                 ],
                 "blockers": [
-                    "Linux-host and Kubernetes egress conformance has not run",
+                    "Kubernetes egress conformance has not run",
                     "DNS preflight cannot eliminate DNS answer changes between validation and use",
                     "remote external servers lack cryptographic runtime attestation",
                 ],
@@ -74,12 +86,12 @@ def sandbox_capability_profile() -> dict:
                     "host environment variables are not injected into the sandbox",
                     "workspace credential paths receive empty read-only overlays",
                     "credential proxy activation requires explicit vault opt-in",
-                    "Windows Docker conformance verified host-env and workspace-secret isolation",
-                    "Windows Docker E2E verified scoped injection, wrong-target isolation, revision replay rejection, revocation and redacted audit",
+                    "Windows and Linux Docker conformance verified host-env and workspace-secret isolation",
+                    "Windows and Linux Docker E2E verified scoped injection, wrong-target isolation, revision replay rejection, revocation and redacted audit",
                 ],
                 "blockers": [
-                    "workspace overlay isolation lacks Linux-host and Kubernetes evidence",
-                    "credential proxy brokering lacks Linux-host and Kubernetes evidence",
+                    "workspace overlay isolation lacks Kubernetes evidence",
+                    "credential proxy brokering lacks Kubernetes evidence",
                 ],
             },
             "command_cancellation": {
@@ -91,11 +103,11 @@ def sandbox_capability_profile() -> dict:
                 "status": CapabilityStatus.PARTIAL.value,
                 "evidence": [
                     "session shutdown and command timeout request sandbox destruction",
-                    "Windows Docker conformance verified runtime and egress container removal",
-                    "Windows Docker conformance verified detached daemon removal",
+                    "Windows and Linux Docker conformance verified runtime and egress container removal",
+                    "Windows and Linux Docker conformance verified detached daemon removal",
                 ],
                 "blockers": [
-                    "Linux-host orphan and daemon-restart cleanup conformance has not run"
+                    "daemon-restart orphan cleanup conformance has not run"
                 ],
             },
         },
