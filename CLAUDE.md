@@ -70,8 +70,7 @@ main.py
         │     └── render.py               # 4-phase ReAct output (思考/行动/观察/结果)
         └── _print_disk_changes()         # post-turn: show files modified in last 30s
 
-cc_harness/memory/                        # ⚠️ in-tree but NOT yet wired into the ReAct loop
-                                          #   (no import from agent/repl/main). SQLite + embeddings.
+cc_harness/memory/                        # SQLite + embeddings; wired through main.py and Runtime memory dependencies.
 ```
 
 **Key data flow**:
@@ -173,6 +172,6 @@ A promptfoo-based red-team suite (LOCAL only, 2026-07-06 起退役 CI integratio
 
 - Multi-LLM backend switching (locked to OpenAI-compatible)
 - Sandbox / Docker — M1 (2026-06-30) landed a portable permission gate (`cc_harness/policy.py`, allow/ask two-tier) + execution hardening (`cc_harness/executor.py`: cwd-lock, env-secret-strip, timeout);M4 (2026-07-03) landed OpenSandbox 用户态容器沙箱(`cc_harness/sandbox.py:SandboxExecutor`,Docker runtime,会话级 lazy create + 项目根 RO mount + 通信错降级 native;`cc_harness/sandbox_server.py` 自动起 opensandbox-server)。A true kernel sandbox (gVisor/Firecracker) is still out of scope — Linux-only, deferred。kill-switch:`policy.yaml` 的 `executor.backend=native` 回 NativeExecutor。
-- Wiring `cc_harness/memory/` into the live agent — the package exists (SQLite + embeddings) but is not yet imported by the ReAct loop. Treat session state as in-memory until it's wired.
+- Context compaction and memory behavior are Runtime-managed; inspect `main.py`, `cc_harness/agent.py`, and `cc_harness/memory/` before changing their injection or persistence contracts.
 - Concurrent tool calls (serial only)
 - SubAgent / Agent Team (PDF 阶段 4-5, not started)

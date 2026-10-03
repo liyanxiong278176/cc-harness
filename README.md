@@ -58,3 +58,9 @@ state.json      # 可恢复执行状态
 integrity.json  # 结果完整性校验
 raw/            # 原始任务证据
 ```
+
+## 上下文管理与记忆
+
+- 上下文压缩机制说明：[docs/context-compaction-explained.md](docs/context-compaction-explained.md)
+- 长期记忆机制说明：[docs/long-term-memory-explained.md](docs/long-term-memory-explained.md)
+- 评测工具与命令：[eval/README.md](eval/README.md)
