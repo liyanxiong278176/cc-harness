@@ -35,6 +35,8 @@ from .llm import ProviderProtocolError
 from .stream_errors import StreamErrorDetails, classify_stream_error
 from .run_events import EventActor, RunEvent
 from .run_kernel import ActionRequest, AgentKernel, SegmentContext
+from .execution_control import BudgetExhausted, ExecutionControl
+from .kernel_middleware import KernelMiddleware
 from .run_model import (
     ActionStatus,
     CompletionCandidate,
@@ -321,6 +323,9 @@ class RunWorker:
         stream_emitter: StreamEmitter | None = None,
     ) -> None:
         self.store = store
+        self.execution = ExecutionControl(store)
+        self.middleware = KernelMiddleware()
+        self._action_reservations: dict[str, str] = {}
         self.kernel = kernel
         self.worker_id = worker_id
         self._uses_default_lease_manager = lease_manager is None
@@ -393,12 +398,17 @@ class RunWorker:
             raise RuntimeError("worker lease expired before execution")
         heartbeat_task: asyncio.Task[None] | None = None
         current_lease = lease
+        self.execution.worker_lease = lease
         self._execution_task = asyncio.current_task()
         self._cancellation_watchdog_task = asyncio.create_task(
             self._cancellation_watchdog(lease.run_id, self._execution_task),
             name=f"cc-harness-cancel-watchdog-{lease.run_id}",
         )
         try:
+            projection = await self.store.load_projection(lease.run_id)
+            if await self.execution.pause_boundary(lease.run_id):
+                return
+            await self.execution.apply_guidance(lease.run_id)
             projection = await self.store.load_projection(lease.run_id)
             if self.working_directory_resolver is not None:
                 self.working_directory = await self.working_directory_resolver(lease.run_id)
@@ -457,8 +467,22 @@ class RunWorker:
             # A Segment is a recoverable interaction interval, not one model
             # call.  It ends at a plan-node/approval/cancellation/completion
             # boundary or when the model returns no verifiable next action.
+            verification_repairs = 0
             while True:
                 projection = await self.store.load_projection(lease.run_id)
+                if await self.execution.pause_boundary(lease.run_id):
+                    return
+                await self.execution.apply_guidance(lease.run_id)
+                projection = await self.store.load_projection(lease.run_id)
+                if self._active_node_id not in projection.plan.by_id:
+                    self._active_node_id = await self._ensure_plan_node_started(current_lease, projection)
+                if (projection.task.plan_approval_required
+                        and projection.discovery_status != "awaiting"
+                        and projection.task.approved_plan_digest != projection.plan.digest):
+                    await self.execution.wait(lease.run_id, kind="waiting_approval",
+                                              reason="plan_requires_approval")
+                    return
+                await self._kernel_phase(lease.run_id, "prepare", "before")
                 if projection.status is RunStatus.CANCEL_REQUESTED:
                     await self._acknowledge_cancellation(current_lease, "cancel requested")
                     return
@@ -609,6 +633,8 @@ class RunWorker:
                         )
                         return
                 round_index = len(projection.actions)
+                await self._kernel_phase(lease.run_id, "prepare", "after")
+                await self._kernel_phase(lease.run_id, "model", "before")
                 # ``segment``/``round`` describe the logical position but are
                 # not unique across a durable resume: a stalled no-action
                 # turn can be resumed with the same pair.  A fresh nonce is
@@ -616,6 +642,8 @@ class RunWorker:
                 # aggregation, WebUI latest-call telemetry, and audit joins
                 # never collapse two real provider requests into one.
                 invocation_id = f"model-{lease.run_id}-{uuid.uuid4().hex}"
+                model_amounts = await self._model_budget(projection, messages)
+                model_reservation = await self.execution.reserve(lease.run_id, model_amounts, key=invocation_id)
                 await self._append(
                     current_lease,
                     "ModelInvocationStarted",
@@ -652,6 +680,11 @@ class RunWorker:
                 invocation_error: str | None = None
                 invocation_error_details: dict[str, Any] | None = None
                 outcome = None
+                from .llm import task_output_token_limit
+                output_limit_token = task_output_token_limit.set(
+                    getattr(getattr(self.kernel, "model", None), "budget_output_tokens", None)
+                    if "tokens" in model_amounts or "cost" in model_amounts else None
+                )
                 try:
                     outcome = await self._execute_model_segment(
                         context,
@@ -676,6 +709,31 @@ class RunWorker:
                     invocation_error = f"{type(exc).__name__}: {details.code}"[:240]
                     raise
                 finally:
+                    task_output_token_limit.reset(output_limit_token)
+                    usage = dict(getattr(outcome, "usage", {}) or {})
+                    token_count = usage.get("total_tokens")
+                    if token_count is None:
+                        token_count = (usage.get("prompt_tokens", usage.get("input_tokens", 0)) or 0) + (
+                            usage.get("completion_tokens", usage.get("output_tokens", 0)) or 0
+                        )
+                    actual = {"steps": 1, "model_calls": 1,
+                              "active_seconds": max(0, time.monotonic() - invocation_started)}
+                    if token_count:
+                        actual["tokens"] = token_count
+                    elif "tokens" in model_amounts:
+                        # Missing provider usage is not zero. Retain the reservation
+                        # conservatively rather than allowing unlimited unmetered calls.
+                        actual["tokens"] = model_amounts["tokens"]
+                    if usage.get("reported_cost") is not None:
+                        actual["cost"] = usage["reported_cost"]
+                    elif "cost" in model_amounts:
+                        actual["cost"] = model_amounts["cost"]
+                    estimated = [key for key in ("tokens", "cost") if key in actual and (
+                        (key == "tokens" and not token_count) or (key == "cost" and usage.get("reported_cost") is None)
+                    )]
+                    await asyncio.shield(self.execution.settle(
+                        lease.run_id, model_reservation, actual, estimated=estimated,
+                    ))
                     if self.capability_runtime is not None and context_build is not None:
                         record_usage = getattr(
                             self.capability_runtime, "record_provider_usage", None
@@ -715,6 +773,13 @@ class RunWorker:
                             finished_payload,
                         )
                 after_model = await self.store.load_projection(lease.run_id)
+                await self._kernel_phase(lease.run_id, "model", "after")
+                if await self.execution.pause_boundary(lease.run_id):
+                    return
+                if after_model.task.goal_revision != projection.task.goal_revision:
+                    # These calls were never dispatched. Discard the stale proposal;
+                    # the next Prepare rebuilds from the new authoritative goal.
+                    continue
                 if after_model.status in {RunStatus.CANCEL_REQUESTED, RunStatus.CANCELLED}:
                     await self._append(
                         current_lease,
@@ -734,6 +799,9 @@ class RunWorker:
                 if protect_output is not None:
                     safe_text, _security_details = protect_output(outcome.model_text, messages)
                     outcome = replace(outcome, model_text=safe_text)
+                refreshed_requests = self._refresh_completed_reads(projection, outcome.action_requests)
+                if refreshed_requests != outcome.action_requests:
+                    outcome = replace(outcome, action_requests=refreshed_requests)
                 message_requests = outcome.action_requests
                 for request_index, request in enumerate(outcome.action_requests):
                     if self._requires_approval(request):
@@ -742,6 +810,17 @@ class RunWorker:
                         # are replanned after the approved result is committed.
                         message_requests = (outcome.action_requests[request_index],)
                         break
+                if outcome.action_requests and not any(self._requires_approval(r) for r in outcome.action_requests):
+                    # Reserve the entire proposal before persisting provider tool calls.
+                    # An exhausted budget must not leave unmatched assistant calls.
+                    for request in outcome.action_requests:
+                        effect = self.contracts.get(request.tool_name).effect_class
+                        amounts = {"tool_calls": 1}
+                        if effect in {EffectClass.UNKNOWN, EffectClass.EXTERNAL_SIDE_EFFECT}:
+                            amounts["risk_actions"] = 1
+                        self._action_reservations[request.action_id] = await self.execution.reserve(
+                            lease.run_id, amounts,
+                        )
                 await self._commit_assistant_message(
                     current_lease,
                     segment,
@@ -767,6 +846,14 @@ class RunWorker:
                         return
                     if await self._active_node_completed(lease.run_id):
                         had_progress = True
+                    if (outcome.completion_candidate is not None and verification_repairs < 2
+                            and not await self._active_node_completed(lease.run_id)):
+                        verification_repairs += 1
+                        await self.execution.append(lease.run_id, "TaskVerificationFinished", {
+                            "passed": False, "issues": ["completion evidence does not satisfy current goal"],
+                            "repair_attempt": verification_repairs,
+                        })
+                        continue
                     if outcome.progress is not None:
                         await self._commit_memory_checkpoint(
                             current_lease,
@@ -829,6 +916,17 @@ class RunWorker:
                         )
                         return
                 statuses = await self._execute_request_batch(current_lease, requests)
+                await self._kernel_phase(lease.run_id, "observe", "after")
+                if await self.execution.pause_boundary(lease.run_id):
+                    return
+                latest_task = await self.store.load_projection(lease.run_id)
+                if latest_task.task.wait.get("requested"):
+                    wait = latest_task.task.wait
+                    await self.execution.wait(lease.run_id, kind=wait["kind"], reason=wait["reason"],
+                                              wait_id=wait["wait_id"], timeout_at=wait.get("timeout_at"))
+                    return
+                if latest_task.task.goal_revision != projection.task.goal_revision:
+                    continue
                 cancellation_state = await self.store.load_projection(lease.run_id)
                 if cancellation_state.status is RunStatus.CANCEL_REQUESTED:
                     await self._acknowledge_cancellation(current_lease, "cancel requested after action boundary")
@@ -878,6 +976,12 @@ class RunWorker:
                 had_action=had_action,
                 had_progress=had_progress,
             )
+        except BudgetExhausted:
+            for key in tuple(self._action_reservations.values()):
+                await self.execution.settle(lease.run_id, key, {})
+            self._action_reservations.clear()
+            await self.execution.pause_boundary(lease.run_id)
+            return
         except asyncio.CancelledError:
             # Ctrl+C/cancel is delivered by the watchdog as soon as the client
             # appends InterruptRequested.  Before acknowledging it, close every
@@ -885,6 +989,9 @@ class RunWorker:
             # observation is *unknown*, never silently successful.
             with contextlib.suppress(Exception):
                 projection = await self.store.load_projection(lease.run_id)
+                if projection.task.pause_requested:
+                    await self._finalize_interruption(current_lease, projection.task.reason, pause=True)
+                    return
                 if projection.status in {RunStatus.CANCEL_REQUESTED, RunStatus.CANCELLED}:
                     await self._finalize_interruption(current_lease, "cancel requested")
                     return
@@ -958,6 +1065,10 @@ class RunWorker:
                     )
             raise
         finally:
+            for key in tuple(self._action_reservations.values()):
+                with contextlib.suppress(Exception):
+                    await self.execution.settle(lease.run_id, key, {})
+            self._action_reservations.clear()
             if self._cancellation_watchdog_task is not None:
                 self._cancellation_watchdog_task.cancel()
                 with contextlib.suppress(asyncio.CancelledError):
@@ -1171,7 +1282,12 @@ class RunWorker:
                 return await execute(context, stream_callback=emit_stream)
             return await execute(context)
 
-        if self.model_timeout_seconds == 0:
+        model_timeout = self.model_timeout_seconds
+        remaining_time = (await self.execution.remaining_time(context.run_id)
+                          if getattr(self.execution, "worker_lease", None) is not None else None)
+        if remaining_time is not None:
+            model_timeout = max(0.001, min(model_timeout or remaining_time, remaining_time))
+        if model_timeout == 0:
             try:
                 result = await execute_kernel()
             except asyncio.CancelledError:
@@ -1193,7 +1309,7 @@ class RunWorker:
             name=f"cc-harness-model-{context.run_id}-{context.lease_epoch}",
         )
         try:
-            result = await asyncio.wait_for(asyncio.shield(task), self.model_timeout_seconds)
+            result = await asyncio.wait_for(asyncio.shield(task), model_timeout)
             await emit_terminal(str(getattr(result, "stop_reason", "model_stop")))
             await stop_flush_task()
             return result
@@ -1203,7 +1319,7 @@ class RunWorker:
             # orphan task: the durable worker is failed/recoverable and will
             # never replay its model result as an action without a new segment.
             timeout_error = ModelInvocationTimeout(
-                f"model segment timed out after {self.model_timeout_seconds:.3f}s"
+                f"model segment timed out after {model_timeout:.3f}s"
             )
             details = classify_stream_error(timeout_error, partial_output=stream_started)
             with contextlib.suppress(Exception):
@@ -1214,6 +1330,11 @@ class RunWorker:
             await emit_terminal("timeout", error_details=details)
             await _cancel_task_bounded(task)
             await stop_flush_task()
+            if remaining_time is not None and (
+                self.model_timeout_seconds == 0 or remaining_time <= self.model_timeout_seconds
+            ):
+                await self.execution.pause(context.run_id, "budget_exhausted: active_seconds")
+                raise BudgetExhausted("active_seconds") from exc
             raise timeout_error from exc
         except asyncio.CancelledError:
             await _cancel_task_bounded(task)
@@ -1228,7 +1349,7 @@ class RunWorker:
             await stop_flush_task()
             raise
 
-    async def _finalize_interruption(self, lease: Lease, reason: str) -> None:
+    async def _finalize_interruption(self, lease: Lease, reason: str, *, pause: bool = False) -> None:
         """Persist safe cancellation outcomes before ``RunCancelled``."""
 
         projection = await self.store.load_projection(lease.run_id)
@@ -1277,7 +1398,10 @@ class RunWorker:
             await self._append_recovered_terminal(
                 lease, action, observation, observation_artifact
             )
-        await self._acknowledge_cancellation(lease, reason)
+        if pause:
+            await self.execution.pause_boundary(lease.run_id)
+        else:
+            await self._acknowledge_cancellation(lease, reason)
 
     async def _execute_granted_actions(self, lease: Lease, projection: RunProjection) -> bool:
         granted = {item.action_id for item in projection.approvals if item.status.value == "granted"}
@@ -1811,6 +1935,32 @@ class RunWorker:
             request_buffer.append(request)
         return tuple(request_buffer), duplicate_inflight
 
+    def _refresh_completed_reads(
+        self, projection: RunProjection, requests: Sequence[ActionRequest]
+    ) -> tuple[ActionRequest, ...]:
+        """Permit a new read after a terminal receipt, keeping effect dedupe.
+
+        The trusted tool registry, not model-declared effects, decides which
+        operations can be reread. The same provider call ID remains a replay;
+        equivalent reads in one new batch retain one shared deduplication key.
+        """
+        fresh_keys: dict[str, str] = {}
+        result = []
+        for request in requests:
+            terminal = self._action_deduplication_status(projection, request)
+            if (
+                self.contracts.get(request.tool_name).effect_class is EffectClass.READ_ONLY
+                and terminal in {ActionStatus.SUCCEEDED, ActionStatus.FAILED, ActionStatus.CANCELLED}
+                and not any(action.action_id == request.action_id for action in projection.actions)
+            ):
+                key = fresh_keys.setdefault(
+                    request.idempotency_key,
+                    f"read:{request.action_id}:{request.idempotency_key}",
+                )
+                request = replace(request, idempotency_key=key)
+            result.append(request)
+        return tuple(result)
+
     @staticmethod
     def _action_deduplication_status(
         projection: RunProjection, request: ActionRequest
@@ -1981,6 +2131,12 @@ class RunWorker:
         candidate: CompletionCandidate | None,
     ) -> bool:
         projection = await self.store.load_projection(lease.run_id)
+        if projection.task.pause_requested or any(not x["applied"] for x in projection.task.guidance):
+            return False
+        if projection.task.guidance and projection.goal and projection.goal.interaction_mode == "coding":
+            latest_guidance = max(item["sequence"] for item in projection.task.guidance)
+            if projection.working_state.last_verification_sequence <= latest_guidance:
+                return False  # old checks cannot certify a revised goal
         # Completion is a state transition, not a cosmetic model response.
         # Refuse it while the durable projection still contains an unresolved
         # error, a requested approval, or an action that has not reached a
@@ -2103,7 +2259,15 @@ class RunWorker:
         )
         await self._append(lease, "CompletionCandidateSubmitted", submitted_payload)
         verifier = self.completion_verifier or self._valid_candidate
-        if verifier(candidate):
+        await self._kernel_phase(lease.run_id, "verify", "before")
+        await self.execution.append(lease.run_id, "TaskVerificationStarted", {})
+        passed = bool(verifier(candidate))
+        await self.execution.append(lease.run_id, "TaskVerificationFinished", {"passed": passed})
+        await self._kernel_phase(lease.run_id, "verify", "after")
+        latest = await self.store.load_projection(lease.run_id)
+        if latest.task.pause_requested or latest.task.goal_revision != projection.task.goal_revision:
+            return False
+        if passed:
             try:
                 if projection.goal is not None:
                     candidate.validate(projection.goal)
@@ -2557,11 +2721,10 @@ class RunWorker:
             return None
         if not _is_benchmark_task() and not verification_evidence:
             return None
-        goal_text = f"{goal.objective} {' '.join(goal.acceptance_criteria)}".casefold()
-        service_goal = any(
-            marker in goal_text
-            for marker in ("service", "server", "endpoint", "listening", "daemon", "api", "health")
-        )
+        # Use the same executable contract as the final gate. Source filenames
+        # such as service.py and unrelated words containing "api" do not
+        # request a running service or a health probe.
+        service_goal = output_contract.require_service_health_check
         if service_goal and not service_probe:
             return None
         if goal.required_evidence and len(evidence) < len(goal.required_evidence):
@@ -2641,6 +2804,7 @@ class RunWorker:
             str(event.payload.get("node_id"))
             for event in page.events
             if event.event_type == "PlanNodeCompleted" and event.payload.get("node_id")
+            and event.sequence > max((x["sequence"] for x in projection.task.guidance), default=0)
         )
         node = next(
             (
@@ -2745,6 +2909,53 @@ class RunWorker:
         attempt: int = 1,
     ) -> ActionStatus:
         """Execute one action while holding its durable resource leases."""
+
+        current = await self.store.load_projection(lease.run_id)
+        if current.task.pause_requested or any(not item["applied"] for item in current.task.guidance):
+            key = self._action_reservations.pop(request.action_id, None)
+            if key is not None:
+                await self.execution.settle(lease.run_id, key, {})
+            contract = self.contracts.get(request.tool_name)
+            if not planned:
+                await self._plan_action(lease, request, contract.effect_class, contract.digest, attempt=attempt)
+            observation = make_observation(
+                action_id=request.action_id, attempt=attempt, tool_name=request.tool_name,
+                status="cancelled", effect_class=contract.effect_class.value,
+                text="This proposal was not executed because the task was paused or requirements changed.",
+                error_kind="proposal_superseded", recovery="replan", provenance=("task-control",),
+            )
+            artifact = self.store.artifacts.put_text(json.dumps(observation.to_dict()), media_type="application/json")
+            await self._append_observation_event(lease, observation, artifact.digest)
+            await self._append(lease, "ActionCancelled", {
+                "action_id": request.action_id, "attempt": attempt,
+                "observation_artifact": artifact.digest, "cancellation_reason": "proposal_superseded",
+            })
+            return ActionStatus.CANCELLED
+
+        await self._kernel_phase(lease.run_id, "act", "before")
+        contract = self.contracts.get(request.tool_name)
+        effect = request.effect_class if request.effect_class != EffectClass.UNKNOWN else contract.effect_class
+        amounts = {"tool_calls": 1}
+        if effect in {EffectClass.EXTERNAL_SIDE_EFFECT, EffectClass.UNKNOWN}:
+            amounts["risk_actions"] = 1
+        reservation = self._action_reservations.pop(request.action_id, None)
+        if reservation is None:
+            reservation = await self.execution.reserve(lease.run_id, amounts)
+        started = time.monotonic()
+        try:
+            return await self._execute_action_with_resources(lease, request, planned=planned, attempt=attempt)
+        finally:
+            await asyncio.shield(self.execution.settle(lease.run_id, reservation, {
+                **amounts, "active_seconds": max(0, time.monotonic() - started),
+            }))
+            remaining = await self.execution.remaining_time(lease.run_id)
+            if remaining is not None and remaining <= 0:
+                await self.execution.pause(lease.run_id, "budget_exhausted: active_seconds")
+            await self._kernel_phase(lease.run_id, "act", "after")
+
+    async def _execute_action_with_resources(
+        self, lease: Lease, request: ActionRequest, *, planned: bool = False, attempt: int = 1,
+    ) -> ActionStatus:
 
         if self.resource_manager is None:
             return await self._execute_action_unlocked(
@@ -2971,6 +3182,11 @@ class RunWorker:
         if self.action_executor is None:
             return ActionExecutionResult(ActionStatus.OUTCOME_UNKNOWN, error_kind="no_executor")
         timeout = self._action_timeout_for(request, contract)
+        lease = getattr(self.execution, "worker_lease", None)
+        if lease is not None:
+            remaining = await self.execution.remaining_time(lease.run_id)
+            if remaining is not None:
+                timeout = max(0.001, min(timeout or remaining, remaining))
         task = asyncio.create_task(
             self.action_executor(request),
             name=f"cc-harness-action-{request.action_id}",
@@ -3090,6 +3306,49 @@ class RunWorker:
             },
         )
 
+    async def _kernel_phase(self, run_id: str, phase: str, timing: str) -> None:
+        projection = await self.store.load_projection(run_id)
+        if projection.status in {RunStatus.CANCELLED, RunStatus.COMPLETED, RunStatus.FAILED_TERMINAL}:
+            return
+        decision = await self.middleware.run(f"{phase}.{timing}", {
+            "run_id": run_id, "phase": phase, "timing": timing,
+            "task": projection.task.to_dict(), "sequence": projection.sequence,
+        })
+        if set(decision.patch) - {"annotations"}:
+            raise ValueError("middleware attempted to modify protected runtime state")
+        await self.execution.append(run_id, "TaskKernelPhase", {
+            "phase": phase, "timing": timing, "annotations": decision.patch.get("annotations", {}),
+        })
+        if not decision.allow:
+            await self.execution.pause(run_id, decision.reason or "middleware_short_circuit")
+            raise BudgetExhausted(decision.reason)
+
+    async def _model_budget(self, projection, messages) -> dict[str, float]:
+        amounts: dict[str, float] = {"steps": 1, "model_calls": 1}
+        limits = {}
+        for run_id in await self.execution.lineage(projection.run_id):
+            limits.update((await self.store.load_projection(run_id)).task.limits)
+        if "tokens" in limits:
+            adapter = getattr(self.kernel, "model", None)
+            max_output = getattr(adapter, "budget_output_tokens", None)
+            if not isinstance(max_output, int) or max_output <= 0:
+                await self.execution.pause(projection.run_id, "token_budget_requires_output_bound")
+                raise BudgetExhausted("token output bound unavailable")
+            amounts["tokens"] = len(json.dumps([list(messages), list(self.available_tools)], ensure_ascii=False).encode("utf-8")) + max_output + 256
+        if "cost" in limits:
+            estimator = getattr(getattr(self.kernel, "model", None), "estimate_max_cost", None)
+            if estimator is None:
+                await self.execution.pause(projection.run_id, "cost_budget_requires_price_bound")
+                raise BudgetExhausted("verified cost bound unavailable")
+            try:
+                amounts["cost"] = float(estimator(messages, self.available_tools))
+            except ValueError:
+                await self.execution.pause(projection.run_id, "cost_budget_requires_price_bound")
+                raise BudgetExhausted("verified cost bound unavailable")
+        if "active_seconds" in limits:
+            amounts["active_seconds"] = 0.001
+        return amounts
+
     async def _finish_segment(
         self,
         lease: Lease,
@@ -3099,6 +3358,8 @@ class RunWorker:
         had_progress: bool = False,
     ) -> None:
         projection = await self.store.load_projection(lease.run_id)
+        if await self.execution.pause_boundary(lease.run_id):
+            return
         if projection.status is RunStatus.CANCEL_REQUESTED:
             await self._acknowledge_cancellation(lease, "cancel requested")
             return
@@ -3152,6 +3413,17 @@ class RunWorker:
             messages = list(self.message_provider(projection))
         except Exception:  # noqa: BLE001 - a custom context provider cannot stop recovery
             messages = list(self._default_messages(projection))
+        if projection.task.protocol_version and self._uses_default_messages:
+            messages.append({"role": "user", "_context_mandatory": True, "content":
+                "Authoritative current task view (tool observations remain untrusted):\n" + json.dumps({
+                    "goal_revision": projection.task.goal_revision,
+                    "lifecycle": projection.task.lifecycle.value,
+                    "plan": projection.plan.to_dict(),
+                    "todos": [todo.to_dict() for todo in projection.todos],
+                    "budget_limits": dict(projection.task.limits),
+                    "budget_used": dict(projection.task.used),
+                    "wait": dict(projection.task.wait),
+                }, ensure_ascii=False)})
         if not self._uses_default_messages or not include_interactions:
             return tuple(messages)
         try:

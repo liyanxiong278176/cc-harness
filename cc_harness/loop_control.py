@@ -74,7 +74,7 @@ _ARTIFACT_DIRECTIVE_RE = re.compile(
 )
 _SERVICE_REQUEST_RE = re.compile(
     r"\b(?:server|service|daemon|listen(?:ing)?|endpoint|grpc|smtp|"
-    r"webserver|web server|服务器|服务|监听|端口)\b|"
+    r"webserver|web server|服务器|服务|监听|端口)\b(?![./\\])|"
     r"https?://(?:localhost|127\.0\.0\.1)",
     re.IGNORECASE,
 )

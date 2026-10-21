@@ -5,6 +5,7 @@ import json
 import sqlite3
 
 import pytest
+from cc_harness.run_model import RunStatus
 
 from cc_harness.coordinator import RunCoordinator, RunRequest
 from cc_harness.lease import LeaseManager
@@ -82,7 +83,9 @@ async def test_supervisor_reclaims_expired_lease_from_still_active_task(tmp_path
         await supervisor.tick()
 
         events = (await store.read(handle.run_id)).events
-        assert any(event.event_type == "WorkerLeaseExpired" for event in events)
+        assert any(event.event_type == "RunPaused" for event in events)
+        assert (await store.load_projection(handle.run_id)).status is RunStatus.PAUSED
+        assert created == 1  # no replacement worker before user continuation
         assert cancelled.is_set()
         await supervisor.stop(drain=False)
     finally:

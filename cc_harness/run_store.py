@@ -1514,7 +1514,7 @@ class RunStore:
                 "UPDATE run_lease SET expires_at = ? WHERE run_id = ? AND epoch = ?",
                 (float(event.payload.get("expires_at", time.time() + 60.0)), event.run_id, event.lease_epoch),
             )
-        elif event.event_type in {"RunResumed", "RunBlocked", "RunStalled", "RunCancelled", "ApprovalRequested"}:
+        elif event.event_type in {"RunResumed", "RunBlocked", "RunStalled", "RunCancelled", "ApprovalRequested", "RunPaused", "TaskWaitStarted"}:
             await db.execute(
                 "DELETE FROM run_resource_lease WHERE run_id = ?",
                 (event.run_id,),

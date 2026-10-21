@@ -160,8 +160,8 @@ async def run_durable_repl(
 ) -> None:
     """Minimal coordinator REPL used by the rebuilt client entrypoint.
 
-    Ordinary text is always a follow-up command; it is never passed to
-    ``run_turn`` or injected into a running model context.
+    Ordinary text guides the current task at a durable safe boundary;
+    explicit /follow-up creates an independent successor task.
     """
     from cc_harness.render import print_info
 
@@ -241,8 +241,16 @@ async def run_durable_repl(
         print_info(console, f"queued run: {active_run_id}")
     while True:
         try:
+            if active_run_id is not None and hasattr(client.coordinator, "execution"):
+                view = await client.coordinator.inspect(active_run_id)
+                if view.status.value not in {"completed", "cancelled", "failed_terminal"}:
+                    owner = view.projection.task.owner_terminal
+                    if owner.get("pid") != os.getpid():
+                        await client.coordinator.execution.attach_terminal(active_run_id)
             raw = (await _read_user("> [durable] ")).strip()
         except EOFError:
+            if active_run_id is not None:
+                await client.coordinator.pause(active_run_id, "terminal_closed")
             break
         except KeyboardInterrupt:
             # Ctrl+C is a runtime operation, not a UI-only interrupt: stop
@@ -251,16 +259,18 @@ async def run_durable_repl(
             if active_run_id is None:
                 print_info(console, "当前没有运行中的任务")
                 continue
-            await client.terminate_run_tree(active_run_id, reason="explicit Ctrl+C termination")
-            print_info(console, f"已终止任务树并保留检查点: {active_run_id}; 输入“继续”可恢复")
+            await client.coordinator.pause(active_run_id, "terminal Ctrl+C pause")
+            print_info(console, f"已暂停任务并保留检查点: {active_run_id}; 输入“继续”可恢复")
             active_run_id = None
             continue
         if not raw:
             continue
         if raw.casefold() in {"exit", "quit"}:
+            if active_run_id is not None:
+                await client.coordinator.pause(active_run_id, "terminal_closed")
             break
         if raw == "/help":
-            print_info(console, "普通消息=follow-up; 继续/接着做=恢复最近任务; /status /usage /interrupt /cancel /resume /approve /reject /list")
+            print_info(console, "普通消息=指导当前任务; /follow-up=独立后续任务; /pause /resume /cancel /status /usage /list")
             continue
         if raw == "/list":
             views = await client.coordinator.list()
@@ -296,7 +306,7 @@ async def run_durable_repl(
             continue
         if _is_durable_continuation(raw):
             view = await client.coordinator.inspect(active_run_id)
-            if view.status.value in {"cancelled", "stalled", "failed_recoverable", "waiting_on_predecessor"}:
+            if view.status.value in {"paused", "cancelled", "stalled", "failed_recoverable", "waiting_on_predecessor"}:
                 active_run_id = await client.continue_run(active_run_id)
                 print_info(console, f"已从检查点继续: {active_run_id}")
             elif view.status.value in {"completed", "failed_terminal"}:
@@ -315,8 +325,8 @@ async def run_durable_repl(
             )
         elif raw == "/usage":
             print_info(console, _format_durable_usage(await client.usage_for_run(active_run_id)))
-        elif raw == "/interrupt":
-            await client.coordinator.interrupt(active_run_id, "client interrupt")
+        elif raw in {"/interrupt", "/pause"}:
+            await client.coordinator.pause(active_run_id, "client pause")
         elif raw == "/cancel":
             await client.terminate_run_tree(active_run_id, reason="client cancel")
             print_info(console, f"已终止任务树并保留检查点: {active_run_id}")
@@ -331,7 +341,7 @@ async def run_durable_repl(
                 active_run_id = resumed
                 print_info(console, f"已恢复: {active_run_id}")
         elif raw.startswith("/follow-up "):
-            receipt = await client.coordinator.send(active_run_id, raw.removeprefix("/follow-up "))
+            receipt = await client.coordinator.send(active_run_id, raw.removeprefix("/follow-up "), follow_up=True)
             print_info(console, f"queued follow-up: {receipt.follow_up_run_id}")
         else:
             receipt = await client.coordinator.send(active_run_id, raw)

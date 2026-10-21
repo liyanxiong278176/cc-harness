@@ -6,6 +6,7 @@ import asyncio
 from collections.abc import AsyncIterator
 from dataclasses import dataclass, field
 import os
+from contextvars import ContextVar
 from typing import Any, Literal
 
 from openai import AsyncOpenAI
@@ -16,6 +17,7 @@ from cc_harness.tokens import UsageRecord
 
 
 _PROVIDER_RETRY_ATTEMPTS = 3
+task_output_token_limit: ContextVar[int | None] = ContextVar("task_output_token_limit", default=None)
 _PROVIDER_RETRY_DELAYS = (1.0, 2.0)
 
 
@@ -396,6 +398,9 @@ class LLMClient:
         """Yield StreamEvents; the final 'done' event carries the full assistant
         message (content + pending tool_calls + finish_reason)."""
         kwargs: dict[str, Any] = {"model": self.model, "messages": messages, "stream": True}
+        output_limit = task_output_token_limit.get()
+        if output_limit is not None:
+            kwargs["max_tokens"] = output_limit
         kwargs["stream_options"] = {"include_usage": True}
         if self.reasoning_effort and self.reasoning_effort_supported is not False:
             kwargs["reasoning_effort"] = self.reasoning_effort

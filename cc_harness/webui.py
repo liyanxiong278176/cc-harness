@@ -99,6 +99,7 @@ _ACTIVE_STATUS_PRIORITY = {
     RunStatus.CANCEL_REQUESTED: 1,
 }
 _RECOVERABLE_STATUSES = {
+    RunStatus.PAUSED,
     RunStatus.CANCELLED,
     RunStatus.STALLED,
     RunStatus.BLOCKED,
@@ -459,6 +460,15 @@ def _public_event(
         if text is not None:
             result["kind"] = "user"
             result["content"] = text
+    elif event_type == "TaskProgressRequested":
+        result["kind"] = "user"
+        result["content"] = str(payload["question"])
+    elif event_type == "TaskProgressReported":
+        result["kind"] = "assistant"
+        result["content"] = str(payload["text"])
+    elif event_type == "TaskGuidanceReceived":
+        result["kind"] = "user"
+        result["content"] = str(payload["text"])
     elif event_type == "RunResumed":
         reason = payload.get("reason")
         if isinstance(reason, str) and reason.strip():
@@ -1598,6 +1608,8 @@ class WebRuntimeManager:
         session_id: str | None = None,
         project_root: str | None = None,
         interaction_mode: str = "auto",
+        budget_limits: dict[str, float] | None = None,
+        plan_mode: bool = False,
     ) -> dict[str, Any]:
         if not text.strip():
             raise ValueError("消息不能为空")
@@ -1616,18 +1628,25 @@ class WebRuntimeManager:
             # active, queue behind that child instead of resuming the stalled
             # root and accidentally running two turns concurrently.
             if head.status in {
+                RunStatus.PAUSED,
                 RunStatus.STALLED,
                 RunStatus.CANCELLED,
                 RunStatus.BLOCKED,
                 RunStatus.FAILED_RECOVERABLE,
             }:
+                if getattr(self, "terminal_pid", None) and head.status is not RunStatus.CANCELLED:
+                    await client.coordinator.execution.attach_terminal(head.run_id, self.terminal_pid)
+                if head.status in {RunStatus.PAUSED, RunStatus.BLOCKED, RunStatus.STALLED, RunStatus.FAILED_RECOVERABLE} and text.strip() not in {"继续", "接着做", "继续执行", "resume", "continue"}:
+                    await client.coordinator.execution.guidance(head.run_id, text.strip())
                 receipt = await client.coordinator.resume(head.run_id, text.strip())
+                if getattr(self, "terminal_pid", None) and receipt.run_id != head.run_id:
+                    await client.coordinator.execution.attach_terminal(receipt.run_id, self.terminal_pid)
                 await self._wake_supervisor(client)
                 return {
                     "session_id": session_id,
                     "run_id": session_id,
-                    "follow_up_run_id": None,
-                    "continuation": "same_run",
+                    "follow_up_run_id": receipt.run_id if receipt.run_id != head.run_id else None,
+                    "continuation": "same_run" if receipt.run_id == head.run_id else "child_run",
                     "sequence": receipt.sequence,
                     "message_event_id": f"{head.run_id}:{receipt.sequence}",
                     "status": "queued",
@@ -1638,7 +1657,7 @@ class WebRuntimeManager:
                 "session_id": session_id,
                 "run_id": session_id,
                 "follow_up_run_id": receipt.follow_up_run_id,
-                "continuation": "child_run",
+                "continuation": "guidance" if receipt.follow_up_run_id is None else "child_run",
                 "sequence": receipt.sequence,
                 "message_event_id": f"{head.run_id}:{receipt.sequence}",
                 "status": "queued",
@@ -1660,9 +1679,17 @@ class WebRuntimeManager:
             client = await self._client_for_root(requested_root, start=True)
         else:
             client = await self._client(start=True)
+        submit_options = {}
+        if budget_limits is not None:
+            submit_options["budget_limits"] = budget_limits
+        if plan_mode:
+            submit_options["plan_mode"] = True
+        if getattr(self, "terminal_pid", None):
+            submit_options["terminal_pid"] = self.terminal_pid
         run_id = await client.submit(
             text.strip(),
             interaction_mode=classify_interaction_mode(text, interaction_mode),
+            **submit_options,
         )
         await self._wake_supervisor(client)
         # ``RunCreated`` is the first durable root event and is therefore a
@@ -1693,6 +1720,8 @@ class WebRuntimeManager:
             "run_id": run_id,
             "project_root": str(client.cwd),
             "status": effective.status.value,
+            "task": _redact(effective.projection.task.to_dict()),
+            "plan_digest": effective.projection.plan.digest,
             "sequence": max((item.sequence for item in tree), default=effective.sequence),
             "projection": projection,
             "usage": _redact(usage),
@@ -1999,14 +2028,18 @@ class WebRuntimeManager:
             raise ValueError("当前会话有待处理审批，请先在运行面板中允许或拒绝该动作")
         if head.status not in _RECOVERABLE_STATUSES:
             raise ValueError(f"当前状态不可恢复: {head.status.value}")
+        if getattr(self, "terminal_pid", None) and head.status is not RunStatus.CANCELLED:
+            await client.coordinator.execution.attach_terminal(head.run_id, self.terminal_pid)
         # ``_client_for_run(start=True)`` already attempted to attach a local
         # supervisor.  If another process owns the project lease, continue
         # remains a durable control-plane write and must not retry leadership
         # a second time in the same request.
-        await client.continue_run(
+        resumed_run_id = await client.continue_run(
             head.run_id,
             reason="WebUI 用户继续",
         )
+        if getattr(self, "terminal_pid", None) and resumed_run_id != head.run_id:
+            await client.coordinator.execution.attach_terminal(resumed_run_id, self.terminal_pid)
 
     async def _wake_supervisor(self, client: DurableRuntimeClient) -> None:
         """Wake the project scheduler after a durable control decision."""
@@ -2163,8 +2196,10 @@ class WebRuntimeManager:
                     if record.parent_run_id is not None:
                         continue
                     view = await client.coordinator.inspect(record.run_id)
-                    if view.status in _ACTIVE_STATUSES:
-                        await client.terminate_run_tree(record.run_id, reason="WebUI 关闭", stop_supervisor=False)
+                    if (view.status in _ACTIVE_STATUSES
+                            and view.projection.task.owner_terminal.get("pid") == getattr(self, "terminal_pid", None)
+                            and getattr(self, "terminal_pid", None) is not None):
+                        await client.coordinator.pause(record.run_id, "terminal_closed")
         for client in clients:
             with contextlib.suppress(Exception):
                 await client.close()
@@ -2188,6 +2223,20 @@ class MessageRequest(BaseModel):
     # ``auto`` is intentionally conservative; callers can opt into the
     # explicit conversation contract for a tool-free turn.
     interaction_mode: str = "auto"
+    budget_limits: dict[str, float] | None = None
+    plan_mode: bool = False
+
+
+class TaskBudgetRequest(BaseModel):
+    limits: dict[str, float]
+
+
+class PlanDecisionRequest(BaseModel):
+    plan_digest: str
+
+
+class WakeTaskRequest(BaseModel):
+    wait_id: str
 
 
 class ArtifactOpenRequest(BaseModel):
@@ -2637,6 +2686,8 @@ def create_web_app(manager: WebRuntimeManager | None = None) -> FastAPI:
                 session_id=payload.session_id,
                 project_root=payload.project_root,
                 interaction_mode=payload.interaction_mode,
+                budget_limits=payload.budget_limits,
+                plan_mode=payload.plan_mode,
             )
         except Exception as exc:
             raise _http_error(exc) from exc
@@ -2847,6 +2898,45 @@ def create_web_app(manager: WebRuntimeManager | None = None) -> FastAPI:
             raise _http_error(exc) from exc
         return {"stopped": True, "run_id": run_id}
 
+    @app.post("/api/sessions/{run_id}/pause")
+    async def pause_session(run_id: str) -> dict[str, Any]:
+        try:
+            client = await manager._validate_root_run(run_id)
+            receipt = await client.coordinator.pause(run_id, "user pause")
+            return {"run_id": receipt.run_id, "status": receipt.status.value}
+        except Exception as exc:
+            raise _http_error(exc) from exc
+
+    @app.put("/api/sessions/{run_id}/budget")
+    async def configure_task_budget(run_id: str, payload: TaskBudgetRequest) -> dict[str, Any]:
+        try:
+            client = await manager._validate_root_run(run_id)
+            await client.coordinator.execution.configure_budget(run_id, payload.limits)
+            return {"updated": True, "run_id": run_id}
+        except Exception as exc:
+            raise _http_error(exc) from exc
+
+    @app.post("/api/sessions/{run_id}/wake")
+    async def wake_task(run_id: str, payload: WakeTaskRequest) -> dict[str, Any]:
+        try:
+            client = await manager._validate_root_run(run_id)
+            resumed = await client.coordinator.execution.wake(run_id, payload.wait_id)
+            if resumed:
+                await manager._wake_supervisor(client)
+            return {"resumed": resumed, "run_id": run_id}
+        except Exception as exc:
+            raise _http_error(exc) from exc
+
+    @app.post("/api/sessions/{run_id}/plan/approve")
+    async def approve_task_plan(run_id: str, payload: PlanDecisionRequest) -> dict[str, Any]:
+        try:
+            client = await manager._validate_root_run(run_id)
+            receipt = await client.coordinator.approve_plan(run_id, payload.plan_digest)
+            await manager._wake_supervisor(client)
+            return {"run_id": receipt.run_id, "status": receipt.status.value}
+        except Exception as exc:
+            raise _http_error(exc) from exc
+
     @app.delete("/api/sessions/{run_id}")
     async def delete_session(run_id: str) -> dict[str, Any]:
         try:
@@ -2942,6 +3032,10 @@ def create_web_app(manager: WebRuntimeManager | None = None) -> FastAPI:
         ("/api/web/v1/sessions/{run_id}", delete_session, ["DELETE"]),
         ("/api/web/v1/sessions/{run_id}/stop", stop_session, ["POST"]),
         ("/api/web/v1/sessions/{run_id}/resume", resume_session, ["POST"]),
+        ("/api/web/v1/sessions/{run_id}/pause", pause_session, ["POST"]),
+        ("/api/web/v1/sessions/{run_id}/budget", configure_task_budget, ["PUT"]),
+        ("/api/web/v1/sessions/{run_id}/wake", wake_task, ["POST"]),
+        ("/api/web/v1/sessions/{run_id}/plan/approve", approve_task_plan, ["POST"]),
         ("/api/web/v1/sessions/{run_id}/approvals/{approval_id}/approve", approve, ["POST"]),
         ("/api/web/v1/sessions/{run_id}/approvals/{approval_id}/reject", reject, ["POST"]),
     )
@@ -3008,6 +3102,7 @@ async def run_web_server(
         return 2
     selected_port = _find_available_port(host, port)
     manager = WebRuntimeManager(initial_cwd=initial_cwd, data_root=data_root, initial_prompt=initial_prompt)
+    manager.terminal_pid = os.getpid()
     app = create_web_app(manager)
     display_host = "localhost" if host in {"127.0.0.1", "::1"} else host
     url_host = f"[{host}]" if ":" in host and host != "::1" else display_host

@@ -472,7 +472,7 @@ def main():
             done.append(sample["sample_id"])
             json_path.write_text(json.dumps(all_results, ensure_ascii=False, indent=1), encoding="utf-8")
             CHECKPOINT.write_text(json.dumps({"done": done}, ensure_ascii=False), encoding="utf-8")
-            trace.flush()
+            trace.close()
             n_pass = sum(1 for r in results if r.get("pass"))
             print(f"[runner]   {sample['sample_id']}: {len(results)} qa, {n_pass} pass", flush=True)
 

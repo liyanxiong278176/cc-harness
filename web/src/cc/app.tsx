@@ -233,6 +233,12 @@ function normalizePermissionMode(value: string | undefined): PermissionMode {
 }
 
 const statusLabels: Record<string, string> = {
+  created: '已创建',
+  paused: '已暂停',
+  waiting_input: '等待补充信息',
+  waiting_event: '等待任务结果',
+  waiting_approval: '等待审批',
+  verifying: '验证中',
   draft: '草稿',
   queued: '排队中',
   running: '运行中',
@@ -252,6 +258,8 @@ const commandItems: CommandItem[] = [
   { id: 'project', command: '/project', label: '选择项目', description: '切换本机项目文件夹', icon: FolderOpen },
   { id: 'status', command: '/status', label: '刷新状态', description: '读取当前会话的 Runtime 状态', icon: RefreshCw },
   { id: 'resume', command: '/resume', label: '继续运行', description: '从检查点继续，或确认解除目标审核阻塞', icon: RotateCcw },
+  { id: 'pause', command: '/pause', label: '暂停任务', description: '保存进度，之后继续原任务', icon: CircleStop },
+  { id: 'approve-plan', command: '/approve-plan', label: '批准当前计划', description: '批准当前计划版本并进入执行', icon: ShieldCheck },
   { id: 'settings', command: '/settings', label: '打开设置', description: '配置 Base URL、API Key 和模型', icon: Settings },
   { id: 'clear', command: '/clear', label: '清空视图', description: '清空当前浏览器视图，不删除审计事件', icon: X },
   { id: 'help', command: '/help', label: '帮助', description: '查看 WebUI 快捷命令', icon: Command },
@@ -1628,7 +1636,7 @@ function QueuePanel({ items }: { items: QueuedMessage[] }) {
           <div className="queue-panel-item" key={item.follow_up_run_id}>
             <span className="queue-panel-dot" />
             <span className="queue-panel-content">{item.content}</span>
-            <span className="queue-panel-gate">{item.gate === 'approval' ? '审批后发送' : item.gate === 'incomplete' ? '前序未完成' : item.gate === 'bypassed' ? '已转向' : '等待中'}</span>
+            <span className="queue-panel-gate">{item.gate === 'approval' ? '可补充或修改要求' : item.gate === 'incomplete' ? '前序未完成' : item.gate === 'bypassed' ? '已转向' : '等待中'}</span>
           </div>
         ))}
       </div>
@@ -2702,7 +2710,7 @@ function App() {
   )
   const conversationTurns = useMemo(() => groupConversationTurns(conversationEvents), [conversationEvents])
   const retryableTurn = useMemo(() => {
-    if (!active || !['cancelled', 'stalled', 'failed_recoverable', 'blocked'].includes(active.status)) return null
+    if (!active || !['paused', 'cancelled', 'stalled', 'failed_recoverable', 'blocked'].includes(active.status)) return null
     let lastUserIndex = -1
     conversationEvents.forEach((event, index) => {
       if (event.kind === 'user' && Boolean(event.content?.trim())) lastUserIndex = index
@@ -2783,7 +2791,7 @@ function App() {
   }
 
   function canContinueToolResult(observation: EventItem) {
-    if (!active || !['cancelled', 'stalled', 'failed_recoverable', 'blocked'].includes(active.status)) return false
+    if (!active || !['paused', 'cancelled', 'stalled', 'failed_recoverable', 'blocked'].includes(active.status)) return false
     if (observation.run_id !== active.run_id) return false
     // Follow-up messages run in a child Run. ContinueToolResult deliberately
     // reads only observations committed by its own Run, so an older cursor
@@ -3016,6 +3024,27 @@ function App() {
     }
   }
 
+  async function pauseSession() {
+    if (!activeSession) return
+    try {
+      await webApi('/api/sessions/' + encodeURIComponent(activeSession) + '/pause', { method: 'POST' })
+      await loadSession(activeSession)
+      notify('已请求暂停；保存进度后可继续原任务')
+    } catch (reason) { setError(displayApiError(reason)) }
+  }
+
+  async function approveCurrentPlan() {
+    if (!activeSession) return
+    try {
+      const current = await webApi<{ plan_digest: string }>('/api/sessions/' + encodeURIComponent(activeSession))
+      await webApi('/api/sessions/' + encodeURIComponent(activeSession) + '/plan/approve', {
+        method: 'POST', body: JSON.stringify({ plan_digest: current.plan_digest }),
+      })
+      await loadSession(activeSession)
+      notify('当前计划已批准')
+    } catch (reason) { setError(displayApiError(reason)) }
+  }
+
   async function stopSession() {
     if (!activeSession) return
     const runId = activeSession
@@ -3235,6 +3264,10 @@ function App() {
     } else if (item.id === 'resume') {
       if (activeSession) void resumeSession()
       else notify('当前没有可恢复的会话')
+    } else if (item.id === 'pause') {
+      void pauseSession()
+    } else if (item.id === 'approve-plan') {
+      void approveCurrentPlan()
     } else if (item.id === 'clear') {
       setEvents([])
       setStreamingRuns({})
@@ -3448,7 +3481,7 @@ function App() {
             {commandPaletteOpen && <CommandPalette items={visibleCommands} selectedIndex={commandIndex} onSelect={selectCommand} />}
             <div className="composer-toolbar"><button className={'composer-project ' + (!project ? 'needs-project' : '')} onClick={chooseProject}><FolderOpen size={16} /><span>{project ? projectName : '选择项目文件夹'}</span><ChevronDown size={14} /></button><div className="composer-toolbar-right"><span className="composer-mode"><ShieldCheck size={13} />本地 Runtime</span></div></div>
              <textarea ref={textareaRef} value={draft} onChange={(event) => { updateDraft(event.target.value); setCursorPosition(event.currentTarget.selectionStart ?? event.currentTarget.value.length); setCommandIndex(0) }} onKeyDown={handleComposerKeyDown} onClick={(event) => { syncCursorPosition(event); if (!project) notify('请先选择本地项目文件夹') }} onKeyUp={syncCursorPosition} onSelect={syncCursorPosition} disabled={!project || sending || sessionLoading} placeholder={sessionLoading ? '正在载入会话…' : project ? '描述要完成的任务，或输入 / 查看命令…' : '请先选择本地项目文件夹'} rows={1} aria-label="任务输入框" />
-          <div className="composer-footer"><div className="composer-footer-left"><PermissionSelector mode={settings.permission_mode} onChange={(mode) => void changePermissionMode(mode)} /><span className="privacy-note"><ShieldCheck size={13} />内容只在本机 Runtime 处理</span>{pendingApprovals.length > 0 && <span className="composer-queue-hint" title="这条消息会在当前工具审批完成后按顺序发送">审批后发送</span>}{active && ['running', 'queued', 'awaiting_approval'].includes(active.status) && pendingApprovals.length === 0 && <span className="composer-queue-hint">消息将排队</span>}</div><div className="composer-actions">{active && ['running', 'queued', 'awaiting_approval'].includes(active.status) && <button className="stop-button" onClick={() => void stopSession()} title="保存当前检查点并停止，随后可发送新指令" aria-label="停止运行"><CircleStop size={15} /><span>停止并转向</span></button>}{active && ['cancelled', 'stalled', 'failed_recoverable', 'blocked'].includes(active.status) && !retryableTurn && <button className="secondary-button compact" onClick={() => void resumeSession()}><RotateCcw size={15} />{active.status === 'blocked' ? '确认继续' : '继续'}</button>}<button className="send-button" onClick={() => void sendMessage()} disabled={!project || !draft.trim() || sending || sessionLoading} aria-label={sending ? '正在提交' : '发送'} title={sending ? '正在提交' : '发送'}>{sending ? <LoaderCircle size={16} className="spin" /> : <Send size={16} />}<span>{sending ? '提交中' : active && pendingApprovals.length > 0 ? '排队' : active && ['running', 'queued'].includes(active.status) ? '排队' : '发送'}</span></button></div></div>
+          <div className="composer-footer"><div className="composer-footer-left"><PermissionSelector mode={settings.permission_mode} onChange={(mode) => void changePermissionMode(mode)} /><span className="privacy-note"><ShieldCheck size={13} />内容只在本机 Runtime 处理</span>{pendingApprovals.length > 0 && <span className="composer-queue-hint" title="补充要求会更新当前任务，旧动作审批可能因此失效">可补充或修改要求</span>}{active && ['running', 'queued', 'awaiting_approval'].includes(active.status) && pendingApprovals.length === 0 && <span className="composer-queue-hint">补充要求将及时生效</span>}</div><div className="composer-actions">{active && ['running', 'queued', 'awaiting_approval', 'waiting_event'].includes(active.status) && <button className="secondary-button compact" onClick={() => void pauseSession()} title="暂停并保留进度"><CircleStop size={15} />暂停</button>}{active && ['running', 'queued', 'awaiting_approval'].includes(active.status) && <button className="stop-button" onClick={() => void stopSession()} title="保存当前检查点并停止，随后可发送新指令" aria-label="停止运行"><CircleStop size={15} /><span>停止并转向</span></button>}{active && ['paused', 'cancelled', 'stalled', 'failed_recoverable', 'blocked'].includes(active.status) && !retryableTurn && <button className="secondary-button compact" onClick={() => void resumeSession()}><RotateCcw size={15} />{active.status === 'blocked' ? '确认继续' : '继续'}</button>}<button className="send-button" onClick={() => void sendMessage()} disabled={!project || !draft.trim() || sending || sessionLoading} aria-label={sending ? '正在提交' : '发送'} title={sending ? '正在提交' : '发送'}>{sending ? <LoaderCircle size={16} className="spin" /> : <Send size={16} />}<span>{sending ? '提交中' : '发送'}</span></button></div></div>
           </div>
           {project && !sessionLoading && conversationTurns.length === 0 && <WelcomeSuggestions onChoose={usePrompt} />}
         </footer>

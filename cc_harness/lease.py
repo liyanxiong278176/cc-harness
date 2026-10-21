@@ -254,6 +254,11 @@ class LeaseManager:
             projection = await self.store.load_projection(run_id)
             if projection.status not in {RunStatus.RUNNING, RunStatus.CANCEL_REQUESTED}:
                 return None
+            if projection.task.protocol_version and projection.status is RunStatus.RUNNING:
+                from .execution_control import ExecutionControl
+                await ExecutionControl(self.store).pause(run_id, "recovery_requires_continuation")
+                await ExecutionControl(self.store).pause_boundary(run_id)
+                return None
             event_type = "RunCancelled" if projection.status is RunStatus.CANCEL_REQUESTED else "WorkerLeaseExpired"
             event = RunEvent.create(
                 run_id=run_id,
@@ -272,6 +277,12 @@ class LeaseManager:
         if not current.is_expired():
             return None
         projection = await self.store.load_projection(run_id)
+        if projection.task.protocol_version and projection.status is RunStatus.RUNNING:
+            from .execution_control import ExecutionControl
+            await self.store.release_lease(run_id, current.epoch)
+            await ExecutionControl(self.store).pause(run_id, "recovery_requires_continuation")
+            await ExecutionControl(self.store).pause_boundary(run_id)
+            return current
         event_type = "RunCancelled" if projection.status is RunStatus.CANCEL_REQUESTED else "WorkerLeaseExpired"
         event = RunEvent.create(
             run_id=run_id,

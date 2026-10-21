@@ -23,6 +23,7 @@ from .run_model import (
     digest_json,
 )
 from .run_outcomes import RunOutcome, outcome_for_status
+from .task_execution import TaskControl
 
 
 class ProjectionError(ValueError):
@@ -112,6 +113,7 @@ class QueueProjection:
     gate: str = "waiting"
     status: str = "queued"
     queued_sequence: int = 0
+    continuation: bool = False
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -121,6 +123,7 @@ class QueueProjection:
             "gate": self.gate,
             "status": self.status,
             "queued_sequence": self.queued_sequence,
+            "continuation": self.continuation,
         }
 
     @classmethod
@@ -132,6 +135,7 @@ class QueueProjection:
             gate=str(data.get("gate", "waiting")),
             status=str(data.get("status", "queued")),
             queued_sequence=int(data.get("queued_sequence", 0)),
+            continuation=bool(data.get("continuation", False)),
         )
 
 
@@ -267,6 +271,7 @@ class WorkingStateProjection:
 @dataclass(frozen=True)
 class RunProjection:
     run_id: str
+    task: TaskControl = field(default_factory=TaskControl)
     sequence: int = 0
     last_event_id: str | None = None
     status: RunStatus = RunStatus.DRAFT
@@ -299,6 +304,7 @@ class RunProjection:
     def to_dict(self) -> dict[str, Any]:
         return {
             "run_id": self.run_id,
+            "task": self.task.to_dict(),
             "sequence": self.sequence,
             "last_event_id": self.last_event_id,
             "status": self.status.value,
@@ -328,6 +334,7 @@ class RunProjection:
         goal_data = data.get("goal")
         return cls(
             run_id=str(data.get("run_id", "")),
+            task=TaskControl.from_dict(data.get("task") or {}),
             sequence=int(data.get("sequence", 0)),
             last_event_id=data.get("last_event_id"),
             status=RunStatus(str(data.get("status", RunStatus.DRAFT.value))),
@@ -434,6 +441,7 @@ def _action_from_dict(data: Mapping[str, Any]) -> ActionAttempt:
 @dataclass
 class _MutableProjection:
     run_id: str
+    task: TaskControl = field(default_factory=TaskControl)
     sequence: int = 0
     last_event_id: str | None = None
     status: RunStatus = RunStatus.DRAFT
@@ -460,6 +468,7 @@ class _MutableProjection:
     def from_projection(cls, projection: RunProjection) -> "_MutableProjection":
         return cls(
             run_id=projection.run_id,
+            task=projection.task,
             sequence=projection.sequence,
             last_event_id=projection.last_event_id,
             status=projection.status,
@@ -486,6 +495,7 @@ class _MutableProjection:
     def freeze(self) -> RunProjection:
         return RunProjection(
             run_id=self.run_id,
+            task=self.task,
             sequence=self.sequence,
             last_event_id=self.last_event_id,
             status=self.status,
@@ -564,6 +574,8 @@ class ProjectionBuilder:
             current_status=state.status,
             goal=state.goal,
         )
+        if state.task.protocol_version and state.status is RunStatus.CANCELLED and event.event_type == "RunResumed":
+            raise ProjectionError("cancelled task requires an associated successor run")
         if event.event_type == "PlanRevised" and state.discovery_status == "awaiting":
             raise ProjectionError("plan mutation is blocked while read-only discovery is active")
         if event.event_type == "ActionPlanned" and state.mutation_gate == "read_only":
@@ -573,6 +585,7 @@ class ProjectionBuilder:
 
     def _apply(self, event: RunEvent, state: _MutableProjection) -> None:
         payload = event.payload
+        state.task = state.task.apply(event.event_type, payload, event.sequence)
         target = None
         if event.event_type == "RunFailed":
             target = RunStatus(str(payload["target_status"]))
@@ -602,6 +615,11 @@ class ProjectionBuilder:
             state.runtime_contract_digest = event.runtime_contract_digest
         elif event.event_type in {"GoalContractAccepted", "GoalContractRevised"}:
             state.goal = GoalContract.from_dict(payload["goal"])
+            if event.event_type == "GoalContractRevised" and payload.get("guidance_ids"):
+                # Keep evidence/history intact, but completed plan nodes cannot exempt
+                # a revised objective from another execution and verification pass.
+                state.todos = {key: replace(todo, status="pending") for key, todo in state.todos.items()}
+                state.working_state = replace(state.working_state, last_verification_ok=None)
         elif event.event_type == "RunRuntimeMigrated":
             state.runtime_contract_digest = str(payload["new_runtime_contract_digest"])
             state.runtime_contract = (
@@ -619,7 +637,20 @@ class ProjectionBuilder:
             state.mutation_gate = "read_only"
         elif event.event_type == "PlanDiscoveryCompleted":
             state.discovery_status = "completed"
+            state.mutation_gate = "read_only" if state.task.plan_approval_required else "open"
+        elif event.event_type == "TaskPlanApproved":
+            if payload["plan_digest"] != state.plan.digest:
+                raise ProjectionError("plan approval refers to a stale plan")
             state.mutation_gate = "open"
+        elif event.event_type == "TaskPlanApprovalRequired":
+            state.mutation_gate = "read_only"
+        elif event.event_type == "TaskApprovalSuperseded":
+            key = str(payload["approval_id"])
+            approval = next((item for item in state.approvals.values() if item.approval_id == key), None)
+            if approval is None:
+                raise ProjectionError("superseded approval is unknown")
+            state.approvals[key] = replace(approval, status=ApprovalStatus.EXPIRED,
+                                          decided_by="task_control", decided_at=event.occurred_at)
         elif event.event_type == "RunClaimed":
             state.active_worker_id = str(payload["worker_id"])
             state.lease_epoch = event.lease_epoch
@@ -632,6 +663,7 @@ class ProjectionBuilder:
             "RunCancelled",
             "RunBlocked",
             "RunStalled",
+            "RunPaused",
         }:
             state.active_worker_id = None
             # A resumed Run is active work again.  Do not leave the previous
@@ -656,6 +688,8 @@ class ProjectionBuilder:
                         )
         elif event.event_type == "PlanCreated" or event.event_type == "PlanRevised":
             state.plan = PlanGraph.from_dict(payload["plan"])
+            if state.task.plan_approval_required:
+                state.mutation_gate = "read_only"
         elif event.event_type == "ToolObservationCommitted":
             self._apply_observation(event, state)
         elif event.event_type.startswith("Action"):
@@ -673,6 +707,7 @@ class ProjectionBuilder:
                 message_artifact=str(payload["message_artifact"]),
                 gate=str(payload.get("gate", "waiting")),
                 queued_sequence=event.sequence,
+                continuation=bool(payload.get("continuation", False)),
             )
         elif event.event_type == "FollowUpStarted":
             follow_up_id = str(payload["follow_up_run_id"])

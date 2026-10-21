@@ -214,7 +214,7 @@ async def test_failed_child_is_durable_and_blocks_required_parent_completion(tmp
 
 
 @pytest.mark.asyncio
-async def test_natural_continuation_resumes_root_and_recoverable_descendants(tmp_path):
+async def test_cancelled_continuation_creates_successor_without_reviving_descendants(tmp_path):
     store = await RunStore(tmp_path, data_root=tmp_path / "state").open()
     coordinator = RunCoordinator(store)
     client = DurableRuntimeClient(store, coordinator)
@@ -228,10 +228,14 @@ async def test_natural_continuation_resumes_root_and_recoverable_descendants(tmp
         await coordinator.cancel(parent.run_id, "Ctrl+C")
         await coordinator.cancel(child.child_run_id, "Ctrl+C")
 
-        await client.continue_run(parent.run_id)
+        successor_id = await client.continue_run(parent.run_id)
 
-        assert (await coordinator.inspect(parent.run_id)).status.value == "queued"
-        assert (await coordinator.inspect(child.child_run_id)).status.value == "queued"
+        assert successor_id != parent.run_id
+        assert (await coordinator.inspect(parent.run_id)).status.value == "cancelled"
+        assert (await coordinator.inspect(child.child_run_id)).status.value == "cancelled"
+        successor = await coordinator.inspect(successor_id)
+        assert successor.status.value == "queued"
+        assert successor.projection.goal.acceptance_criteria == ("report",)
         client.start_supervisor.assert_awaited_once()
     finally:
         await store.close()

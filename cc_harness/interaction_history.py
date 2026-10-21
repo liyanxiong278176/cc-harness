@@ -327,6 +327,14 @@ async def materialize_interaction_messages(
             message = _handoff_message(store, event)
             if message is not None:
                 messages.append(message)
+        elif event.event_type == "TaskVerificationFinished" and not event.payload.get("passed"):
+            messages.append({"role": "user", "content":
+                "Runtime verification found gaps. Repair within the existing goal and permissions; "
+                "do not weaken acceptance checks. Gaps: " + json.dumps(event.payload.get("issues", [])),
+                "_cc_harness_untrusted": True})
+        elif event.event_type == "TaskGuidanceReceived":
+            messages.append({"role": "user", "content": str(event.payload["text"]),
+                             "_context_mandatory": True, "_cc_harness_guidance": True})
         elif event.event_type == "RunResumed":
             message = _resume_message(event)
             if message is not None:

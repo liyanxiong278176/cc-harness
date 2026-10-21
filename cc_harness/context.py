@@ -17,6 +17,7 @@ Design spec: ``docs/superpowers/specs/2026-06-12-context-compaction-design.md``.
 """
 from __future__ import annotations
 
+import asyncio
 import copy
 import hashlib
 import json
@@ -30,6 +31,12 @@ from typing import Any
 
 from cc_harness.atomic import atomic_write_text
 from cc_harness.config import ContextConfig
+from cc_harness.context_evidence import (
+    exclude_retained_turns,
+    fresh_tool_results,
+    refresh_task_evidence,
+    retained_tool_turns,
+)
 from cc_harness.context_refs import (
     context_message_ref,
     context_scope_ref,
@@ -60,7 +67,7 @@ _FALLBACK_CHARS = 200
 # compaction artifacts unsafe to reuse.  This invalidates stale projections on
 # resume instead of replaying an artifact that was produced with the old
 # last-user protect-boundary behavior.
-_COMPACTION_ALGORITHM_VERSION = "v6-authoritative-tail-provider-budget"
+_COMPACTION_ALGORITHM_VERSION = "v12-pressure-before-evidence-refresh"
 
 # 3-group fence regex for user ```` ``` ```` code blocks (no nested-fence support).
 _CODE_FENCE_RE = re.compile(r"```([^\n]*)\n(.*?)\n```", re.DOTALL)
@@ -170,6 +177,7 @@ class ContextProjection:
                 projection = payload.get("projection_messages")
                 if (
                     isinstance(projection, list)
+                    and payload.get("algorithm_version") == _COMPACTION_ALGORITHM_VERSION
                     and 0 <= stored.source_count <= len(source_messages)
                     and stored.source_digest == _messages_digest(source_messages[: stored.source_count])
                 ):
@@ -220,6 +228,8 @@ class ContextProjection:
         )
         for version, path, payload in ordered:
             self.compaction_version = max(self.compaction_version, version)
+            if payload.get("algorithm_version") != _COMPACTION_ALGORITHM_VERSION:
+                continue
             if payload.get("tier") == CompactionTier.SUMMARIZE.name.lower() or path.name.startswith("summary-"):
                 try:
                     summary_version = int(payload.get("summary_version", version))
@@ -334,7 +344,7 @@ class ContextProjection:
         )
         if selected_tier != CompactionTier.NONE:
             if self.state_store is not None:
-                stored = self.state_store.by_key(expected_key)
+                stored = await asyncio.to_thread(self.state_store.by_key, expected_key)
                 if stored is not None:
                     projection = stored.payload.get("projection_messages")
                     if isinstance(projection, list):
@@ -387,21 +397,34 @@ class ContextProjection:
         expected_parent = self.current_version
         if selected_tier != CompactionTier.NONE and self.state_store is not None:
             lease_owner = uuid.uuid4().hex
-            try:
-                lease_epoch, expected_parent = self.state_store.acquire(
-                    lease_owner,
-                    ttl_seconds=config.compaction_lease_ttl_seconds,
-                )
-            except ContextLeaseConflict as exc:
-                return CompactionStats(
-                    tier=selected_tier,
-                    before_tokens=total_before,
-                    after_tokens=total_before,
-                    ratio_before=ratio_before,
-                    ratio_after=ratio_before,
-                    error=str(exc),
-                    compaction_key=expected_key,
-                )
+            wait_until = time.monotonic() + min(5.0, config.compaction_lease_ttl_seconds)
+            while True:
+                try:
+                    lease_epoch, expected_parent = await asyncio.to_thread(
+                        self.state_store.acquire,
+                        lease_owner,
+                        ttl_seconds=config.compaction_lease_ttl_seconds,
+                    )
+                    break
+                except ContextLeaseConflict as exc:
+                    if time.monotonic() >= wait_until:
+                        return CompactionStats(
+                            tier=selected_tier,
+                            before_tokens=total_before,
+                            after_tokens=total_before,
+                            ratio_before=ratio_before,
+                            ratio_after=ratio_before,
+                            error=str(exc),
+                            compaction_key=expected_key,
+                        )
+                    await asyncio.sleep(0.05)
+            # A writer may have published this exact key between the initial
+            # lookup and acquisition. Reuse its immutable projection instead
+            # of returning freshly generated content that was never committed.
+            published = await asyncio.to_thread(self.state_store.by_key, expected_key)
+            if published is not None:
+                await asyncio.to_thread(self.state_store.release, lease_owner, lease_epoch)
+                return await self.compact(source_messages, tool_specs, counter, config, llm)
         before_messages = copy.deepcopy(self.messages)
         before_source_count = self.source_count
         before_summary_version = self.summary_version
@@ -428,11 +451,11 @@ class ContextProjection:
             self.current_version = before_current_version
             self.current_artifact = before_current_artifact
             if self.state_store is not None and lease_owner is not None and lease_epoch is not None:
-                self.state_store.release(lease_owner, lease_epoch)
+                await asyncio.to_thread(self.state_store.release, lease_owner, lease_epoch)
             return stats
         if stats.tier == CompactionTier.NONE:
             if self.state_store is not None and lease_owner is not None and lease_epoch is not None:
-                self.state_store.release(lease_owner, lease_epoch)
+                await asyncio.to_thread(self.state_store.release, lease_owner, lease_epoch)
             return stats
         if not stats.applied:
             # The tier was selected, but no eligible message changed (for
@@ -446,7 +469,7 @@ class ContextProjection:
             self.current_version = before_current_version
             self.current_artifact = before_current_artifact
             if self.state_store is not None and lease_owner is not None and lease_epoch is not None:
-                self.state_store.release(lease_owner, lease_epoch)
+                await asyncio.to_thread(self.state_store.release, lease_owner, lease_epoch)
             return stats
 
         self.compaction_version = (expected_parent or self.compaction_version) + 1
@@ -533,7 +556,8 @@ class ContextProjection:
             )
             if self.state_store is not None:
                 assert lease_owner is not None and lease_epoch is not None
-                stored = self.state_store.commit(
+                stored = await asyncio.to_thread(
+                    self.state_store.commit,
                     owner_id=lease_owner,
                     epoch=lease_epoch,
                     expected_parent=expected_parent,
@@ -584,7 +608,7 @@ class ContextProjection:
             stats.error = f"atomic compaction commit failed: {exc}"
             stats.before_snapshot = before_messages
             if self.state_store is not None and lease_owner is not None and lease_epoch is not None:
-                self.state_store.release(lease_owner, lease_epoch)
+                await asyncio.to_thread(self.state_store.release, lease_owner, lease_epoch)
         return stats
 
     def _compaction_payload(
@@ -610,6 +634,7 @@ class ContextProjection:
         ) if source_end > 0 else None
         return {
             "schema_version": "cc-harness.context-compaction.v4",
+            "algorithm_version": _COMPACTION_ALGORITHM_VERSION,
             "version": self.compaction_version,
             "summary_version": self.summary_version or None,
             "summary_identity": (
@@ -995,6 +1020,7 @@ def _compaction_key(
         ],
         "context_window": config.context_window,
         "protect_zone_tokens": config.protect_zone_tokens,
+        "evidence_token_budget": config.evidence_token_budget,
         "summarize_max_output_tokens": config.summarize_max_output_tokens,
         "model": getattr(llm, "resolved_model", None) or getattr(llm, "model", None),
         "summary_prompt_digest": "sha256:" + hashlib.sha256(
@@ -1152,6 +1178,7 @@ def _is_mandatory(message: dict) -> bool:
     """Deterministically preserve current instructions and working state."""
     return bool(
         message.get("_context_mandatory")
+        or message.get("_context_evidence_tool")
         or message.get("_working_state")
         or message.get("_permission_state")
         or message.get("_unknown_side_effect")
@@ -1673,6 +1700,18 @@ async def apply_tier3_summarize(
                 for message in authoritative_messages[:source_protect]
                 if message.get("role") == "system" or _is_mandatory(message)
             ]
+            # Snapshots are projection-only untrusted evidence. Keep them
+            # without promoting them to system authority or orphan tool turns.
+            evidence_turns = retained_tool_turns(
+                authoritative_messages, counter or TokenCounter(), config.evidence_token_budget,
+                max(0, (config.context_window - config.output_reserve_tokens
+                        - config.tool_schema_reserve_tokens) // 2),
+            )
+            if not evidence_turns:
+                mandatory.extend(
+                    copy.deepcopy(message) for message in messages
+                    if message.get("_context_evidence")
+                )
             project_memory = [
                 copy.deepcopy(message)
                 for message in authoritative_messages[:source_protect]
@@ -1700,10 +1739,10 @@ async def apply_tier3_summarize(
                 cumulative_summaries.append(summary_message)
             messages[:] = mandatory + project_memory + cumulative_summaries + [
                 *([pointer_message] if pointer_message is not None else []),
-                *[
-                    copy.deepcopy(item)
-                    for item in authoritative_messages[source_protect:]
-                ],
+                *evidence_turns,
+                *exclude_retained_turns(
+                    authoritative_messages[source_protect:], evidence_turns
+                ),
             ]
             insert_idx = len(mandatory) + len(project_memory) + len(cumulative_summaries) - 1
         else:
@@ -1790,12 +1829,31 @@ async def maybe_compact(
         before, _usable, ratio = usable_input_budget(messages, tool_specs, counter, config)
 
         if ratio < config.tier1_threshold:
+            # Choose the tier before shortening evidence. Otherwise consumed
+            # fresh output can silently bypass the Summary pressure trigger.
+            if authoritative_messages is not None and any(
+                m.get("_context_evidence") or m.get("_context_evidence_tool")
+                for m in messages
+            ):
+                refresh_task_evidence(
+                    messages, authoritative_messages, counter, config.evidence_token_budget,
+                    max(0, (config.context_window - config.output_reserve_tokens
+                            - config.tool_schema_reserve_tokens) // 2),
+                )
+            after, _, ratio_after = usable_input_budget(messages, tool_specs, counter, config)
             return CompactionStats(
                 tier=CompactionTier.NONE,
                 before_tokens=before,
-                after_tokens=before,
+                after_tokens=after,
                 ratio_before=ratio,
-                ratio_after=ratio,
+                ratio_after=ratio_after,
+            )
+
+        if authoritative_messages is not None:
+            refresh_task_evidence(
+                messages, authoritative_messages, counter, config.evidence_token_budget,
+                max(0, (config.context_window - config.output_reserve_tokens
+                        - config.tool_schema_reserve_tokens) // 2),
             )
 
         # In durable mode the authoritative source marks current instructions
@@ -1825,6 +1883,10 @@ async def maybe_compact(
         # Select one mutually-exclusive tier from the original pressure.
         if ratio < config.tier2_threshold:
             snipped = apply_tier1_snip(messages, protect_until, config)
+            # Keep canonical paired previews at their original tool slots.
+            # The standalone snapshot is only needed when Summary drops turns.
+            if any(m.get("_context_evidence_tool") for m in messages):
+                messages[:] = [m for m in messages if not m.get("_context_evidence")]
             after, _usable_after, ratio_after = usable_input_budget(
                 messages, tool_specs, counter, config
             )
@@ -1840,6 +1902,8 @@ async def maybe_compact(
 
         if ratio < config.tier3_threshold:
             pruned_tool, truncated_asst = apply_tier2_prune(messages, protect_until, config)
+            if any(m.get("_context_evidence_tool") for m in messages):
+                messages[:] = [m for m in messages if not m.get("_context_evidence")]
             after, _usable_after, ratio_after = usable_input_budget(
                 messages, tool_specs, counter, config
             )
@@ -1853,6 +1917,23 @@ async def maybe_compact(
                 messages_assistant_truncated=truncated_asst,
             )
             return stats
+
+        # Do not pay for a summary of the very first tool batch before the
+        # model has seen it. It is fresh evidence, not compressible history.
+        if authoritative_messages is not None:
+            fresh = fresh_tool_results(
+                authoritative_messages, counter,
+                max(0, (config.context_window - config.output_reserve_tokens
+                        - config.tool_schema_reserve_tokens) // 2),
+            )
+            last_call = next((i for i in range(len(authoritative_messages) - 1, -1, -1)
+                              if authoritative_messages[i].get("role") == "assistant"), 0)
+            if fresh and not any(
+                m.get("role") != "system" and not _is_mandatory(m)
+                for m in authoritative_messages[:last_call]
+            ):
+                messages[:] = [m for m in messages if not m.get("_context_evidence")]
+                return _noop_stats(messages, counter, tool_specs, config)
 
         # Tier 3: Summary from authoritative source facts only.
         authoritative_start = 0

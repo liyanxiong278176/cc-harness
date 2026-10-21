@@ -11,6 +11,7 @@ from dataclasses import dataclass
 from uuid import uuid4
 
 from .followups import FollowUpService
+from .execution_control import ExecutionControl
 from .run_model import RunStatus
 from .lease import (
     LeaseManager,
@@ -47,6 +48,7 @@ class LocalSupervisor:
         lease_ttl_seconds: float = 120.0,
     ) -> None:
         self.store = store
+        self.execution = ExecutionControl(store)
         self.worker_factory = worker_factory
         self.max_workers = max(1, max_workers)
         self.poll_interval = max(0.01, poll_interval)
@@ -123,6 +125,7 @@ class LocalSupervisor:
 
     async def tick(self) -> SupervisorStats:
         await self._ensure_supervisor_lease()
+        await self.execution.inspect_waits_and_terminals()
         finished = [run_id for run_id, (task, _worker) in self._active.items() if task.done()]
         for run_id in finished:
             task, _worker = self._active.pop(run_id)
@@ -166,7 +169,12 @@ class LocalSupervisor:
             for record in records:
                 if record.run_id in self._active:
                     continue
-                worker = self.worker_factory(record.run_id)
+                task = (await self.store.load_projection(record.run_id)).task
+                receiver = self.execution.receivers.get(task.owner)
+                if task.owner != "main" and receiver is None:
+                    await self.execution.pause(record.run_id, "handoff_receiver_unavailable")
+                    continue
+                worker = (receiver or self.worker_factory)(record.run_id)
                 # The factory may provide a task-specific lease manager. The
                 # default worker created by DurableRuntimeClient uses the
                 # supervisor window below, while explicit test/custom workers
@@ -303,10 +311,43 @@ class LocalSupervisor:
                 # an explicit repair/reconciliation path, but never let it
                 # abort scheduling of healthy siblings.
                 continue
-            if projection is not None and projection.discovery_status == "awaiting":
+            if not projection.task.protocol_version:
+                await self.execution.migrate_legacy(record.run_id)
+                continue
+            if projection is not None and projection.task.pause_requested:
+                await self.execution.pause_boundary(record.run_id)
+                continue
+            if (projection is not None and projection.discovery_status == "awaiting"
+                    and not projection.task.plan_approval_required):
                 continue
             if record.parent_run_id is None:
                 selected.append(record)
+                continue
+            # Include candidates selected in this tick, not only already leased
+            # workers, when enforcing concurrency limits across the ancestry.
+            parents = {item.run_id: item.parent_run_id for item in all_records}
+            def descends_from(child_id, ancestor_id):
+                seen = set()
+                while child_id and child_id not in seen:
+                    seen.add(child_id)
+                    child_id = parents.get(child_id)
+                    if child_id == ancestor_id:
+                        return True
+                return False
+            concurrent_allowed = True
+            for ancestor_id in (await self.execution.lineage(record.run_id))[:-1]:
+                ancestor = await self._selection_projection(ancestor_id, projections)
+                if ancestor is None:
+                    concurrent_allowed = False
+                    break
+                cap = ancestor.task.limits.get("concurrent_children", float("inf"))
+                active = sum(item.status in {"running", "cancel_requested"}
+                             and descends_from(item.run_id, ancestor_id) for item in all_records)
+                proposed = sum(descends_from(item.run_id, ancestor_id) for item in selected)
+                if active + proposed >= cap:
+                    concurrent_allowed = False
+                    break
+            if not concurrent_allowed:
                 continue
             if not await self._record_is_ready(
                 record,
@@ -381,6 +422,11 @@ class LocalSupervisor:
         parent = await self._selection_projection(record.parent_run_id, projections)
         if parent is None:
             return False
+        if not record.predecessor_run_id and (
+            parent.status in {RunStatus.PAUSED, RunStatus.CANCELLED, RunStatus.CANCEL_REQUESTED}
+            or parent.task.pause_requested
+        ):
+            return False
         if parent.discovery_status == "awaiting":
             return False
         child = next(
@@ -405,6 +451,8 @@ class LocalSupervisor:
         ]
         if len(active_children) >= parent.plan.max_concurrent_children:
             return False
+        if len(active_children) >= parent.task.limits.get("concurrent_children", float("inf")):
+            return False
         return True
 
     async def _completed_plan_nodes(self, run_id: str, projection) -> set[str]:
@@ -418,6 +466,7 @@ class LocalSupervisor:
             str(event.payload["node_id"])
             for event in page.events
             if event.event_type == "PlanNodeCompleted"
+            and event.sequence > max((x["sequence"] for x in projection.task.guidance), default=0)
         )
         return completed
 
