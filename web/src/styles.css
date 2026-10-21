@@ -618,3 +618,13 @@ button:focus-visible, input:focus-visible, textarea:focus-visible { outline: 2px
 @media (prefers-reduced-motion: reduce) {
   *, *::before, *::after { scroll-behavior: auto !important; animation-duration: .01ms !important; animation-iteration-count: 1 !important; transition-duration: .01ms !important; }
 }
+/* Local management uses the same project/runtime facts as command entrypoints. */
+.local-assets-modal { max-height: 85vh; overflow-y: auto; }
+.asset-tabs { display: flex; gap: 8px; flex-wrap: wrap; margin: 12px 0; }
+.asset-tabs button, .local-assets-modal article button { padding: 7px 10px; border: 1px solid var(--border); border-radius: 7px; background: transparent; color: inherit; cursor: pointer; }
+.asset-tabs button[aria-pressed="true"] { background: var(--surface-hover, #8883); }
+.asset-item { padding: 12px 0; border-bottom: 1px solid var(--border); overflow-wrap: anywhere; }
+.asset-item p { white-space: pre-wrap; }
+.asset-item small { display: block; opacity: .7; margin: 6px 0; }
+.asset-item code, .local-assets-modal details code { font-size: 11px; overflow-wrap: anywhere; }
+.asset-error { color: #d95858; }

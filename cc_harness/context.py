@@ -168,6 +168,7 @@ class ContextProjection:
         )
         self._restore_latest(source_messages)
         self.messages = _repair_tool_result_pairing(self.messages)
+        self._source_prefix_digest = _messages_digest(source_messages[:self.source_count])
 
     def _restore_latest(self, source_messages: list[dict]) -> None:
         """Restore the one current projection while keeping source authoritative."""
@@ -256,14 +257,32 @@ class ContextProjection:
             return
 
     def sync(self, source_messages: list[dict]) -> None:
-        if len(source_messages) < self.source_count:
+        if (len(source_messages) < self.source_count
+            or _messages_digest(source_messages[:self.source_count]) != self._source_prefix_digest):
+            # Direct/legacy callers may insert before a trailing user turn.
+            # Preserve a snip/prune representation only when its exact source
+            # digest AND index still match. Summaries cannot be rebased this
+            # way; rebuild those from the authoritative transcript instead.
+            reusable = []
+            if not any(m.get(SUMMARY_MARKER_KEY) for m in self.messages):
+                reusable = [entry for entry in self.cumulative_entries
+                    if entry.get("entry_type") == "message" and isinstance(entry.get("source_index"), int)
+                    and 0 <= entry["source_index"] < len(source_messages)
+                    and entry.get("source_digest") == authoritative_message_digest(source_messages[entry["source_index"]])]
             self.messages = copy.deepcopy(source_messages)
+            for entry in reusable:
+                representations = entry.get("representations") or []
+                if representations and isinstance(representations[-1].get("message"), dict):
+                    self.messages[entry["source_index"]] = copy.deepcopy(representations[-1]["message"])
             self.source_count = len(source_messages)
+            self._source_prefix_digest = _messages_digest(source_messages)
+            self.cumulative_entries = copy.deepcopy(reusable)
             self.messages = _repair_tool_result_pairing(self.messages)
             return
         if len(source_messages) > self.source_count:
             self.messages.extend(copy.deepcopy(source_messages[self.source_count:]))
             self.source_count = len(source_messages)
+        self._source_prefix_digest = _messages_digest(source_messages)
         self.messages = _repair_tool_result_pairing(self.messages)
 
     def _current_payload(self) -> dict[str, Any] | None:
@@ -1057,6 +1076,12 @@ def _repair_tool_result_pairing(messages: list[dict]) -> list[dict]:
                 for tool_call in (message.get("tool_calls") or [])
                 if isinstance(tool_call, dict) and tool_call.get("id")
             ]
+            # A malformed or duplicate declaration must not survive merely
+            # because every *filtered* call has a matching observation.
+            unique_calls = {}
+            for tool_call in tool_calls:
+                unique_calls.setdefault(str(tool_call["id"]), tool_call)
+            tool_calls = list(unique_calls.values())
             # Tool results are committed independently and may arrive in a
             # different order from the model response.  Only inspect the
             # contiguous provider result block; anything later is an orphan
@@ -1075,7 +1100,7 @@ def _repair_tool_result_pairing(messages: list[dict]) -> list[dict]:
                 for tool_call in tool_calls
                 if str(tool_call["id"]) in result_by_id
             ]
-            if len(complete_calls) == len(tool_calls):
+            if complete_calls == message["tool_calls"]:
                 repaired.append(message)
             else:
                 # Preserve visible assistant text/reasoning, but never send a

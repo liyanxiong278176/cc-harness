@@ -159,10 +159,14 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--command",
-        choices=("run", "submit", "status", "list", "attach", "approve", "reject", "interrupt", "cancel", "resume", "follow-up", "rollback", "supervisor"),
+        choices=("run", "submit", "status", "list", "attach", "approve", "reject", "interrupt", "cancel", "resume", "follow-up", "rollback", "supervisor", "assets"),
         default=None,
     )
     parser.add_argument("--run-id", default=None)
+    parser.add_argument("--asset-action", choices=("list", "forget", "enable", "disable", "reload", "bind", "cleanup-preview", "cleanup"), default="list")
+    parser.add_argument("--asset-id", default=None)
+    parser.add_argument("--asset-path", default=None)
+    parser.add_argument("--preview-token", default=None)
     parser.add_argument("--message", default=None)
     parser.add_argument("--approval-id", default=None)
     parser.add_argument("--action-args-digest", default=None)
@@ -226,6 +230,16 @@ async def _run_durable(args, cwd: Path) -> int:
                 return 2
             return await _run_durable_print(client, args, objective)
         command = args.command
+        if command == "assets":
+            from cc_harness.local_assets import LocalAssets
+            try:
+                result = await LocalAssets(client).apply({"action": args.asset_action, "id": args.asset_id,
+                            "run_id": args.run_id, "path": args.asset_path, "token": args.preview_token})
+                print(json.dumps(result, ensure_ascii=False, indent=2))
+                return 0
+            except (ValueError, KeyError, OSError) as exc:
+                Console(stderr=True, no_color=True).print(f"local assets: {exc}")
+                return 2
         if command == "supervisor":
             await client.run_supervisor_forever(
                 reasoning_effort=args.effort,

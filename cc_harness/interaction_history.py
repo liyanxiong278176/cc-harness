@@ -133,6 +133,7 @@ def objective_messages(
                 f"Constraints:\n{constraints}"
             ),
             "_context_mandatory": True,
+            "_memory_user_source": goal.objective,
         },
     )
 

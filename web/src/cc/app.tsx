@@ -12,6 +12,7 @@ import {
   Send, Settings, ShieldCheck, Sparkles, Sun, Trash2, X,
 } from 'lucide-react'
 import { webApi, webEventsUrl, type ApiError, type StreamErrorDetail } from './api'
+import { LocalAssetsModal } from './LocalAssetsModal'
 import { StreamingMessage } from '../components/chat/StreamingMessage'
 import { WelcomeSuggestions } from '../components/chat/WelcomeSuggestions'
 import { SyntaxCode } from '../components/right-panel/SyntaxCode'
@@ -1978,6 +1979,7 @@ function App() {
   const [error, setError] = useState<string | null>(null)
   const [toast, setToast] = useState<string | null>(null)
   const [settingsOpen, setSettingsOpen] = useState(false)
+  const [assetsOpen, setAssetsOpen] = useState(false)
   const [shortcutsOpen, setShortcutsOpen] = useState(false)
   const [contextOpen, setContextOpen] = useState(false)
   const [contextAnchor, setContextAnchor] = useState<'bottom' | null>(null)
@@ -3410,6 +3412,7 @@ function App() {
         </div>
         <div className="sidebar-bottom">
           <button className="project-chip" onClick={chooseProject}><FolderOpen size={15} /><span>{project ? project.root : '选择项目文件夹'}</span><ChevronRight size={14} /></button>
+          <button className="settings-button" onClick={() => setAssetsOpen(true)} disabled={!project} aria-label="本地能力与记忆"><Sparkles size={17} /><span>本地能力与记忆</span></button>
           <div className="sidebar-actions"><button className="settings-button" onClick={() => setSettingsOpen(true)} aria-label="设置"><Settings size={17} /><span>设置</span></button><button className="collapse-button" onClick={() => setLeftCollapsed(true)} title="收起侧栏" aria-label="收起侧栏"><PanelLeftClose size={16} /></button></div>
         </div>
       </aside>
@@ -3517,6 +3520,7 @@ function App() {
         <div className="inspector-model"><div className="model-chip"><span className="model-chip-dot" /><div><small>当前模型</small><strong>{settings.model || '未配置'}</strong></div></div><button className="icon-button" onClick={() => setSettingsOpen(true)} title="设置"><Settings size={16} /></button></div>
           </>}
       </aside>
+      {assetsOpen && project && <LocalAssetsModal key={project.root} projectRoot={project.root} runId={activeSessionRef.current} onClose={() => setAssetsOpen(false)} />}
       {settingsOpen && <SettingsModal initial={settings} onClose={() => setSettingsOpen(false)} onSaved={(value) => setSettings(value)} />}
       {shortcutsOpen && <KeyboardShortcutsModal onClose={() => setShortcutsOpen(false)} />}
       {toast && <div className="toast" role="status"><Check size={15} />{toast}</div>}

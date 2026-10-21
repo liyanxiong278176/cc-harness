@@ -7,7 +7,7 @@ import json
 import logging
 import re
 import time
-from contextlib import asynccontextmanager, suppress
+from contextlib import asynccontextmanager, suppress, nullcontext
 from collections.abc import AsyncIterator, Iterable
 from dataclasses import dataclass
 from pathlib import Path
@@ -115,6 +115,10 @@ class RunStore:
         self.artifacts = artifact_store or ArtifactStore(self.state_dir / "objects")
         self._db: aiosqlite.Connection | None = None
         self._write_lock = asyncio.Lock()
+        # Serialize event construction (read sequence -> append), shared by
+        # Worker and ExecutionControl. SQL transaction locking alone cannot
+        # protect the gap between these two operations.
+        self.event_append_lock = asyncio.Lock()
         self._open_lock = asyncio.Lock()
         # Legacy snapshots can be replayed safely, but a terminal Run may be
         # read many times by the supervisor.  Keep the migration diagnostic
@@ -317,7 +321,7 @@ class RunStore:
                     await self._db.close()
                     self._db = None
 
-    async def referenced_artifact_digests(self) -> set[str]:
+    async def referenced_artifact_digests(self, *, _locked: bool = False) -> set[str]:
         """Collect every content digest reachable from the durable runtime.
 
         Object publication intentionally happens before the event commit.  If a
@@ -343,8 +347,8 @@ class RunStore:
                 for item in value:
                     collect(item)
 
-        async with self._write_lock:
-            async with self._transaction(db, write=False):
+        async with (nullcontext() if _locked else self._write_lock):
+            async with (nullcontext() if _locked else self._transaction(db, write=False)):
                 cursor = await db.execute(
                     "SELECT payload_json, artifact_refs_json FROM run_event"
                 )
@@ -364,6 +368,28 @@ class RunStore:
                 collect(json.loads(projection_json))
             except (TypeError, ValueError, json.JSONDecodeError):
                 continue
+        # Manifests and continuations refer to other content-addressed objects.
+        # Follow those edges rather than collecting a still-live nested object.
+        import sqlite3
+        assets_db = self.project_root / ".cc-harness" / "local-assets.db"
+        if assets_db.is_file():
+            with sqlite3.connect(assets_db, timeout=30) as assets:
+                if assets.execute("SELECT 1 FROM sqlite_master WHERE name='skill_snapshot_history'").fetchone():
+                    collect([row[0] for row in assets.execute("SELECT digest FROM skill_snapshot_history")])
+        pending = list(found)
+        visited = set()
+        while pending:
+            ref = pending.pop()
+            if ref in visited:
+                continue
+            visited.add(ref)
+            try:
+                payload = json.loads(self.artifacts.read_text(ref))
+            except (OSError, RuntimeError, KeyError, ValueError, UnicodeError):
+                continue
+            previous = set(found)
+            collect(payload)
+            pending.extend(found - previous)
         return found
 
     async def collect_artifact_garbage(
@@ -371,24 +397,20 @@ class RunStore:
         *,
         now: float | None = None,
         grace_period_seconds: float | None = None,
+        allowed_digests: set[str] | None = None,
     ) -> GarbageCollectionReport:
         """Delete only old objects that are unreachable from durable state."""
 
-        referenced = await self.referenced_artifact_digests()
-        # Temp files are not addressable artifacts and can only be abandoned by
-        # an interrupted atomic publish; clean them independently.
-        self.artifacts.cleanup_temporary_files(
-            older_than_seconds=(
-                self.artifacts.grace_period_seconds
-                if grace_period_seconds is None
-                else max(0.0, float(grace_period_seconds))
-            )
-        )
-        return self.artifacts.collect_garbage(
-            referenced,
-            now=now,
-            grace_period_seconds=grace_period_seconds,
-        )
+        async with self._write_lock:
+            async with self._transaction(self._require_db(), write=True):
+                referenced = await self.referenced_artifact_digests(_locked=True)
+                if allowed_digests is not None:
+                    for path in self.artifacts.root.glob("[0-9a-f][0-9a-f]/*"):
+                        digest = "sha256:" + path.name
+                        if path.suffix != ".json" and digest not in allowed_digests:
+                            referenced.add(digest)
+                return self.artifacts.collect_garbage(
+                    referenced, now=now, grace_period_seconds=grace_period_seconds)
 
     @staticmethod
     async def _rollback_open_transaction(db: aiosqlite.Connection) -> None:

@@ -56,6 +56,8 @@ EVENT_TYPES = frozenset(CONTROL_EVENT_FIELDS) | frozenset(
         "ToolObservationChunkCommitted",
         "ToolObservationCommitted",
         "ContextProjectionBuilt",
+        "SkillSnapshotPinned",
+        "FailureResolved",
         "ContextCompacted",
         "MemoryCandidateRecorded",
         "MemoryCheckpointCommitted",
@@ -149,6 +151,8 @@ _REQUIRED_PAYLOAD_FIELDS: dict[str, tuple[str, ...]] = {
         "projection_digest",
     ),
     "ContextCompacted": ("projection_id", "tier", "source_digest"),
+    "SkillSnapshotPinned": ("snapshot", "revision", "reason"),
+    "FailureResolved": ("failed_action_id", "resolving_action_id", "observation_artifact"),
     "MemoryCandidateRecorded": ("candidate_id", "source_digest", "status"),
     "MemoryCheckpointCommitted": ("checkpoint_id", "source_digest", "captured_count"),
     "PredecessorHandoffCommitted": ("predecessor_run_id", "handoff_artifact"),
@@ -492,6 +496,7 @@ class EventValidator:
                 "projected_message_count",
                 "captured_count",
                 "retryable",
+                "revision",
             }
         }
         for field_name in string_fields:
@@ -592,6 +597,12 @@ class EventValidator:
             for name in ("source_message_count", "projected_message_count"):
                 if not isinstance(payload[name], int) or payload[name] < 0:
                     raise EventValidationError(f"{name} must be a non-negative integer")
+        if event.event_type == "SkillSnapshotPinned":
+            _require_string(payload["snapshot"], "payload.snapshot")
+            if not isinstance(payload["revision"], int) or payload["revision"] < 1:
+                raise EventValidationError("skill snapshot revision must be positive")
+            if payload["reason"] not in {"initial", "explicit_reload"}:
+                raise EventValidationError("invalid skill snapshot selection reason")
         if event.event_type == "MemoryCheckpointCommitted":
             if not isinstance(payload["captured_count"], int) or payload["captured_count"] < 0:
                 raise EventValidationError("captured_count must be a non-negative integer")

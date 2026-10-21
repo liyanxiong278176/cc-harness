@@ -34,6 +34,7 @@ from .loop_control import (
 from .llm import ProviderProtocolError
 from .stream_errors import StreamErrorDetails, classify_stream_error
 from .run_events import EventActor, RunEvent
+from .local_verification import python_assertion_verifier
 from .run_kernel import ActionRequest, AgentKernel, SegmentContext
 from .execution_control import BudgetExhausted, ExecutionControl
 from .kernel_middleware import KernelMiddleware
@@ -198,12 +199,12 @@ _VERIFICATION_COMMAND_RE = re.compile(
     r"\b(?:make|just|task)\s+(?:test|check|verify|lint|validate)\b|"
     r"\bctest(?:\s|$)|"
     r"(?:^|[;&|\s])(?:\./)?(?:tests?/[A-Za-z0-9_.-]+|test(?:s)?\.(?:sh|py|js|ts)|run_tests?)(?:\s|$)|"
-    r"\b(?:python(?:3)?|bash|sh|node|ruby|perl)\b[^;&|\n]*(?:\btests?\b|test[_./-])|"
+    r"\b(?:python(?:3)?|bash|sh|node|ruby|perl)\b[^;&|\n]*(?:\btests?\b|(?:test|verify|validate|check)[_./-])|"
     r"\b(?:verify|validate|lint|typecheck|compile|build|smoke)\b|"
-    r"\b(?:git\s+(?:status|diff(?:\s+--check)?))\b|"
+    r"\bgit\s+diff\s+--check\b|"
     r"\b(?:curl|wget|grpcurl)\b|\b(?:nc|netcat)\s+-z\b|"
     r"\b(?:systemctl\s+is-active|service\s+\S+\s+status)\b|"
-    r"\b(?:sha256sum|sha512sum|md5sum|cmp|stat|file|command\s+-v|which)\b|"
+    r"\bcmp\b|"
     r"(?:^|\s)--(?:check|verify|validate)\b)",
     re.IGNORECASE,
 )
@@ -214,7 +215,32 @@ def _is_verification_command(tool_name: str, command: str) -> bool:
 
     if tool_name != "run_command":
         return False
+    if "|" in command and "pipefail" not in command:
+        return False  # a downstream success can mask the verifier's failure
     return bool(_VERIFICATION_COMMAND_RE.search(command or ""))
+
+
+def _local_verifier_invocations(command: str) -> set[str]:
+    """Identify the same local verifier across display/redirect wrappers."""
+    invocations = set()
+    for match in re.finditer(r"\b(?:python(?:3)?|pytest|ruff|mypy|node|npm|pnpm|yarn)\s+[^;|\n]+", command):
+        core = re.split(r"\s+\d*[<>]", match.group())[0].strip()
+        if _VERIFICATION_COMMAND_RE.search(core) and not re.search(r"\b(?:deploy|publish|push|upload)\b", core):
+            invocations.add(" ".join(core.split()))
+    return invocations
+
+
+def _observation_verifies(observation: ToolObservation, command: str) -> bool:
+    annotation = observation.metadata.get("verification")
+    checked_script = (observation.tool_name == "run_command" and isinstance(annotation, Mapping)
+                      and annotation.get("kind") == "local_python_assertions"
+                      and isinstance(annotation.get("assertions"), int) and annotation["assertions"] > 0
+                      and re.fullmatch(r"sha256:[0-9a-f]{64}", str(annotation.get("script_digest", "")))
+                      and observation.metadata.get("exit_code") == 0)
+    if observation.status != "succeeded" or not observation.complete or not (_is_verification_command(observation.tool_name, command) or checked_script):
+        return False
+    text = "\n".join(str(block.text or "") for block in observation.content)
+    return not re.search(r"(?im)^\s*(?:[\w]*exit(?:_code)?|returncode)\s*[=:]\s*-?[1-9]\d*\s*$", text)
 
 
 def _observation_is_decisive(
@@ -313,6 +339,7 @@ class RunWorker:
         persist_interactions: bool = True,
         activation_manifest: ActivationManifest | None = None,
         project_instructions: str | None = None,
+        project_instruction_sources: Sequence[Mapping[str, Any]] = (),
         child_completion_callback: ChildCompletionCallback | None = None,
         child_cancellation_callback: ChildCancellationCallback | None = None,
         child_failure_callback: ChildFailureCallback | None = None,
@@ -349,6 +376,7 @@ class RunWorker:
         self.persist_interactions = persist_interactions
         self.activation_manifest = activation_manifest
         self.project_instructions = project_instructions
+        self.project_instruction_sources = tuple(project_instruction_sources)
         self.child_completion_callback = child_completion_callback
         self.child_cancellation_callback = child_cancellation_callback
         self.child_failure_callback = child_failure_callback
@@ -369,7 +397,8 @@ class RunWorker:
         self.stream_emitter = stream_emitter
         self.working_directory: Path = self.store.project_root
         self._active_node_id: str | None = None
-        self._event_lock = asyncio.Lock()
+        self._event_lock = store.event_append_lock
+        self._assessed_verification_sequence = 0
         self._execution_task: asyncio.Task | None = None
         self._cancellation_watchdog_task: asyncio.Task | None = None
 
@@ -509,15 +538,48 @@ class RunWorker:
                             return
                 context_manifest_artifact: str | None = None
                 context_build = None
+                if projection.skill_snapshot is None and self.capability_runtime is not None:
+                    local_skills = getattr(self.capability_runtime, "local_skills", None)
+                    if callable(local_skills):
+                        snapshot, info = await asyncio.to_thread(local_skills().snapshot, lease.run_id)
+                        await self._append(current_lease, "SkillSnapshotPinned", {
+                            "snapshot": snapshot, "revision": info["revision"], "reason": "initial"}, artifact_refs=(snapshot,))
+                        projection = await self.store.load_projection(lease.run_id)
                 messages = await self._messages_for_projection(
                     projection,
                     include_interactions=self.capability_runtime is None,
                 )
+                invocation_tools = self.available_tools
+                completion_assessment = False
+                ws = projection.working_state
+                if (self.capability_runtime is not None and projection.goal is not None
+                    and projection.goal.interaction_mode == "coding" and not _is_benchmark_task()
+                    and ws.last_verification_ok is True and ws.last_verification_sequence >= ws.last_mutation_sequence
+                    and ws.last_verification_sequence > self._assessed_verification_sequence
+                    and not ws.unresolved_errors and not projection.task.pause_requested):
+                    contract = completion_contract_from_instruction(_goal_public_text(projection.goal))
+                    if contract.required_artifacts and await self._durable_contract_satisfied(lease.run_id, projection, contract):
+                        proposal = await self._synthesize_completion_candidate(current_lease, projection)
+                        if proposal is not None:
+                            # The model needs a bounded request template, not
+                            # the entire receipt ledger. The final gate always
+                            # reconstructs the full proof from durable events.
+                            tests = tuple(e for e in proposal.evidence if e.kind == EvidenceKind.TEST)
+                            proposal = replace(proposal, evidence=(tests[-1:] or proposal.evidence[-1:]))
+                            completion_assessment = True
+                            self._assessed_verification_sequence = ws.last_verification_sequence
+                            invocation_tools = ()
+                            messages = (*messages, {"role": "user", "_context_mandatory": True, "_cc_harness_untrusted": True,
+                                "content": "Runtime completion review: required local outputs exist and current verification receipts are available. "
+                                "Compare ALL current goal criteria against the committed facts. No tools are available in this review. "
+                                "If satisfied, give a concise final summary and emit the following completion proposal unchanged. "
+                                "If any criterion is missing, describe that concrete gap instead; do not claim completion or restart exploration. "
+                                "This request grants no permissions.\n<cc-harness-complete>" + json.dumps(proposal.to_dict(), ensure_ascii=False) + "</cc-harness-complete>"})
                 if self.capability_runtime is not None:
                     context_build = await self.capability_runtime.build_context(
                         projection,
                         messages,
-                        self.available_tools,
+                        invocation_tools,
                         # Automatic memory injection is an L3 persona snapshot;
                         # explicit memory_recall progressively searches L3→L0.
                         query="",
@@ -594,8 +656,16 @@ class RunWorker:
                         )
                     )
                     compaction_error = context_build.compaction.error
+                    if context_coverage.get("integrity_errors"):
+                        await self.execution.wait(lease.run_id, kind="waiting_input",
+                                                  reason="context_integrity: " + "; ".join(context_coverage["integrity_errors"]))
+                        return
                     if context_overflow and not compaction_error:
                         compaction_error = "mandatory context overflow after compaction"
+                    if context_overflow:
+                        await self.execution.wait(lease.run_id, kind="waiting_input",
+                                                  reason="context budget still exceeded after bounded rebuild")
+                        return
                     if (
                         context_build.compaction.applied
                         or compaction_error
@@ -632,6 +702,10 @@ class RunWorker:
                             },
                         )
                         return
+                generation_reader = getattr(self.capability_runtime, "memory_generation", None)
+                if callable(generation_reader) and context_build is not None:
+                    if context_build.coverage.get("memory_generation") != await generation_reader():
+                        continue  # rebuild at the next model boundary after a concurrent forget
                 round_index = len(projection.actions)
                 await self._kernel_phase(lease.run_id, "prepare", "after")
                 await self._kernel_phase(lease.run_id, "model", "before")
@@ -652,6 +726,7 @@ class RunWorker:
                         "segment": segment,
                         "round": round_index,
                         "context_manifest_artifact": context_manifest_artifact,
+                        "purpose": "completion_review" if completion_assessment else "execution",
                     },
                     artifact_refs=(
                         (context_manifest_artifact,)
@@ -669,7 +744,7 @@ class RunWorker:
                     run_id=lease.run_id,
                     projection=projection,
                     messages=tuple(dict(item) for item in messages),
-                    available_tools=self.available_tools,
+                    available_tools=invocation_tools,
                     working_state=projection.working_state.to_dict(),
                     lease_epoch=current_lease.epoch,
                     worker_id=self.worker_id,
@@ -829,6 +904,15 @@ class RunWorker:
                     tool_requests=message_requests,
                 )
 
+                if completion_assessment and (outcome.completion_candidate is None or outcome.action_requests):
+                    for request in outcome.action_requests:
+                        reservation = self._action_reservations.pop(request.action_id, None)
+                        if reservation is not None:
+                            await self.execution.settle(lease.run_id, reservation, {})
+                    await self.execution.append(lease.run_id, "TaskVerificationFinished", {"passed": False,
+                        "issues": [outcome.model_text[:2000] or "Completion review did not submit a valid proposal; continue with the concrete missing acceptance checks."]})
+                    continue
+
                 if not outcome.action_requests:
                     if outcome.progress is not None:
                         await self._append(
@@ -846,11 +930,11 @@ class RunWorker:
                         return
                     if await self._active_node_completed(lease.run_id):
                         had_progress = True
-                    if (outcome.completion_candidate is not None and verification_repairs < 2
+                    if ((outcome.completion_candidate is not None or (self.capability_runtime is not None and not _is_benchmark_task() and outcome.model_text.strip())) and verification_repairs < 2
                             and not await self._active_node_completed(lease.run_id)):
                         verification_repairs += 1
                         await self.execution.append(lease.run_id, "TaskVerificationFinished", {
-                            "passed": False, "issues": ["completion evidence does not satisfy current goal"],
+                            "passed": False, "issues": await self._completion_repair_issues(lease.run_id),
                             "repair_attempt": verification_repairs,
                         })
                         continue
@@ -862,7 +946,6 @@ class RunWorker:
                         )
                     break
 
-                had_action = True
                 requests, duplicate_inflight = self._deduplicate_action_requests(
                     projection, outcome.action_requests
                 )
@@ -899,6 +982,14 @@ class RunWorker:
                             segment=segment,
                             committed_progress=True,
                         )
+                    if self.capability_runtime is not None and verification_repairs < 2 and not _is_benchmark_task():
+                        verification_repairs += 1
+                        await self.execution.append(lease.run_id, "TaskVerificationFinished", {
+                            "passed": False, "repair_attempt": verification_repairs,
+                            "issues": ["The requested identical actions already have durable terminal receipts and were not executed again. "
+                                       "Reuse successful results; repair inputs for failed actions. Do not repeat the same proposal without a changed input. "
+                                       "Continue toward the missing delivery/verification checks."] + await self._completion_repair_issues(lease.run_id)})
+                        continue
                     break
                 for request in requests:
                     if self._requires_approval(request):
@@ -915,6 +1006,7 @@ class RunWorker:
                             },
                         )
                         return
+                had_action = True
                 statuses = await self._execute_request_batch(current_lease, requests)
                 await self._kernel_phase(lease.run_id, "observe", "after")
                 if await self.execution.pause_boundary(lease.run_id):
@@ -949,7 +1041,7 @@ class RunWorker:
                         {"progress": outcome.progress.to_dict()},
                     )
                     had_progress = True
-                if await self._try_accept_completion(current_lease, outcome.completion_candidate):
+                if outcome.completion_candidate is not None and await self._try_accept_completion(current_lease, outcome.completion_candidate):
                     await self._commit_memory_checkpoint(
                         current_lease,
                         segment=segment,
@@ -1605,6 +1697,17 @@ class RunWorker:
             if approval.status.value == "requested"
         }
         recovered = False
+        # Pause/crash recovery may already have marked a started effect as
+        # unknown. Explicit continuation does not reconcile that effect, so
+        # keep the same barrier used for outcomes discovered below.
+        unknown = next((action for action in projection.actions
+                        if action.status is ActionStatus.OUTCOME_UNKNOWN), None)
+        if unknown is not None:
+            await self._append(lease, "RunBlocked", {
+                "reason": "action outcome is unknown after worker recovery",
+                "action_id": unknown.action_id,
+            })
+            return True, True
         for action in projection.actions:
             if action.action_id in pending_approval_actions:
                 continue
@@ -1947,6 +2050,23 @@ class RunWorker:
         fresh_keys: dict[str, str] = {}
         result = []
         for request in requests:
+            uncertain = next((a for a in reversed(projection.actions)
+                if a.tool_name == request.tool_name and a.normalized_args_digest == request.normalized_args_digest
+                and a.status in {ActionStatus.PLANNED, ActionStatus.PREPARED, ActionStatus.STARTED, ActionStatus.OUTCOME_UNKNOWN}), None)
+            if uncertain is not None:
+                result.append(replace(request, idempotency_key=uncertain.idempotency_key))
+                continue
+            if request.tool_name == "run_command" and (_is_verification_command(request.tool_name, str(request.arguments.get("command", "")))
+                or python_assertion_verifier(self.working_directory, str(request.arguments.get("command", ""))) is not None):
+                # Local verification is a new operation after inputs change.
+                # Never re-key externally effectful commands or provider IDs
+                # already committed; uncertain outcomes still require recovery.
+                command = str(request.arguments.get("command", ""))
+                if (re.match(r"\s*(?:python(?:3)?|pytest|ruff|mypy|node|npm|pnpm|yarn)\b", command)
+                    and not re.search(r"\b(?:push|publish|deploy|upload|curl|wget)\b", command)
+                    and not request.arguments.get("idempotency_key") and not request.arguments.get("_cc_idempotency_key")
+                    and not any(a.action_id == request.action_id for a in projection.actions)):
+                    request = replace(request, idempotency_key=f"verify:{projection.working_state.last_mutation_sequence}:{request.idempotency_key}")
             terminal = self._action_deduplication_status(projection, request)
             if (
                 self.contracts.get(request.tool_name).effect_class is EffectClass.READ_ONLY
@@ -1960,6 +2080,70 @@ class RunWorker:
                 request = replace(request, idempotency_key=key)
             result.append(request)
         return tuple(result)
+
+    async def _resolve_replaced_failures(self, lease, request, observation, observation_artifact):
+        projection = await self.store.load_projection(lease.run_id)
+        unresolved = {e.get("action_id") for e in projection.working_state.unresolved_errors}
+        pinned_resource = None
+        if request.tool_name == "read_skill":
+            for block in observation.content:
+                try:
+                    resource = json.loads(str(block.text or ""))
+                except (ValueError, TypeError):
+                    continue
+                if isinstance(resource, dict) and resource.get("snapshot") == projection.skill_snapshot:
+                    pinned_resource = resource.get("resource_path")
+        for action in projection.actions:
+            if action.action_id not in unresolved or action.status is not ActionStatus.FAILED:
+                continue
+            args = json.loads(self.store.artifacts.read_text(action.arguments_artifact))
+            discarded_precondition = False
+            if action.tool_name in {"Write", "Edit", "run_command"} and _observation_verifies(observation, str(request.arguments.get("command", ""))):
+                receipt = next((o for o in projection.observations if o.action_id == action.action_id and o.status == "failed"), None)
+                if receipt is not None:
+                    failed_observation = json.loads(self.store.artifacts.read_text(receipt.observation_artifact))
+                    failed_text = " ".join(str(b.get("text", "")) for b in failed_observation.get("content", [])).casefold()
+                    if action.tool_name in {"Write", "Edit"}:
+                        discarded_precondition = any(marker in failed_text for marker in (
+                            "requires expected_hash", "stale content hash", "file changed before commit", "exact old_text must match once", "expected_hash mismatch"))
+                    else:
+                        # PowerShell parses the entire statement before any
+                        # command runs. A host-reported parser rejection has
+                        # no command effect to reconcile; keep its failure in
+                        # history but allow independently verified work to end.
+                        stderr = str(failed_observation.get("metadata", {}).get("stderr", "")).lstrip()
+                        discarded_precondition = stderr.startswith("ParserError:")
+            if action.tool_name != request.tool_name and not (action.tool_name == "Read" and pinned_resource) and not discarded_precondition:
+                continue
+            same_command = (request.tool_name == "run_command" and _observation_verifies(observation, str(request.arguments.get("command", "")))
+                            and (args == dict(request.arguments) or bool(_local_verifier_invocations(str(args.get("command", "")))
+                                     & _local_verifier_invocations(str(request.arguments.get("command", ""))))))
+            same_file = (request.tool_name in {"Write", "Edit", "Read"} and args.get("path")
+                         and self._workspace_path(str(args["path"])) is not None
+                         and self._workspace_path(str(args["path"])) == self._workspace_path(str(request.arguments.get("path", ""))))
+            pinned_read = (action.tool_name == "Read" and pinned_resource and args.get("path")
+                           and self._workspace_path(str(args["path"])) is not None
+                           and self._workspace_path(str(args["path"])) == self._workspace_path(str(pinned_resource)))
+            if same_command or same_file or pinned_read or discarded_precondition:
+                await self._append(lease, "FailureResolved", {"failed_action_id": action.action_id,
+                    "resolving_action_id": request.action_id, "observation_artifact": observation_artifact,
+                    "reason": "rejected pre-execution proposal superseded by verified current workspace" if discarded_precondition else "successful corresponding replacement"},
+                    artifact_refs=(observation_artifact,))
+
+    async def _completion_repair_issues(self, run_id):
+        p = await self.store.load_projection(run_id)
+        contract = completion_contract_from_instruction(_goal_public_text(p.goal) if p.goal else "")
+        issues = list(artifact_validation_issues(self.working_directory, contract.required_artifacts))
+        unresolved = {e.get("action_id") for e in p.working_state.unresolved_errors}
+        for a in p.actions:
+            if a.action_id in unresolved:
+                args = self.store.artifacts.read_text(a.arguments_artifact)
+                issues.append(f"Unresolved failed {a.tool_name}: {args[:600]}. Repair its cause and run the corresponding action/verifier successfully.")
+        issues.append("Completion is not verified. Run a goal-relevant verifier after the last edit, without output pipelines that mask its exit code. Check required outputs. A command succeeding or git status alone is not goal acceptance.")
+        if any(a.action_id in unresolved and a.tool_name == "Read"
+               and "skill-runs" in self.store.artifacts.read_text(a.arguments_artifact) for a in p.actions):
+            issues.append("For the failed pinned Skill resource read, use read_skill with the enabled skill_id and resource instead of direct Read of the internal path.")
+        return issues
 
     @staticmethod
     def _action_deduplication_status(
@@ -2158,13 +2342,20 @@ class RunWorker:
                 ActionStatus.PLANNED,
                 ActionStatus.PREPARED,
                 ActionStatus.STARTED,
-                ActionStatus.FAILED,
                 ActionStatus.OUTCOME_UNKNOWN,
             }
             for action in latest_actions.values()
         ):
             return False
         source = "model"
+        if self.capability_runtime is not None and self.completion_verifier is None and not _is_benchmark_task():
+            # The product path never trusts model-assigned evidence kinds,
+            # short fixture digests or claimed test outcomes. A completion
+            # declaration only requests reconstruction from actual receipts.
+            candidate = await self._synthesize_completion_candidate(lease, projection)
+            if candidate is None:
+                return False
+            source = "runtime"
         # A model candidate is only a request to complete.  On the official
         # benchmark path, canonicalize every evidence reference against the
         # append-only observation ledger before it can reach CompletionAccepted.
@@ -2194,7 +2385,12 @@ class RunWorker:
                     "diagnosis": "completion evidence is not bound to a durable tool observation",
                 },
             )
-            return False
+            if self.capability_runtime is None:
+                return False
+            # Product models often describe a test with an invalid reference.
+            # Discard that claim and reconstruct from actual committed receipts;
+            # never let model-supplied evidence override the local verifier.
+            candidate = None
         if candidate is None:
             candidate = await self._synthesize_completion_candidate(lease, projection)
             if candidate is None:
@@ -2380,7 +2576,7 @@ class RunWorker:
                 if isinstance(arguments, Mapping)
                 else ""
             )
-            if _is_verification_command(observation.tool_name, command):
+            if _observation_verifies(observation, command):
                 successful_commands.add(
                     _text_digest(_normalise_command(command))
                 )
@@ -2583,7 +2779,6 @@ class RunWorker:
                 ActionStatus.PLANNED,
                 ActionStatus.PREPARED,
                 ActionStatus.STARTED,
-                ActionStatus.FAILED,
                 ActionStatus.OUTCOME_UNKNOWN,
             }
             for action in latest_actions.values()
@@ -2658,7 +2853,7 @@ class RunWorker:
             )
             source = command or observation.tool_name
             marker_text = f"{observation.tool_name} {command}".casefold()
-            is_verification = _is_verification_command(observation.tool_name, command)
+            is_verification = _observation_verifies(observation, command)
             if any(
                 marker in marker_text
                 for marker in ("curl", "health", "readiness", "grpcurl", "nc ", "ss ")
@@ -3104,6 +3299,7 @@ class RunWorker:
                 error_kind=result.error_kind,
                 recovery=("reconcile" if result.status is ActionStatus.OUTCOME_UNKNOWN else "none"),
                 provenance=("durable-worker", request.tool_name),
+                metadata={"request_arguments": dict(request.arguments)},
             )
         if not observation_artifact:
             observation_ref = self.store.artifacts.put_text(
@@ -3154,6 +3350,7 @@ class RunWorker:
             payload["reason"] = result.error_kind or "unknown"
         await self._append(lease, event_type, payload)
         if event_type == "ActionSucceeded":
+            await self._resolve_replaced_failures(lease, request, observation, observation_artifact)
             verification = self._verification_evidence(request, observation, observation_artifact)
             if verification is not None:
                 await self._append(
@@ -3222,7 +3419,7 @@ class RunWorker:
             return None
         command = str(request.arguments.get("command") or "")
         source = command or request.tool_name
-        if not _is_verification_command(request.tool_name, command):
+        if not _observation_verifies(observation, command):
             return None
         return EvidenceRef(
             evidence_id=f"verification-{observation.observation_id}",
@@ -3396,12 +3593,15 @@ class RunWorker:
             secure_goal = getattr(self.capability_runtime, "secured_goal_text", None)
             if secure_goal is not None:
                 objective_text = secure_goal(projection)
-        return objective_messages(
+        messages = list(objective_messages(
             projection,
             cwd=self.working_directory,
             project_instructions=self.project_instructions,
             objective_text=objective_text,
-        )
+        ))
+        if messages and self.project_instruction_sources:
+            messages[0] = {**messages[0], "_project_sources": [dict(x) for x in self.project_instruction_sources]}
+        return messages
 
     async def _messages_for_projection(
         self,

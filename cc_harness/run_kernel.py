@@ -88,9 +88,15 @@ class ModelSegment:
 
     @classmethod
     def from_mapping(cls, value: Mapping[str, Any]) -> "ModelSegment":
-        raw_calls = value.get("tool_calls") or ()
+        if not isinstance(value, Mapping):
+            raise KernelProtocolError("model segment must be an object")
+        raw_calls = value.get("tool_calls")
+        if raw_calls is None:
+            raw_calls = ()
         if not isinstance(raw_calls, (list, tuple)):
             raise KernelProtocolError("model tool_calls must be a list")
+        if any(not isinstance(item, Mapping) for item in raw_calls):
+            raise KernelProtocolError("model tool call must be an object")
         return cls(
             text=str(value.get("text") or value.get("content") or ""),
             tool_calls=tuple(dict(item) for item in raw_calls),
@@ -197,10 +203,16 @@ class ReActKernel:
         else:
             raw = await complete(context.messages, context.available_tools)
         segment = raw if isinstance(raw, ModelSegment) else ModelSegment.from_mapping(raw)
+        if not isinstance(segment.tool_calls, (list, tuple)):
+            raise KernelProtocolError("model tool_calls must be a list")
         requests: list[ActionRequest] = []
         intents: list[EventIntent] = []
+        action_ids: set[str] = set()
         for index, call in enumerate(segment.tool_calls):
             request = self._action_request(context, call, index)
+            if request.action_id in action_ids:
+                raise KernelProtocolError("model tool calls have duplicate action ids")
+            action_ids.add(request.action_id)
             requests.append(request)
             intents.append(
                 EventIntent(
@@ -245,8 +257,10 @@ class ReActKernel:
 
     @staticmethod
     def _action_request(context: SegmentContext, call: Mapping[str, Any], index: int) -> ActionRequest:
-        name = str(call.get("name") or call.get("tool_name") or "")
-        if not name:
+        if not isinstance(call, Mapping):
+            raise KernelProtocolError("model tool call must be an object")
+        name = call.get("name") or call.get("tool_name") or ""
+        if not isinstance(name, str) or not name.strip():
             raise KernelProtocolError("model tool call has no tool name")
         raw_arguments = call.get("arguments", call.get("args", {}))
         if isinstance(raw_arguments, str):

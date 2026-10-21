@@ -1,52 +1,33 @@
-# 运行截图
+# 当前项目执行截图
 
 [返回项目 README](../README.md)
 
-本组截图于 2026-10-12 重新构建并运行当前工作区版本后拍摄，未复用已有验收截图。
-使用 `npm run build` 构建 WebUI，启动当前 Python WebUI 后端，在 Chromium 中通过
-Playwright 实际点击、输入任务、处理审批并截图。模型为本机配置的 `deepseek-flash`；
-没有模拟 API 响应或注入运行成功状态。运行数据使用独立目录，演示文件保存在本机
-`.playwright-mcp/` 中。桌面截图为 1600 × 1000，窄屏截图为 390 × 844。
+拍摄日期：2026-10-21（Asia/Singapore）。WebUI 使用 `npm run build` 重新构建，后端通过
+`python main.py --no-open --port 3080 --data-root .playwright-mcp/readme-runtime-20261021` 启动。
+执行后端为 native，模型使用本机已有配置 `deepseek-flash`。
+截图使用 Playwright/Chromium，尺寸 1600 × 1000，保存浏览器实际画面，没有修改 DOM、
+模拟 API 返回或注入成功状态。通过真实项目选择 API 选择当前仓库，任务输入、发送、审批、
+状态面板及本地资产操作在浏览器中完成。
 
-## 截图索引
+## 原图访问路径
 
-| 页面或操作 | 截图 | 内容 |
+| 顺序 | 原图 | 实际状态 |
 | --- | --- | --- |
-| 深色首页 | [01-welcome-dark.png](01-welcome-dark.png) | 未选择项目时的欢迎页与输入门禁 |
-| 浅色首页 | [02-welcome-light.png](02-welcome-light.png) | 实际切换浅色主题 |
-| 项目选择 | [03-project-ready.png](03-project-ready.png) | 手动输入本机路径后，项目就绪与任务建议 |
-| 工具运行中 | [04-task-running.png](04-task-running.png) | 模型实际发起 Glob 调用，显示执行参数与运行状态 |
-| 运行详情 | [05-runtime-panel.png](05-runtime-panel.png) | 状态、执行后端、调度器、上下文和事件时间线 |
-| 模型设置 | [06-model-settings.png](06-model-settings.png) | Base URL、模型名称与已遮蔽的 API Key |
-| 斜杠命令 | [07-slash-commands.png](07-slash-commands.png) | 在输入框键入 `/` 打开命令菜单 |
-| 快捷键 | [08-keyboard-shortcuts.png](08-keyboard-shortcuts.png) | 实际按 Ctrl + / 打开帮助 |
-| 权限策略 | [09-permission-options.png](09-permission-options.png) | 三档权限菜单与当前选项 |
-| 上下文用量 | [10-context-usage.png](10-context-usage.png) | 实际运行产生的 token 用量详情 |
-| 消息排队 | [11-message-queue.png](11-message-queue.png) | 工具执行期间提交后续消息，展示队列 |
-| 停止运行 | [12-stopped-run.png](12-stopped-run.png) | 实际点击停止后的部分输出与恢复入口 |
-| Write 参数 | [13-write-approval.png](13-write-approval.png) | Write 创建演示 Markdown 前的待审批状态 |
-| 产物预览 | [14-artifact-preview.png](14-artifact-preview.png) | 允许 Write 后创建真实文件，并打开 Markdown 预览 |
-| 产物源码 | [15-artifact-source.png](15-artifact-source.png) | 同一文件切换至代码视图 |
-| 产物全屏 | [16-artifact-fullscreen.png](16-artifact-fullscreen.png) | 实际打开全屏预览 |
-| 模型回复 | [17-model-answer.png](17-model-answer.png) | 写入后的真实回复与会话状态 |
-| 执行计划 | [18-execution-plan.png](18-execution-plan.png) | 目标契约、PlanGraph 和 Todo 浮层 |
-| 会话搜索 | [19-session-search.png](19-session-search.png) | 按关键词筛选本次创建的会话 |
-| 窄屏对话 | [20-mobile-chat.png](20-mobile-chat.png) | 手动收起侧栏后的窄屏工具执行页面 |
-| 窄屏设置 | [21-mobile-settings.png](21-mobile-settings.png) | 窄屏下的模型设置弹窗 |
-| 审批卡片 | [22-approval-pending.png](22-approval-pending.png) | 真实 Write 请求的“允许一次”与“拒绝”按钮 |
-| 审批拒绝 | [23-approval-rejected.png](23-approval-rejected.png) | 实际拒绝 Write，工具标记未执行，目标文件未创建 |
-| Read 后回复 | [24-read-answer.png](24-read-answer.png) | 仅读取 README 前 30 行后的真实模型回复 |
-| Read 结果 | [25-read-tool-result.png](25-read-tool-result.png) | 展开成功的 Read 参数和 30/60 行结果 |
-| 流式回复 | [26-streaming-response.png](26-streaming-response.png) | 真实模型正在逐步输出内容时截图 |
+| 01 | [启动 WebUI](runtime-20261021/01-welcome.png) | 项目尚未选择，显示欢迎页 |
+| 02 | [输入测试任务](runtime-20261021/02-task-ready.png) | 当前项目为 cc-harness，任务请求运行矩阵测试并写报告 |
+| 03 | [命令审批](runtime-20261021/03-command-approval.png) | 模型规划真实 run_command，等待“允许一次” |
+| 04 | [命令执行中](runtime-20261021/04-command-running.png) | 实际点击允许，工具进入执行阶段 |
+| 05 | [未知结果阻塞](runtime-20261021/05-command-blocked.png) | executor_lost，运行阻塞，未生成任务要求的 Markdown |
+| 06 | [只读报告任务](runtime-20261021/06-report-reading.png) | 新建任务，请求读取测试与修复报告并概述结果 |
+| 07 | [报告摘要与暂停](runtime-20261021/07-report-result.png) | 已生成中文概述；最终暂停，不能视为 Run 完成 |
+| 08 | [上下文来源](runtime-20261021/08-context-sources.png) | 查看真实来源清单及续行资料 |
+| 09 | [Skill 管理](runtime-20261021/09-local-skills.png) | 当前项目的真实 Skill 列表；不表示本任务调用过 Skill |
+| 10 | [Runtime 状态](runtime-20261021/10-runtime-state.png) | 查看暂停原因、上下文用量和事件时间线 |
 
-## 本次运行的实际情况
+## 运行记录与限制
 
-- OpenSandbox 不可用，Runtime 显示“沙箱不可用 · 已降级本机”。本组截图不证明沙箱执行成功。
-- Write 获批后确实创建了 180 字节的演示文件；Read 也实际成功读取了 README 的前 30 行。
-  两个会话随后显示“已暂停”，因此工具成功和整体 Run 完成应分别判断。
-- Glob 对当前大目录的调用耗时较长。运行中截图仅记录调用与排队状态，不将其列为成功的目录检索证据。
-- 拒绝审批后，`.playwright-mcp/readme-approval.md` 未创建；拒绝截图展示真实工具观察和模型后续回复。
-- 窄屏对话截图先手动收起侧栏；未收起时侧栏会明显挤占对话区域。
-- 本组覆盖主要可见页面及操作流程，不作为所有异常恢复、长历史、网络断线或安全边界均通过的测试报告。
-
-此目录中的其他图片为之前已有的素材，不属于本次重新运行的截图组。
+- 命令任务：`d3007364-d34b-464a-ab0e-3ef2a01106ae`，最终 blocked，事件序号 36。工具回执为 executor_lost，因此没有将这次请求记作 pytest 通过。单独诊断发现当前大工作区的快照扫描遇到无法访问的 Windows 缓存文件（WinError 1920）；该问题在此次拍摄中保留为已知问题，未修复。
+- 只读任务：`4d7930d0-499a-4f1b-9963-ee8139d8f1a6`，最终 paused，事件序号 150。实际调用 Read、read_ref 并返回中文摘要；完成门槛仍要求验证，模型遵守“不执行命令”的限制，反复报告同一缺口后触发 no verifiable progress 暂停。该任务不算 completed。
+- 页面显示记忆已启用、安全部分降级。启动日志记录既有记忆库的向量维数与本次配置不一致；本组图片不能证明跨会话记忆召回或安全能力全部正常。
+- 截图中的“565 通过、1 跳过”来自模型读取的此前审计报告，不能替代这次浏览器任务的执行回执。原测试证据范围见 [测试与修复报告](../docs/audits/runtime-context-memory-skill-matrix-20261021.md)。
+- 原始运行数据保存在本机 `.playwright-mcp/readme-runtime-20261021/`，不提交聊天数据库、API 密钥或工具缓存。旧版 img 图片已移除，本目录链接均指向本次新拍摄的 PNG。

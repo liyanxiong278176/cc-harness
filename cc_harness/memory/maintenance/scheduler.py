@@ -153,6 +153,9 @@ class MaintenanceScheduler:
         deleted = await purge_stale(self._store, staleness_threshold=threshold, limit=limit)
         return len(deleted)
     async def _run_consolidation(self) -> int:
+        if getattr(self._service, "require_verified", False):
+            # Keep source-backed facts separate instead of persisting an unverified LLM merge.
+            return 0
         from cc_harness.memory.maintenance.consolidation import consolidate
         embedder = getattr(self, "_embedder", None)
         if embedder is None:

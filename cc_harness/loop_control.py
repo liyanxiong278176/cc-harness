@@ -67,7 +67,7 @@ _EXPLICIT_ARTIFACT_RE = re.compile(
     r"(?<![\w.-])(/(?:app|tmp|workspace)/[A-Za-z0-9_./-]+)"
 )
 _ARTIFACT_DIRECTIVE_RE = re.compile(
-    r"\b(?:create|write|save|store|produce|generate|output|place|put|"
+    r"\b(?:create|write|save|store|produce|generate|output|export|place|put|"
     r"required|must\s+(?:exist|contain|be)|deliver(?:able|ed)|artifact|"
     r"创建|写入|保存|生成|输出|放到|存储|必须(?:存在|包含)|产物|交付)\b",
     re.IGNORECASE,
@@ -497,6 +497,20 @@ def completion_contract_from_instruction(
             digest_match = re.search(r"\bsha256:[0-9a-f]{64}\b", line, re.IGNORECASE)
             if digest_match:
                 artifact_digests[path] = digest_match.group(0).lower()
+    # Local tasks use relative filenames, not just Harbor's /app paths. Parse
+    # output clauses separately so an earlier input filename is not promoted
+    # to an output requirement merely because it shares the same paragraph.
+    output_directive = re.compile(r"\b(?:implement|create|write|save|produce|generate|output|export|deliver)\b|创建|写入|生成|输出|保存|导出", re.I)
+    local_path = re.compile(r"(?<![\w:/\\.-])([\w.-]+(?:[/\\][\w.-]+)*\.(?:py|js|ts|tsx|jsx|jsonl?|csv|txt|md|yaml|yml|html|css|toml|sql|xml|sh))\b", re.I)
+    for clause in re.split(r"[.!?。；;]\s+|\n", instruction):
+        directive = output_directive.search(clause)
+        if directive is None or re.search(r"(?:do not|don't|never|不要|不必)\s*$", clause[:directive.start()], re.I):
+            continue
+        for match in local_path.finditer(clause[directive.end():]):
+            path = match.group(1).replace("\\", "/")
+            if path not in required:
+                required.append(path)
+                artifact_formats[path] = "json" if path.endswith(".json") else None
     verification_commands = _instruction_commands(instruction, _TEST_COMMAND_RE)
     service_health_commands = _instruction_commands(instruction, _SERVICE_HEALTH_COMMAND_RE)
     # Only the official adapter may authorize paths outside the mounted

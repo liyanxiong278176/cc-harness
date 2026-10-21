@@ -15,6 +15,7 @@ LLM 看到 pointer、需要精确细节时,主动调 `read_ref(source_ref=...)` 
 from __future__ import annotations
 
 import json
+import hashlib
 import inspect
 import re
 import sqlite3
@@ -182,7 +183,47 @@ async def read_ref_handler(
         )
     offset = max(0, int(args.get("offset", 0)))
     limit = min(500, max(1, int(args.get("limit", 200))))
-    lines = ref_file.read_text(encoding="utf-8").splitlines()
+    # Older runs can contain pointer-to-pointer objects. Resolve only complete
+    # pointer bodies, in the same context manifest, with bounded depth and hash
+    # checks at every hop. Never follow arbitrary paths embedded in evidence.
+    records = (_sqlite_manifest_records(Path(state_db_path), str(history_context_id or ""))
+               if state_db_path is not None else _manifest_records(Path(manifest_path)) if manifest_path else [])
+    by_node = {str(r.get("node_id")): r for r in records}
+    chain = []
+    requested_node = node_id
+    for _ in range(8):
+        if node_id in chain:
+            return ToolResult.error("cyclic reference", "[read_ref] cyclic offload reference")
+        chain.append(node_id)
+        try:
+            body = ref_file.read_bytes()
+            expected = str(by_node.get(node_id, {}).get("content_digest") or "")
+            if expected and "sha256:" + hashlib.sha256(body).hexdigest() != expected:
+                return ToolResult.error("reference digest mismatch", "[read_ref] reference digest mismatch")
+            content = body.decode("utf-8")
+        except (OSError, UnicodeError):
+            return ToolResult.error("reference unavailable", "[read_ref] reference is unavailable")
+        pointer = content.strip()
+        if pointer.startswith("{") and "\n" in pointer:
+            header_line, remainder = pointer.split("\n", 1)
+            try:
+                old_header = json.loads(header_line)
+            except ValueError:
+                old_header = None
+            if isinstance(old_header, dict) and "source_ref" in old_header:
+                pointer = remainder.strip()
+        alias = re.fullmatch(r"\[offloaded node=([A-Za-z0-9_-]+)\b.*\]", pointer, re.S)
+        if alias is None:
+            break
+        node_id = alias.group(1)
+        if records and node_id not in by_node:
+            return ToolResult.error("unauthorized reference", "[read_ref] alias is outside the active manifest")
+        ref_file = _resolve_ref_file(node_id, refs_root, manifest_path, state_db_path=state_db_path, context_id=history_context_id)
+        if not ref_file.resolve().is_relative_to(refs_root):
+            return ToolResult.error("invalid reference", "[read_ref] alias escapes the active refs root")
+    else:
+        return ToolResult.error("reference depth exceeded", "[read_ref] offload alias depth exceeded")
+    lines = content.splitlines()
     selected = lines[offset:offset + limit]
     next_offset = offset + len(selected)
     complete = next_offset >= len(lines)
@@ -190,6 +231,8 @@ async def read_ref_handler(
         {
             "node_id": node_id,
             "source_ref": f"node:{node_id}",
+            "requested_source_ref": f"node:{requested_node}",
+            "alias_chain": chain,
             "offset": offset,
             "returned_lines": len(selected),
             "next_offset": None if complete else next_offset,
@@ -439,12 +482,15 @@ def _resolve_ref_file(
     if state_db_path is not None:
         for record in reversed(_sqlite_manifest_records(Path(state_db_path), str(context_id or ""))):
             if record.get("node_id") == node_id:
+                canonical = _canonical_local_ref(record, refs_root)
+                if canonical is not None:
+                    return canonical
                 candidate = Path(str(record.get("result_ref") or "")).resolve()
                 try:
                     candidate.relative_to(refs_root)
                 except ValueError:
                     candidate = _rebase_snapshot_ref(candidate, refs_root)
-                return candidate
+                return candidate.resolve()
     if manifest_path is None:
         return refs_root / f"{node_id}.md"
     path = Path(manifest_path)
@@ -457,6 +503,9 @@ def _resolve_ref_file(
             continue
         if record.get("node_id") != node_id:
             continue
+        canonical = _canonical_local_ref(record, refs_root)
+        if canonical is not None:
+            return canonical
         candidate = Path(str(record.get("result_ref") or "")).resolve()
         try:
             candidate.relative_to(refs_root)
@@ -471,8 +520,18 @@ def _resolve_ref_file(
                 candidate.relative_to(refs_root)
             except ValueError:
                 return refs_root / f"{node_id}.invalid"
-        return candidate
+        return candidate.resolve()
     return refs_root / f"{node_id}.missing"
+
+
+def _canonical_local_ref(record: dict, refs_root: Path) -> Path | None:
+    digest = str(record.get("content_digest") or "")
+    if not re.fullmatch(r"sha256:[0-9a-f]{64}", digest):
+        return None
+    candidate = (refs_root / "objects" / f"{digest[7:]}.md").resolve()
+    if candidate.is_relative_to(refs_root) and candidate.is_file():
+        return candidate
+    return None
 
 
 def _source_ref_node_id(value: object) -> str:

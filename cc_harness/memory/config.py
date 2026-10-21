@@ -80,6 +80,7 @@ class MemoryConfig(BaseModel):
     layered_inject: bool = True          # pre-turn 分层注入开关
     capture_enabled: bool = True         # L0 会话录制开关
     pipeline_enabled: bool = True        # L1 提取 + L2/L3 聚合开关
+    verified_auto_memory: bool = True    # 自动写入必须引用用户原话或成功工具观察
     # Q4 短期符号化卸载字段
     offload_enabled: bool = True            # 总开关:false = 不卸载,胖结果原样留历史
     offload_threshold: int = 2000           # 单节点 tool-call 结果 token 上限,超过则卸载

@@ -61,36 +61,10 @@ eval/result/locomo-*.json
 eval/result/promptfoo-result/
 eval/result/parity-*/
 /img/*
-!/img/campus-eats-result.png
-
-# README screenshots captured from the running WebUI.
 !/img/README.md
-!/img/01-welcome-dark.png
-!/img/02-welcome-light.png
-!/img/03-project-ready.png
-!/img/04-task-running.png
-!/img/05-runtime-panel.png
-!/img/06-model-settings.png
-!/img/07-slash-commands.png
-!/img/08-keyboard-shortcuts.png
-!/img/09-permission-options.png
-!/img/10-context-usage.png
-!/img/11-message-queue.png
-!/img/12-stopped-run.png
-!/img/13-write-approval.png
-!/img/14-artifact-preview.png
-!/img/15-artifact-source.png
-!/img/16-artifact-fullscreen.png
-!/img/17-model-answer.png
-!/img/18-execution-plan.png
-!/img/19-session-search.png
-!/img/20-mobile-chat.png
-!/img/21-mobile-settings.png
-!/img/22-approval-pending.png
-!/img/23-approval-rejected.png
-!/img/24-read-answer.png
-!/img/25-read-tool-result.png
-!/img/26-streaming-response.png
+# Fresh execution screenshots linked directly from README.
+!/img/runtime-20261021/
+!/img/runtime-20261021/*.png
 
 # cc-harness ad-hoc session/test memory DB
 cc_harness/memory/*.db

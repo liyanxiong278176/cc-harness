@@ -124,6 +124,7 @@ async def build_memory_extras(
         )
         decider = LLMDecider(llm=decider_llm)
         service = MemoryService(store=store, embedder=embedder, decider=decider)
+        service.require_verified = bool(memory_config and memory_config.verified_auto_memory)
         retriever = MemoryRetriever(
             store=store,
             embedder=embedder,
@@ -144,6 +145,7 @@ async def build_memory_extras(
         threshold=(memory_config.pipeline_threshold if memory_config else 0.55),
         recent_turns=(memory_config.pipeline_recent_turns if memory_config else 10),
         max_delta_tokens=(memory_config.pipeline_max_delta_tokens if memory_config else 4000),
+        verified_sources=(memory_config.verified_auto_memory if memory_config else True),
     )
     persona_path = db_path.parent / "persona.md"
     scenarios_dir = db_path.parent / "scenarios"
@@ -191,7 +193,7 @@ async def build_memory_extras(
                 },
             }
         )
-    elif not read_only:
+    elif not read_only and not (memory_config and memory_config.verified_auto_memory):
         extras.append(
             {"spec": MEMORY_SAVE_SPEC, "handler": memory_save_handler, "deps": {"service": service}}
         )

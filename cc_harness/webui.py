@@ -2244,6 +2244,15 @@ class ArtifactOpenRequest(BaseModel):
     project_root: str = Field(min_length=1, max_length=4096)
 
 
+class LocalAssetRequest(BaseModel):
+    action: str = Field(max_length=40)
+    id: str | None = Field(default=None, max_length=300)
+    run_id: str | None = Field(default=None, max_length=300)
+    path: str | None = Field(default=None, max_length=4096)
+    token: str | None = Field(default=None, max_length=100)
+    project_root: str = Field(min_length=1, max_length=4096)
+
+
 class SettingsRequest(BaseModel):
     base_url: str | None = None
     model: str | None = None
@@ -2383,6 +2392,31 @@ def create_web_app(manager: WebRuntimeManager | None = None) -> FastAPI:
 
     app = FastAPI(title="cc-harness WebUI", version="0.1.0", docs_url=None, redoc_url=None, lifespan=lifespan)
     app.state.manager = manager
+
+    async def local_assets_service(expected_root: str | None):
+        from .local_assets import LocalAssets
+        root = manager._require_root()
+        if expected_root is not None and Path(expected_root).resolve() != root.resolve():
+            raise ValueError("selected project changed; refresh local assets")
+        return LocalAssets(await manager._client_for_root(root))
+
+    @app.get("/api/local-assets")
+    async def get_local_assets(run_id: str | None = None, project_root: str | None = None):
+        try:
+            assets = await local_assets_service(project_root)
+            if run_id:
+                _root, effective, _head, _approvals, _tree = await manager._conversation_snapshot(assets.client, run_id)
+                run_id = effective.run_id
+            return await assets.inspect(run_id)
+        except Exception as exc:
+            raise _http_error(exc) from exc
+
+    @app.post("/api/local-assets")
+    async def update_local_assets(payload: LocalAssetRequest):
+        try:
+            return await (await local_assets_service(payload.project_root)).apply(payload.model_dump())
+        except Exception as exc:
+            raise _http_error(exc) from exc
 
     @app.get("/api/health")
     async def health() -> dict[str, Any]:

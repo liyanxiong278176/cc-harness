@@ -37,6 +37,10 @@ class ExecutionControl:
         self.receivers[name] = worker_factory
 
     async def append(self, run_id: str, event_type: str, payload: Mapping[str, Any]):
+        async with self.store.event_append_lock:
+            return await self._append_locked(run_id, event_type, payload)
+
+    async def _append_locked(self, run_id: str, event_type: str, payload: Mapping[str, Any]):
         for attempt in range(12):
             lease = getattr(self, "worker_lease", None)
             if lease is not None:

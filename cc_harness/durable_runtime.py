@@ -1142,6 +1142,7 @@ class DurableRuntimeClient:
                     self.project_instructions.text
                     if self.project_instructions is not None else None
                 ),
+                project_instruction_sources=(self.project_instructions.source_metadata if self.project_instructions else ()),
                 child_completion_callback=self._on_child_completed,
                 child_cancellation_callback=self._on_child_cancelled,
                 child_failure_callback=self._on_child_failed,
@@ -1533,7 +1534,7 @@ class DurableRuntimeClient:
                         "source": "durable-extra-capability",
                     }
                 )
-                if name in {"read_ref", "search_ref", "inspect_node"}:
+                if name in {"read_ref", "search_ref", "inspect_node", "read_skill"}:
                     contracts.register(
                         ToolRecoveryContract(
                             name,
@@ -1588,6 +1589,8 @@ class DurableRuntimeClient:
                 for extra in (extras or ())
             )
             specs = select_tool_specs(specs, self.tool_bundles, native_names=native_names)
+        if "read_skill" in handler_deps:
+            handler_deps["read_skill"]["tool_names"] = {s["function"]["name"] for s in specs}
         return tuple(specs), contracts, handlers, handler_deps
 
     @staticmethod
@@ -1838,6 +1841,8 @@ class DurableRuntimeClient:
         if command_lock:
             await self._workspace_command_lock.acquire()
         workspace_before = _workspace_snapshot(execution_root) if command_lock else {}
+        from .local_verification import python_assertion_verifier
+        verifier_before = python_assertion_verifier(execution_root, str(request.arguments.get("command", ""))) if command_lock else None
         try:
             execution_request = request
             capability_id = request.arguments.get("capability_id")
@@ -1900,6 +1905,9 @@ class DurableRuntimeClient:
                     separators=(",", ":"),
                 ).encode()
                 metadata = dict(result.metadata)
+                if (verifier_before is not None and not result.is_error and metadata.get("exit_code") == 0
+                    and python_assertion_verifier(execution_root, str(request.arguments.get("command", ""))) == verifier_before):
+                    metadata["verification"] = verifier_before
                 metadata.update(
                     {
                         "workspace_baseline": {
@@ -2026,7 +2034,7 @@ class DurableRuntimeClient:
         if not isinstance(path, str) and isinstance(metadata.get("continued_request_arguments"), Mapping):
             path = metadata["continued_request_arguments"].get("path")
         paths = (str(path),) if isinstance(path, str) and path else ()
-        modified = paths if original_tool in {"Edit", "Write"} else ()
+        modified = paths if original_tool in {"Edit", "Write"} and not result.is_error else ()
         if request.tool_name == "run_command":
             modified = tuple(
                 str(item)

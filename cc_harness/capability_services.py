@@ -211,6 +211,7 @@ class SharedCapabilityServices:
             policy=policy,
             context_config=context_config
             or load_context_config(
+                policy_path,
                 model=config.openai_model,
                 environ=config.runtime_environment,
             ),
