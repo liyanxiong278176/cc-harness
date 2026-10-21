@@ -42,6 +42,9 @@ class CompletionEvidenceError(DomainValidationError):
 
 
 class RunStatus(str, Enum):
+    PAUSED = "paused"
+    WAITING_INPUT = "waiting_input"
+    WAITING_EVENT = "waiting_event"
     DRAFT = "draft"
     QUEUED = "queued"
     RUNNING = "running"
@@ -861,11 +864,23 @@ class RunStateMachine:
     """
 
     _TARGETS: ClassVar[dict[str, dict[RunStatus, set[RunStatus]]]] = {
+        "RunPaused": {
+            status: {RunStatus.PAUSED} for status in RunStatus
+            if status not in {RunStatus.COMPLETED, RunStatus.CANCELLED, RunStatus.FAILED_TERMINAL}
+        },
+        "TaskWaitStarted": {RunStatus.RUNNING: {RunStatus.WAITING_EVENT}},
+        "TaskWaitResolved": {RunStatus.WAITING_EVENT: {RunStatus.QUEUED}},
+        "TaskApprovalSuperseded": {
+            RunStatus.AWAITING_APPROVAL: {RunStatus.QUEUED},
+            RunStatus.QUEUED: {RunStatus.QUEUED}, RunStatus.RUNNING: {RunStatus.RUNNING},
+        },
         "RunQueued": {RunStatus.DRAFT: {RunStatus.QUEUED}},
         "RunClaimed": {RunStatus.QUEUED: {RunStatus.RUNNING}},
         "RunYielded": {RunStatus.RUNNING: {RunStatus.QUEUED}},
         "WorkerLeaseExpired": {RunStatus.RUNNING: {RunStatus.QUEUED}},
         "RunResumed": {
+            RunStatus.PAUSED: {RunStatus.QUEUED},
+            RunStatus.WAITING_INPUT: {RunStatus.QUEUED},
             # A retried resume request may be appended after the first
             # request already put the run back in the durable queue.  Treat
             # that duplicate as an idempotent no-op during replay.
@@ -907,6 +922,9 @@ class RunStateMachine:
         },
         "RunStalled": {RunStatus.RUNNING: {RunStatus.STALLED}},
         "RunCancelled": {
+            RunStatus.PAUSED: {RunStatus.CANCELLED},
+            RunStatus.WAITING_INPUT: {RunStatus.CANCELLED},
+            RunStatus.WAITING_EVENT: {RunStatus.CANCELLED},
             RunStatus.DRAFT: {RunStatus.CANCELLED},
             RunStatus.QUEUED: {RunStatus.CANCELLED},
             RunStatus.AWAITING_APPROVAL: {RunStatus.CANCELLED},
@@ -1103,6 +1121,23 @@ class RunStateMachine:
         completion: CompletionCandidate | None = None,
         goal: GoalContract | None = None,
     ) -> RunStatus:
+        from .task_execution import CONTROL_EVENT_FIELDS
+        if event_type in CONTROL_EVENT_FIELDS and event_type not in self._TARGETS:
+            allowed = {
+                "TaskPauseRequested": {RunStatus.RUNNING},
+                "TaskWaitRequested": {RunStatus.RUNNING},
+                "TaskVerificationStarted": {RunStatus.RUNNING},
+                "TaskVerificationFinished": {RunStatus.RUNNING},
+                "TaskGuidanceApplied": {RunStatus.RUNNING, RunStatus.QUEUED},
+                "TaskHandoffRecorded": {RunStatus.PAUSED},
+                "TaskKernelPhase": {RunStatus.RUNNING, RunStatus.CANCEL_REQUESTED},
+            }.get(event_type)
+            if allowed is not None and current not in allowed:
+                raise InvalidRunTransition(f"{event_type} is invalid from {current.value}")
+            if current in {RunStatus.CANCELLED, RunStatus.COMPLETED, RunStatus.FAILED_TERMINAL}:
+                if event_type not in {"TaskBudgetSettled", "TaskControlEnabled", "TaskProgressRequested", "TaskProgressReported"}:
+                    raise InvalidRunTransition(f"{event_type} is invalid from {current.value}")
+            return current
         if event_type == "RunCreated":
             if current is not RunStatus.DRAFT:
                 raise InvalidRunTransition("RunCreated is only valid for a draft run")

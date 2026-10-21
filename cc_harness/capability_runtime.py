@@ -8,6 +8,7 @@ implementation hidden inside the worker loop.
 
 from __future__ import annotations
 
+import asyncio
 import contextlib
 import copy
 import hashlib
@@ -463,7 +464,8 @@ class AgentCapabilityRuntime:
         self._source_history[projection.run_id] = [dict(message) for message in source]
         if projection_view is None:
             artifact_dir = self.cwd / ".cc-harness" / "context" / projection.run_id
-            projection_view = ContextProjection(
+            projection_view = await asyncio.to_thread(
+                ContextProjection,
                 source,
                 artifact_dir=artifact_dir,
                 state_db_path=self.store.db_path,
@@ -518,7 +520,7 @@ class AgentCapabilityRuntime:
                 memory_fingerprint = str(version) if version is not None else None
                 state_store = getattr(projection_view, "state_store", None)
                 persisted = (
-                    state_store.memory_injection()
+                    await asyncio.to_thread(state_store.memory_injection)
                     if state_store is not None and memory_fingerprint is not None
                     else None
                 )
@@ -570,7 +572,8 @@ class AgentCapabilityRuntime:
                                 ).digest
                         if state_store is not None and memory_fingerprint is not None:
                             with contextlib.suppress(Exception):
-                                state_store.set_memory_injection(
+                                await asyncio.to_thread(
+                                    state_store.set_memory_injection,
                                     memory_fingerprint,
                                     block_artifact=memory_block_artifact,
                                     has_block=bool(memory_block),
@@ -614,7 +617,8 @@ class AgentCapabilityRuntime:
                                 ).digest
                         if state_store is not None and memory_fingerprint is not None:
                             with contextlib.suppress(Exception):
-                                state_store.set_memory_injection(
+                                await asyncio.to_thread(
+                                    state_store.set_memory_injection,
                                     memory_fingerprint,
                                     block_artifact=memory_block_artifact,
                                     has_block=bool(memory_block),
@@ -640,7 +644,8 @@ class AgentCapabilityRuntime:
                             ).digest
                     if state_store is not None and memory_fingerprint is not None:
                         with contextlib.suppress(Exception):
-                            state_store.set_memory_injection(
+                            await asyncio.to_thread(
+                                state_store.set_memory_injection,
                                 memory_fingerprint,
                                 block_artifact=memory_block_artifact,
                                 has_block=bool(memory_block),
@@ -802,7 +807,8 @@ class AgentCapabilityRuntime:
             ),
             "security_l5_enabled": self.l5 is not None,
         }
-        call_manifest_uri = projection_view.record_call_manifest(
+        call_manifest_uri = await asyncio.to_thread(
+            projection_view.record_call_manifest,
             stats,
             [dict(item) for item in tool_specs],
             self.token_counter,

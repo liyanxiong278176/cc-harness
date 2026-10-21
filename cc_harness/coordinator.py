@@ -9,6 +9,7 @@ from dataclasses import dataclass
 from typing import Any, Sequence
 
 from .approvals import ApprovalDecision, ApprovalService
+from .execution_control import ExecutionControl
 from .artifacts import ArtifactStore
 from .followups import FollowUpService
 from .goals import GoalAssessment, GoalContractService
@@ -100,6 +101,9 @@ class RunRequest:
     # Persisted on the GoalContract so completion behavior is explicit and
     # recoverable. The default remains the strict coding contract.
     interaction_mode: str = "coding"
+    budget_limits: Mapping[str, float] | None = None
+    plan_mode: bool = False
+    terminal_pid: int | None = None
 
 
 @dataclass(frozen=True)
@@ -152,6 +156,7 @@ class RunCoordinator:
         self.goals = GoalContractService()
         self.plans = PlanGraphService()
         self.worktrees = worktrees
+        self.execution = ExecutionControl(store)
 
     async def submit(self, request: RunRequest) -> RunHandle:
         run_id = str(uuid.uuid4())
@@ -181,6 +186,13 @@ class RunCoordinator:
             actor,
         )
         root_node = PlanNode(f"root-{run_id}", "root", depth=0)
+        await self.execution.enable(run_id)
+        if request.budget_limits is not None:
+            await self.execution.configure_budget(run_id, request.budget_limits)
+        if request.terminal_pid is not None:
+            await self.execution.attach_terminal(run_id, request.terminal_pid)
+        if request.plan_mode:
+            await self.execution.append(run_id, "TaskPlanApprovalRequired", {})
         root_plan = PlanGraph(nodes=(root_node,), revision=1)
         await self._append(run_id, "PlanCreated", {"plan": root_plan.to_dict()}, actor)
         await self._append(
@@ -197,7 +209,7 @@ class RunCoordinator:
             },
             actor,
         )
-        if request.plan_discovery:
+        if request.plan_discovery or request.plan_mode:
             await self._append(
                 run_id,
                 "PlanDiscoveryStarted",
@@ -341,6 +353,27 @@ class RunCoordinator:
 
     async def resume(self, run_id: str, reason: str = "client resume") -> ControlReceipt:
         view = await self.inspect(run_id)
+        if not view.projection.task.protocol_version:
+            await self.execution.migrate_legacy(run_id)
+            view = await self.inspect(run_id)
+        if view.status is RunStatus.CANCELLED:
+            receipt = await self.followups.enqueue(run_id, reason, continuation=True)
+            return ControlReceipt(receipt.follow_up_run_id, RunStatus.QUEUED, receipt.sequence)
+        if view.status is RunStatus.PAUSED:
+            if view.projection.task.reservations:
+                for owner_id in {item["owner_run_id"] for item in view.projection.task.reservations.values()}:
+                    await self.execution.recover_reservations(owner_id)
+                view = await self.inspect(run_id)
+            limits = view.projection.task.limits
+            if any(view.projection.task.used.get(k, 0) >= v for k, v in limits.items()):
+                raise ValueError("increase exhausted budget before resuming")
+            await self._append(run_id, "RunResumed", {"reason": reason}, EventActor("client", "local-client"))
+            await self.execution.apply_guidance(run_id)
+            for child in view.projection.children:
+                child_view = await self.inspect(child.child_run_id)
+                if child_view.status is RunStatus.PAUSED:
+                    await self.resume(child.child_run_id, reason)
+            return await self._control_receipt(run_id)
         if view.status in {
             RunStatus.STALLED,
             RunStatus.BLOCKED,
@@ -374,8 +407,29 @@ class RunCoordinator:
         updated = await self.inspect(run_id)
         return ControlReceipt(run_id, updated.status, updated.sequence)
 
+    async def _control_receipt(self, run_id: str) -> ControlReceipt:
+        view = await self.inspect(run_id)
+        return ControlReceipt(run_id, view.status, view.sequence)
+
+    async def pause(self, run_id: str, reason: str = "user pause") -> ControlReceipt:
+        await self.execution.pause(run_id, reason)
+        return await self._control_receipt(run_id)
+
+    async def approve_plan(self, run_id: str, plan_digest: str) -> ControlReceipt:
+        view = await self.inspect(run_id)
+        if not view.projection.task.plan_approval_required:
+            raise ValueError("task does not require plan approval")
+        if view.projection.plan.digest != plan_digest:
+            raise ValueError("plan changed; approval is stale")
+        await self.execution.append(run_id, "TaskPlanApproved", {"plan_digest": plan_digest})
+        if view.status is RunStatus.WAITING_EVENT:
+            await self.execution.wake(run_id, str(view.projection.task.wait["wait_id"]))
+        return await self._control_receipt(run_id)
+
     async def cancel(self, run_id: str, reason: str) -> ControlReceipt:
         view = await self.inspect(run_id)
+        for child in view.projection.children:
+            await self.cancel(child.child_run_id, reason)
         actor = EventActor("client", "local-client")
         if view.status is RunStatus.RUNNING:
             await self._append(run_id, "InterruptRequested", {"reason": reason}, actor)
@@ -529,12 +583,18 @@ class RunCoordinator:
         if view.projection.discovery_status == "awaiting":
             raise ValueError("plan mutation is blocked while discovery is active")
         if any(
-            action.status.value in {"started", "succeeded"}
+            action.status.value == "started"
             and action.effect_class not in {"read_only", EffectClass.READ_ONLY}
             for action in view.projection.actions
         ):
             raise ValueError("plan mutation requires a quiescent run after mutating actions")
         revision = self.plans.revise(view.projection.plan, nodes, reason=reason)
+        completed = {todo.todo_id for todo in view.projection.todos if todo.status in {"done", "completed"}}
+        old_nodes = view.projection.plan.by_id
+        new_nodes = revision.plan.by_id
+        if any(node_id not in new_nodes or new_nodes[node_id] != old_nodes.get(node_id)
+               for node_id in completed):
+            raise ValueError("replanning must preserve completed milestones and their evidence")
         await self._append(
             run_id,
             "PlanRevised",
@@ -817,6 +877,11 @@ class RunCoordinator:
             }, actor)
             await self._append(parent_run_id, "ChildDelegationCommitted", {"child_run_id": child_id, "delegation_artifact": delegation.digest, "node_id": spec.node_id}, actor, artifact_refs=(delegation.digest,))
             await self._append(child_id, "RunCreated", {"goal": goal.to_dict(), "runtime_contract": contract.to_dict()}, actor)
+            if spec.budget:
+                from .task_execution import BUDGET_DIMENSIONS
+                limits = {k: v for k, v in spec.budget.items() if k in BUDGET_DIMENSIONS}
+                if limits:
+                    await self.execution.configure_budget(child_id, limits)
             await self._append(child_id, "PredecessorHandoffCommitted", {
                 "predecessor_run_id": parent_run_id,
                 "handoff_artifact": delegation.digest,
@@ -878,6 +943,12 @@ class RunCoordinator:
         )
 
     async def accept_child_candidate(self, parent_run_id: str, child_run_id: str) -> dict[str, Any]:
+        current_parent = await self.store.load_projection(parent_run_id)
+        current_child = await self.store.load_projection(child_run_id)
+        relevant = [entry for entry in current_parent.task.guidance if child_run_id in entry["affected_children"]]
+        if relevant and not all(any(child_entry["text"] == entry["text"] and child_entry["applied"]
+                                    for child_entry in current_child.task.guidance) for entry in relevant):
+            raise ValueError("child candidate predates the current task requirements")
         parent = await self.inspect(parent_run_id)
         if parent.status in {RunStatus.CANCELLED, RunStatus.COMPLETED, RunStatus.FAILED_TERMINAL}:
             raise ValueError("cannot accept a child candidate for a terminal parent Run")
@@ -926,7 +997,27 @@ class RunCoordinator:
             EventActor("coordinator", "local-coordinator"),
         )
 
-    async def send(self, run_id: str, message: str) -> QueueReceipt:
+    async def send(self, run_id: str, message: str, *, follow_up: bool = False) -> QueueReceipt:
+        view = await self.inspect(run_id)
+        if not follow_up and message.strip().rstrip("?？。!！").casefold() in {
+            "进度", "现在进度", "进度如何", "做到哪了", "做到哪里了", "做得怎么样了", "status", "progress",
+        }:
+            await self.execution.append(run_id, "TaskProgressRequested", {"question": message})
+            done = sum(todo.status in {"done", "completed"} for todo in view.projection.todos)
+            labels = {"created": "已创建", "running": "执行中", "waiting_input": "等待输入",
+                      "waiting_approval": "等待审批", "waiting_event": "等待结果", "paused": "已暂停",
+                      "verifying": "验证中", "completed": "已完成", "cancelled": "已取消", "failed": "失败"}
+            text = f"当前状态：{labels[view.projection.task.lifecycle.value]}；已完成 {done}/{len(view.projection.todos)} 项。"
+            if view.projection.task.reason:
+                text += f" 等待或停止原因：{view.projection.task.reason}。"
+            event = await self.execution.append(run_id, "TaskProgressReported", {"text": text})
+            artifact = self.artifacts.put_text(message)
+            return QueueReceipt(run_id, event.sequence, artifact.digest)
+        if not follow_up and view.status not in {RunStatus.CANCELLED, RunStatus.COMPLETED, RunStatus.FAILED_TERMINAL}:
+            await self.execution.guidance(run_id, message)
+            artifact = self.artifacts.put_text(message, media_type="text/plain; charset=utf-8")
+            updated = await self.inspect(run_id)
+            return QueueReceipt(run_id, updated.sequence, artifact.digest)
         receipt = await self.followups.enqueue(run_id, message)
         item = await self.store.load_projection(run_id)
         queued = next(item for item in item.queue if item.follow_up_run_id == receipt.follow_up_run_id)
@@ -943,6 +1034,8 @@ class RunCoordinator:
     ) -> RunEvent:
         projection = await self.store.load_projection(run_id)
         runtime_contract_digest = str(projection.runtime_contract_digest or "")
+        if event_type == "RunCreated":
+            payload = {**payload, "task_protocol_version": 1}
         if event_type == "RunCreated" and not runtime_contract_digest:
             runtime_contract_digest = RuntimeContract.from_dict(payload["runtime_contract"]).digest
         event = RunEvent.create(

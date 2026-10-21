@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import json
 import uuid
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 from .artifacts import ArtifactStore
 from .run_events import EventActor, RunEvent
@@ -30,7 +30,7 @@ class FollowUpService:
         self.artifacts = artifacts or store.artifacts
         self.actor = EventActor("client", "local-client")
 
-    async def enqueue(self, predecessor_run_id: str, message: str) -> FollowUpReceipt:
+    async def enqueue(self, predecessor_run_id: str, message: str, *, continuation: bool = False) -> FollowUpReceipt:
         if not message.strip():
             raise ValueError("follow-up message cannot be empty")
         artifact = self.artifacts.put_text(message, media_type="text/plain; charset=utf-8")
@@ -45,6 +45,7 @@ class FollowUpService:
                 "predecessor_run_id": predecessor_run_id,
                 "message_artifact": artifact.digest,
                 "gate": gate,
+                "continuation": continuation,
             },
         )
         await self.store.append(event, expected_sequence=predecessor.sequence)
@@ -128,6 +129,11 @@ class FollowUpService:
             constraints=constraints,
             interaction_mode=predecessor.goal.interaction_mode if predecessor.goal else "coding",
         )
+        if item.continuation and predecessor.goal is not None:
+            goal = replace(predecessor.goal,
+                objective=predecessor.goal.objective + "\n\nContinuation request:\n" + message,
+                constraints=(*predecessor.goal.constraints, *constraints),
+                contract_version=predecessor.goal.contract_version + 1)
         handoff = self.artifacts.put_text(
             json.dumps(
                 {
@@ -171,7 +177,7 @@ class FollowUpService:
         existing_events = (await self.store.read(follow_up_run_id, limit=100_000)).events
         event_types = {event.event_type for event in existing_events}
         if child.sequence == 0:
-            await self._append_new_run(follow_up_run_id, "RunCreated", {"goal": goal.to_dict(), "runtime_contract": contract.to_dict()}, contract)
+            await self._append_new_run(follow_up_run_id, "RunCreated", {"goal": goal.to_dict(), "runtime_contract": contract.to_dict(), "task_protocol_version": 1}, contract)
         child = await self.store.load_projection(follow_up_run_id)
         if "PredecessorHandoffCommitted" not in event_types:
             await self._append_new_run(

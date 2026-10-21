@@ -53,17 +53,19 @@ class LocalCoordinatorTransport:
             request = RunRequest(
                 objective=str(decoded["objective"]),
                 acceptance_criteria=tuple(str(item) for item in decoded.get("acceptance_criteria") or ("completed",)),
+                budget_limits=decoded.get("budget_limits"), plan_mode=bool(decoded.get("plan_mode", False)),
             )
             handle = await self.coordinator.submit(request)
             return {"run_id": handle.run_id}
         if kind == "status":
             view = await self.coordinator.inspect(str(decoded["run_id"]))
-            return {"run_id": view.run_id, "status": view.status.value, "sequence": view.sequence}
+            return {"run_id": view.run_id, "status": view.status.value, "sequence": view.sequence,
+                    "task": view.projection.task.to_dict()}
         if kind == "list":
             views = await self.coordinator.list(set(decoded.get("statuses") or ()) or None)
             return {"runs": [{"run_id": view.run_id, "status": view.status.value, "sequence": view.sequence} for view in views]}
         if kind == "follow-up":
-            receipt = await self.coordinator.send(str(decoded["run_id"]), str(decoded["message"]))
+            receipt = await self.coordinator.send(str(decoded["run_id"]), str(decoded["message"]), follow_up=True)
             return {
                 "run_id": receipt.run_id,
                 "sequence": receipt.sequence,
@@ -84,6 +86,18 @@ class LocalCoordinatorTransport:
                 reason=str(decoded.get("reason") or "client rejected"),
             )
             return {"run_id": decision.run_id, "approval_id": decision.approval_id, "status": decision.status}
+        if kind == "pause":
+            receipt = await self.coordinator.pause(str(decoded["run_id"]), str(decoded.get("reason") or "client pause"))
+            return {"run_id": receipt.run_id, "status": receipt.status.value, "sequence": receipt.sequence}
+        if kind == "guidance":
+            receipt = await self.coordinator.send(str(decoded["run_id"]), str(decoded["message"]))
+            return {"run_id": receipt.run_id, "sequence": receipt.sequence}
+        if kind == "budget":
+            await self.coordinator.execution.configure_budget(str(decoded["run_id"]), decoded["limits"])
+            return {"updated": True}
+        if kind == "approve-plan":
+            receipt = await self.coordinator.approve_plan(str(decoded["run_id"]), str(decoded["plan_digest"]))
+            return {"run_id": receipt.run_id, "status": receipt.status.value}
         if kind == "resume":
             receipt = await self.coordinator.resume(str(decoded["run_id"]), str(decoded.get("reason") or "client resume"))
             return {"run_id": receipt.run_id, "status": receipt.status.value, "sequence": receipt.sequence}

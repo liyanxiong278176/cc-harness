@@ -1,6 +1,6 @@
 # cc-harness WebUI 体验设计契约
 
-状态：已确认（2026-09-15）
+状态：已被取代（2026-09-30）；现行契约见 [`Claude Desktop 参考式 WebUI 重设计契约`](claude-desktop-reference-webui.md)。
 
 本文记录 cc-harness WebUI 后续重构的共同设计结论。它约束页面呈现和交互语义，不替代 Runtime、事件流、权限、上下文或记忆的事实契约。
 

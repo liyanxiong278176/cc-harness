@@ -1,0 +1,3 @@
+# ADR 0115: Separate task lifecycle from scheduling state
+
+Accepted and implemented during the 2026-10-20 execution-kernel work. The authoritative task projection distinguishes CREATED, RUNNING, WAITING_INPUT, WAITING_APPROVAL, WAITING_EVENT, PAUSED, VERIFYING, COMPLETED, FAILED, and CANCELLED, while queue placement and worker leases remain separate scheduling information. Historical RunStatus values remain a compatibility codec for existing events and clients; task.lifecycle and task.scheduling are rebuilt from the same event stream, avoiding a competing state store while allowing old histories and snapshots to remain readable.

@@ -181,7 +181,19 @@ def _query_terms(text: str) -> tuple[str, ...]:
 
 def _matches(query: str, candidate: str) -> bool:
     q = query.casefold().strip()
-    value = str(candidate or "").casefold()
+    # Snapshot references are provenance, not answer-bearing memory. Matching
+    # a scenario ID here used to stop progressive recall before reading L2.
+    lines: list[str] = []
+    in_reference_list = False
+    for line in str(candidate or "").splitlines():
+        if re.match(r"^\s*(?:scenario_ids|atom_ids)\s*:", line, re.IGNORECASE):
+            in_reference_list = True
+            continue
+        if in_reference_list and (not line.strip() or re.match(r"^\s*-\s", line)):
+            continue
+        in_reference_list = False
+        lines.append(line)
+    value = "\n".join(lines).casefold()
     if not q or not value:
         return False
     if q in value:

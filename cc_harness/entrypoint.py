@@ -335,6 +335,8 @@ async def _run_durable_print(client, args, objective: str) -> int:
         if args.model and client._llm is not None:
             client._llm.model = args.model
         terminal = {
+            RunStatus.PAUSED,
+            RunStatus.WAITING_EVENT,
             RunStatus.COMPLETED,
             RunStatus.CANCELLED,
             RunStatus.FAILED_TERMINAL,

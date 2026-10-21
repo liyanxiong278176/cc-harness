@@ -1,0 +1,3 @@
+# ADR 0116: Distinguish pause, cancellation, and client loss
+
+The 2026-10-20 design interview established that page disconnection leaves tasks running, terminal closure pauses its owned tasks, and process/machine recovery waits for explicit continuation. Pause preserves the Run identity; cancellation is terminal and a subsequent continuation creates an associated Run preserving the goal, scope and acceptance contract. This replaces cancelled-Run resurrection and uniform client-detach behavior, accepting explicit ownership tracking and migration work to preserve the user's stop/continue intent without hiding already committed effects.

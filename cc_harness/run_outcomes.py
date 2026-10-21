@@ -190,6 +190,9 @@ class RunOutcome:
         if value == "completed":
             return cls(OutcomeKind.PASS, FailureClass.NONE, False, details=dict(details or {}))
         if value in {
+            "paused",
+            "waiting_input",
+            "waiting_event",
             "draft",
             "queued",
             "running",

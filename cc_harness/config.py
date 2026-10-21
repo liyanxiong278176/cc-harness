@@ -411,6 +411,7 @@ class ContextConfig(BaseModel):
     tier3_threshold: float = 0.95
     protect_zone_tokens: int = 8_192
     protected_tool_patterns: list[str] = []
+    evidence_token_budget: int = 2048
     snip_head_lines: int = 5
     snip_tail_lines: int = 1
     summarize_max_output_tokens: int = 2_000
@@ -442,6 +443,8 @@ class ContextConfig(BaseModel):
         # Plan3 tier1:若调整上限,MemoryConfig.offload_ratio validator 上限也需同步(< tier1)
         if self.protect_zone_tokens < 0:
             raise ValueError("protect_zone_tokens must be non-negative")
+        if self.evidence_token_budget < 0:
+            raise ValueError("evidence_token_budget must be non-negative")
         if self.context_window <= 0:
             raise ValueError("context_window must be positive")
         if self.output_reserve_tokens < 0 or self.tool_schema_reserve_tokens < 0:

@@ -26,7 +26,7 @@ async def test_follow_up_is_queued_then_materialized_after_cancelled_predecessor
     try:
         coordinator = RunCoordinator(store)
         predecessor = await coordinator.submit(RunRequest("first task", ("done",)))
-        queued = await coordinator.send(predecessor.run_id, "continue with the next task")
+        queued = await coordinator.send(predecessor.run_id, "continue with the next task", follow_up=True)
         assert queued.follow_up_run_id
         assert (await store.load_projection(predecessor.run_id)).queue[0].gate == "waiting"
         await coordinator.cancel(predecessor.run_id, "user cancelled")
@@ -50,7 +50,7 @@ async def test_supervisor_releases_follow_up_after_predecessor_cancel(tmp_path) 
     try:
         coordinator = RunCoordinator(store)
         predecessor = await coordinator.submit(RunRequest("first task", ("done",)))
-        queued = await coordinator.send(predecessor.run_id, "continue automatically")
+        queued = await coordinator.send(predecessor.run_id, "continue automatically", follow_up=True)
         await coordinator.cancel(predecessor.run_id, "user cancelled")
 
         def factory(_run_id):
@@ -88,7 +88,7 @@ async def test_supervisor_releases_follow_up_after_predecessor_stalled(tmp_path)
             EventActor("worker", "stalled-worker"),
         )
         await lease_manager.release(lease)
-        queued = await coordinator.send(predecessor.run_id, "continue the conversation")
+        queued = await coordinator.send(predecessor.run_id, "continue the conversation", follow_up=True)
 
         def factory(_run_id):
             return RunWorker(store, ReActKernel(EmptyModel()), worker_id="follow-up-worker")

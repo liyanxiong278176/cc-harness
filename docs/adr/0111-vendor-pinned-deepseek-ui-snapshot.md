@@ -1,5 +1,5 @@
 ---
-status: accepted
+status: superseded by ADR-0113
 ---
 
 # Vendor a pinned DeepSeek UI source snapshot

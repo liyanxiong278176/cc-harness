@@ -73,8 +73,8 @@ from .durable_subagents import (
     durable_dispatch_subagent_handler,
     durable_reject_child_candidate_handler,
 )
-from .worktrees import WorktreeManager
 
+from .worktrees import WorktreeManager
 
 _COMPLETION_BLOCK = re.compile(
     r"<cc-harness-complete>\s*(\{.*?\})\s*</cc-harness-complete>",
@@ -189,6 +189,21 @@ class DurableModelAdapter(ModelAdapter):
     def __init__(self, llm: LLMClient, *, tool_bundles=None) -> None:
         self.llm = llm
         self.tool_bundles = tool_bundles
+        self.budget_output_tokens = int(os.getenv("CC_HARNESS_BUDGET_MAX_OUTPUT_TOKENS", "8192"))
+        if self.budget_output_tokens <= 0:
+            raise ValueError("budget output bound must be positive")
+
+    def estimate_max_cost(self, messages, tools) -> float:
+        import math
+        rates = [os.getenv("CC_HARNESS_BUDGET_INPUT_COST_PER_MILLION"),
+                 os.getenv("CC_HARNESS_BUDGET_OUTPUT_COST_PER_MILLION")]
+        if any(value is None for value in rates):
+            raise ValueError("configure input/output price bounds before using a cost budget")
+        input_rate, output_rate = (float(value) for value in rates)
+        if any(not math.isfinite(value) or value < 0 for value in (input_rate, output_rate)):
+            raise ValueError("price bounds must be finite nonnegative numbers")
+        input_bound = len(json.dumps([list(messages), list(tools)], ensure_ascii=False).encode("utf-8")) + 256
+        return (input_bound * input_rate + self.budget_output_tokens * output_rate) / 1_000_000
 
     @staticmethod
     def _provider_messages(
@@ -564,6 +579,9 @@ class DurableRuntimeClient:
         *,
         confirm_high_risk: bool = False,
         interaction_mode: str = "coding",
+        budget_limits: Mapping[str, float] | None = None,
+        plan_mode: bool = False,
+        terminal_pid: int | None = None,
     ) -> str:
         # Terminal-Bench supplies a frozen official task statement inside an
         # isolated Harbor container.  Its instructions can describe external
@@ -574,6 +592,8 @@ class DurableRuntimeClient:
             os.getenv("CC_HARNESS_TRUSTED_BENCHMARK_TASK", "") == "1"
             and os.getenv("CC_HARNESS_TERMINAL_BENCH", "") == "1"
         )
+        if not official_benchmark and re.search(r"先(?:给|出|写|制定)(?:个|一个|一份)?(?:方案|计划)|先规划|plan first", objective, re.I):
+            plan_mode = True
         if official_benchmark:
             goal_provenance = "official_benchmark"
         elif confirm_high_risk:
@@ -597,6 +617,7 @@ class DurableRuntimeClient:
                     acceptance_criteria,
                     goal_provenance=goal_provenance,
                     interaction_mode=interaction_mode,
+                    budget_limits=budget_limits, plan_mode=plan_mode, terminal_pid=terminal_pid,
                 )
             )
         ).run_id
@@ -635,6 +656,7 @@ class DurableRuntimeClient:
                     {"child_run_id": child_run_id},
                     EventActor("coordinator", "local-coordinator"),
                 )
+                await self.coordinator.execution.wake(record.parent_run_id, child_run_id)
                 return
             if self.coordinator.worktrees is None or not node.worktree_id or not node.worktree_base_commit:
                 raise RuntimeError("mutating child has no isolated worktree metadata")
@@ -652,6 +674,7 @@ class DurableRuntimeClient:
                 verification_evidence=candidate.evidence,
             )
             await self.coordinator.submit_child_candidate(record.parent_run_id, change_set)
+            await self.coordinator.execution.wake(record.parent_run_id, child_run_id)
         except Exception as exc:  # noqa: BLE001 - preserve a durable conflict instead of failing silently
             try:
                 record = await self.store.load_run_record(child_run_id)
@@ -674,6 +697,7 @@ class DurableRuntimeClient:
             child = next((item for item in parent.children if item.child_run_id == child_run_id), None)
             if child and child.status not in {"cancelled", "completed", "accepted", "candidate_submitted"}:
                 await self.coordinator._append(record.parent_run_id, "ChildRunCancelled", {"child_run_id": child_run_id, "reason": reason}, EventActor("coordinator", "local-coordinator"))
+                await self.coordinator.execution.wake(record.parent_run_id, child_run_id)
         except Exception:
             pass
 
@@ -691,6 +715,7 @@ class DurableRuntimeClient:
                     {"child_run_id": child_run_id, "reason": reason},
                     EventActor("coordinator", "local-coordinator"),
                 )
+                await self.coordinator.execution.wake(record.parent_run_id, child_run_id)
         except Exception:
             pass
 
@@ -771,6 +796,7 @@ class DurableRuntimeClient:
         records = {record.run_id: record for record in await self.store.list_runs()}
         views = await self.coordinator.list()
         eligible = {
+            RunStatus.PAUSED,
             RunStatus.CANCELLED,
             RunStatus.STALLED,
             RunStatus.BLOCKED,
@@ -786,14 +812,16 @@ class DurableRuntimeClient:
 
     async def continue_run(self, run_id: str, *, reason: str = "natural-language continuation") -> str:
         root_view = await self.coordinator.inspect(run_id)
-        await self.coordinator.resume(run_id, reason)
+        receipt = await self.coordinator.resume(run_id, reason)
+        if receipt.run_id != run_id:
+            run_id = receipt.run_id
         # Ctrl+C/cancellation is recorded independently for every Run in the
         # tree.  Once the parent is resumed, re-queue only recoverable
         # descendants; terminal failures and already completed children stay
         # untouched.  This keeps continuation checkpoint-based and avoids
         # creating duplicate child Runs.
         recoverable = {
-            RunStatus.CANCELLED,
+            RunStatus.PAUSED,
             RunStatus.STALLED,
             RunStatus.BLOCKED,
             RunStatus.FAILED_RECOVERABLE,
@@ -1357,6 +1385,7 @@ class DurableRuntimeClient:
         *,
         extras: Sequence[Mapping[str, Any]] | None = None,
     ):
+        from .execution_tools import TASK_PLAN_SPEC, TASK_WAIT_SPEC, task_plan, task_wait
         def apply_permission_mode(contract: ToolRecoveryContract) -> ToolRecoveryContract:
             """Bind a provider/tool contract to this client's approval mode."""
 
@@ -1459,6 +1488,8 @@ class DurableRuntimeClient:
             }
             specs.append(copied)
         for spec, name, handler in (
+            (TASK_PLAN_SPEC, "task_plan", task_plan),
+            (TASK_WAIT_SPEC, "task_wait", task_wait),
             (DISPATCH_SUBAGENT_SPEC, "dispatch_subagent", durable_dispatch_subagent_handler),
             (ACCEPT_CHILD_CANDIDATE_SPEC, "accept_child_candidate", durable_accept_child_candidate_handler),
             (REJECT_CHILD_CANDIDATE_SPEC, "reject_child_candidate", durable_reject_child_candidate_handler),

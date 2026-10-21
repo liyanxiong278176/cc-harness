@@ -11,6 +11,7 @@ from __future__ import annotations
 import json
 import math
 import uuid
+from .task_execution import CONTROL_EVENT_FIELDS, validate_control_payload
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any, Mapping
@@ -31,7 +32,7 @@ class EventValidationError(ValueError):
 
 EVENT_SCHEMA_VERSION = 1
 
-EVENT_TYPES = frozenset(
+EVENT_TYPES = frozenset(CONTROL_EVENT_FIELDS) | frozenset(
     {
         "RunCreated",
         "GoalContractAccepted",
@@ -430,6 +431,10 @@ class EventValidator:
                 f"{event.event_type} payload is missing required fields: {missing}"
             )
         EventValidator._validate_payload_types(event)
+        try:
+            validate_control_payload(event.event_type, event.payload)
+        except (ValueError, TypeError, KeyError) as exc:
+            raise EventValidationError(str(exc)) from exc
         if current_status is not None:
             target = None
             if event.event_type == "RunFailed":

@@ -4,6 +4,7 @@ import asyncio
 import time
 
 import pytest
+from cc_harness.run_model import RunStatus
 
 from cc_harness.run_kernel import ActionRequest, ModelSegment, ReActKernel
 from cc_harness.lease import LeaseManager
@@ -140,6 +141,9 @@ async def test_worker_retries_only_idempotent_read_after_lease_expiry(tmp_path) 
             worker_id="worker-recovered",
             action_executor=counted_success,
         )
+        # Recovery reconstructs state but must wait for an explicit continuation.
+        assert (await coordinator.inspect(handle.run_id)).status is RunStatus.PAUSED
+        await coordinator.resume(handle.run_id, "continue after crash")
         await second_worker.execute(await second_worker.claim(handle.run_id))
 
         assert calls == 1

@@ -1,7 +1,9 @@
 # DeepSeek Harness WebUI 观察与 cc-harness 适配记录
 
+> 历史记录：当前 WebUI 设计已由 [`Claude Desktop 参考式 WebUI 重设计契约`](design/claude-desktop-reference-webui.md) 取代。本文件保留旧快照审阅与截图记录，不再指导实现。
+
 更新时间：2026-09-14  
-参考源码：[`vendor/deepseek-ui/`](../vendor/deepseek-ui/)（原始 checkout 仅用于审阅）  
+参考源码：已删除的历史快照 `vendor/deepseek-ui/`（commit 记录见下方；该源码不再随仓库分发）
 参考版本：`c291e7961a515f6d7af9304e7fd1d257929aef26`  
 上游项目：[deepseek-ai/deepseek-harness](https://github.com/deepseek-ai/deepseek-harness)
 
