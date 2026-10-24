@@ -30,7 +30,15 @@ _INJECTION_PATTERNS: list[re.Pattern[str]] = [
     re.compile(r"</?(?:untrusted|user_input)\b", re.IGNORECASE),
 ]
 
-MAX_INPUT_LEN = 8000
+MAX_INPUT_LEN = 8000  # historical fast-path cutoff (kept for import compatibility)
+# Deterministic patterns are linear (no nested quantifiers), so they can scan
+# large inputs.  The cap below only bounds pathological multi-megabyte text;
+# inputs over it are scanned head + tail instead of being skipped entirely.
+MAX_HEURISTIC_SCAN_LEN = 1_000_000
+# The semantic judge has a finite context and per-call cost.  Longer inputs are
+# judged on head+tail; the truncation is recorded in the audit reason so a
+# "benign" verdict over a truncated prompt is never mistaken for full coverage.
+MAX_JUDGE_INPUT_CHARS = 24_000
 JUDGE_THRESHOLD = 0.5
 MAX_BENIGN_FAST_PATH_LEN = 2000
 
@@ -176,6 +184,18 @@ def _wrap(raw: str) -> str:
     return f"<user_input>{raw}</user_input>"
 
 
+def _bound_for_judge(text: str) -> tuple[str, bool]:
+    """Return a judge-sized view of the input plus whether it was truncated."""
+    if len(text) <= MAX_JUDGE_INPUT_CHARS:
+        return text, False
+    head = MAX_JUDGE_INPUT_CHARS * 3 // 4
+    tail = MAX_JUDGE_INPUT_CHARS - head
+    return (
+        f"{text[:head]}\n…[middle omitted from judge input]…\n{text[-tail:]}",
+        True,
+    )
+
+
 async def scan_user_input(
     raw: str,
     *,
@@ -187,10 +207,16 @@ async def scan_user_input(
     if not l2_cfg.enabled:
         return ScanResult(allowed=True, reason="l2_disabled", wrapped_text=_wrap(raw))
 
-    if l2_cfg.heuristic_on and len(raw) <= MAX_INPUT_LEN:
-        hit, rule_id = heuristic_check(raw)
+    if l2_cfg.heuristic_on:
+        # Scan the whole input, not just short ones: padding used to disable the
+        # deterministic layer entirely (len > MAX_INPUT_LEN skipped the check).
+        hit, rule_id = heuristic_check(raw[:MAX_HEURISTIC_SCAN_LEN])
         if hit:
             return ScanResult(allowed=False, reason=rule_id)
+        if len(raw) > MAX_HEURISTIC_SCAN_LEN:
+            hit, rule_id = heuristic_check(raw[-MAX_HEURISTIC_SCAN_LEN:])
+            if hit:
+                return ScanResult(allowed=False, reason=rule_id)
         if _is_narrow_benign_task(raw):
             return ScanResult(
                 allowed=True,
@@ -198,8 +224,10 @@ async def scan_user_input(
                 wrapped_text=_wrap(raw),
             )
 
+    judge_text, judge_truncated = _bound_for_judge(raw)
+    truncated_suffix = ";judge_input_truncated" if judge_truncated else ""
     first = await _judge_check_with_usage(
-        raw,
+        judge_text,
         client=client,
         model=model,
         system_prompt=_JUDGE_SYSTEM,
@@ -207,14 +235,14 @@ async def scan_user_input(
     if first.label == "benign" or first.confidence < JUDGE_THRESHOLD:
         return ScanResult(
             allowed=True,
-            reason=first.reason,
+            reason=f"{first.reason}{truncated_suffix}",
             wrapped_text=_wrap(raw),
             model_calls=first.model_calls,
             usage=first.usage,
         )
 
     review = await _judge_check_with_usage(
-        raw,
+        judge_text,
         client=client,
         model=model,
         system_prompt=_JUDGE_REVIEW_SYSTEM,
@@ -230,7 +258,7 @@ async def scan_user_input(
         )
     return ScanResult(
         allowed=True,
-        reason=f"judge_disagreement:{first.reason};{review.reason}",
+        reason=f"judge_disagreement:{first.reason};{review.reason}{truncated_suffix}",
         wrapped_text=_wrap(raw),
         model_calls=model_calls,
         usage=usage,

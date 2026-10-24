@@ -6,7 +6,6 @@
 - 与 resume_task 段并列,互不破坏(append-only)
 - run_turn 签名接受 todo_hints kwarg 且透传到 _refresh_system_prompt
 """
-import pytest
 
 
 def _make_resume_task(title: str = "ship feature", priority: str = "high",
@@ -110,54 +109,9 @@ def test_refresh_system_prompt_preserves_resume_block_unaffected_when_injecting_
 
 
 # --- run_turn pass-through ---
+#
+# The ``run_turn`` pass-through smoke test was removed with batch 1 of
+# docs/runtime-legacy-migration.md: ``todo_hints`` is a legacy-only feature
+# (only agent.run_turn consumes it), so its pass-through coverage dies with the
+# engine.  The three section-injection tests above are the real contract.
 
-
-@pytest.mark.asyncio
-async def test_run_turn_accepts_todo_hints_kwarg(tmp_path):
-    """run_turn 接受 todo_hints 形参,透传到 _refresh_system_prompt,注入 system prompt。
-
-    smoke test: 不调真 LLM,用 FakeLLM 立即 stop,验证 todo_hints 进入 system prompt。
-    """
-    from dataclasses import dataclass, field
-    from cc_harness import agent as agent_mod
-
-    @dataclass
-    class _Ev:
-        kind: str
-        text: str = ""
-        content: str = ""
-        finish_reason: str | None = None
-        pending: list = field(default_factory=list)
-
-    class FakeLLM:
-        async def chat(self, messages, tools):
-            yield _Ev(
-                kind="done", content="ok", pending=[], finish_reason="stop",
-            )
-
-    class FakeMCP:
-        def list_tools(self) -> list[dict]:
-            return []
-
-        async def call_tool(self, name: str, args: dict):
-            from cc_harness.mcp_client import ToolResult
-            return ToolResult.success("")
-
-    cwd = str(tmp_path)
-    llm = FakeLLM()
-    mcp = FakeMCP()
-    messages = [{"role": "user", "content": "x"}]
-    hints = ["task T1 criterion 未体现: 实现 verify"]
-
-    # run_turn 接受 todo_hints kwarg(不抛 TypeError)
-    await agent_mod.run_turn(
-        messages, llm, mcp, mode="coding", cwd=cwd, max_iter=1,
-        todo_hints=hints,
-    )
-
-    # system prompt 含 <todo_hints> 段(透传到 _refresh_system_prompt)
-    assert messages[0]["role"] == "system"
-    content = messages[0]["content"]
-    assert "<todo_hints>" in content
-    assert "T1" in content
-    assert "实现 verify" in content

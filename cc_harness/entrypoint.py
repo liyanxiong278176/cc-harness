@@ -7,7 +7,6 @@ import asyncio
 import contextlib
 import json
 import locale
-import math
 import os
 import sys
 from importlib.metadata import PackageNotFoundError, version
@@ -18,7 +17,6 @@ from prompt_toolkit import PromptSession
 from rich.console import Console
 
 from cc_harness.config import ConfigError
-from cc_harness.runtime import SessionRuntime
 from cc_harness.run_telemetry import aggregate_model_usage
 
 
@@ -59,7 +57,10 @@ def build_parser() -> argparse.ArgumentParser:
         "--mode",
         choices=("coding", "plan", "design", "chat"),
         default=None,
-        help="Session mode; when omitted, a resumed session keeps its saved mode",
+        help=(
+            "Accepted for compatibility with older eval launchers; the Durable "
+            "Runtime chooses its own interaction mode and ignores this flag"
+        ),
     )
     parser.add_argument("--model", default=None)
     parser.add_argument("--effort", choices=("low", "medium", "high"), default=None)
@@ -111,8 +112,11 @@ def build_parser() -> argparse.ArgumentParser:
     iteration_group.add_argument(
         "--max-iterations",
         type=_iteration_limit,
-        default=20,
-        help="Maximum model/tool loop iterations for one turn (1-100)",
+        default=None,
+        help=(
+            "Cap model calls for this run (1-100). Default: no cap for interactive "
+            "sessions; the cap is enforced through the durable budget ledger"
+        ),
     )
     iteration_group.add_argument(
         "--unbounded-iterations",
@@ -150,7 +154,6 @@ def build_parser() -> argparse.ArgumentParser:
         help="Start the WebUI without opening a browser",
     )
     parser.add_argument("--lang", choices=("zh-CN", "en"), default=None)
-    parser.add_argument("--repl", action="store_true", help=argparse.SUPPRESS)
     parser.add_argument(
         "--runtime",
         choices=("durable",),
@@ -174,6 +177,20 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
+def _budget_limits(args) -> dict[str, float] | None:
+    """Translate ``--max-iterations`` into durable budget limits.
+
+    The flag used to be parsed and never applied (the live loop had no model
+    call cap at all).  Durable runs enforce budgets through the event ledger:
+    each model call reserves ``steps``/``model_calls``, so the flag maps onto
+    both counters.  ``None`` keeps the historical unbounded behaviour.
+    """
+    value = getattr(args, "max_iterations", None)
+    if value is None:
+        return None
+    return {"model_calls": float(value), "steps": float(value)}
+
+
 def main() -> None:
     raise SystemExit(asyncio.run(async_main()))
 
@@ -189,15 +206,15 @@ async def async_main(argv: list[str] | None = None) -> int:
     if not cwd.is_dir():
         Console(stderr=True).print(f"[red]working directory not found:[/red] {cwd}")
         return 2
-    # The installed command has one execution path.  Legacy SessionRuntime
-    # helpers remain importable only for data migration/tests; they are not a
-    # selectable runtime or a fallback for a Durable Run.
+    # The installed command has one execution path: the Durable Runtime.  The
+    # legacy ReAct loop was removed from the product (it survives only as the
+    # LoCoMo benchmark adapter), so there is no selectable/fallback engine here.
     return await _run_durable(args, cwd)
 
 
 async def _run_durable(args, cwd: Path) -> int:
     from cc_harness.durable_runtime import DurableRuntimeClient
-    from cc_harness.repl import run_durable_repl
+    from cc_harness.durable_repl import run_durable_repl
 
     # The browser is the default control plane.  It owns no second execution
     # engine: the WebUI module creates the same DurableRuntimeClient used by
@@ -273,7 +290,11 @@ async def _run_durable(args, cwd: Path) -> int:
             if not objective:
                 Console(stderr=True, no_color=True).print("durable run requires a prompt")
                 return 2
-            run_id = await client.submit(objective, confirm_high_risk=args.confirm_high_risk)
+            run_id = await client.submit(
+        objective,
+        confirm_high_risk=args.confirm_high_risk,
+        budget_limits=_budget_limits(args),
+    )
             print(json.dumps({"run_id": run_id}, ensure_ascii=False))
             return 0
         if command in {"status", "attach"}:
@@ -330,7 +351,11 @@ async def _run_durable_print(client, args, objective: str) -> int:
 
     from cc_harness.run_model import ApprovalStatus, RunStatus
 
-    run_id = await client.submit(objective, confirm_high_risk=args.confirm_high_risk)
+    run_id = await client.submit(
+        objective,
+        confirm_high_risk=args.confirm_high_risk,
+        budget_limits=_budget_limits(args),
+    )
     # Start the supervisor concurrently with the print-mode control loop.  A
     # worker can reach a durable approval boundary before ``start_supervisor``
     # returns; waiting for startup first would leave a non-interactive
@@ -600,176 +625,6 @@ def _recoverable_durable_error(error: str | None) -> bool:
             "run failed_recoverable",
         )
     )
-
-
-async def _run_print(
-    runtime: SessionRuntime,
-    prompt_text: str,
-    permission_mode: str,
-    output_format: str = "text",
-) -> int:
-    from cc_harness.terminal.attachments import AttachmentError, AttachmentManager
-
-    final = ""
-    events: list[dict] = []
-
-    async def emit(event: dict) -> None:
-        nonlocal final
-        events.append(event)
-        if event.get("type") == "result":
-            final = str(event.get("text", ""))
-
-    async def confirm(tool: str, args: dict, reason: str) -> str:
-        del tool, args, reason
-        return "yes" if permission_mode == "bypass-prompts" else "no"
-
-    try:
-        manager = AttachmentManager(
-            runtime.cwd,
-            runtime.additional_dirs,
-            runtime.session_store.attachments_root / runtime.state.session_id,
-        )
-
-        async def reject_outside(_path: Path) -> bool:
-            return False
-
-        try:
-            message_content, _attachments = await manager.prepare(
-                prompt_text,
-                confirm_outside=reject_outside,
-            )
-        except AttachmentError as exc:
-            Console(stderr=True, no_color=True).print(str(exc))
-            return 2
-        stats = await runtime.run_user_turn(
-            prompt_text,
-            message_content=message_content,
-            event_emitter=emit,
-            confirm_handler=confirm,
-        )
-        error = getattr(stats, "error", None) if stats is not None else None
-        if output_format == "json":
-            _write_print_json(runtime, final, stats, error=error, events=events)
-        if error:
-            if output_format != "json":
-                Console(stderr=True, no_color=True).print(error)
-            return 1
-        if output_format != "json":
-            Console(no_color=True, force_terminal=False).print(final, markup=False)
-        return 0
-    finally:
-        await runtime.close()
-
-
-def _api_cost_status(stats) -> str:
-    """Return billing status without inferring a tariff from token counts."""
-
-    missing = object()
-    cost = getattr(stats, "api_reported_cost", missing)
-    complete_attr = getattr(stats, "api_cost_complete", missing)
-    observed_attr = getattr(stats, "api_cost_observed", missing)
-    # Stats objects created before the explicit completeness flags were added
-    # may still carry a provider-reported cost.  Preserve that fact without
-    # guessing a price from tokens; new objects always take the stricter path.
-    if cost is not missing and complete_attr is missing and observed_attr is missing:
-        try:
-            return "reported" if cost is not None and math.isfinite(float(cost)) else "unavailable"
-        except (TypeError, ValueError):
-            return "unavailable"
-    complete = bool(complete_attr) if complete_attr is not missing else False
-    observed = bool(observed_attr) if observed_attr is not missing else False
-    if complete and cost is not missing and cost is not None:
-        try:
-            if math.isfinite(float(cost)):
-                return "reported"
-        except (TypeError, ValueError):
-            pass
-    return "incomplete" if observed else "unavailable"
-
-
-def _write_print_json(
-    runtime: SessionRuntime,
-    final: str,
-    stats,
-    *,
-    error: str | None,
-    events: list[dict],
-) -> None:
-    providers = list(getattr(stats, "api_providers", []) or [])
-    models = list(getattr(stats, "api_models", []) or [])
-    # Legacy/non-durable sessions may not have populated identity arrays yet;
-    # use the configured client as a safe compatibility fallback (base_url is
-    # reduced to its host so credentials/query strings can never leak).
-    if not providers:
-        base_url = getattr(runtime.llm, "base_url", None)
-        if base_url:
-            provider = str(base_url).split("//", 1)[-1].split("/", 1)[0]
-            if provider:
-                providers = [provider]
-    if not models:
-        model = getattr(runtime.llm, "resolved_model", None) or getattr(runtime.llm, "model", None)
-        if model:
-            models = [str(model)]
-    payload = {
-        "schema_version": "cc-harness.print-result.v1",
-        "type": "result",
-        "text": final,
-        "requested_model": runtime.llm.model,
-        "resolved_model": runtime.llm.resolved_model,
-        "error": error,
-        "runtime": "interactive",
-        "trajectory": events,
-        "usage": {
-            "input_tokens": int(getattr(stats, "api_prompt_tokens", 0) or 0),
-            "uncached_input_tokens": int(
-                getattr(
-                    stats,
-                    "api_uncached_prompt_tokens",
-                    getattr(stats, "api_prompt_tokens", 0),
-                )
-                or 0
-            ),
-            "cache_creation_input_tokens": int(
-                getattr(stats, "api_cache_creation_prompt_tokens", 0) or 0
-            ),
-            "cache_read_input_tokens": int(getattr(stats, "api_cache_read_prompt_tokens", 0) or 0),
-            "output_tokens": int(getattr(stats, "api_completion_tokens", 0) or 0),
-            "model_calls": int(getattr(stats, "iter_count", 0) or 0)
-            + int(getattr(stats, "auxiliary_model_calls", 0) or 0),
-            "tool_calls": len(getattr(stats, "tool_call_log", []) or []),
-            "cost_microusd": None,
-            "api_reported_cost": getattr(stats, "api_reported_cost", None),
-            "api_reported_cost_currency": getattr(stats, "api_reported_cost_currency", None),
-            "api_cost_source": "provider",
-            "api_cost_status": _api_cost_status(stats),
-            "api_cost_observed": bool(getattr(stats, "api_cost_observed", False)),
-            "api_cost_complete": bool(getattr(stats, "api_cost_complete", False)),
-            "cache_hit_ratio": (
-                int(getattr(stats, "api_cache_read_prompt_tokens", 0) or 0)
-                / int(getattr(stats, "api_prompt_tokens", 0) or 1)
-                if int(getattr(stats, "api_prompt_tokens", 0) or 0) > 0
-                else None
-            ),
-            "provider": providers[0] if providers else None,
-            "model": models[0] if models else None,
-            "providers": providers,
-            "models": models,
-            "provider_metadata": list(getattr(stats, "api_provider_metadata", []) or []),
-            "invocations": [
-                dict(item)
-                for item in (getattr(stats, "api_invocations", []) or [])[:512]
-            ],
-            "stop_reasons": dict(getattr(stats, "api_stop_reasons", {}) or {}),
-        },
-    }
-    encoded = (json.dumps(payload, ensure_ascii=False, allow_nan=False) + "\n").encode("utf-8")
-    buffer = getattr(sys.stdout, "buffer", None)
-    if buffer is not None:
-        buffer.write(encoded)
-        buffer.flush()
-    else:
-        sys.stdout.write(encoded.decode("utf-8"))
-
 
 async def _setup_wizard(lang: str) -> None:
     zh = lang.startswith("zh")

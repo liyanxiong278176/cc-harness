@@ -4,49 +4,60 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## What this is
 
-cc-harness 是一个**跑在终端里的编程代理**:通过 OpenAI 兼容 LLM(默认配 DeepSeek)执行 ReAct 循环,工具来自 MCP server(fs/git)+ 一个内置 `run_command`,输出 思考/行动/观察/结果 4 段。
+cc-harness 是一个**本地编程代理**:通过 OpenAI 兼容 LLM(默认配 DeepSeek)执行 ReAct 循环,工具来自 MCP server(fs/git)+ 内置 `run_command`,默认在浏览器 WebUI 里工作(事件流渲染,不再是终端 4 段输出)。
 
-## Web UI (`--serve` 模式)
+## 当前状态(2026-10,读代码前先看这段)
 
-2026-07-25 起加 FastAPI + WebSocket 后端 + React/Vite 前端。**与 REPL 并存**:`python main.py` 走 REPL,`python main.py --serve --port 8765` 走 Web。两路径共享 boot wiring,防御层 L2/L4/L5/L8 原样透传。
+- **只有一条执行链路**:`main.py` → `cc_harness.entrypoint`(durable)→ `DurableRuntimeClient` → `RunWorker`。
+  **产品侧 legacy 已删除**:`repl.py` / `runtime.py` / `tui/` / `project/subagent.py` 不再存在,
+  REPL 交互层是 `durable_repl.py`(只调 durable 客户端)。
+  `cc_harness/agent.py:run_turn` 保留为 **eval-only 引擎**:唯一消费者是 `eval/locomo/runner.py`
+  (已发布 LoCoMo 数字绑定该循环,迁移会重新基线)。产品包 import 它 = guard test 失败
+  (`tests/test_single_runtime.py`),预算由 `python scripts/legacy_engine_inventory.py --check` 强制
+  (product_refs 必须 0,eval_refs=7,test_refs=165 只降不升);剩余计划见 `docs/runtime-legacy-migration.md`。
+- **记忆已接入主链路**(CLAUDE.md 旧版说"未接入"是错的):`capability_runtime` 在 durable boot 时构造 memory deps;
+  自动注入只到 L3 画像,`memory_recall` 工具负责按层取 L1/L0。legacy 的 REPL boot 已随 `repl.py` 删除。
+- **测试**:`python -m pytest tests` 可一键跑;`tests/test_agentdojo_adapter.py` 在缺 `agentdojo` 时整体 skip
+  (可选依赖:`pip install -e '.[benchmarks]'`)。完整套件本地实测 ~45 min,CI 上限已调到 75 min。
+- 对外口径(数字/边界/已知问题)以 `README.md` + `docs/eval-evidence/` 为准,不要再引用旧版"RO mount""凭据不可达"等说法。
+
+## Web UI
+
+FastAPI + WebSocket 后端 + React/Vite 前端;WebUI 只读 durable 事件流,不拥有第二套执行引擎。
+`cc-harness --no-open --port 3080` 启动后端,前端产物在 `web/dist/`(dev 手册见 `docs/web-frontend.md`)。
 
 详见:
-- spec: `docs/superpowers/specs/2026-07-25-codex-web-ui-design.md`
-- plan: `docs/superpowers/plans/2026-07-25-codex-web-ui.md`
 - 前端 dev 手册: `docs/web-frontend.md`
+- runtime 全景: `docs/agent-runtime-full-flow.md`
 
 ## Common commands
 
 ```bash
 # Install (pyproject.toml is the source of truth for deps)
-pip install -e .                 # also required by the eval provider (imports cc_harness)
+pip install -e .                 # required by the eval provider (imports cc_harness)
 pip install -e '.[dev]'          # pytest / pytest-asyncio / pytest-cov / ruff
+pip install -e '.[benchmarks]'   # optional: agentdojo 等基准适配器
 
-# Run the REPL (entry point)
-.venv/Scripts/python.exe main.py
-.venv/Scripts/python.exe main.py --mode plan          # start in plan mode
-.venv/Scripts/python.exe main.py --design-dir <path>  # custom design save dir
+# Run (唯一入口:durable runtime;默认起 WebUI)
+python main.py                       # 等价于 cc-harness
+python main.py --no-open --port 3080
+python main.py --command status      # 命令行控制面(status/list/attach/approve/...)
 
-# Tests (~200 in tests/test_*.py)
-.venv/Scripts/python.exe -m pytest tests/                 # all
-.venv/Scripts/python.exe -m pytest tests/test_X.py -v     # one file
-.venv/Scripts/python.exe -m pytest tests/test_X.py::test_name  # one test
-.venv/Scripts/python.exe -m pytest tests/ -k "name_substr" # by name
+# Tests (~2,100 个 test 函数,217 个文件)
+python -m pytest tests/                          # 全量(本地 ~45min;CI 上限 75min)
+python -m pytest tests/ -x -q                    # 快速失败
+python -m pytest tests/test_context.py -v        # 单文件
+python -m pytest tests/test_policy.py::test_name # 单用例
 
 # Lint
-.venv/Scripts/python.exe -m ruff check cc_harness/ tests/
+python -m ruff check cc_harness/ tests/
 
-# Phase-1 regression (creates + runs hello.py end-to-end)
-.venv/Scripts/python.exe run_verify.py
+# Phase-1 regression(需要真实 LLM)
+python run_verify.py
 
-# Web UI serve (FastAPI + WS; spec/code/plan: docs/superpowers/specs + plans/2026-07-25-codex-web-ui*)
-PYTHONIOENCODING=utf-8 .venv/Scripts/python.exe main.py --serve --port 8765  # 后端;浏览器: web/dist/ (prod) or vite dev
-cd web && npm run dev                                                      # Vite dev (proxy /api + /ws → 8765)
-
-# Eval / red-team (see "Eval / red-team" section below)
-cd eval/promptfoo && npm run security     # static + dynamic attacks → eval
-cd eval/promptfoo && npm run view         # browser UI of last result
-python eval/promptfoo/tools/run_eval.py all --keep-json  # one-shot: security + OWASP → .md report
+# Eval / red-team (见下方小节)
+cd eval/promptfoo && npm run security
+python eval/promptfoo/tools/run_eval.py all --keep-json
 ```
 
 Force UTF-8 on Windows (avoids GBK crashes on 思考/✅/中文):
@@ -57,32 +68,56 @@ PYTHONIOENCODING=utf-8 .venv/Scripts/python.exe ...
 ## Architecture (data flow)
 
 ```
-main.py
-  └── repl.py:run_repl()                  # sticky mode (coding/plan/design), slash commands
-        │     slash cmds: /plan /design /coding /mode /help /clear (case-insensitive)
-        ├── run_turn()  [agent.py]        # ReAct while loop, max_iter=20
-        │     ├── llm.py:LLMClient        # OpenAI stream + tool_calls accumulator
-        │     ├── mcp_client.py:MCPClient # stdio/sse/http → OpenAI tool schema
-        │     ├── tools.py:NATIVE_TOOLS   # currently: run_command (asyncio subprocess)
-        │     ├── tools.py:is_dangerous   # rm -rf / format / drop / shutdown → user confirm
-        │     ├── prompts.py:Section pool # 10 sections in SECTION_POOL, gated by conditions
-        │     ├── tokens.py               # tiktoken 5-bucket counting + turn/session stats
-        │     └── render.py               # 4-phase ReAct output (思考/行动/观察/结果)
-        └── _print_disk_changes()         # post-turn: show files modified in last 30s
-
-cc_harness/memory/                        # SQLite + embeddings; wired through main.py and Runtime memory dependencies.
+main.py                                  # 兼容 shim:只做 UTF-8 stdio + 委托
+  └── cc_harness/entrypoint.py           # 唯一入口(durable)
+        └── durable_runtime.py           # DurableRuntimeClient:submit/attach/approve
+              ├── coordinator.py         # Run 状态机 + 事件
+              ├── run_store.py           # append-only 事件 + lease/epoch 校验
+              ├── supervisor.py          # 选可运行 run → claim
+              └── worker.py:RunWorker    # 每 segment: 投影→压缩→LLM→策略→工具→落事件
+                    ├── run_kernel.py    # ReAct 内核(budget / loop guard)
+                    ├── capability_runtime.py:build_context  # 上下文装配
+                    ├── context.py       # Snippet→Prune→Summary 三级压缩
+                    ├── memory/          # L0-L3 分层记忆(已接入主链路)
+                    ├── policy.py        # allow/ask/deny + hard-deny
+                    ├── security.py      # 确定性参数 provenance
+                    └── executor.py / sandbox.py  # 执行加固 / 容器
+        (eval-only,产品不得 import) agent.py:run_turn → eval/locomo/runner.py
 ```
 
 **Key data flow**:
-- `messages: list[dict]` (OpenAI chat format) is the single state across turns
-- `messages[0]` is the system prompt; rebuilt on every turn in `agent._refresh_system_prompt` to match the current mode
-- Tool specs: `mcp.list_tools() + NATIVE_TOOLS specs` → sent to LLM; tool_calls routed by name (MCP vs native)
-- Streaming is buffered (not token-by-token). Each iteration prints the LLM's full text as a single 思考 block, then 行动/观察 for each tool call, so the 4-phase layout is clean and never duplicated. See `agent.run_turn` for the trade-off.
-- `tokens.py` categorizes the final `messages` + tool schemas into 5 buckets (system/user/tool_calls/llm_output/tool_definitions) and compares tiktoken totals against the API-reported usage (`api_vs_breakdown_drift_pct`). Per-turn (`TurnTokenStats`) aggregates roll up into `SessionTokenStats`.
+- 持久状态是 `run_store` 的事件流;`messages` 是每个 segment 由投影重建的视图,不是唯一真相。
+- 工具动作先过 `PolicyEngine.evaluate`,再走 `RunWorker` 的审批/租约,最后才 dispatch。
+- 上下文压缩有独立 SQLite 版本库(lease + epoch),压缩结果按源 digest 幂等复用,并可 `read_ref` 回查原文。
+- `tokens.py` 仍用于 5 桶统计,并与 provider 上报 usage 对账(`api_vs_breakdown_drift_pct`)。
+- 工具结果统一在 `ToolResult.__post_init__` 做 head/tail 截断(默认 128K 字符,`CC_HARNESS_MAX_TOOL_CHARS` 可调),
+  metadata 记 `tool_text_truncated` / `tool_text_chars`;classmethod 和直接构造都挡得住,避免一次巨量输出
+  先污染事件日志、再由压缩来收拾。
+
+## 2026-10 运行时加固(都有回归测试或定向验证)
+
+- **`--max-iterations` 真的生效**:以前只解析不落地(活循环没有模型调用上限)。现在映射成 durable 预算
+  `{"model_calls": N, "steps": N}`(`entrypoint._budget_limits`),默认 `None` 保持无上限;
+  `--unbounded-iterations` 仍是显式无上限。
+- **follow-up 启动竞态**:`enqueue`(coordinator/webui)与 `release_ready`(supervisor)可能同时启动同一
+  queued item → `UNIQUE run_id` / `RunCreated can only be the first event`。`_start` 现在按 store 取进程级
+  asyncio 锁,并把"run 已存在"的插入冲突视为并发启动成功。
+- **租约心跳不再静默死**:`ResourceLeaseManager._heartbeat_loop` 遇到瞬时 store 错误会记日志并重试(3 次),
+  只有被 fence 才停;`release` 的 `except (…, Exception)` 简化为 `suppress(Exception)` 并注明原因。
+- **取消 watchdog 降载**:`RunWorker._cancellation_watchdog` 从"每 50 ms 全量重建 projection"改成
+  "单行 `load_run_record` + 50→500 ms 退避",取消延迟仍 <0.5 s,写锁压力下降一个数量级。
+- **workspace 快照移出事件循环**:`_workspace_snapshot`(逐文件 sha256)改用 `asyncio.to_thread`,
+  不再阻塞心跳/取消/WebUI 流。
 
 ## Design decisions (non-obvious)
 
-**3 modes, not just 1.** `mode in {coding, plan, design}` is sticky across the turn. In plan/design, `tool_specs = None` is sent to the LLM so it physically cannot emit tool_calls (any that leak through are dropped with a warn).
+**3 modes, not just 1.** `mode in {coding, plan, design}` 是 legacy 引擎的粘性模式(plan/design 时
+`tool_specs=None`,模型物理上发不出 tool_calls)。**产品已无 mode 选择**:`--mode` 仅为 eval launcher 兼容保留,
+durable 自己决定交互模式。要改模式语义,先确认改的是 durable(`interaction_mode`)还是 eval-only `agent.py`。
+
+**Context and memory contracts are Runtime-managed.**  Compaction, memory injection and
+persistence live in `capability_runtime` + `cc_harness/memory/`; `main.py` is only a CLI shim.
+Inspect those modules (and `context.py`) before changing what the model sees.
 
 **`run_command` is built-in, NOT via MCP.** Community shell MCP servers either don't work on Windows (`@kevinwatt/shell-mcp` uses `whereis`) or require LLM sampling we don't implement (`@mako10k/mcp-shell-server` enhanced mode). The native async subprocess in `tools.py` just works. Don't add an MCP shell server back without understanding why we removed it.
 
@@ -90,28 +125,44 @@ cc_harness/memory/                        # SQLite + embeddings; wired through m
 
 **Safety is not a sandbox.** `is_dangerous` only matches a hardcoded regex list (rm -rf, format, drop table, fork bomb, shutdown, reboot). It's "prevent accidental mistakes" not security. Don't expand the regex list to be a permission system — that scope was explicitly cut. (The red-team eval below is how we actually measure safety.)
 
-**L4 权限闸门(M1,2026-06-30)。** `agent.py` 派发点不再用 `is_dangerous` 正则当闸门,
-改用 `cc_harness/policy.py` 的 Claude Code 式 allow/ask 两档引擎(无 deny)。
-执行/写/工作区外读/出站 → ask(用户 yes/always/no);工作区内读 → allow。
-`is_dangerous` 保留但仅用于丰富 ask 原因。会话 allowlist 进程内、退出即失效。
-红队无需改:wrapper 喂 `exit` 行 → confirm 返回 no → 所有 ask 自动不执行。
-执行加固(cwd 锁/env 剥离/超时)在 `cc_harness/executor.py`。审计落 `<root>/logs/policy.jsonl`。
+**L4 权限闸门(M1 起,持续加固)。** 派发点不再用 `is_dangerous` 正则当闸门,改用
+`cc_harness/policy.py` 的三档引擎:**allow / ask / deny**。
+工作区内读 → allow;执行/写/出站/未知工具 → ask;工作区外路径与敏感凭据路径 → **deny(hard,不可询问)**。
+`is_dangerous` 保留但仅用于丰富 ask 原因。会话 allowlist 进程内、退出即失效,且**绕不过 hard-deny**。
+
+2026-10 加固(有回归测试):
+- **路径包含递归化**:`_extract_paths` 递归遍历参数,已知 path key 与"长得像路径"的未知 key(`target`、
+  `options.path`)都进 hard-deny。此前只查固定 key,换 key 名就能读 `~/.ssh`。
+- **写动作优先于读子串**:工具名里出现 write/delete/push/commit/apply 等动词即降级为 ask,
+  防止不可信 MCP server 用 `evil_filesystem_read_all` / `git_list_and_push` 把自己命名进免审档。
+- **工作区不能给自己松绑**:`load_policy_config` / `load_l2_config` / `load_l5_config` /
+  `load_executor_config` 会把落在 cwd 内的 `policy.yaml` 视为"数据"——它可以收紧,但不能把
+  `enabled` / `l2.enabled` / `l5.enabled` 设成 false,也不能把 `executor.backend` 降级成 native;
+  被拒的字段记在 `workspace_overrides_rejected` 并打 warning。显式信任要 `CC_HARNESS_TRUST_WORKSPACE_POLICY=1`
+  (`tests/test_workspace_policy_trust.py` 覆盖)。`mcp.json` 仍是用户信任的代码,不受此约束。
+- **残余风险(已知)**:分类仍主要靠名字 + 声明 capability;`mcp.json` 从工作区读取,
+  克隆不可信仓库时应先审阅或用 `hardened` profile。
+
+执行加固(cwd 锁/env 剥离/超时/进程树 kill)在 `cc_harness/executor.py`。审计落 `<root>/logs/policy.jsonl`。
 完整设计见 docs/superpowers/specs/2026-06-30-l4-policy-engine-design.md。
 
-**L2 输入防御(M2,2026-07-01)。** `repl.py` 读入用户输入后、进 `run_turn` 前过两道:
+**L2 输入防御(M2,2026-07-01)。** 入口在 durable 的 `capability_runtime`(提交 run 时、进入 kernel 之前)过两道:
 ① `cc_harness/l2.py:heuristic_check`(传统正则,命中即拦,零延迟);
 ② DeepSeek judge(复用 provider,结构化 JSON 分类 benign/injection/jailbreak)。
 命中即**硬阻断**:不进主 LLM、不调工具、**不入 messages 历史**(切断上下文传播),
-经 `print_result` 打模糊拒绝模板(不透露检测原因,避免帮攻击者迭代)。真实原因落 `<root>/logs/l2.jsonl`。
+打模糊拒绝模板(不透露检测原因,避免帮攻击者迭代)。真实原因落审计。
 指令层级(`prompts.py:instruction_hierarchy`,始终生效):`<user_input>` 包用户输入、
-`<untrusted>` 包外部工具输出(`agent.py` 仅成功回填处),声明开发者>用户>工具返回。
-judge 失败 fail-open(`judge_error` 审计,L4 兜底)。kill-switch:`policy.yaml` 的 `l2.enabled=false`。
+`<untrusted>` 包外部工具输出,声明开发者>用户>工具返回。
+judge 失败 fail-open(`judge_error` 审计,L4 兜底)。kill-switch:`policy.yaml` 的 `l2.enabled=false`
+(仅用户级配置生效;工作区内的 policy 不能关,见 L4 一节)。
+**长输入不再绕过**:正则层跑全文(线性 pattern,`MAX_HEURISTIC_SCAN_LEN` 只兜超大病态输入,超限改为头+尾扫描),
+语义 judge 只看 head+tail(`MAX_JUDGE_INPUT_CHARS=24K`),截断会写进审计 reason(`judge_input_truncated`)。
 **无 key 退化**:judge 仅在配置了 `OPENAI_API_KEY` 时构造 client;无 key 时 `l2_client=None`,
 judge 路径 fail-open(等价 heuristic-only,审计记 `judge_error:AttributeError`),heuristic 第一道仍生效。
 完整设计见 docs/superpowers/specs/2026-07-01-l2-input-defense-design.md。
 
-**L5 输出 DLP(M3,2026-07-01)。** 与 M2(L2 输入)对称,守**输出**:`agent.py:run_turn`
-在 LLM 主动产生的文本(思考段 + 结果段)被 `print_*` / `messages.append` 之前过 `cc_harness/l5.py`。
+**L5 输出 DLP(M3,2026-07-01)。** 与 M2(L2 输入)对称,守**输出**:durable 侧在 assistant 文本被
+提交为事件之前过 `cc_harness/l5.py`(`capability_runtime` 调用);eval-only 的 `agent.run_turn` 走同一层。
 分层检测:① Layer A 密钥正则(`KeyRegexLayer`,零依赖,永远在,已知格式:OpenAI/AWS/GitHub/GitLab/Slack/Google/PEM/JWT);
 ② Layer B Presidio PII(`PresidioLayer`,可选 `pip install -e '.[dlp]'`,邮箱 + 中文手机/身份证 custom recognizer)。
 命中替换为 `[REDACTED:<type>]`,**历史也存脱敏版**(切断"思考读到→结果复述"二段泄露)。
@@ -121,7 +172,7 @@ fail-soft:Presidio 不可用 → 自动只跑 Layer A(密钥仍护);scan 异常 
 kill-switch:`policy.yaml` 的 `l5.enabled=false`。工具观察段不扫(M2 已用 `<untrusted>` 隔离;脱敏它破坏 coding)。
 完整设计见 docs/superpowers/specs/2026-07-01-l5-output-dlp-design.md。
 
-**Windows GBK fix in `main.py` lines 17-23 must stay.** Without `sys.stdin.reconfigure(encoding="utf-8")`, the GBK default codepage crashes on the first non-ASCII char the LLM outputs (✅, 中文, 思考, etc.).
+**Windows GBK fix at the top of `main.py` must stay.** Without `sys.stdin.reconfigure(encoding="utf-8")` (and the same for stdout/stderr), the GBK default codepage crashes on the first non-ASCII char the LLM outputs (✅, 中文, 思考, etc.).
 
 ## Eval / red-team (`eval/promptfoo/`)
 
@@ -148,30 +199,41 @@ A promptfoo-based red-team suite (LOCAL only, 2026-07-06 起退役 CI integratio
   - **Pass^k + Wilson CI**:`promptfooconfig.unified.yaml` 15 处 critical attack 加 `repeat: 5`,`report_to_md.py:wilson_ci + aggregate_repeats` 出 `hold^k / σ / 95%CI` 表(n=5 CI 仍宽,诚实呈现)。
   - **Multi-source judge**:`promptfooconfig.unified.yaml` defaultTest 加第二源 MiMo(`openai:mimo-v2.5-pro` + `MIMO_API_KEY` 兜底 `OPENAI_API_KEY`),`report_to_md.py:judge_agreement` 算一致率 + Δ>0.3 标 `⚠ judge 分歧` 送人工。
   - **Gold-set + κ + 回归**:`judges/calibration_set.yaml` 双区(50 baseline + pending),`tools/calibrate.py` 三件套 `cohen_kappa` / `collect_failures` / `regression_run` + `report_to_md.py` 末尾渲染校准+回归段。50 baseline 全 placeholder(`# TODO: 人工校准`),当前 κ=1.0 trivial;真实校准后才有判别力。
-  - **Cyber 6 子类 + Locomo 桥接**:`attacks.yaml` 加 cyber 6 子类各 ≥5(privilege-escalation / lateral-movement / persistence / data-exfiltration / credential-theft / supply-chain),`defense_matrix.yaml` 登记 6 子类 layer。Locomo memory 5-key(recall/timeliness/utilization/compaction/consistency)经 `render_locomo_section` 桥接到 `unified-report.md`;降级原因 = `cc_harness/memory/` 未 wired 进 ReAct,`run_eval.py:_run_locomo` 当前返 None(TODO)。
+  - **Cyber 6 子类 + Locomo 桥接**:`attacks.yaml` 加 cyber 6 子类各 ≥5(privilege-escalation / lateral-movement / persistence / data-exfiltration / credential-theft / supply-chain),`defense_matrix.yaml` 登记 6 子类 layer。Locomo memory 5-key(recall/timeliness/utilization/compaction/consistency)经 `render_locomo_section` 桥接到 `unified-report.md`;记忆现已接入主链路,LoCoMo 独立报告见 `eval/result/cc-only/locomo-memory/.../report.md`(tracked),但 `run_eval.py:_run_locomo` 的 unified 桥接仍是 TODO。
 
 ## Test conventions
 
-- ~200 tests in `tests/test_*.py` (collected by pytest, default pattern). Eval tooling has its own tests: `test_generate_attacks.py`, `test_curate_attacks.py`, `test_dedup_logic.py`, `test_report_to_md.py`, `test_run_eval.py`, `test_smoke_curate.py`, `test_strategies_yaml.py`, `test_cc_harness_wrapper.py`, `test_tokens.py`, `test_defense_matrix.py`, `test_attacks_yaml.py`, `test_promptfoo_configs.py`.
+- 2,100+ 个 test 函数、217 个 `tests/test_*.py`(默认 pattern 收集)。其中 **15 个文件 / 165 处引用**驱动
+  eval-only 的 `run_turn`;预算由 `python scripts/legacy_engine_inventory.py --check` 守着(product_refs 必须 0,
+  test_refs/eval_refs 只降不升),**新测试一律对准 durable**;批次计划见 `docs/runtime-legacy-migration.md`。Eval tooling 自带测试:`test_generate_attacks.py`,
+  `test_curate_attacks.py`, `test_dedup_logic.py`, `test_report_to_md.py`, `test_run_eval.py`,
+  `test_smoke_curate.py`, `test_strategies_yaml.py`, `test_cc_harness_wrapper.py`, `test_tokens.py`,
+  `test_defense_matrix.py`, `test_attacks_yaml.py`, `test_promptfoo_configs.py`。
 - `tests/_test_*.py` (leading underscore) are **integration tests requiring a real LLM** — not collected by pytest by default; only run manually
 - Test agents use `FakeLLM` (pre-programmed stream events) + `FakeMCP` (pre-programmed tool results), defined in `test_agent.py` and reused via imports
 - New test file naming: `test_<module>.py`, mirror source module names
-- For REPL tests, mock `_read_user` (not `builtins.input` directly — too fragile in subprocess tests)
+- 交互层测试:改 `durable_repl` 时 mock `_read_user`,不要 patch `builtins.input`(子进程测试里太脆)。
+- legacy `run_turn` 测试的夹具(`FakeLLM` / `FakeMCP` / `FakeStreamEvent`)仍定义在 `test_agent.py`,
+  由 15 个文件 import;删除引擎时它们一起走。
 
 ## Config & files
 
 - `.env` — core (3 required, no defaults — see `config.py`): `OPENAI_API_KEY`, `OPENAI_BASE_URL`, `OPENAI_MODEL`. Eval + memory add: `EMBEDDING_BASE_URL` / `EMBEDDING_API_KEY` / `EMBEDDING_MODEL` / `EMBEDDING_DIM` (SiliconFlow `BAAI/bge-m3`, dim 1024), `JUDGE_MODEL`, and `PROMPTFOO_API_KEY` (OWASP plugins only). CI builds these into `eval/promptfoo/.env.ci` from secrets.
 - `pyproject.toml` — deps + packaging (`pip install -e .`). pytest config: `asyncio_mode = "auto"`, `testpaths = ["tests"]`. ruff: line-length 100, target py311.
 - `mcp.json`: MCP server entries. Per-server failures are isolated — one bad server logs a red warning, the rest still boot (`init_timeout_s` defaults to 30s in `mcp_client.py`). The bundled config mixes stdio (npx-launched: filesystem, playwright) and SSE (ModelScope-hosted: fetch + others) transports. Tool names are exposed to the LLM as `mcp__{server}__{tool}`.
-- `~/.cc-harness/designs/`: design-mode artifacts land here by default (`{ISO ts}-{first-line-slug}.md`); override with `python main.py --design-dir <path>`
+- `~/.cc-harness/designs/`: design-mode artifacts 的旧落盘目录;design 模式随 legacy 引擎一起移除,新代码不要再写这里。
 - `docs/superpowers/` — planning artifacts for the superpowers workflow: `plans/<date>-<slug>.md` and `specs/<date>-<slug>-design.md` per feature (e.g. context-compaction, real-token-tracking, dynamic-attack-generation, severity-redesign). Read the matching plan before extending that feature.
-- `run_verify.py` (root): Phase-1 regression script — spawns the REPL as a subprocess, pipes one command in, captures output, exits. Useful for end-to-end smoke after a refactor. Requires a real LLM (hits the configured provider).
+- `run_verify.py` (root): Phase-1 regression script — spawns the CLI as a subprocess, pipes one command in, captures output, exits. Useful as an end-to-end smoke after a refactor. Requires a real LLM (hits the configured provider).
 - `eval/bug/`: captured red-team failure artifacts from past runs (result JSONs, screenshots, reports) — debugging evidence, not test fixtures.
 
 ## Out of scope (don't add unless asked)
 
 - Multi-LLM backend switching (locked to OpenAI-compatible)
-- Sandbox / Docker — M1 (2026-06-30) landed a portable permission gate (`cc_harness/policy.py`, allow/ask two-tier) + execution hardening (`cc_harness/executor.py`: cwd-lock, env-secret-strip, timeout);M4 (2026-07-03) landed OpenSandbox 用户态容器沙箱(`cc_harness/sandbox.py:SandboxExecutor`,Docker runtime,会话级 lazy create + 项目根 RO mount + 通信错降级 native;`cc_harness/sandbox_server.py` 自动起 opensandbox-server)。A true kernel sandbox (gVisor/Firecracker) is still out of scope — Linux-only, deferred。kill-switch:`policy.yaml` 的 `executor.backend=native` 回 NativeExecutor。
-- Context compaction and memory behavior are Runtime-managed; inspect `main.py`, `cc_harness/agent.py`, and `cc_harness/memory/` before changing their injection or persistence contracts.
-- Concurrent tool calls (serial only)
-- SubAgent / Agent Team (PDF 阶段 4-5, not started)
+- 真正的内核级沙箱(gVisor/Firecracker)—— 现有 OpenSandbox 是用户态容器:`cc_harness/sandbox.py:SandboxExecutor`
+  会话级 lazy create,**workspace 是 RW 挂载**(不是 RO,旧文档写错了),敏感路径用空 RO overlay 遮罩;
+  Docker 不可用时 `standard` profile **降级 native 并审计**,`hardened` / `benchmark-one-shot` 直接失败。
+  kill-switch:`CC_HARNESS_EXECUTOR_BACKEND=native` 显式选择(工作区 policy.yaml 不能把 backend 降级)。
+- 不要新增第三套执行引擎:产品是 Durable Runtime,eval-only 的 `agent.run_turn` 是唯一例外(见迁移文档)。
+- 不要把 `agent.run_turn` 重新接回产品路径:`tests/test_single_runtime.py` + 预算脚本会失败。
+- 并发工具调用(目前串行)
+- SubAgent / Agent Team(已有 `dispatch_subagent`,但仍是串行子任务,不做多 agent 编排)

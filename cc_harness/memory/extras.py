@@ -130,6 +130,8 @@ async def build_memory_extras(
             embedder=embedder,
             top_k=(memory_config.retriever_top_k if memory_config else 5),
             token_budget=(memory_config.injection_token_budget if memory_config else 800),
+            min_similarity=(memory_config.min_similarity if memory_config else 0.0),
+            relative_margin=(memory_config.relative_margin if memory_config else 0.25),
         )
     except Exception as e:
         await _close_components(embedder, decider_llm, store)

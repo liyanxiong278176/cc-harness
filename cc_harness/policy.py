@@ -11,6 +11,7 @@
 from __future__ import annotations
 
 import os
+import re
 from collections.abc import Iterator
 from dataclasses import dataclass, field
 from enum import Enum
@@ -47,12 +48,33 @@ class Decision:
 _FS_READ = ("read", "list", "search", "info", "stat", "grep", "glob")
 _FS_WRITE = ("write", "edit", "move", "rename", "delete", "remove", "create", "mkdir", "touch")
 _NET = ("fetch", "bing", "http", "url", "request", "curl", "wget")
+# Verbs that imply a side effect.  They are matched *before* read markers so a
+# tool name cannot buy the no-prompt tier by containing "read" somewhere.
+_WRITE_MARKERS = (
+    "write", "edit", "move", "rename", "delete", "remove", "create", "mkdir",
+    "touch", "push", "commit", "reset", "checkout", "merge", "rebase", "upload",
+    "apply", "patch", "exec", "spawn", "install", "chmod", "chown",
+)
+_GIT_WRITE_MARKERS = (
+    "write", "push", "commit", "reset", "checkout", "merge", "rebase", "apply",
+    "patch", "clone", "fetch", "pull", "tag", "stash", "clean", "restore",
+)
 
 _PATH_KEYS = {
     "path", "file_path", "filePath", "filename", "uri", "cwd",
     "source", "destination", "src", "dst", "old_path", "new_path",
 }
 _PATH_LIST_KEYS = {"paths", "files"}
+# Values of these keys are payload, not locations.  Scanning them for path-like
+# strings would deny legitimate writes whose *content* mentions a path.
+_PAYLOAD_KEYS = {
+    "content", "new_content", "old_content", "text", "body", "data", "diff",
+    "patch", "pattern", "regex", "query", "command", "script", "description",
+    "prompt", "message", "old_string", "new_string",
+}
+# A bare string is treated as a location only when it looks like one; unknown
+# keys such as ``target`` or ``options.path`` must not bypass containment.
+_PATH_LIKE_RE = re.compile(r"^(?:[A-Za-z]:[\\/]|\\\\|/|~[\\/]|\.{1,2}[\\/])")
 _SENSITIVE_DIR_NAMES = {
     ".ssh",
     ".aws",
@@ -85,15 +107,20 @@ def _classify(name: str) -> str:
     if "context7" in n:
         return "docs"
     if "git" in n:
-        # git 读类放行,写类询问
+        # Write verbs win over read verbs: an untrusted server can name a tool
+        # ``git_list_and_push`` and a read-substring rule would auto-allow it.
+        if any(k in n for k in _GIT_WRITE_MARKERS):
+            return "git_write"
         if any(k in n for k in ("log", "status", "diff", "show", "branch", "list")):
             return "git_read"
         return "git_write"
     if "filesystem" in n or "_fs_" in n:
+        # Same precedence rule: ``evil_filesystem_read_all`` must not be able to
+        # smuggle a write/exec verb past a read-only substring match.
+        if any(k in n for k in _WRITE_MARKERS):
+            return "fs_write"
         if any(k in n for k in _FS_READ):
             return "fs_read"
-        if any(k in n for k in _FS_WRITE):
-            return "fs_write"
         return "fs_other"
     if any(k in n for k in _NET):
         return "network"
@@ -123,17 +150,47 @@ def _path_from_value(key: str, value: str) -> str | None:
     return value
 
 
-def _extract_paths(args: dict) -> Iterator[str]:
-    """Yield every declared local path so secondary destinations cannot bypass policy."""
-    for key, value in args.items():
-        if key in _PATH_KEYS and isinstance(value, str) and value:
+def _iter_string_values(value: object, key: str | None = None) -> Iterator[tuple[str | None, str]]:
+    """Walk arguments recursively, yielding ``(key, string)`` for every leaf."""
+    if isinstance(value, str):
+        yield key, value
+    elif isinstance(value, dict):
+        for child_key, child in value.items():
+            yield from _iter_string_values(child, key=str(child_key))
+    elif isinstance(value, (list, tuple, set, frozenset)):
+        for item in value:
+            yield from _iter_string_values(item, key=key)
+
+
+def _extract_paths(args: dict, cls: str | None = None) -> Iterator[str]:
+    """Yield every declared or path-like local path, nested values included.
+
+    Two rules, both needed to close the same hole:
+
+    * declared path keys / path lists are always treated as locations, at any
+      nesting depth (``{"options": {"path": ...}}``);
+    * unknown keys are treated as locations when the value *looks* like a path
+      (``{"target": "/home/u/.ssh/id_rsa"}``).
+
+    Payload keys and shell/command text are skipped: a command string is not a
+    location, and scanning file content would deny legitimate writes.  Docs
+    tools are skipped too because their identifiers (``/org/project``) look
+    like absolute paths; their explicit ``path`` arguments are still checked.
+    """
+    for key, value in _iter_string_values(args):
+        if key in _PATH_KEYS:
             path = _path_from_value(key, value)
             if path:
                 yield path
-        elif key in _PATH_LIST_KEYS and isinstance(value, list):
-            for item in value:
-                if isinstance(item, str) and item:
-                    yield item
+        elif key in _PATH_LIST_KEYS:
+            yield value
+        elif (
+            key is not None
+            and key not in _PAYLOAD_KEYS
+            and cls not in ("shell", "network", "docs")
+            and _PATH_LIKE_RE.match(value.strip())
+        ):
+            yield value.strip()
 
 
 def _resolve(target: str, project_root: Path) -> Path:
@@ -295,7 +352,7 @@ class PolicyEngine:
 
         # Hard safety runs before every convenience control. Neither an allowlist
         # entry nor enabled=false may approve an undeclared root or credential path.
-        for target in _extract_paths(args):
+        for target in _extract_paths(args, cls):
             resolved = _resolve(target, root)
             containing_root = next(
                 (allowed for allowed in allowed_roots if resolved.is_relative_to(allowed)),

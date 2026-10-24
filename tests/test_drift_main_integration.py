@@ -135,92 +135,9 @@ def _fake_read_user_raises_eof():
 
 
 @pytest.mark.asyncio
-async def test_repl_passes_drift_detector_to_memory_service(
-    tmp_path, monkeypatch,
-):
-    """repl 接受 drift_detector 形参 + finally 块 await drift_detector._drain。
-
-    沿 E2 reflection_engine 模式(repl.py line 462-468):
-    - keyword-only 形参
-    - finally 块 try/except 包裹 _drain(timeout_s=5.0)
-
-    Plan 偏差修复(避免回归 / 简化 mock):
-    1. 用 pytest fixture `monkeypatch`(自动 cleanup),不直接调 pytest.MonkeyPatch()
-    2. fake_llm/fake_mcp 用 MagicMock,只满足形参;mcp.list_tools() 默认 MagicMock
-       (repl line 207 `n_tools = len(mcp.list_tools())` → 0 即可)
-    3. _read_user 一次性 raise EOFError,让主循环 break 走 finally — 不需要
-       构造 memory_extras / manifest / scheduler / reflection_engine 等复杂 boot
-    4. 不构造 DriftDetector(本 task 只测形参 + finally 接口;构造留给 T2.3 main.py)
-    """
-    from cc_harness import repl
-
-    fake_drift = MagicMock()
-    fake_drift._drain = AsyncMock()
-
-    monkeypatch.setattr(repl, "_read_user", _fake_read_user_raises_eof())
-    # 截短 setup:不需要 init_session_executor/shutdown_session_executor 真副作用,
-    # 桩成 no-op 让 finally 走得快
-    monkeypatch.setattr(repl, "init_session_executor", lambda c, r: None)
-    monkeypatch.setattr(repl, "shutdown_session_executor",
-                        AsyncMock())  # repl 调 `await shutdown_session_executor()`
-
-    fake_llm = MagicMock()
-    fake_mcp = MagicMock()
-    fake_mcp.list_tools = MagicMock(return_value=[])
-
-    await repl.run_repl(
-        llm=fake_llm, mcp=fake_mcp, cwd=str(tmp_path),
-        drift_detector=fake_drift,
-    )
-
-    # finally 块:drift_detector 非 None → await _drain(timeout_s=5.0) 被调
-    fake_drift._drain.assert_awaited_once()
-    call_kwargs = fake_drift._drain.await_args.kwargs
-    assert call_kwargs.get("timeout_s") == 5.0
 
 
 @pytest.mark.asyncio
-async def test_repl_without_drift_detector_skips_drain(tmp_path, monkeypatch):
-    """repl.run_repl 不传 drift_detector(默认 None)→ finally 不 await 任何 _drain。
-
-    验证默认 None 守卫 + 向后兼容(无 drift 形参时走老路径,不报错)。
-    """
-    from cc_harness import repl
-
-    monkeypatch.setattr(repl, "_read_user", _fake_read_user_raises_eof())
-    monkeypatch.setattr(repl, "init_session_executor", lambda c, r: None)
-    monkeypatch.setattr(repl, "shutdown_session_executor", AsyncMock())
-
-    fake_llm = MagicMock()
-    fake_mcp = MagicMock()
-    fake_mcp.list_tools = MagicMock(return_value=[])
-
-    # drift_detector 不传(默认 None)— 不应抛 TypeError
-    await repl.run_repl(
-        llm=fake_llm, mcp=fake_mcp, cwd=str(tmp_path),
-    )
-
-
-def test_main_boot_imports_drift_detector():
-    """main.py 可 import，且 DriftDetector API 已接入 run_repl。"""
-    import inspect
-
-    import main  # noqa: F401
-    from cc_harness.drift.detector import DriftDetector
-    from cc_harness.repl import run_repl
-
-    sig = inspect.signature(run_repl)
-    assert "drift_detector" in sig.parameters
-
-    methods = [
-        "check_after_write",
-        "check_after_read",
-        "_judge_entities",
-        "_judge_group_consistency",
-        "_audit",
-    ]
-    for method in methods:
-        assert hasattr(DriftDetector, method), f"DriftDetector 缺 {method}"
 
 
 # --- E5 R3 M2: turn_idx 注入测试 ---

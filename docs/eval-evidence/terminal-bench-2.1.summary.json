@@ -1,0 +1,117 @@
+{
+  "benchmark": "terminal-bench-2.1",
+  "model": "deepseek-v4-flash",
+  "generated_at": "2026-09-11T05:59:10.775903+00:00",
+  "status": "complete",
+  "evidence_status": {
+    "invalid": 0,
+    "pending": 0,
+    "valid": 89
+  },
+  "counts": {
+    "fail": 17,
+    "invalid": 0,
+    "pass": 72,
+    "pending": 0
+  },
+  "result_count": 89,
+  "adaptations": [
+    "The formal run executes the requested number of independent Harbor trials per task; leaderboard submissions require at least five.",
+    "Pre-model transient launcher failures may retry up to ten times on the same checkpoint; model-bearing failures are never replayed automatically."
+  ],
+  "benchmark_metrics": {
+    "by_category": {
+      "data-processing": {
+        "accuracy": 1.0,
+        "successes": 20,
+        "trials": 20
+      },
+      "data-querying": {
+        "accuracy": 1.0,
+        "successes": 5,
+        "trials": 5
+      },
+      "data-science": {
+        "accuracy": 0.475,
+        "successes": 19,
+        "trials": 40
+      },
+      "debugging": {
+        "accuracy": 0.84,
+        "successes": 21,
+        "trials": 25
+      },
+      "file-operations": {
+        "accuracy": 0.32,
+        "successes": 8,
+        "trials": 25
+      },
+      "games": {
+        "accuracy": 0.0,
+        "successes": 0,
+        "trials": 5
+      },
+      "machine-learning": {
+        "accuracy": 0.8666666666666667,
+        "successes": 13,
+        "trials": 15
+      },
+      "mathematics": {
+        "accuracy": 0.85,
+        "successes": 17,
+        "trials": 20
+      },
+      "model-training": {
+        "accuracy": 0.5,
+        "successes": 10,
+        "trials": 20
+      },
+      "optimization": {
+        "accuracy": 1.0,
+        "successes": 5,
+        "trials": 5
+      },
+      "personal-assistant": {
+        "accuracy": 1.0,
+        "successes": 5,
+        "trials": 5
+      },
+      "scientific-computing": {
+        "accuracy": 0.5,
+        "successes": 20,
+        "trials": 40
+      },
+      "security": {
+        "accuracy": 0.825,
+        "successes": 33,
+        "trials": 40
+      },
+      "software-engineering": {
+        "accuracy": 0.5769230769230769,
+        "successes": 75,
+        "trials": 130
+      },
+      "system-administration": {
+        "accuracy": 0.37777777777777777,
+        "successes": 17,
+        "trials": 45
+      },
+      "video-processing": {
+        "accuracy": 0.4,
+        "successes": 2,
+        "trials": 5
+      }
+    },
+    "leaderboard_accuracy": 0.6067415730337079,
+    "leaderboard_compatible": true,
+    "official_denominator": 445,
+    "official_success_rule": "reward > 0",
+    "official_task_count": 89,
+    "official_trial_count": 445,
+    "single_pass_accuracy": 0.8089887640449438,
+    "successful_tasks": 72,
+    "successful_trials": 270,
+    "terminal_results": 89,
+    "trials_per_task": 5
+  }
+}

@@ -442,4 +442,8 @@ async def test_durable_summary_does_not_protect_entire_autonomous_transcript(tmp
     assert stats.summarized
     assert stats.error is None
     assert stats.after_tokens <= 2_000
-    assert summary_llm.calls == 1
+    # Chunked summarization (one call per summary-input cap) replaced the old
+    # single tail-truncated call, so the count scales with the delta.  Keep a
+    # sanity bound instead of pinning it to one: the exact count depends on the
+    # tokenizer used by the caller.
+    assert 1 <= summary_llm.calls <= 8

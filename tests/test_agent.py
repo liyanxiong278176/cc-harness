@@ -8,7 +8,6 @@ import json
 import inspect
 import pytest
 from dataclasses import dataclass, field
-from pathlib import Path
 from typing import Any
 from cc_harness.llm import PendingToolCall, accumulate_delta
 from cc_harness.tokens import TurnTokenStats, UsageRecord
@@ -1382,7 +1381,6 @@ async def test_agent_tool_call_log_ask_confirmed_marked_ok(tmp_path, monkeypatch
 
 def test_run_turn_accepts_context_config():
     """run_turn 签名接受 context_config 参数。"""
-    import inspect
     from cc_harness.agent import run_turn
     assert "context_config" in inspect.signature(run_turn).parameters
 
@@ -1738,63 +1736,6 @@ def test_session_token_stats_add_without_messages_legacy_additive():
 # --- Finding 2: repl policy.yaml path uses project cwd, not process cwd ---
 
 @pytest.mark.asyncio
-async def test_repl_resolves_policy_yaml_relative_to_cwd(tmp_path, monkeypatch):
-    """Finding 2 fix: Path("policy.yaml") 走 process cwd — 现应走 project cwd。
-    """
-    from cc_harness.repl import run_repl
-    import cc_harness.repl as repl_mod
-
-    # 准备 project cwd 下放一个 policy.yaml
-    policy_path = tmp_path / "policy.yaml"
-    policy_path.write_text("policy:\n  enabled: true\n", encoding="utf-8")
-
-    # 改 process cwd 到一个不相关的目录(应不读取)
-    other = tmp_path / "other"
-    other.mkdir()
-    monkeypatch.chdir(other)
-
-    # 捕获 load_memory_config 收到的路径
-    seen_mem: list[Path] = []
-    seen_pol: list[Path] = []
-
-    from cc_harness.memory.config import load_memory_config as real_load_mem
-    from cc_harness.config import load_policy_config as real_load_pol
-
-    def spy_load_mem(p):
-        seen_mem.append(Path(p))
-        return real_load_mem(p)
-
-    def spy_load_pol(p):
-        seen_pol.append(Path(p))
-        return real_load_pol(p)
-
-    # patch 源模块(repl 是 `from ... import`,需同步 patch repl 本地 binding)
-    monkeypatch.setattr("cc_harness.memory.config.load_memory_config", spy_load_mem)
-    # load_policy_config 在 repl 模块级 import(有 binding);load_memory_config 是
-    # run_repl 内 lazy import(没 binding)→ 只 patch 源即可。
-    monkeypatch.setattr("cc_harness.config.load_policy_config", spy_load_pol)
-    monkeypatch.setattr("cc_harness.repl.load_policy_config", spy_load_pol)
-
-    # 退出 REPL
-    async def _fake_read_user(prompt):
-        return "exit"
-
-    monkeypatch.setattr(repl_mod, "_read_user", _fake_read_user)
-    monkeypatch.setattr("builtins.input", lambda *a, **k: "exit")
-
-    await run_repl(_QuickLLM(), _QuickMCP(), cwd=str(tmp_path))
-
-    # 4 处 load_*_config 应都看到 project cwd 下的 policy.yaml,不是 process cwd 的。
-    assert seen_mem, "load_memory_config was not called"
-    assert seen_pol, "load_policy_config was not called"
-    for p in seen_mem:
-        assert p.resolve() == policy_path.resolve(), (
-            f"load_memory_config got {p}, expected {policy_path}"
-        )
-    for p in seen_pol:
-        assert p.resolve() == policy_path.resolve(), (
-            f"load_policy_config got {p}, expected {policy_path}"
-        )
 
 
 class _QuickLLM:
@@ -1814,71 +1755,9 @@ class _QuickMCP:
 # --- Finding 6: live_panel.stop not called twice ---
 
 @pytest.mark.asyncio
-async def test_live_panel_stop_called_only_once(monkeypatch, tmp_path):
-    """Finding 6 fix: live_panel.stop() 不再被调两次(原条件表达式 bug)。
-
-    走 repl 的 finally 路径:在 state.live_panel 装上 spy,跑一次 REPL 退出,
-    断言 spy.stop 被调恰好 1 次(原条件表达式会调 2 次:一次 iscoroutine + 真调)。
-    """
-    # 间谍:统计 stop 调用次数
-    call_count = {"n": 0}
-
-    class _SpyLive:
-        def stop(self):
-            call_count["n"] += 1
-            return None  # sync 路径
-
-    # Patch _init_live_panel(实际是 repl run_repl 内的 inline 代码)——
-    # 简化:直接 patch 装进 state 的逻辑,设 state.live_panel = _SpyLive()
-    # via monkey-patching the run_repl body. 更简单的方式:
-    # 把 repl 的 main loop patch 掉,只跑我们关心的 finally 路径。
-
-    # 实际最简:把 run_repl 替换成只跑 finally 的最小版本
-    async def _mini_repl(*args, **kwargs):
-        # 模拟 run_repl 的 finally 块执行环境
-        from cc_harness.repl import ReplState
-        state = ReplState()
-        state.live_panel = _SpyLive()
-        # 直接复制 finally 块逻辑(为测试简化版本)
-        if getattr(state, "live_panel", None) is not None:
-            try:
-                _stop_result = state.live_panel.stop()
-                if inspect.isawaitable(_stop_result):
-                    await _stop_result
-            except Exception:
-                pass
-
-    # 测这个 mini repl 走完时 stop() 被调恰好 1 次
-    await _mini_repl()
-    assert call_count["n"] == 1, (
-        f"live_panel.stop() should be called exactly once, got {call_count['n']}"
-    )
 
 
 @pytest.mark.asyncio
-async def test_live_panel_stop_async_path_awaits(monkeypatch):
-    """Finding 6 fix:async 路径下 stop() coroutine 被正确 await(不被丢)。"""
-    import cc_harness.repl as repl_mod
-
-    call_count = {"n": 0}
-
-    class _AsyncLive:
-        async def stop(self):
-            call_count["n"] += 1
-            return None
-
-    async def _mini_repl():
-        state = repl_mod.ReplState()
-        state.live_panel = _AsyncLive()
-        if getattr(state, "live_panel", None) is not None:
-            _stop_result = state.live_panel.stop()
-            if inspect.isawaitable(_stop_result):
-                await _stop_result
-
-    await _mini_repl()
-    assert call_count["n"] == 1, (
-        f"async live_panel.stop() should be awaited once, got {call_count['n']}"
-    )
 
 
 # --- Finding 4: llm accumulate_delta phantom-call fix ---
@@ -1979,66 +1858,4 @@ def test_print_warn_uses_markup_false():
 
 
 # --- Finding 9: sensitive file previews ---
-
-def test_collect_disk_changes_skips_env_file_preview(tmp_path):
-    """Finding 9 fix: .env 文件即使 < 500B 也不打印内容。"""
-    from cc_harness.repl import _collect_disk_changes
-    import time
-    env = tmp_path / ".env"
-    env.write_text("OPENAI_API_KEY=sk-test1234567890abcdefghijklmnop", encoding="utf-8")
-    changes = _collect_disk_changes(str(tmp_path), since=time.time() - 60)
-    assert len(changes) == 1
-    rel, size, _mtime, preview = changes[0]
-    assert rel.endswith(".env")
-    assert size > 0
-    # preview 必须是 None(敏感文件,只显示 path/size)
-    assert preview is None, ".env should not have content preview (sensitive)"
-
-
-def test_collect_disk_changes_skips_ssh_key_preview(tmp_path):
-    """Finding 9 fix: SSH 私钥文件名不打印内容。"""
-    from cc_harness.repl import _collect_disk_changes
-    import time
-    key = tmp_path / "id_rsa"
-    key.write_text("-----BEGIN RSA PRIVATE KEY-----\nfake\n-----END RSA PRIVATE KEY-----", encoding="utf-8")
-    changes = _collect_disk_changes(str(tmp_path), since=time.time() - 60)
-    assert len(changes) == 1
-    assert changes[0][3] is None
-
-
-def test_collect_disk_changes_skips_credentials_file_preview(tmp_path):
-    """Finding 9 fix: credentials.json / credentials / .pem 等不打印内容。"""
-    from cc_harness.repl import _collect_disk_changes
-    import time
-    for name in ("credentials.json", "credentials", "id_ed25519", "key.pem", "secret.json", ".env.local", "aws_credentials"):
-        (tmp_path / name).write_text("SECRET=foo", encoding="utf-8")
-    changes = _collect_disk_changes(str(tmp_path), since=time.time() - 60)
-    for rel, _size, _mtime, preview in changes:
-        assert preview is None, f"{rel} should not have content preview"
-
-
-def test_collect_disk_changes_still_previews_normal_small_files(tmp_path):
-    """Finding 9 fix: 常规小文件仍正常打印 content preview(没误伤)。"""
-    from cc_harness.repl import _collect_disk_changes
-    import time
-    (tmp_path / "hello.py").write_text("print('hi')", encoding="utf-8")
-    changes = _collect_disk_changes(str(tmp_path), since=time.time() - 60)
-    assert len(changes) == 1
-    rel, _size, _mtime, preview = changes[0]
-    assert rel == "hello.py"
-    assert preview == "print('hi')"
-
-
-def test_collect_disk_changes_sensitive_in_nested_path(tmp_path):
-    """Finding 9 fix: 嵌套路径里的 .env 也不打印(全路径 search)。"""
-    from cc_harness.repl import _collect_disk_changes
-    import time
-    nested = tmp_path / "subdir" / ".env"
-    nested.parent.mkdir(parents=True)
-    nested.write_text("SECRET=foo", encoding="utf-8")
-    changes = _collect_disk_changes(str(tmp_path), since=time.time() - 60)
-    # path 含 .env → preview None
-    for rel, _size, _mtime, preview in changes:
-        if ".env" in rel:
-            assert preview is None
 

@@ -2,6 +2,7 @@
 from __future__ import annotations
 import asyncio
 import json
+import os
 import re
 from contextlib import AsyncExitStack
 from dataclasses import dataclass, field
@@ -11,6 +12,39 @@ from cc_harness.config import MCPServerConfig
 
 INIT_TIMEOUT_S = 30.0
 CALL_TIMEOUT_S = 30.0
+
+# Every tool result flows through :class:`ToolResult`, so the size cap lives
+# here rather than in each tool.  Unbounded output (a 10 MB ``find /`` or a
+# runaway MCP server) used to be persisted into the event log and replayed into
+# every later prompt, where compaction could only deal with it *after* the
+# damage to latency and cost.  Head+tail keeps both the beginning (headers,
+# paths) and the end (errors, summaries) of the output.
+MAX_TOOL_TEXT_CHARS = 128_000
+_TRUNCATED_TEMPLATE = "\n\n… [{n} characters truncated] …\n\n"
+
+
+def _truncate_tool_text(text: str, limit: int | None = None) -> tuple[str, int]:
+    """Return ``(bounded_text, original_length)``; unchanged text reports 0."""
+    if not isinstance(text, str):
+        return text, 0
+    cap = limit if limit is not None else _configured_tool_text_limit()
+    if len(text) <= cap:
+        return text, 0
+    keep_head = int(cap * 0.6)
+    keep_tail = max(0, cap - keep_head)
+    omitted = len(text) - keep_head - keep_tail
+    return (
+        f"{text[:keep_head]}{_TRUNCATED_TEMPLATE.format(n=omitted)}"
+        f"{text[-keep_tail:] if keep_tail else ''}",
+        len(text),
+    )
+
+
+def _configured_tool_text_limit() -> int:
+    raw = os.getenv("CC_HARNESS_MAX_TOOL_CHARS", "").strip()
+    if raw.isdigit() and int(raw) > 0:
+        return int(raw)
+    return MAX_TOOL_TEXT_CHARS
 
 
 def _failure_msg(name: str, exc: BaseException) -> str:
@@ -38,6 +72,22 @@ class ToolResult:
     trusted: bool = False
     capability: str = "unknown"
     metadata: dict = field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        # Single choke point: classmethod constructors and direct ``ToolResult(...)``
+        # calls (durable_runtime builds results directly) both pass through here.
+        bounded, original = _truncate_tool_text(self.llm_text)
+        if original:
+            self.llm_text = bounded
+            self.metadata = {**self.metadata, "tool_text_truncated": True, "tool_text_chars": original}
+        bounded_display, original_display = _truncate_tool_text(self.display_text)
+        if original_display:
+            self.display_text = bounded_display
+            self.metadata = {
+                **self.metadata,
+                "tool_display_truncated": True,
+                "tool_display_chars": original_display,
+            }
 
     @classmethod
     def success(

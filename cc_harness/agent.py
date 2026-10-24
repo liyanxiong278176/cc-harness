@@ -1,5 +1,12 @@
 """ReAct loop: streams one LLM turn, routes finish_reason, dispatches tools.
 
+**Eval-only engine.**  The product runs the Durable Runtime
+(``entrypoint`` → ``durable_runtime`` → ``worker``).  This module is kept for
+exactly one consumer: ``eval/locomo/runner.py``, whose published LoCoMo numbers
+are tied to this loop.  Do not import it from ``cc_harness/`` — the guard test
+``tests/test_single_runtime.py`` fails if you do.  Migrating LoCoMo to the
+durable runtime is what finally removes this file.
+
 Output is the classic 4-phase ReAct format (per user spec):
     思考: <LLM's full reasoning text>
     行动: <tool call>

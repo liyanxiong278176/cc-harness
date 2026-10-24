@@ -14,7 +14,10 @@ jobs:
   test:
     name: Python 3.11 / ${{ matrix.os }}
     runs-on: ${{ matrix.os }}
-    timeout-minutes: 30
+    # Measured 14–25 min locally (2,400 tests; the web/live-audit/sandbox tests
+    # dominate).  45 min leaves headroom for the slower hosted runners without
+    # reviving the old 30-minute cap that used to fail healthy runs.
+    timeout-minutes: 45
     strategy:
       fail-fast: false
       matrix:
@@ -40,6 +43,8 @@ jobs:
           tests/test_sandbox_capabilities.py
       - name: Full Python Ruff regression gate
         run: python scripts/check_ruff_baseline.py
+      - name: Legacy engine budget
+        run: python scripts/legacy_engine_inventory.py --check
       - name: Test
         env:
           CC_HARNESS_RUN_REAL_LLM: "0"

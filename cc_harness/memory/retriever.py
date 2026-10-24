@@ -23,12 +23,28 @@ def _format_age(ts: float) -> str:
 
 
 class MemoryRetriever:
-    def __init__(self, store, embedder, top_k: int = 5, token_budget: int = 800, drift_detector=None):  # E5
+    def __init__(
+        self,
+        store,
+        embedder,
+        top_k: int = 5,
+        token_budget: int = 800,
+        drift_detector=None,  # E5
+        *,
+        min_similarity: float = 0.0,
+        relative_margin: float = 0.25,
+    ):
         self._store = store
         self._embedder = embedder
         self.top_k = top_k
         self.token_budget = token_budget
         self.drift_detector = drift_detector
+        # Relevance gate for vector hits.  ``relative_margin`` drops hits that
+        # are clearly worse than this query's best match (scale-free, so it
+        # works for any embedding space); ``min_similarity`` is an optional
+        # absolute cosine floor for operators who have calibrated one.
+        self.min_similarity = min_similarity
+        self.relative_margin = relative_margin
 
     async def search(
         self,
@@ -42,6 +58,7 @@ class MemoryRetriever:
         actual_turn_idx = turn_idx if turn_idx is not None else 0
         embedding = await self._embedder.embed(query)
         results = await self._store.search_similar(embedding, k=top_k * 2)
+        results = self._gate_by_relevance(embedding, results)
         if results:
             ids = [m.id for m, _ in results]
             try:
@@ -50,12 +67,22 @@ class MemoryRetriever:
                 logger.warning("touch_recall failed (non-fatal): %s", e)
         from cc_harness.memory.maintenance.recall_weight import RecallWeighter
         weighter = RecallWeighter()
-        weighted = weighter.apply(self._filter_layers(results, layers))
+        # sqlite-vec returns a distance (lower is better) while RecallWeighter
+        # assumes a score (higher is better) and multiplies by a staleness
+        # weight.  Feeding the raw distance reversed relevance — the worst hit
+        # came first and staleness made a memory look *better* — so convert to a
+        # bounded similarity before weighting.
+        weighted = weighter.apply(
+            [
+                (mem, 1.0 / (1.0 + max(0.0, float(distance))))
+                for mem, distance in self._filter_layers(results, layers)
+            ]
+        )
 
         # E5 drift 检测(召出后, ≥2 同 entity 才判)
         if self.drift_detector is not None and weighted:
             try:
-                # weighted 是 list[(Memory, distance)],DriftDetector 要 list[Memory],拆 tuple
+                # weighted 是 list[(Memory, similarity)],DriftDetector 要 list[Memory],拆 tuple
                 results_list = [m for m, _ in weighted]
                 await self.drift_detector.check_after_read(
                     session_id=results_list[0].session_id or "default",
@@ -190,6 +217,50 @@ class MemoryRetriever:
         except Exception as e:
             logger.warning("_search_fts_only failed, returning []: %s", e)
             return []
+
+    @staticmethod
+    def _cosine(a, b) -> float | None:
+        """Cosine similarity for two equal-length vectors, else ``None``."""
+        try:
+            if not a or not b or len(a) != len(b):
+                return None
+            dot = sum(float(x) * float(y) for x, y in zip(a, b))
+            na = sum(float(x) * float(x) for x in a) ** 0.5
+            nb = sum(float(y) * float(y) for y in b) ** 0.5
+            if na == 0.0 or nb == 0.0:
+                return None
+            return dot / (na * nb)
+        except (TypeError, ValueError):
+            return None
+
+    def _gate_by_relevance(self, query_embedding, results: list) -> list:
+        """Drop vector hits that are noise for this query.
+
+        The store returns the k nearest neighbours regardless of how far away
+        they are, so a query with no relevant memory used to inject five
+        unrelated facts with full confidence.  Gating is relative by default
+        (works for any embedding space, including the local hash embedder) with
+        an optional absolute floor for calibrated deployments.
+        """
+        if not results:
+            return results
+        scored: list[tuple[object, float, float | None]] = []
+        for mem, distance in results:
+            similarity = self._cosine(query_embedding, getattr(mem, "embedding", None))
+            scored.append((mem, distance, similarity))
+        if self.min_similarity > 0.0:
+            scored = [
+                item
+                for item in scored
+                if item[2] is None or item[2] >= self.min_similarity
+            ]
+        known = [item[2] for item in scored if item[2] is not None]
+        if known and self.relative_margin > 0.0:
+            floor = max(known) - self.relative_margin
+            scored = [
+                item for item in scored if item[2] is None or item[2] >= floor
+            ]
+        return [(mem, distance) for mem, distance, _ in scored]
 
     async def build_injection_block(self, query: str) -> str:
         if not (query or "").strip():

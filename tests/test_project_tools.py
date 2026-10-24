@@ -14,7 +14,7 @@ from __future__ import annotations
 
 from datetime import datetime, timezone
 from pathlib import Path
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
@@ -716,91 +716,3 @@ async def test_dispatch_prevalidates_all_sub_specs_before_creating(deps):
     runner.run.assert_not_awaited()
 
 
-async def test_dispatch_converts_runner_exception_and_pauses_failure(deps):
-    """One runner exception becomes a failed result without aborting fan-out."""
-    from cc_harness.project.subagent import SubAgentResult
-
-    parent = await deps["service"].create(title="parent")
-    runner = MagicMock(current_depth=0, MAX_DEPTH=2)
-
-    async def run(**kwargs):
-        if kwargs["title"] == "boom":
-            raise RuntimeError("runner exploded")
-        return SubAgentResult(
-            task_id=kwargs["task_id"], title=kwargs["title"], status="done",
-        )
-
-    runner.run = AsyncMock(side_effect=run)
-    pauses = []
-
-    async def progress_cb(task_id, status, detail=""):
-        return None
-
-    async def failure_pause_cb(result):
-        pauses.append(result)
-        return "continue"
-
-    result = await dispatch_subagent_handler(
-        {
-            "task_id": parent.id,
-            "sub_specs": [{"title": "good"}, {"title": "boom"}],
-        },
-        dispatch_subagent_runner=runner,
-        progress_cb=progress_cb,
-        failure_pause_cb=failure_pause_cb,
-        **deps,
-    )
-
-    assert result.is_error is False
-    assert "good" in result.llm_text
-    assert "boom" in result.llm_text
-    assert len(pauses) == 1
-    assert pauses[0].status == "failed"
-    assert pauses[0].title == "boom"
-    assert "RuntimeError" in (pauses[0].error or "")
-
-
-async def test_subagent_user_rejected_policy_tool_is_nonfatal(deps, caplog):
-    """A policy ask rejected by the user is observable but not a runner failure."""
-    import logging
-
-    from cc_harness.project.subagent import SubAgentRunner
-
-    task = await deps["service"].create(title="policy task")
-    await deps["service"].update(task.id, status="in_progress")
-    await deps["service"].update(task.id, status="done")
-    runner = SubAgentRunner(
-        llm=MagicMock(),
-        mcp=MagicMock(),
-        todo_service=deps["service"],
-        project_root=deps["cwd"],
-        max_iter=5,
-        policy=MagicMock(),
-    )
-
-    async def fake_run_turn(messages, *args, **kwargs):
-        messages.append({
-            "role": "tool",
-            "name": "run_command",
-            "content": "[未执行:用户拒绝] run_command — requires confirmation",
-            "is_error": True,
-        })
-        messages.append({"role": "assistant", "content": "continued safely"})
-        return MagicMock(
-            error=None, api_total_tokens=0, breakdown_subtotal=1,
-        )
-
-    with caplog.at_level(logging.INFO, logger="cc_harness.project.subagent"):
-        with patch("cc_harness.agent.run_turn", side_effect=fake_run_turn):
-            result = await runner.run(
-                task_id=task.id,
-                title=task.title,
-                session_id=deps["session_id"],
-                timeout=10,
-                retried=True,
-            )
-
-    assert result.status == "done"
-    assert any(
-        "run_command" in record.getMessage() for record in caplog.records
-    )

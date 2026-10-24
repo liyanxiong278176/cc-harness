@@ -103,7 +103,7 @@ def _env_flag(name: str) -> bool:
 
 @dataclass
 class SharedCapabilityServices:
-    """Configuration shared by SessionRuntime and DurableRuntime.
+    """Process-wide services shared by durable workers and the WebUI/CLI.
 
     Resource ownership remains with the caller.  In particular, the returned
     L2 client is closed by the runtime that constructed this bundle.
@@ -138,7 +138,7 @@ class SharedCapabilityServices:
     ) -> "SharedCapabilityServices":
         root = Path(cwd).resolve()
         policy_path = root / "policy.yaml"
-        policy_config = load_policy_config(policy_path)
+        policy_config = load_policy_config(policy_path, project_root=root)
         profile_name = profile.name if profile is not None else "standard"
         provenance_mode = profile_name == "hardened-safety" or os.getenv(
             "CC_HARNESS_SECURITY_MODE", ""
@@ -149,7 +149,7 @@ class SharedCapabilityServices:
             additional_roots=additional_roots,
             provenance_mode=provenance_mode,
         )
-        l2_config = load_l2_config(policy_path)
+        l2_config = load_l2_config(policy_path, project_root=root)
         l2_client = (
             make_async_openai(
                 api_key=config.openai_api_key,
@@ -158,8 +158,8 @@ class SharedCapabilityServices:
             if l2_config.enabled and config.openai_api_key
             else None
         )
-        executor_config = load_executor_config(policy_path)
-        l5_config = load_l5_config(policy_path)
+        executor_config = load_executor_config(policy_path, project_root=root)
+        l5_config = load_l5_config(policy_path, project_root=root)
         if host_execution:
             executor_config.backend = ExecutorBackend.NATIVE
         memory_config = load_memory_config(

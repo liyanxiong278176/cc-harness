@@ -3,6 +3,15 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
+import pytest
+
+# agentdojo is an optional benchmark dependency (``pip install -e '.[benchmarks]'``).
+# A plain ``pip install -e '.[dev]'`` must still be able to collect the suite.
+pytest.importorskip(
+    "agentdojo",
+    reason="optional benchmark dependency; install with pip install -e '.[benchmarks]'",
+)
+
 from eval.cc_only.adapters.agentdojo import (
     AgentDojoBalanced500Adapter,
     AgentDojoBalancedAdapter,

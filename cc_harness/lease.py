@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import logging
 import os
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
@@ -18,8 +19,9 @@ from .run_store import (
     LeaseFenceError,
     ResourceLeaseConflict,
     RunStore,
-    RunStoreError,
 )
+
+log = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
@@ -429,7 +431,9 @@ class ResourceLeaseManager:
                 heartbeat_task.cancel()
                 with contextlib.suppress(asyncio.CancelledError):
                     await heartbeat_task
-            with contextlib.suppress(LeaseFenceError, RunStoreError, Exception):
+            # Release is best-effort: the lease is already fenced/expired and a
+            # failure here must not mask the action's own exception.
+            with contextlib.suppress(Exception):
                 await self.release(resources)
 
     async def _heartbeat_loop(
@@ -438,6 +442,7 @@ class ResourceLeaseManager:
         resources: tuple[ResourceLease, ...],
     ) -> None:
         interval = max(0.25, min(10.0, self.ttl_seconds / 3.0))
+        consecutive_failures = 0
         while True:
             await asyncio.sleep(interval)
             try:
@@ -448,8 +453,35 @@ class ResourceLeaseManager:
                 # original expiry here: RunWorker renews the same epoch in
                 # place, so a long action must keep its resource lock alive
                 # beyond the first TTL window.
-            except (LeaseFenceError, RunStoreError, Exception):
+                consecutive_failures = 0
+            except LeaseFenceError:
+                # Another worker owns the lease now; renewing is meaningless and
+                # the action must not keep writing under a stale epoch.
+                log.warning(
+                    "resource lease for run %s was fenced by a newer owner; "
+                    "heartbeat stopped",
+                    lease.run_id,
+                )
                 return
+            except Exception as exc:  # noqa: BLE001 - a transient store error must not kill the lock
+                consecutive_failures += 1
+                log.warning(
+                    "resource lease heartbeat failed for run %s (%d/3): %s",
+                    lease.run_id,
+                    consecutive_failures,
+                    exc,
+                )
+                if consecutive_failures >= 3:
+                    # Give up loudly: the TTL fence is now the only protection,
+                    # and the operator needs the trail to explain a takeover.
+                    log.error(
+                        "resource lease heartbeat gave up for run %s after %d "
+                        "consecutive failures; lease will expire",
+                        lease.run_id,
+                        consecutive_failures,
+                    )
+                    return
+                await asyncio.sleep(min(interval, 1.0))
 
 
 __all__ = [

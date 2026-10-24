@@ -1487,14 +1487,15 @@ def _cap_delta_size(
     config: ContextConfig,
     counter: TokenCounter | None,
 ) -> str:
-    """Enforce the Tier-3 delta size cap (spec L236-237).
+    """Bound one summarizer input to the summary budget.
 
     If the serialized delta exceeds ``summarize_max_output_tokens * 4`` tokens
-    (default ≈ 8K), truncate to 70% of the budget — keeping the most recent
+    (default ≈ 8K), truncate to 70% **of that cap** — keeping the most recent
     messages and dropping earlier ones — and prefix a truncation marker naming
-    how many earlier messages were omitted. Prevents the Tier-3 summary LLM call
-    from itself overflowing the context window or being silently truncated by
-    the provider. When under the cap, ``rendered_delta`` is returned unchanged.
+    how many earlier messages were omitted.  Callers chunk the delta first (see
+    ``_summary_chunks``), so this is a belt-and-braces bound and never receives
+    a whole history: a summary produced from the tail alone would otherwise be
+    persisted while still advertising full coverage.
     """
     token_counter = counter if counter is not None else TokenCounter()
     budget = config.summarize_max_output_tokens
@@ -1502,8 +1503,9 @@ def _cap_delta_size(
     if token_counter.count_text(rendered_delta) <= cap:
         return rendered_delta
 
-    # Over the cap: keep the most recent messages that fit in 70% of the budget.
-    keep_budget = int(budget * 0.7)
+    # Over the cap: keep the most recent messages that fit in 70% of the cap
+    # (previously 70% of the *output* budget, i.e. 4× less than the stated cap).
+    keep_budget = int(cap * 0.7)
     kept: list[dict] = []
     running = 0
     for m in reversed(delta_messages):
@@ -1603,10 +1605,12 @@ async def apply_tier3_summarize(
     The projection is rebuilt from the cumulative fragments plus the protected
     source tail; Snip/Prune output is never used as Summary input.
 
-    The serialized delta is capped at ``summarize_max_output_tokens * 4`` tokens
-    (spec L236-237): over the cap it is truncated to 70% of the budget with a
-    truncation marker, so the summary LLM call cannot itself overflow the
-    context window or be silently truncated by the provider.
+    The serialized delta is split into chunks of at most
+    ``summarize_max_output_tokens * 4`` tokens (spec L236-237) and every chunk
+    is summarized, carrying the previous chunk's summary forward.  A single
+    oversized message is split at the text level by ``_summary_chunks``; the
+    delta is never dropped, so a summary can safely advertise full coverage of
+    the compacted range.
 
     Errors are caught and surfaced via ``CompactionStats.error`` — this
     function never raises (Tier 3 failure must not kill the cascade).
@@ -1653,25 +1657,17 @@ async def apply_tier3_summarize(
         # preserve older summary fragments byte-for-byte. Direct callers keep
         # the historical previous-summary merge behavior.
         content = "" if authoritative_messages is not None else (prev_content or "")
-        if authoritative_messages is not None:
-            # Durable compaction must remain bounded even when a checkpoint is
-            # rebased after a long interruption.  Sending one capped delta is
-            # both cheaper and lease-safe; the omission marker makes the loss
-            # explicit while the authoritative source refs retain recovery
-            # access to the complete transcript.
-            rendered_deltas = [
-                _cap_delta_size(
-                    _render_messages_for_summary(delta_messages),
-                    delta_messages,
-                    config,
-                    counter,
-                )
-            ]
-        else:
-            rendered_deltas = [
-                _render_messages_for_summary(chunk)
-                for chunk in _summary_chunks(delta_messages, config, counter)
-            ]
+        # Chunk the delta instead of truncating it: every authoritative message
+        # must reach the summarizer, otherwise the persisted summary claims full
+        # coverage of a range it only saw the tail of (silent history loss).
+        # Chunks are merged sequentially through ``content``; ``_cap_delta_size``
+        # remains a per-chunk guard for a single oversized message.
+        rendered_deltas = [
+            _cap_delta_size(
+                _render_messages_for_summary(chunk), chunk, config, counter
+            )
+            for chunk in _summary_chunks(delta_messages, config, counter)
+        ]
         for rendered_delta in rendered_deltas:
             user_prompt = summary_user_prompt(content or None, rendered_delta)
             summary_messages = [
