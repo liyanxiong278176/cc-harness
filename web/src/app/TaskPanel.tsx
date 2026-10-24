@@ -12,6 +12,14 @@ function Glyph({ status }: { status: TaskView['status'] }) {
   return <CircleDashed size={14} className="task-pending" />
 }
 
+function statusLabel(status: TaskView['status']): string {
+  if (status === 'done') return '已完成'
+  if (status === 'running') return '进行中'
+  if (status === 'blocked') return '已阻塞'
+  if (status === 'failed') return '失败'
+  return '待执行'
+}
+
 export function TaskPanel({
   tasks, running,
 }: {
@@ -24,10 +32,14 @@ export function TaskPanel({
   const progress = useMemo(() => {
     const done = tasks.filter(task => task.status === 'done').length
     const active = tasks.filter(task => task.status === 'running').length
-    const pending = tasks.length - done - active
+    const blocked = tasks.filter(task => task.status === 'blocked').length
+    const failed = tasks.filter(task => task.status === 'failed').length
+    const pending = tasks.length - done - active - blocked - failed
     return [
       done > 0 ? `${done} 已完成` : '',
       active > 0 ? `${active} 进行中` : '',
+      blocked > 0 ? `${blocked} 已阻塞` : '',
+      failed > 0 ? `${failed} 失败` : '',
       pending > 0 ? `${pending} 待执行` : '',
     ].filter(Boolean).join(' · ')
   }, [tasks])
@@ -56,9 +68,15 @@ export function TaskPanel({
       {!collapsed && (
         <ol className="task-list">
           {tasks.map(task => (
-            <li key={task.id} className="task-item" data-status={task.status}>
+            <li
+              key={task.id}
+              className="task-item"
+              data-status={task.status}
+              title={`${task.title} · ${statusLabel(task.status)}`}
+            >
               <span className="task-glyph"><Glyph status={task.status} /></span>
               <span className="task-title">{task.title}</span>
+              <span className="sr-only">{statusLabel(task.status)}</span>
             </li>
           ))}
         </ol>

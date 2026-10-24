@@ -66,17 +66,20 @@ test('tool summaries survive a later observation event', () => {
   assert.equal(tool.status, 'done')
 })
 
-test('deriveTasks prefers real todos, then titled plan nodes', () => {
+test('deriveTasks mirrors the Runtime todo list, including generated Run ids', () => {
   const generated: TodoItem = {
-    todo_id: 'root-0123456789abcdef0123456789abcdef',
-    title: 'root-0123456789abcdef0123456789abcdef',
+    todo_id: 'follow-up-0123456789abcdef0123456789abcdef',
+    title: '回答用户身份问题',
     status: 'done',
   }
   const real: TodoItem = { todo_id: 'step1', title: '检查目录', status: 'in_progress' }
   assert.deepEqual(deriveTasks([generated, real], undefined, 'running'), [
+    { id: generated.todo_id, title: '回答用户身份问题', status: 'done' },
     { id: 'step1', title: '检查目录', status: 'running' },
   ])
-  assert.deepEqual(deriveTasks([generated], {
+  // The plan-node fallback is only for a Runtime that has not materialised a
+  // todo list yet.
+  assert.deepEqual(deriveTasks([], {
     nodes: [{ node_id: 'step-one', title: '检查目录' }, { node_id: 'step-two', title: '汇报' }],
   }, 'running'), [
     { id: 'step-one', title: '检查目录', status: 'pending' },
@@ -108,6 +111,27 @@ test('todo, plan and approval events update without dropping prior state', () =>
   assert.equal(approvals.length, 1)
   const decided = applyApprovalEvent(approvals, event('ApprovalGranted', 'status', { approval_id: 'approval-1' }))
   assert.equal(decided.length, 0)
+})
+
+test('TodoUpdated keeps plan_node_id while applying task_plan title and status', () => {
+  let todos: TodoItem[] = []
+  todos = applyTodoEvent(todos, event('TodoCreated', 'status', {
+    todo: {
+      id: 'follow-up-run',
+      plan_node_id: 'follow-up-run',
+      title: '你是谁',
+      status: 'pending',
+    },
+  }))
+  todos = applyTodoEvent(todos, event('TodoUpdated', 'status', {
+    todo: { id: 'follow-up-run', title: '回答用户身份问题', status: 'done' },
+  }))
+  assert.equal(todos[0]?.title, '回答用户身份问题')
+  assert.equal(todos[0]?.status, 'done')
+  assert.equal(todos[0]?.plan_node_id, 'follow-up-run')
+  assert.deepEqual(deriveTasks(todos, undefined, 'completed'), [
+    { id: 'follow-up-run', title: '回答用户身份问题', status: 'done' },
+  ])
 })
 
 test('mergeTodoLists keeps snapshot fields authoritative', () => {

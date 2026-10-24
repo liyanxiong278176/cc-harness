@@ -26,14 +26,14 @@ Vite 默认把 `/api` 代理到 `http://127.0.0.1:3080`，可用 `VITE_API_PROXY
 - 对话内容列 `clamp(680px, 60%, 920px)`，用户气泡 22px 圆角、右对齐；助手正文 14/24px，Markdown 全宽。
 - 每一轮用户消息把过程与最终回答分开：过程（工具、思考、通知、错误）折叠为「执行过程 · N 步」，最终助手回答始终可见；最新一轮运行中默认展开较短的执行过程。
 - 输入卡 22px 圆角，底部工具行包含工作区、模式、权限、模型、发送/停止；Enter 发送、Shift+Enter 换行。
-- 输入卡上方按需显示「任务列表」（来自 `todos` / `plan.nodes`，实时更新）和审批卡。
+- 输入卡上方按需显示「任务列表」（只跟随 Runtime task-control 层 `task_projection.todos`，标题与状态随 `TodoCreated/Updated/Completed` 实时更新）和审批卡。
 - 新建会话为居中 Hero：鱼形标识、标题、工作区选择与输入卡。
 - 深/浅主题共享语义 token：暗色背景 `#151517`、侧栏 `#1b1b1c`、气泡/输入卡 `#2c2c2e`、主文字 `#f9fafb`。
 
 ## 数据与联调
 
 - 初次加载只请求 `/api/bootstrap?include_sessions=false`，侧栏会话列表独立加载，不再阻塞输入卡。
-- 会话正文使用 `GET /api/sessions/{run_id}/chat?limit=1200`：服务端只读取聊天相关事件（用户/助手/工具/计划/审批），并聚合 Run 树中的 `todos` 与 `plan.nodes`，所以刷新后计划不会退回根任务。
+- 会话正文使用 `GET /api/sessions/{run_id}/chat?limit=1200`：服务端只读取聊天相关事件（用户/助手/工具/计划/审批），并聚合 Run 树中的 `todos` 与 `plan.nodes` 用于对话历史；任务列表单独使用 `task_projection`（effective/current Run 的 Runtime task-control 层），不会把整棵会话树的历史 todo 混进当前任务。
 - SSE 使用 `GET /api/sessions/{run_id}/events?after=<root_seq>&cursors=<json>`。`cursors` 按 Run 传入每个子 Run 的已知序列，避免切换会话或重连时从 0 重放整棵树。
 - 临时增量走 `stream` 事件（`content` / `reasoning` / `tool_call_delta` / `done`）。durable `AssistantMessageCommitted` 到达后会清掉对应 Run 的临时段，并忽略迟到的增量，避免重复文本和完成协议 JSON 泄露。
 - 发送消息先本地插入用户气泡，再 POST；POST 只写入 durable 队列即返回，supervisor 的启动放到后台任务，输入区不再等待模型/工具初始化。
