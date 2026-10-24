@@ -63,8 +63,8 @@ eval/result/parity-*/
 /img/*
 !/img/README.md
 # Fresh execution screenshots linked directly from README.
-!/img/runtime-20261021/
-!/img/runtime-20261021/*.png
+!/img/runtime-20261024/
+!/img/runtime-20261024/*.png
 
 # cc-harness ad-hoc session/test memory DB
 cc_harness/memory/*.db
