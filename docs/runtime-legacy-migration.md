@@ -56,7 +56,7 @@ python scripts/legacy_engine_inventory.py --check
 
 | 范围 | 引擎 | 约束 |
 | --- | --- | --- |
-| `cc_harness/`（产品） | Durable Runtime | 不得引用 legacy（guard test + 预算脚本，CI 强制） |
+| `cc_harness/`（产品） | Durable Runtime | 不得引用 legacy（guard test + 预算脚本强制） |
 | `eval/locomo/` | legacy `run_turn` | 唯一的允许消费者，`eval_refs` 预算 7 |
 | `tests/` | 两者 | `test_refs` 预算 165，只降不升 |
 

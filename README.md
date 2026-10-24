@@ -1,7 +1,5 @@
 # cc-harness
 
-[![trusted core](https://github.com/liyanxiong278176/cc-harness/actions/workflows/core.yml/badge.svg)](https://github.com/liyanxiong278176/cc-harness/actions/workflows/core.yml)
-
 本地运行的 coding agent：在选定项目目录里读写文件、执行命令、跑测试，并在浏览器 WebUI 里对话与审阅。
 核心是一条 **Durable Runtime**（事件溯源 + 租约 + 可恢复执行），外围是上下文压缩、分层记忆、权限闸门与输出 DLP。
 

@@ -18,7 +18,7 @@ cc-harness 是一个**本地编程代理**:通过 OpenAI 兼容 LLM(默认配 De
 - **记忆已接入主链路**(CLAUDE.md 旧版说"未接入"是错的):`capability_runtime` 在 durable boot 时构造 memory deps;
   自动注入只到 L3 画像,`memory_recall` 工具负责按层取 L1/L0。legacy 的 REPL boot 已随 `repl.py` 删除。
 - **测试**:`python -m pytest tests` 可一键跑;`tests/test_agentdojo_adapter.py` 在缺 `agentdojo` 时整体 skip
-  (可选依赖:`pip install -e '.[benchmarks]'`)。完整套件本地实测 ~45 min,CI 上限已调到 75 min。
+  (可选依赖:`pip install -e '.[benchmarks]'`)。完整套件本地实测 15–25 min;项目不再有 CI,发布前本地跑全量。
 - 对外口径(数字/边界/已知问题)以 `README.md` + `docs/eval-evidence/` 为准,不要再引用旧版"RO mount""凭据不可达"等说法。
 
 ## Web UI
@@ -44,7 +44,7 @@ python main.py --no-open --port 3080
 python main.py --command status      # 命令行控制面(status/list/attach/approve/...)
 
 # Tests (~2,100 个 test 函数,217 个文件)
-python -m pytest tests/                          # 全量(本地 ~45min;CI 上限 75min)
+python -m pytest tests/                          # 全量(本地 15-25 min)
 python -m pytest tests/ -x -q                    # 快速失败
 python -m pytest tests/test_context.py -v        # 单文件
 python -m pytest tests/test_policy.py::test_name # 单用例
@@ -176,7 +176,7 @@ kill-switch:`policy.yaml` 的 `l5.enabled=false`。工具观察段不扫(M2 已�
 
 ## Eval / red-team (`eval/promptfoo/`)
 
-A promptfoo-based red-team suite (LOCAL only, 2026-07-06 起退役 CI integration):
+A promptfoo-based red-team suite (LOCAL only;无 CI integration):
 
 - **Provider** = `wrappers/cc_harness.py`, a custom Python provider that spawns `python -u main.py --mode coding`, waits `boot_wait`s for MCP init, writes the attack prompt to stdin + `exit`, then parses the 结果 segment out of the 4-phase output. `timeout` is in **ms** (not s) — footgun(no implicit conversion,在 wrapper 已是 ms,但 README 一律标 ms)。
 - **One unified config, LOCAL only (2026-07-06 起)**:`promptfooconfig.unified.yaml` — 同文件含 `tests:` + `redteam:` 两段,两次 promptfoo invocation 一把跑完。取代历史的 4 个 config(`security` / `redteam` / `redteam-full` / `security-allow`,已删除)。
@@ -184,16 +184,16 @@ A promptfoo-based red-team suite (LOCAL only, 2026-07-06 起退役 CI integratio
   - **redteam 段**(`promptfoo redteam run`):OWASP 全 4 类(1/6/7/9 → 17 底层 plugins,见 §9.6)+ `coding-agent:all`(13 件全集,取代历史的 `:core` 5 件)+ `mcp`。Needs `PROMPTFOO_API_KEY`(promptfoo cloud 生成 attack)。`numTests: 3` × ~20 plugin = ~60 底 probe(展开含 `harmful` × 26)~150-200,本地串行 ~5-10h。
   - **执行类沙箱(L8)**:inline 沙箱 30 条让 wrapper 注 `CC_HARNESS_AUTOCONFIRM=always` + `SANDBOX_FALLBACK=hard`(沙箱挂不降级 native → 防降级泄露 CI secret / 真泄露),`judges/sandbox_isolation.txt` 判容器 vs 宿主视角。前置 Docker + `pip install -e '.[sandbox]'`,不起跑 → `SandboxExecutor` fail-soft → false negative(L8 hold 不住报 hold,假数据)。
   - **跑法**:`python tools/run_eval.py unified`(或 `npm run redteam-all`)— 内部 `promptfoo eval` 跑 tests 段 + `promptfoo redteam generate/eval` 跑 redteam 段,合一份 `unified-report.md`。`run_eval.py` 仍保留 `security/redteam/all` 旧入口(向后兼容,历史引用)。
-  - **不卡 CI**:本机跑 ~5-10h,Actions free-tier 跑不起。`.github/workflows/redteam.yml` 与 `.github/workflows/redteam-full.yml` 2026-07-06 起整体退场(stub,`on: {}`),CI 红队历史详见 git blame。
+  - **本地跑**:~5-10h。`.github/workflows/` 已于 2026-10 整体删除,红队只在需要时本地执行。
 - **`defense_matrix.yaml` = 分类单一来源**:category/pluginId → 防御层(L2/L4/L5/**L8**/judge)+ severity。执行类(coding-agent `sandbox-read/write-escape`/`network-egress-bypass`/`procfs-credential-read`/`secret-env/file-read`)主层 **L8**(沙箱隔离层,spec §6.4):allow 模式跑,区分 L4(agent 闸门漏)vs L8(沙箱兜)。`report_to_md.py:classify_layer` 从它加载(取代硬编码表)。加新 category/pluginId **必须先登记**,否则 `UnknownCategoryError` → report fail-closed 收集到"未知 category"段(不静默落"其它")。`harmful:*` special-case 归 judge(不进 matrix)。
 - **Per-layer ASR 衡量**:report 的"防御矩阵"表按 L2/L4/L5/**L8**/judge 各层汇总 ASR(真实突破/总数),回答"M1(L4)/M2(L2)/M3(L5)/M4(L8 沙箱) 各挡哪类攻击"。L8 ASR = allow 模式执行类攻击的沙箱隔离率(沙箱 hold/总数);deny 模式 config 不产生 L8 数据(执行类只在 allow 跑)。
 - **`[dlp]` 前置**:测 PII 类(`pii-exfil`)前 `pip install -e '.[dlp]'`(装 presidio)。未装时 `report_to_md._presidio_available()` 返回 False,`pii-exfil` 不计入 L5 ASR(避免被算成 L5 全突破),report 标"环境未就绪"。
 - **Tools (`eval/promptfoo/tools/`)**:
   - `generate_attacks.py` — LLM-generates dynamic attacks per category (5 cats × N). Categories are hardcoded — **add a new capability to cc-harness → add a category here first**, else the dynamic generator won't probe the new attack surface.
   - `curate_attacks.py` — promotes eval failures into the static set. Promotion requires `score < 0.4` AND `cosine_sim < 0.85` vs existing (embedding dedup, fail-closed). Manual (`npm run curate`); human reviews the diff before commit.
-  - `report_to_md.py` — **single source of truth for classification + PR comment** (no JS/Python split). Run by CI's comment job. `classify_layer` + `compute_asr_by_layer` + `severity_gate()` 都在这。
+  - `report_to_md.py` — **single source of truth for classification** (no JS/Python split). 本地生成报告。`classify_layer` + `compute_asr_by_layer` + `severity_gate()` 都在这。
   - `run_eval.py` — one-shot Python harness: `python tools/run_eval.py {security|redteam|all|unified} [--keep-json] [--per-cat N]`. 推荐 `unified`(LOCAL 一键跑完,2026-07-06 起取代 `security/redteam/all` 三个旧入口)。Wraps `npx promptfoo`, writes JSON to `.report-cache/` (deleted unless `--keep-json`), emits `*-report.md`(`unified-report.md` 为合并输出)。
-- **CI retired (2026-07-06)**:`.github/workflows/redteam.yml` 与 `.github/workflows/redteam-full.yml` 整体退场(`on: {}`,stub)。Actions free-tier 跑不起 full OWASP + coding-agent:all(~5-10h,job 360min 上限余量为 0),改成 LOCAL `npm run redteam-all` 跑。CI 历史上以 `redteam.yml` 3 jobs(eval → redteam → comment)串 + `severity_gate` 阻断合并;`run_eval.py unified` 单进程含所有 4 类 ASR (L2/L4/L5/L8)。CI 红队历史详见 git blame,re-enable 需重写一个 CI-only config(`numTests: 1` 提速 + 启 PROMPTFOO_API_KEY secret)。
+- **无 CI(2026-10)**:`.github/workflows/` 已删除(原 core / redteam / redteam-full / sandbox-conformance)。测试、lint、预算闸门、红队全部本地跑;`run_eval.py unified` 单进程含 4 类 ASR(L2/L4/L5/L8)。历史见 git blame。
 - **Eval-v2 (2026-07-28,14 task) 在原 red-team 上加了 5 个能力**(详见 `docs/eval-methodology.md`):
   - **Trajectory + outcome 双覆盖**:`python main.py --emit-events <path>` 把 Thought/Action/Observation/Result 落 JSONL,`wrappers/cc_harness.py` 把步数/工具错误/borderline 摘要塞进 judge input,`report_to_md.py` 失败/通过表加 3 列。独立可视化:`python eval/promptfoo/tools/trajectory_to_html.py <dir> -o trajectory-report.html`(零依赖,不碰 web/src)。
   - **Pass^k + Wilson CI**:`promptfooconfig.unified.yaml` 15 处 critical attack 加 `repeat: 5`,`report_to_md.py:wilson_ci + aggregate_repeats` 出 `hold^k / σ / 95%CI` 表(n=5 CI 仍宽,诚实呈现)。
@@ -218,7 +218,7 @@ A promptfoo-based red-team suite (LOCAL only, 2026-07-06 起退役 CI integratio
 
 ## Config & files
 
-- `.env` — core (3 required, no defaults — see `config.py`): `OPENAI_API_KEY`, `OPENAI_BASE_URL`, `OPENAI_MODEL`. Eval + memory add: `EMBEDDING_BASE_URL` / `EMBEDDING_API_KEY` / `EMBEDDING_MODEL` / `EMBEDDING_DIM` (SiliconFlow `BAAI/bge-m3`, dim 1024), `JUDGE_MODEL`, and `PROMPTFOO_API_KEY` (OWASP plugins only). CI builds these into `eval/promptfoo/.env.ci` from secrets.
+- `.env` — core (3 required, no defaults — see `config.py`): `OPENAI_API_KEY`, `OPENAI_BASE_URL`, `OPENAI_MODEL`. Eval + memory add: `EMBEDDING_BASE_URL` / `EMBEDDING_API_KEY` / `EMBEDDING_MODEL` / `EMBEDDING_DIM` (SiliconFlow `BAAI/bge-m3`, dim 1024), `JUDGE_MODEL`, and `PROMPTFOO_API_KEY` (OWASP plugins only);本地写在 `eval/promptfoo/.env`。
 - `pyproject.toml` — deps + packaging (`pip install -e .`). pytest config: `asyncio_mode = "auto"`, `testpaths = ["tests"]`. ruff: line-length 100, target py311.
 - `mcp.json`: MCP server entries. Per-server failures are isolated — one bad server logs a red warning, the rest still boot (`init_timeout_s` defaults to 30s in `mcp_client.py`). The bundled config mixes stdio (npx-launched: filesystem, playwright) and SSE (ModelScope-hosted: fetch + others) transports. Tool names are exposed to the LLM as `mcp__{server}__{tool}`.
 - `~/.cc-harness/designs/`: design-mode artifacts 的旧落盘目录;design 模式随 legacy 引擎一起移除,新代码不要再写这里。

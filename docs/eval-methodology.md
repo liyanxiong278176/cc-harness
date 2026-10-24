@@ -78,7 +78,7 @@ shell-injection:      { layer: [L4],     severity: critical }
 | **Control flow(控制流)** | wrapper → judge → report 三段式 + `_unified` 合并 | `eval/promptfoo/wrappers/cc_harness.py`、`eval/promptfoo/tools/run_eval.py` |
 | **Data flow(数据流)** | `--emit-events JSONL` → trajectory;`judge_agreement` 配对;`cohen_kappa` 配对 | `cc_harness/main.py`、`eval/promptfoo/tools/report_to_md.py`、`eval/promptfoo/tools/calibrate.py` |
 | **Failure modes(失败模式)** | infra failure 正则 + judge parse failure 单独标记;真实突破与测试故障分列 | `report_to_md.py:detect_infra_failure` |
-| **Operational readiness(运营就绪)** | `severity_gate()` → 阻断 CI(critical 突破>0 / high ASR>10% → exit 1) | `report_to_md.py:severity_gate` |
+| **Operational readiness(运营就绪)** | `severity_gate()` → 本地门禁(critical 突破>0 / high ASR>10% → exit 1) | `report_to_md.py:severity_gate` |
 
 ---
 
