@@ -313,7 +313,14 @@ export function applyTodoEvent(todos: TodoItem[], event: RuntimeEvent): TodoItem
   const index = todos.findIndex(item => item.todo_id === todo.todo_id)
   if (index < 0) return [...todos, todo]
   const next = todos.slice()
-  next[index] = { ...next[index], ...todo }
+  // TodoUpdated is a partial fact: task_plan revisions may omit the
+  // plan_node_id while changing title/status. Keep the prior link instead of
+  // erasing it, so the checklist cannot fall back to a stale plan node.
+  next[index] = {
+    ...next[index],
+    ...todo,
+    plan_node_id: todo.plan_node_id ?? next[index].plan_node_id,
+  }
   return next
 }
 
@@ -405,9 +412,11 @@ function normalizeStatus(value: string | undefined): TaskView['status'] {
 }
 
 /**
- * The runtime emits one generated todo per Run plus, when the agent uses the
- * planning tools, real user-facing steps.  Prefer the real todos; fall back to
- * titled plan nodes so a plan-first session still gets a visible checklist.
+ * The Runtime task-control projection is the single source of truth for the
+ * checklist.  It may use generated Run ids (root-… / follow-up-…), but those
+ * ids carry the authoritative title and status, so the UI must not filter them
+ * in favour of plan nodes.  A plan-node fallback is used only when the Runtime
+ * has not materialised a todo list yet.
  */
 export function deriveTasks(
   todos: TodoItem[],
@@ -415,13 +424,19 @@ export function deriveTasks(
   runStatus: string,
   activeRunId?: string,
 ): TaskView[] {
-  const useful = todos.filter(todo => !isGenerated(todo.todo_id) && !isGenerated(todo.title))
-  if (useful.length > 0) {
-    return useful.map((todo, index) => ({
-      id: todo.todo_id || `todo-${index}`,
-      title: todo.title,
-      status: normalizeStatus(todo.status),
-    }))
+  if (todos.length > 0) {
+    return todos.slice(0, 40).map((todo, index) => {
+      const node = plan?.nodes?.find(item => item.node_id === todo.plan_node_id)
+      const rawTitle = todo.title || asString(node?.title)
+      const title = rawTitle && !isGenerated(rawTitle)
+        ? rawTitle
+        : asString(node?.title) || `步骤 ${index + 1}`
+      return {
+        id: todo.todo_id || `todo-${index}`,
+        title,
+        status: normalizeStatus(todo.status),
+      }
+    })
   }
   const nodes = plan?.nodes ?? []
   const titled = nodes.filter(node => {

@@ -91,6 +91,9 @@ export function App() {
   const [activeId, setActiveId] = useState<string | null>(() => initialActive())
   const [events, setEvents] = useState<RuntimeEvent[]>(storedChat?.events ?? [])
   const [projection, setProjection] = useState<Projection>(storedChat?.projection ?? {})
+  const [taskProjection, setTaskProjection] = useState<Projection>(
+    storedChat?.task_projection ?? {},
+  )
   const [status, setStatus] = useState(storedChat?.status ?? 'paused')
   const [liveSegments, setLiveSegments] = useState<LiveSegment[]>([])
   const [pendingUsers, setPendingUsers] = useState<PendingUser[]>([])
@@ -112,6 +115,7 @@ export function App() {
   const sessionsRef = useRef<Session[]>([])
   sessionsRef.current = sessions
   const cursorsRef = useRef<Record<string, number>>({})
+  const taskRunIdRef = useRef(storedChat?.task_run_id ?? '')
   const chatCacheRef = useRef<Map<string, ChatSnapshot>>(new Map())
   const streamRef = useRef<EventSource | null>(null)
   const reconnectRef = useRef<number | undefined>(undefined)
@@ -130,10 +134,17 @@ export function App() {
     const count = sessions.filter(session => activeStatuses.has(session.status)).length
     return count > 0 ? count : (running ? 1 : 0)
   }, [sessions, running])
-  const tasks = useMemo(
-    () => deriveTasks(projectionTodos(projection), projectionPlan(projection), status, projection.effective_run_id),
-    [projection, status],
-  )
+  const tasks = useMemo(() => {
+    // ``projection`` is the root conversation projection (its todos span the
+    // whole Run tree).  The task dock must mirror the Runtime task-control
+    // layer only; never fall back to the aggregated tree checklist.
+    return deriveTasks(
+      projectionTodos(taskProjection),
+      projectionPlan(taskProjection),
+      status,
+      taskProjection.run_id || projection.effective_run_id,
+    )
+  }, [projection, taskProjection, status])
   const approvals = useMemo(
     () => (status === 'awaiting_approval' || projectionApprovals(projection).length > 0)
       ? projectionApprovals(projection)
@@ -177,6 +188,21 @@ export function App() {
     }
   }, [projectRoot])
 
+  const adoptTaskSnapshot = useCallback((snapshot: ChatSnapshot) => {
+    // ``task_projection`` is the Runtime task-control layer.  Older cached
+    // payloads did not carry it; clear the dock rather than showing the
+    // aggregated conversation tree until the fresh snapshot arrives.
+    if (!snapshot.task_projection) {
+      taskRunIdRef.current = ''
+      setTaskProjection({})
+      return
+    }
+    taskRunIdRef.current = snapshot.task_run_id
+      || snapshot.task_projection.run_id
+      || ''
+    setTaskProjection(snapshot.task_projection)
+  }, [])
+
   const refreshChat = useCallback(async (id: string) => {
     try {
       const snapshot = await webApi<ChatSnapshot>(`/api/sessions/${encodeURIComponent(id)}/chat?limit=1200`)
@@ -193,13 +219,14 @@ export function App() {
         ...snapshot.projection,
         todos: mergeTodoLists(projectionTodos(snapshot.projection), projectionTodos(previous)),
       }))
+      adoptTaskSnapshot(snapshot)
       setSessions(previous => previous.map(session => session.run_id === id
         ? { ...session, status: snapshot.status, updated_at: new Date().toISOString() }
         : session))
     } catch {
       // A background refresh is best-effort; the visible snapshot stays.
     }
-  }, [])
+  }, [adoptTaskSnapshot])
 
   const scheduleRefresh = useCallback((id: string, delay = 650) => {
     window.clearTimeout(refreshTimer.current)
@@ -302,7 +329,38 @@ export function App() {
     setSessions(previous => previous.map(session => session.run_id === id
       ? { ...session, status: statusFromEvent(session.status, event), updated_at: event.occurred_at }
       : session))
-    const relevant = ['TodoCreated', 'TodoUpdated', 'TodoCompleted', 'PlanCreated', 'PlanRevised', 'PlanNodeStarted', 'PlanNodeCompleted', 'ApprovalRequested', 'ApprovalGranted', 'ApprovalRejected', 'RunOutcomeRecorded', 'RunFailed', 'RunBlocked', 'RunCancelled']
+    // The task dock follows the Runtime task-control projection, not the
+    // root conversation projection (whose todos span every Run in the tree).
+    // A new root Run starts a fresh checklist; a child/follow-up becomes
+    // effective asynchronously, so its authoritative todo list is adopted by
+    // the scheduled chat snapshot instead of guessed from the event stream.
+    if (
+      event.event_type === 'RunCreated'
+      && event.run_id === activeIdRef.current
+      && event.run_id !== taskRunIdRef.current
+    ) {
+      taskRunIdRef.current = event.run_id
+      setTaskProjection({ run_id: event.run_id, status: 'queued', todos: [], plan: undefined })
+    }
+    if (event.event_type.startsWith('Todo') || event.event_type.startsWith('Plan')) {
+      if (!taskRunIdRef.current) taskRunIdRef.current = event.run_id
+      if (event.run_id === taskRunIdRef.current) {
+        setTaskProjection(previous => {
+          if (event.event_type.startsWith('Todo')) {
+            return {
+              ...previous,
+              run_id: previous.run_id ?? event.run_id,
+              todos: applyTodoEvent(projectionTodos(previous), event),
+            }
+          }
+          const plan = applyPlanEvent(previous.plan, event)
+          return plan === previous.plan
+            ? previous
+            : { ...previous, run_id: previous.run_id ?? event.run_id, plan }
+        })
+      }
+    }
+    const relevant = ['TodoCreated', 'TodoUpdated', 'TodoCompleted', 'PlanCreated', 'PlanRevised', 'PlanNodeStarted', 'PlanNodeCompleted', 'ApprovalRequested', 'ApprovalGranted', 'ApprovalRejected', 'FollowUpQueued', 'RunCreated', 'RunOutcomeRecorded', 'RunFailed', 'RunBlocked', 'RunCancelled']
     setProjection(previous => {
       let next: Projection | null = null
       if (event.event_type.startsWith('Todo')) {
@@ -388,6 +446,8 @@ export function App() {
       closeStream()
       setEvents([])
       setProjection({})
+      setTaskProjection({})
+      taskRunIdRef.current = ''
       setStatus('paused')
       setLiveSegments([])
       setPendingUsers([])
@@ -410,6 +470,7 @@ export function App() {
     if (cached) {
       setEvents(cached.events)
       setProjection(cached.projection)
+      adoptTaskSnapshot(cached)
       setStatus(cached.status)
       setProjectRoot(cached.project_root)
       cursorsRef.current = cached.cursors ?? cursorsFrom(cached.events)
@@ -417,6 +478,8 @@ export function App() {
     } else {
       setEvents([])
       setProjection({})
+      setTaskProjection({})
+      taskRunIdRef.current = ''
       setStatus('paused')
       cursorsRef.current = {}
       setChatLoading(true)
@@ -430,6 +493,7 @@ export function App() {
       cursorsRef.current = snapshot.cursors ?? cursorsFrom(snapshot.events)
       setEvents(snapshot.events)
       setProjection(snapshot.projection)
+      adoptTaskSnapshot(snapshot)
       setStatus(snapshot.status)
       setProjectRoot(snapshot.project_root)
       writeString(PROJECT_KEY, snapshot.project_root)
@@ -538,6 +602,8 @@ export function App() {
         const created = response.session_id || response.run_id
         if (created) {
           startedRef.current = true
+          taskRunIdRef.current = ''
+          setTaskProjection({})
           setActiveId(created)
           setStatus('queued')
         }
