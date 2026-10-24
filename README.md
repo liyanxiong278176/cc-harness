@@ -4,14 +4,25 @@
 
 ## 运行截图
 
-以下截图来自重新构建、启动后的实际浏览器操作和真实模型调用。
+以下截图于 **2026-10-21** 重新构建并启动当前项目后，在真实浏览器和模型调用过程中拍摄。
+点击下表链接可直接查看图片。
 
-[![cc-harness 工具写入与产物预览](img/14-artifact-preview.png)](img/14-artifact-preview.png)
+| 执行阶段 | 图片访问路径 |
+| --- | --- |
+| 启动 WebUI | [01-welcome.png](img/runtime-20261021/01-welcome.png) |
+| 选择当前项目并输入测试任务 | [02-task-ready.png](img/runtime-20261021/02-task-ready.png) |
+| 命令等待审批 | [03-command-approval.png](img/runtime-20261021/03-command-approval.png) |
+| 允许后执行命令 | [04-command-running.png](img/runtime-20261021/04-command-running.png) |
+| 命令结果未知，任务阻塞 | [05-command-blocked.png](img/runtime-20261021/05-command-blocked.png) |
+| 提交只读报告任务 | [06-report-reading.png](img/runtime-20261021/06-report-reading.png) |
+| 报告摘要及暂停状态 | [07-report-result.png](img/runtime-20261021/07-report-result.png) |
+| 查看上下文来源 | [08-context-sources.png](img/runtime-20261021/08-context-sources.png) |
+| 查看本地 Skill 管理 | [09-local-skills.png](img/runtime-20261021/09-local-skills.png) |
+| 查看 Runtime 状态与事件 | [10-runtime-state.png](img/runtime-20261021/10-runtime-state.png) |
 
-点击进入 [截图目录 `img/`](img/)，或查看 [完整截图索引与运行说明](img/README.md)。
-覆盖深浅主题、项目选择、对话与流式回复、工具执行、审批允许与拒绝、消息排队与停止、
-运行详情、上下文与执行计划、产物预览、设置、快捷键、会话搜索和窄屏页面。
-本次运行的沙箱降级及暂停状态见截图索引中的说明。
+本次命令演示因 `executor_lost` 阻塞；只读任务成功读取报告并生成摘要，随后因完成门槛暂停，
+两次运行均未标记为 completed。详情见 [截图索引与运行记录](img/README.md)。
+此前已完成的确定性测试结果见 [测试与修复报告](docs/audits/runtime-context-memory-skill-matrix-20261021.md)。
 
 ## 下载
 
@@ -50,6 +61,8 @@ cc-harness --no-open --port 3080
 ```
 
 ## 当前评测结果访问路径
+
+本地记忆、Skill、续行资料与上下文来源可从 WebUI 的“本地能力与记忆”管理，也可运行 `cc-harness --command assets`。配置、命令及数据保留边界见 [本地信息资产说明](docs/local-information-assets.md)。
 
 以下是当前项目已经完成的评测结果目录。每个目录中的 `report.md` 为阅读版报告，
 `summary.json` 为机器可读汇总；评测结果仅保存在本机，未提交到 Git。

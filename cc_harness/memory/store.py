@@ -2,6 +2,8 @@
 from __future__ import annotations
 import asyncio
 import logging
+import json
+import hashlib
 import re
 import time
 import uuid
@@ -234,6 +236,95 @@ class MemoryStore:
             "ON session_message(session_id, turn_idx)"
         )
         await self._migrate()
+        await self._db.executescript("""
+            CREATE TABLE IF NOT EXISTS memory_retraction (
+                kind TEXT NOT NULL, digest TEXT NOT NULL, created_at REAL NOT NULL,
+                PRIMARY KEY(kind,digest));
+            CREATE TABLE IF NOT EXISTS memory_generation (id INTEGER PRIMARY KEY CHECK(id=1), epoch INTEGER NOT NULL);
+            INSERT OR IGNORE INTO memory_generation VALUES (1,0);
+            CREATE TABLE IF NOT EXISTS memory_recall_boundary (id INTEGER PRIMARY KEY CHECK(id=1), conversation_id INTEGER NOT NULL);
+            INSERT OR IGNORE INTO memory_recall_boundary
+            SELECT 1, CASE WHEN (SELECT epoch FROM memory_generation WHERE id=1)>0
+                THEN (SELECT COALESCE(MAX(id),0) FROM conversation) ELSE 0 END;
+        """)
+        await self._db.commit()
+
+    async def generation(self) -> int:
+        cur = await self._db.execute("SELECT epoch FROM memory_generation WHERE id=1")
+        return int((await cur.fetchone())[0])
+
+    async def retracted(self, kind: str, value: str) -> bool:
+        digest = hashlib.sha256(value.strip().encode("utf-8")).hexdigest()
+        cur = await self._db.execute("SELECT 1 FROM memory_retraction WHERE kind=? AND digest=?", (kind, digest))
+        return await cur.fetchone() is not None
+
+    async def forget(self, memory_id: str) -> dict:
+        """Withdraw retrieval semantics, retaining independently governed L0 evidence."""
+        from cc_harness.atomic import atomic_write_text
+        async with self._write_lock:
+            try:
+                await begin_immediate(self._db)
+                cur = await self._db.execute("SELECT id,text,provenance_json,session_id,supersedes_id,merged_from FROM memories WHERE project_scope IS ? OR project_scope IS NULL", (self.project_scope,))
+                records = {r[0]: r for r in await cur.fetchall()}
+                if memory_id not in records or not records[memory_id][1]:
+                    if await self.retracted("id", memory_id):
+                        epoch = await self.generation()
+                        await self._db.commit()
+                        return {"forgotten_ids": [memory_id], "memory_epoch": epoch, "raw_history_retained": True}
+                    raise KeyError("memory not found or already forgotten")
+                withdrawn = {memory_id}
+                # Merges and superseded versions are an explicit derivation graph.
+                # Conservatively withdraw a whole merged conclusion if one input is removed.
+                changed = True
+                while changed:
+                    previous = set(withdrawn)
+                    selected_text = {records[i][1] for i in withdrawn if i in records}
+                    selected_sources = {json.loads(records[i][2] or "{}").get("source_digest") for i in withdrawn if i in records} - {None}
+                    for ident, candidate, raw, _session, predecessor, merged in records.values():
+                        data = json.loads(raw or "{}")
+                        parents = set(json.loads(merged or "[]")) | set(data.get("parent_ids", []))
+                        if predecessor:
+                            parents.add(predecessor)
+                        if ident in withdrawn or parents & withdrawn or candidate in selected_text or data.get("source_digest") in selected_sources:
+                            withdrawn.add(ident)
+                            withdrawn.update(parents & records.keys())
+                    changed = previous != withdrawn
+                keys = []
+                for ident in withdrawn:
+                    _, text, raw, session_id, _, _ = records[ident]
+                    provenance = json.loads(raw or "{}")
+                    keys.extend([("id", ident), ("text", text)])
+                    if provenance.get("source_digest"):
+                        keys.append(("source", provenance["source_digest"]))
+                    if session_id and text:
+                        conv = await self._db.execute("SELECT role,content FROM conversation WHERE session_id=?", (session_id,))
+                        for role, content in await conv.fetchall():
+                            if text in content:
+                                keys.append(("source", hashlib.sha256(f"{role}\x00{content}".encode()).hexdigest()))
+                for kind, value in keys:
+                    await self._db.execute("INSERT OR IGNORE INTO memory_retraction VALUES (?,?,?)",
+                                           (kind, hashlib.sha256(value.strip().encode()).hexdigest(), time.time()))
+                for ident in withdrawn:
+                    await self._db.execute("DELETE FROM vec_memories WHERE id=?", (ident,))
+                    await self._db.execute("UPDATE memories SET text='',embedding=?,validity='tombstoned',tombstoned_at=?,provenance_json='{}' WHERE id=?",
+                                           (b"", time.time(), ident))
+                await self._db.execute("UPDATE memory_generation SET epoch=epoch+1 WHERE id=1")
+                # Historical assistant/tool turns may paraphrase a recalled
+                # fact in other sessions. Without complete per-turn lineage,
+                # conservatively fence ALL prior L0 fallback at withdrawal.
+                # Raw history and surviving verified L1 facts stay intact.
+                await self._db.execute("UPDATE memory_recall_boundary SET conversation_id=(SELECT COALESCE(MAX(id),0) FROM conversation) WHERE id=1")
+                epoch = await self.generation()
+                if str(self.db_path) != ":memory:":
+                    root = self.db_path.parent.resolve()
+                    for path in [*root.glob("persona*.md"), *(root / "scenarios").glob("*.md")]:
+                        if path.resolve().is_relative_to(root):
+                            atomic_write_text(path, f"validity: retracted\nmemory_epoch: {epoch}\n")
+                await self._db.commit()
+                return {"forgotten_ids": sorted(withdrawn), "memory_epoch": epoch, "raw_history_retained": True}
+            except BaseException:
+                await self._db.rollback()
+                raise
 
     async def _migrate(self) -> None:
         """旧库兼容:探测 memories 缺列则 ALTER 补上 layer/session_id;conversation
@@ -401,7 +492,7 @@ class MemoryStore:
         cursor = await self._db.execute(
             "SELECT id, session_id, turn_idx, role, content, ts, dates, entities, keywords, "
             "message_idx, content_digest FROM conversation "
-            f"WHERE {where} ORDER BY turn_idx DESC, id DESC LIMIT ?",
+            f"WHERE ({where}) AND id > (SELECT conversation_id FROM memory_recall_boundary WHERE id=1) ORDER BY turn_idx DESC, id DESC LIMIT ?",
             [*params, limit],
         )
         rows = await cursor.fetchall()
@@ -420,6 +511,7 @@ class MemoryStore:
                 "content_digest": row[10],
             }
             for row in rows
+            if not await self.retracted("source", hashlib.sha256(f"{row[3]}\x00{row[4]}".encode()).hexdigest())
         ]
 
     async def add(self, text: str, embedding: list[float], source: str,
@@ -461,6 +553,16 @@ class MemoryStore:
         """Insert one memory while the caller owns ``write_lock``/transaction."""
 
         assert self._db is not None, "init_schema first"
+        if await self.retracted("text", text):
+            raise ValueError("memory was explicitly forgotten")
+        data = json.loads(provenance_json or "{}")
+        if "memory_epoch" in data and data["memory_epoch"] != await self.generation():
+            raise ValueError("memory generation changed before publication")
+        for parent in data.get("parent_ids", []):
+            if await self.retracted("id", parent):
+                raise ValueError("memory input was explicitly forgotten")
+        if data.get("source_digest") and await self.retracted("source", data["source_digest"]):
+            raise ValueError("memory source was explicitly forgotten")
         if len(embedding) != self.embedding_dim:
             raise ValueError(f"embedding dim {len(embedding)} != configured {self.embedding_dim}")
         now = time.time()
@@ -493,7 +595,7 @@ class MemoryStore:
         )
         return mem
 
-    async def update(self, id: str, text: str, embedding: list[float]) -> Memory:
+    async def update(self, id: str, text: str, embedding: list[float], *, provenance_json: str | None = None) -> Memory:
         assert self._db is not None
         if len(embedding) != self.embedding_dim:
             raise ValueError(f"embedding dim {len(embedding)} != configured {self.embedding_dim}")
@@ -502,9 +604,21 @@ class MemoryStore:
         async with self._write_lock:
             try:
                 await begin_immediate(self._db)
+                original = await self.get(id)
+                if original is None or original.validity != "active" or await self.retracted("text", text):
+                    raise ValueError("cannot update inactive or forgotten memory")
+                if provenance_json is not None:
+                    data = json.loads(provenance_json)
+                    if data.get("memory_epoch", await self.generation()) != await self.generation():
+                        raise ValueError("memory generation changed before update")
+                    for parent in data.get("parent_ids", []):
+                        if await self.retracted("id", parent):
+                            raise ValueError("memory input was explicitly forgotten")
+                    if data.get("source_digest") and await self.retracted("source", data["source_digest"]):
+                        raise ValueError("memory source was explicitly forgotten")
                 await self._db.execute(
-                    "UPDATE memories SET text=?, embedding=?, updated_at=? WHERE id=?",
-                    (text, blob, now, id),
+                    "UPDATE memories SET text=?, embedding=?, updated_at=?,provenance_json=COALESCE(?,provenance_json) WHERE id=?",
+                    (text, blob, now, provenance_json, id),
                 )
                 await self._db.execute(
                     "UPDATE vec_memories SET embedding=? WHERE id=?",
@@ -645,6 +759,8 @@ class MemoryStore:
         self, query_embedding: list[float], k: int = 5,
     ) -> list[tuple[Memory, float]]:
         assert self._db is not None
+        if k <= 0:
+            return []
         if len(query_embedding) != self.embedding_dim:
             raise ValueError(f"query dim {len(query_embedding)} != configured {self.embedding_dim}")
         blob = _vec_to_blob(query_embedding)
@@ -711,7 +827,7 @@ class MemoryStore:
         bm25_score 越小越相关(BM25 convention)。
         失败(SQL 异常 / FTS5 不可用)返 [],不抛。
         """
-        if not self._has_fts5 or not query.strip():
+        if k <= 0 or not self._has_fts5 or not query.strip():
             return []
         safe_query = _safe_fts5_query(query)
         if not safe_query:

@@ -1,6 +1,7 @@
 # ADR-0113：以 Claude Desktop 为参照重建 cc-harness WebUI
 
 - 状态：Accepted
+- 2026-10-23 更新：主要参考产品选择已被 [ADR-0118](0118-use-deepseek-harness-as-redesign-interaction-reference.md) 取代；其余规则在本轮访谈逐项审议。
 - 日期：2026-09-30
 - 范围：React/Vite WebUI、项目产物只读 API
 

@@ -398,6 +398,10 @@ class MutationEngine:
                     raise NativeToolError(f"parent directory does not exist: {target.parent}")
                 created_dirs = self._create_parent_directories(target.parent)
             raw = content.encode("utf-8")
+            if os.name == "nt" and target.suffix.lower() == ".ps1" and not raw.startswith(codecs.BOM_UTF8):
+                # Windows PowerShell 5 reads BOM-less scripts as the ANSI
+                # code page. UTF-8 Chinese can become syntax or string errors.
+                raw = codecs.BOM_UTF8 + raw
             try:
                 verified = _resolve_mutation_path(path, self.root)
                 if verified != target or not target.parent.is_dir():

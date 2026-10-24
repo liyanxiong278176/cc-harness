@@ -296,6 +296,8 @@ class RunProjection:
     working_state: WorkingStateProjection = field(default_factory=WorkingStateProjection)
     active_worker_id: str | None = None
     lease_epoch: int = 0
+    skill_snapshot: str | None = None
+    skill_revision: int = 0
 
     @classmethod
     def empty(cls, run_id: str = "") -> "RunProjection":
@@ -304,6 +306,7 @@ class RunProjection:
     def to_dict(self) -> dict[str, Any]:
         return {
             "run_id": self.run_id,
+            **({"skill_snapshot": self.skill_snapshot, "skill_revision": self.skill_revision} if self.skill_snapshot else {}),
             "task": self.task.to_dict(),
             "sequence": self.sequence,
             "last_event_id": self.last_event_id,
@@ -334,6 +337,8 @@ class RunProjection:
         goal_data = data.get("goal")
         return cls(
             run_id=str(data.get("run_id", "")),
+            skill_snapshot=data.get("skill_snapshot"),
+            skill_revision=int(data.get("skill_revision", 0)),
             task=TaskControl.from_dict(data.get("task") or {}),
             sequence=int(data.get("sequence", 0)),
             last_event_id=data.get("last_event_id"),
@@ -441,6 +446,8 @@ def _action_from_dict(data: Mapping[str, Any]) -> ActionAttempt:
 @dataclass
 class _MutableProjection:
     run_id: str
+    skill_snapshot: str | None = None
+    skill_revision: int = 0
     task: TaskControl = field(default_factory=TaskControl)
     sequence: int = 0
     last_event_id: str | None = None
@@ -468,6 +475,8 @@ class _MutableProjection:
     def from_projection(cls, projection: RunProjection) -> "_MutableProjection":
         return cls(
             run_id=projection.run_id,
+            skill_snapshot=projection.skill_snapshot,
+            skill_revision=projection.skill_revision,
             task=projection.task,
             sequence=projection.sequence,
             last_event_id=projection.last_event_id,
@@ -495,6 +504,8 @@ class _MutableProjection:
     def freeze(self) -> RunProjection:
         return RunProjection(
             run_id=self.run_id,
+            skill_snapshot=self.skill_snapshot,
+            skill_revision=self.skill_revision,
             task=self.task,
             sequence=self.sequence,
             last_event_id=self.last_event_id,
@@ -609,6 +620,15 @@ class ProjectionBuilder:
         except ValueError as exc:
             raise ProjectionError(str(exc)) from exc
 
+        if event.event_type == "SkillSnapshotPinned":
+            if payload["reason"] == "initial" and state.skill_snapshot is not None:
+                raise ProjectionError("task already has a pinned skill snapshot")
+            if payload["reason"] == "explicit_reload" and state.status in {RunStatus.RUNNING, RunStatus.QUEUED, RunStatus.CANCEL_REQUESTED}:
+                raise ProjectionError("pause task before reloading skills")
+            if int(payload["revision"]) <= state.skill_revision:
+                raise ProjectionError("skill revision must advance")
+            state.skill_snapshot = str(payload["snapshot"])
+            state.skill_revision = int(payload["revision"])
         if event.event_type == "RunCreated":
             state.goal = GoalContract.from_dict(payload["goal"])
             state.runtime_contract = RuntimeContract.from_dict(payload["runtime_contract"])
@@ -692,6 +712,17 @@ class ProjectionBuilder:
                 state.mutation_gate = "read_only"
         elif event.event_type == "ToolObservationCommitted":
             self._apply_observation(event, state)
+        elif event.event_type == "FailureResolved":
+            failed_id = str(payload["failed_action_id"])
+            resolving_id = str(payload["resolving_action_id"])
+            failed = [a for a in state.actions.values() if a.action_id == failed_id]
+            resolved_by = [a for a in state.actions.values() if a.action_id == resolving_id]
+            proof = [o for o in state.observations.values() if o.action_id == resolving_id
+                     and o.observation_artifact == payload["observation_artifact"] and o.status == "succeeded" and o.complete]
+            if not failed or failed[-1].status is not ActionStatus.FAILED or not resolved_by or resolved_by[-1].status is not ActionStatus.SUCCEEDED or not proof:
+                raise ProjectionError("failure resolution requires a failed attempt and a successful durable replacement")
+            state.working_state = replace(state.working_state, unresolved_errors=tuple(
+                e for e in state.working_state.unresolved_errors if e.get("action_id") != failed_id))
         elif event.event_type.startswith("Action"):
             self._apply_action(event, state)
         elif event.event_type.startswith("Reconciliation"):
@@ -709,12 +740,16 @@ class ProjectionBuilder:
                 queued_sequence=event.sequence,
                 continuation=bool(payload.get("continuation", False)),
             )
-        elif event.event_type == "FollowUpStarted":
+        elif event.event_type in {"FollowUpStarted", "FollowUpClaimed", "FollowUpUpdated", "FollowUpCancelled"}:
             follow_up_id = str(payload["follow_up_run_id"])
             item = state.queue.get(follow_up_id)
             if item is None:
                 raise ProjectionError(f"follow-up event has no queued item: {follow_up_id}")
-            state.queue[follow_up_id] = replace(item, status="started")
+            if event.event_type == "FollowUpUpdated":
+                state.queue[follow_up_id] = replace(item, message_artifact=str(payload["message_artifact"]))
+            else:
+                status = {"FollowUpStarted": "started", "FollowUpClaimed": "starting", "FollowUpCancelled": "cancelled"}[event.event_type]
+                state.queue[follow_up_id] = replace(item, status=status)
         elif event.event_type == "PredecessorBypassed":
             predecessor_id = str(payload["predecessor_run_id"])
             target_id = str(payload.get("follow_up_run_id") or "")

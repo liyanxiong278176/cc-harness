@@ -34,6 +34,7 @@ class MemoryService:
         self.embedder = embedder
         self.decider = decider
         self.drift_detector = drift_detector
+        self.require_verified = False
 
     async def recall(self, query: str, top_k: int = 5) -> list:
         embedding = await self.embedder.embed(query)
@@ -128,12 +129,16 @@ class MemoryService:
                 )
         return results
 
-    async def save(self, text: str, source: str, session_id: str | None = None, *, turn_idx: int | None = None) -> SaveResult:
+    async def save(self, text: str, source: str, session_id: str | None = None, *, turn_idx: int | None = None,
+                   provenance: dict | None = None) -> SaveResult:
         # M2: turn_idx 优先用 caller 传,None 时退占位(向后兼容)
         actual_turn_idx = turn_idx if turn_idx is not None else int(time.time() * 1000) % 1000
         t0 = time.time()
         result_action_mem = None
+        if self.require_verified and (not provenance or not provenance.get("verified_at")):
+            return SaveResult(action="CANDIDATE", error=None)
         try:
+            provenance_json = json.dumps(provenance or {}, ensure_ascii=False, sort_keys=True)
             embedding = await self.embedder.embed(text)
             similar = await self.store.search_similar(embedding, k=5)
             # 冲突检测用的 embedding:ADD/DELETE 用原文 embedding;UPDATE 用 merged 后的
@@ -149,9 +154,12 @@ class MemoryService:
                 decision = await self.decider.decide(
                     text, similar, recent_reflections=recent_reflections
                 )
+                if provenance and decision.action == Decision.UPDATE:
+                    # A generated merged sentence is not itself verified evidence.
+                    decision = DecisionResult(action=Decision.ADD)
 
             if decision.action == Decision.ADD:
-                mem = await self.store.add(text, embedding, source, session_id=session_id)
+                mem = await self.store.add(text, embedding, source, session_id=session_id, provenance_json=provenance_json)
                 result_action_mem = mem
                 result = SaveResult(action="ADD", memory=mem, duration_ms=_ms(t0))
 
@@ -165,6 +173,7 @@ class MemoryService:
                     new_embedding,
                     source=source,
                     session_id=session_id,
+                    provenance_json=provenance_json,
                 )
                 conflict_embedding = new_embedding
                 result_action_mem = mem
@@ -173,7 +182,7 @@ class MemoryService:
             elif decision.action == Decision.DELETE:
                 old = await self.store.get(decision.target_id)
                 await self.store.delete(decision.target_id)
-                mem = await self.store.add(text, embedding, source, session_id=session_id)
+                mem = await self.store.add(text, embedding, source, session_id=session_id, provenance_json=provenance_json)
                 result_action_mem = mem
                 result = SaveResult(action="DELETE_THEN_ADD", memory=mem, previous=old,
                                     deleted_id=decision.target_id, duration_ms=_ms(t0))

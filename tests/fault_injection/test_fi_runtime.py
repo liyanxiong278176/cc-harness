@@ -149,12 +149,22 @@ async def test_real_provider_probe_uses_configured_model_without_leaking_secrets
     ],
     ids=["invalid-json", "array-arguments", "missing-tool-name"],
 )
-async def test_a2_kernel_rejects_malformed_tool_protocol(call):
+async def test_a2_kernel_handles_malformed_tool_protocol(call):
     run_id = str(uuid.uuid4())
     context = SegmentContext(run_id, RunProjection.empty(run_id), ())
     kernel = ReActKernel(ScriptedModel(ModelSegment(tool_calls=(call,))))
-    with pytest.raises(KernelProtocolError):
-        await kernel.execute_segment(context)
+    if "name" not in call:
+        # A missing tool name cannot be routed anywhere; it remains a hard
+        # protocol error.
+        with pytest.raises(KernelProtocolError):
+            await kernel.execute_segment(context)
+        return
+    outcome = await kernel.execute_segment(context)
+    request = outcome.action_requests[0]
+    assert request.protocol_error
+    assert request.effect_class is EffectClass.READ_ONLY
+    # Malformed JSON is replannable feedback, not a worker-killing exception.
+    assert "JSON" in request.protocol_error or "object" in request.protocol_error
 
 
 def test_a2_reasoning_replay_preserves_legacy_data_and_accepts_new_redacted_artifacts():
@@ -264,6 +274,9 @@ async def test_a3_started_read_action_retries_new_attempt_after_lease_recovery(t
         )
         await store._db.commit()
         await LeaseManager(store, ttl_seconds=30).reclaim_expired(run_id)
+        assert (await store.load_projection(run_id)).status is RunStatus.PAUSED
+        assert await store.current_lease(run_id) is None
+        await RunCoordinator(store).resume(run_id, "continue after crash")
         assert (await store.load_projection(run_id)).status is RunStatus.QUEUED
         new = await claim_run(store, run_id, "recovery-reader")
         executor = CountingExecutor(ActionExecutionResult(ActionStatus.SUCCEEDED))
@@ -283,7 +296,7 @@ async def test_a3_started_read_action_retries_new_attempt_after_lease_recovery(t
         assert {item.attempt for item in attempts} == {1, 2}
         assert attempts[-1].status is ActionStatus.SUCCEEDED
         events = (await store.read(run_id, limit=10_000)).events
-        assert "WorkerLeaseExpired" in event_types(events)
+        assert "RunPaused" in event_types(events)
         assert event_types(events).count("ToolObservationCommitted") >= 2
         assert_valid_history(events)
     finally:
@@ -308,6 +321,9 @@ async def test_a3_started_external_action_becomes_unknown_and_blocked(tmp_path):
         )
         await store._db.commit()
         await LeaseManager(store, ttl_seconds=30).reclaim_expired(run_id)
+        assert (await store.load_projection(run_id)).status is RunStatus.PAUSED
+        assert await store.current_lease(run_id) is None
+        await RunCoordinator(store).resume(run_id, "reconcile external action after crash")
         new = await claim_run(store, run_id, "recovery-external")
         worker = RunWorker(store, ReActKernel(ScriptedModel()), worker_id="recovery-external")
         recovered, blocked = await worker._recover_inflight_actions(
@@ -325,6 +341,41 @@ async def test_a3_started_external_action_becomes_unknown_and_blocked(tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_a3_unknown_effect_blocks_worker_until_reconciled_without_replay(tmp_path):
+    _project, store, run_id = await make_run(tmp_path)
+    try:
+        old = await claim_run(store, run_id, "crashed-external")
+        await _seed_started_action(store, run_id, old,
+            effect=EffectClass.EXTERNAL_SIDE_EFFECT.value,
+            tool="process_stop", action_id="uncertain-effect")
+        await store._db.execute(
+            "UPDATE run_lease SET acquired_at=1, expires_at=2 WHERE run_id=?", (run_id,))
+        await store._db.commit()
+        await LeaseManager(store).reclaim_expired(run_id)
+        coordinator = RunCoordinator(store)
+        await coordinator.resume(run_id, "continue after crash")
+        model = ScriptedModel(ModelSegment(text="Need further inspection."))
+        executor = CountingExecutor(ActionExecutionResult(ActionStatus.SUCCEEDED))
+        worker = RunWorker(store, ReActKernel(model), worker_id="recovered",
+                           action_executor=executor)
+        await worker.execute(await worker.claim(run_id))
+        assert (await store.load_projection(run_id)).status is RunStatus.BLOCKED
+        assert model.calls == 0 and executor.calls == []
+        result = store.artifacts.put_text("provider confirmed effect completed")
+        await coordinator.reconcile_action(run_id, "uncertain-effect", "succeeded",
+                                           result_artifact=result.digest)
+        await coordinator.resume(run_id, "continue after reconciliation")
+        await worker.execute(await worker.claim(run_id))
+        assert model.calls == 1 and executor.calls == []
+        projection = await store.load_projection(run_id)
+        assert projection.actions[0].status is ActionStatus.SUCCEEDED
+        assert projection.status is not RunStatus.BLOCKED
+        assert_valid_history((await store.read(run_id, limit=10_000)).events)
+    finally:
+        await store.close()
+
+
+@pytest.mark.asyncio
 async def test_a4_old_epoch_is_fenced_and_healthy_lease_survives(tmp_path):
     _project, store, run_id = await make_run(tmp_path)
     try:
@@ -334,6 +385,8 @@ async def test_a4_old_epoch_is_fenced_and_healthy_lease_survives(tmp_path):
         )
         await store._db.commit()
         await LeaseManager(store, ttl_seconds=30).reclaim_expired(run_id)
+        assert (await store.load_projection(run_id)).status is RunStatus.PAUSED
+        await RunCoordinator(store).resume(run_id, "continue with a fresh worker epoch")
         new = await claim_run(store, run_id, "epoch-b")
         projection = await store.load_projection(run_id)
         stale = RunEvent.create(

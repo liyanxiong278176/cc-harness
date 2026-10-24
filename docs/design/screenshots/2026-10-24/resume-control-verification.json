@@ -1,0 +1,12 @@
+{
+  "result": "passed",
+  "source": "Real local supervisor claims paused run and executes Read after UI Continue; no remote model",
+  "checks": [
+    "immediate disabled spinner",
+    "one resume POST and zero message POSTs",
+    "real tool observation committed",
+    "running state and pause control visible",
+    "no control-message bubbles before or after reload"
+  ],
+  "errors": []
+}

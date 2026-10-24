@@ -404,6 +404,8 @@ class ContextConfig(BaseModel):
     reserves.  A single invocation selects one mutually-exclusive tier:
     tier1(0.6) Snip / tier2(0.8) Prune / tier3(0.95) Summary.
     """
+    policy_version: str = "local-context@1"
+    integrity_check_enabled: bool = True
     enabled: bool = True
     context_window: int = 1_000_000            # deepseek-v4-flash 真实窗口
     tier1_threshold: float = 0.6
@@ -467,7 +469,8 @@ def load_context_config(
 ) -> ContextConfig:
     """从 CONTEXT_* env 构造;缺省默认(1M 窗口)。
 
-    path 暂不读(policy.yaml 无 context 段);env 覆盖:CONTEXT_ENABLED / CONTEXT_WINDOW /
+    policy.yaml 的 context 段提供版本化本地策略，环境变量优先覆盖。
+    env 覆盖:CONTEXT_ENABLED / CONTEXT_WINDOW /
     CONTEXT_TIER1/2/3 / CONTEXT_PROTECT_TOKENS / CONTEXT_OUTPUT_RESERVE_TOKENS /
     CONTEXT_TOOL_RESERVE_TOKENS / CONTEXT_COMPACTION_LEASE_TTL_SECONDS /
     CONTEXT_PROVIDER_SAFETY_FACTOR。
@@ -482,13 +485,21 @@ def load_context_config(
     lease_ttl = env.get("CONTEXT_COMPACTION_LEASE_TTL_SECONDS")
     provider_safety = env.get("CONTEXT_PROVIDER_SAFETY_FACTOR")
     kw: dict = {}
+    if path is not None and path.exists():
+        import yaml
+        raw = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
+        if not isinstance(raw, dict) or not isinstance(raw.get("context", {}), dict):
+            raise ConfigError("context policy must be a mapping")
+        kw.update(raw.get("context", {}))
+        if "context_window" in kw:
+            kw.update(context_window_source="project-policy", context_window_verified=True)
     if enabled is not None and enabled.strip():
         kw["enabled"] = enabled.strip().lower() in ("1", "true", "yes", "on")
     if cw:
         kw["context_window"] = int(cw)
         kw["context_window_source"] = "CONTEXT_WINDOW"
         kw["context_window_verified"] = True
-    elif model:
+    elif model and "context_window" not in kw:
         from cc_harness.model_capabilities import get_model_capability
 
         capability = get_model_capability(model)

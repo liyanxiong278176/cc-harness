@@ -1,0 +1,285 @@
+{
+  "errors": [],
+  "timing": [
+    {
+      "url": "http://127.0.0.1:3084/api/bootstrap?include_sessions=false",
+      "ms": 5
+    },
+    {
+      "url": "http://127.0.0.1:3084/api/web/v1/capabilities",
+      "ms": 2
+    },
+    {
+      "url": "http://127.0.0.1:3084/api/sessions",
+      "ms": 863
+    },
+    {
+      "url": "http://127.0.0.1:3084/api/sessions/ad686df6-16e7-4acf-9afa-8ef325e6e13c",
+      "ms": 943
+    },
+    {
+      "url": "http://127.0.0.1:3084/api/sessions/ad686df6-16e7-4acf-9afa-8ef325e6e13c/timeline?limit=10000",
+      "ms": 2163
+    },
+    {
+      "url": "http://127.0.0.1:3084/api/sessions",
+      "ms": 3602
+    },
+    {
+      "url": "http://127.0.0.1:3084/api/sessions/ad686df6-16e7-4acf-9afa-8ef325e6e13c",
+      "ms": 1520
+    },
+    {
+      "url": "http://127.0.0.1:3084/api/sessions/ad686df6-16e7-4acf-9afa-8ef325e6e13c/timeline?limit=10000",
+      "ms": 2858
+    },
+    {
+      "url": "http://127.0.0.1:3084/api/sessions/ad686df6-16e7-4acf-9afa-8ef325e6e13c/changes",
+      "ms": 3847
+    },
+    {
+      "url": "http://127.0.0.1:3084/api/sessions",
+      "ms": 1320
+    },
+    {
+      "url": "http://127.0.0.1:3084/api/sessions/ad686df6-16e7-4acf-9afa-8ef325e6e13c",
+      "ms": 1213
+    },
+    {
+      "url": "http://127.0.0.1:3084/api/sessions/ad686df6-16e7-4acf-9afa-8ef325e6e13c/timeline?limit=10000",
+      "ms": 2546
+    },
+    {
+      "url": "http://127.0.0.1:3084/api/sessions/ad686df6-16e7-4acf-9afa-8ef325e6e13c",
+      "ms": 1030
+    },
+    {
+      "url": "http://127.0.0.1:3084/api/sessions/ad686df6-16e7-4acf-9afa-8ef325e6e13c/timeline?limit=10000",
+      "ms": 2281
+    },
+    {
+      "url": "http://127.0.0.1:3084/api/sessions",
+      "ms": 2631
+    },
+    {
+      "url": "http://127.0.0.1:3084/api/sessions/ad686df6-16e7-4acf-9afa-8ef325e6e13c/timeline?limit=10000",
+      "ms": 2121
+    },
+    {
+      "url": "http://127.0.0.1:3084/api/sessions",
+      "ms": 2575
+    },
+    {
+      "url": "http://127.0.0.1:3084/api/sessions/ad686df6-16e7-4acf-9afa-8ef325e6e13c",
+      "ms": 2665
+    },
+    {
+      "url": "http://127.0.0.1:3084/api/sessions/ad686df6-16e7-4acf-9afa-8ef325e6e13c",
+      "ms": 1013
+    },
+    {
+      "url": "http://127.0.0.1:3084/api/sessions/ad686df6-16e7-4acf-9afa-8ef325e6e13c/timeline?limit=10000",
+      "ms": 3106
+    },
+    {
+      "url": "http://127.0.0.1:3084/api/sessions/ad686df6-16e7-4acf-9afa-8ef325e6e13c/changes",
+      "ms": 3575
+    },
+    {
+      "url": "http://127.0.0.1:3084/api/sessions",
+      "ms": 3533
+    },
+    {
+      "url": "http://127.0.0.1:3084/api/sessions/ad686df6-16e7-4acf-9afa-8ef325e6e13c/timeline?limit=10000",
+      "ms": 2716
+    },
+    {
+      "url": "http://127.0.0.1:3084/api/sessions",
+      "ms": 3051
+    },
+    {
+      "url": "http://127.0.0.1:3084/api/sessions/ad686df6-16e7-4acf-9afa-8ef325e6e13c",
+      "ms": 2941
+    },
+    {
+      "url": "http://127.0.0.1:3084/api/sessions/ad686df6-16e7-4acf-9afa-8ef325e6e13c/timeline?limit=10000",
+      "ms": 2506
+    },
+    {
+      "url": "http://127.0.0.1:3084/api/sessions",
+      "ms": 2702
+    },
+    {
+      "url": "http://127.0.0.1:3084/api/sessions/ad686df6-16e7-4acf-9afa-8ef325e6e13c",
+      "ms": 2825
+    },
+    {
+      "url": "http://127.0.0.1:3084/api/sessions/ad686df6-16e7-4acf-9afa-8ef325e6e13c/timeline?limit=10000",
+      "ms": 2330
+    },
+    {
+      "url": "http://127.0.0.1:3084/api/sessions",
+      "ms": 2758
+    },
+    {
+      "url": "http://127.0.0.1:3084/api/sessions/ad686df6-16e7-4acf-9afa-8ef325e6e13c",
+      "ms": 2860
+    },
+    {
+      "url": "http://127.0.0.1:3084/api/sessions/ad686df6-16e7-4acf-9afa-8ef325e6e13c/timeline?limit=10000",
+      "ms": 2418
+    },
+    {
+      "url": "http://127.0.0.1:3084/api/sessions",
+      "ms": 3299
+    },
+    {
+      "url": "http://127.0.0.1:3084/api/sessions/ad686df6-16e7-4acf-9afa-8ef325e6e13c/changes",
+      "ms": 2852
+    },
+    {
+      "url": "http://127.0.0.1:3084/api/sessions/ad686df6-16e7-4acf-9afa-8ef325e6e13c",
+      "ms": 3755
+    },
+    {
+      "url": "http://127.0.0.1:3084/api/sessions",
+      "ms": 852
+    },
+    {
+      "url": "http://127.0.0.1:3084/api/sessions/ad686df6-16e7-4acf-9afa-8ef325e6e13c",
+      "ms": 1623
+    },
+    {
+      "url": "http://127.0.0.1:3084/api/sessions/ad686df6-16e7-4acf-9afa-8ef325e6e13c/timeline?limit=10000",
+      "ms": 2859
+    },
+    {
+      "url": "http://127.0.0.1:3084/api/sessions",
+      "ms": 975
+    },
+    {
+      "url": "http://127.0.0.1:3084/api/sessions/ad686df6-16e7-4acf-9afa-8ef325e6e13c",
+      "ms": 1293
+    },
+    {
+      "url": "http://127.0.0.1:3084/api/sessions/ad686df6-16e7-4acf-9afa-8ef325e6e13c/timeline?limit=10000",
+      "ms": 2576
+    },
+    {
+      "url": "http://127.0.0.1:3084/api/sessions",
+      "ms": 958
+    },
+    {
+      "url": "http://127.0.0.1:3084/api/sessions/ad686df6-16e7-4acf-9afa-8ef325e6e13c/timeline?limit=10000",
+      "ms": 2557
+    },
+    {
+      "url": "http://127.0.0.1:3084/api/sessions/ad686df6-16e7-4acf-9afa-8ef325e6e13c",
+      "ms": 2778
+    },
+    {
+      "url": "http://127.0.0.1:3084/api/sessions/ad686df6-16e7-4acf-9afa-8ef325e6e13c/timeline?limit=10000",
+      "ms": 2562
+    },
+    {
+      "url": "http://127.0.0.1:3084/api/sessions",
+      "ms": 3023
+    },
+    {
+      "url": "http://127.0.0.1:3084/api/sessions/ad686df6-16e7-4acf-9afa-8ef325e6e13c",
+      "ms": 3023
+    },
+    {
+      "url": "http://127.0.0.1:3084/api/sessions",
+      "ms": 946
+    },
+    {
+      "url": "http://127.0.0.1:3084/api/sessions/ad686df6-16e7-4acf-9afa-8ef325e6e13c",
+      "ms": 1232
+    },
+    {
+      "url": "http://127.0.0.1:3084/api/sessions/ad686df6-16e7-4acf-9afa-8ef325e6e13c/timeline?limit=10000",
+      "ms": 2691
+    },
+    {
+      "url": "http://127.0.0.1:3084/api/sessions/ad686df6-16e7-4acf-9afa-8ef325e6e13c/changes",
+      "ms": 3057
+    },
+    {
+      "url": "http://127.0.0.1:3084/api/sessions/ad686df6-16e7-4acf-9afa-8ef325e6e13c/timeline?limit=10000",
+      "ms": 2626
+    },
+    {
+      "url": "http://127.0.0.1:3084/api/sessions",
+      "ms": 2997
+    },
+    {
+      "url": "http://127.0.0.1:3084/api/sessions/ad686df6-16e7-4acf-9afa-8ef325e6e13c",
+      "ms": 3106
+    },
+    {
+      "url": "http://127.0.0.1:3084/api/sessions",
+      "ms": 964
+    },
+    {
+      "url": "http://127.0.0.1:3084/api/sessions/ad686df6-16e7-4acf-9afa-8ef325e6e13c",
+      "ms": 1439
+    },
+    {
+      "url": "http://127.0.0.1:3084/api/sessions/ad686df6-16e7-4acf-9afa-8ef325e6e13c/timeline?limit=10000",
+      "ms": 2730
+    },
+    {
+      "url": "http://127.0.0.1:3084/api/sessions",
+      "ms": 903
+    },
+    {
+      "url": "http://127.0.0.1:3084/api/sessions/ad686df6-16e7-4acf-9afa-8ef325e6e13c/timeline?limit=10000",
+      "ms": 2417
+    },
+    {
+      "url": "http://127.0.0.1:3084/api/sessions/ad686df6-16e7-4acf-9afa-8ef325e6e13c",
+      "ms": 2622
+    },
+    {
+      "url": "http://127.0.0.1:3084/api/sessions/ad686df6-16e7-4acf-9afa-8ef325e6e13c/timeline?limit=10000",
+      "ms": 2749
+    },
+    {
+      "url": "http://127.0.0.1:3084/api/sessions",
+      "ms": 2843
+    },
+    {
+      "url": "http://127.0.0.1:3084/api/sessions/ad686df6-16e7-4acf-9afa-8ef325e6e13c",
+      "ms": 2993
+    },
+    {
+      "url": "http://127.0.0.1:3084/api/sessions",
+      "ms": 1103
+    },
+    {
+      "url": "http://127.0.0.1:3084/api/sessions/ad686df6-16e7-4acf-9afa-8ef325e6e13c/timeline?limit=10000",
+      "ms": 2549
+    },
+    {
+      "url": "http://127.0.0.1:3084/api/sessions/ad686df6-16e7-4acf-9afa-8ef325e6e13c",
+      "ms": 2767
+    },
+    {
+      "url": "http://127.0.0.1:3084/api/sessions/ad686df6-16e7-4acf-9afa-8ef325e6e13c/timeline?limit=10000",
+      "ms": 2283
+    },
+    {
+      "url": "http://127.0.0.1:3084/api/sessions/ad686df6-16e7-4acf-9afa-8ef325e6e13c/changes",
+      "ms": 3306
+    },
+    {
+      "url": "http://127.0.0.1:3084/api/sessions/ad686df6-16e7-4acf-9afa-8ef325e6e13c",
+      "ms": 3998
+    },
+    {
+      "url": "http://127.0.0.1:3084/api/sessions",
+      "ms": 4022
+    }
+  ]
+}

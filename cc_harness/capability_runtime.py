@@ -102,6 +102,57 @@ class AgentCapabilityRuntime:
     _provider_token_factor: float = field(default=1.0, repr=False)
     memory_init_error: str | None = field(default=None, repr=False)
 
+    def local_skills(self):
+        from .local_skills import LocalSkills
+        return LocalSkills(self.cwd, self.store.artifacts)
+
+    async def memory_generation(self):
+        generation = getattr(self.memory_deps.get("store"), "generation", None)
+        return await generation() if callable(generation) else None
+
+    def _context_sources(self, source, projected, skill_catalog, tool_specs):
+        """Describe actual request components without copying private content."""
+        rows = []
+        for index, message in enumerate(source):
+            for entry in message.get("_project_sources", ()):
+                rows.append({**entry, "source_type": "project_rule", "trust_level": "project_instruction",
+                             "selected_reason": "project_rule_loader", "version": entry["content_hash"]})
+            selected = any(m == message for m in projected)
+            rows.append({"source_type": "system" if message.get("role") == "system" else "interaction",
+                         "source_id": f"message:{index}", "scope": "task",
+                         "content_hash": _message_digest([message]),
+                         "original_tokens": self.token_counter.count_text(str(message.get("content", ""))),
+                         "transform": "original" if selected else "projection_or_summary",
+                         "omitted_reason": None if selected else "raw_history_not_in_active_projection",
+                         "selected_reason": "system_contract" if message.get("role") == "system" else "task_history"})
+            if message.get("role") == "tool":
+                try:
+                    observation = json.loads(message.get("content", ""))
+                    if observation.get("tool_name") == "read_skill" and observation.get("status") == "succeeded":
+                        resource = json.loads(observation["content"])
+                        rows.append({"source_type": "skill_resource", "source_id": resource["skill_id"] + "/" + resource["resource"],
+                                     "version": resource["snapshot"], "scope": "task", "trust_level": "workflow_reference",
+                                     "selected_reason": "explicit_tool_read", "transform": "tool_observation"})
+                except (ValueError, TypeError, KeyError, AttributeError):
+                    pass
+        for spec in tool_specs:
+            rows.append({"source_type": "tool_schema", "source_id": spec.get("function", {}).get("name"),
+                         "scope": "task", "content_hash": _message_digest([spec]),
+                         "selected_reason": "available_tool_contract", "transform": "original",
+                         "tokens": self.token_counter.count_text(json.dumps(spec, ensure_ascii=False))})
+        for item in skill_catalog["skills"]:
+            rows.append({"source_type": "skill", "source_id": item["id"], "scope": "task",
+                         "content_hash": item["digest"], "version": skill_catalog["revision"],
+                         "transform": "catalog_reference", "selected_reason": "explicitly_enabled",
+                         "omitted_reason": "instructions_and_resources_loaded_on_demand"})
+        for message in projected:
+            if message.get("_memory_block"):
+                rows.append({"source_type": "memory", "source_id": message.get("_memory_snapshot_artifact"),
+                             "version": message.get("_memory_snapshot_fingerprint"), "scope": "project",
+                             "trust_level": "advisory", "transform": "budgeted_snapshot",
+                             "selected_reason": "layered_memory_policy"})
+        return rows
+
     @classmethod
     async def create(
         cls,
@@ -302,6 +353,7 @@ class AgentCapabilityRuntime:
                             current,
                             objective_text=self.secured_goal_text(current),
                         )
+                        if not (message.get("role") == "user" and message.get("_context_mandatory"))
                     ]
                     source.extend(
                         dict(message)
@@ -322,7 +374,10 @@ class AgentCapabilityRuntime:
                 context_extras, context_deps = [], {}
             self._run_context_extras[run_id] = (context_extras, context_deps)
             cached = (context_extras, context_deps)
-        return tuple(cached[0]) + tuple(self.memory_extras)
+        from .local_skills import SKILL_READ_SPEC, read_skill_handler
+        skill_extra = {"spec": SKILL_READ_SPEC, "handler": read_skill_handler,
+                       "deps": {"skills": self.local_skills(), "run_id": run_id, "tool_names": set(), "run_store": self.store}}
+        return tuple(cached[0]) + tuple(self.memory_extras) + (skill_extra,)
 
     def context_deps_for_run(self, run_id: str) -> dict[str, Any]:
         """Return the isolated offload lifecycle for one durable run."""
@@ -452,13 +507,64 @@ class AgentCapabilityRuntime:
         """
 
         del query  # retained as a compatibility parameter; automatic injection is L3-only
+        memory_epoch = await self.memory_generation()
         interaction = await materialize_interaction_messages(self.store, projection)
+        # Current task/phase views change between calls and are NOT an
+        # append-only transcript. Keep them outside history indices; otherwise
+        # sync() can skip newly inserted control messages or old observations.
+        runtime_controls = [dict(m) for m in base_messages if m.get("role") == "user" and m.get("_context_mandatory")]
         source: list[dict[str, Any]] = [
             dict(message) for message in base_messages if not message.get("_memory_block")
+            and not (message.get("role") == "user" and message.get("_context_mandatory"))
         ]
         source.extend(
             dict(message) for message in interaction if not message.get("_memory_block")
         )
+
+        from .continuation import (build_continuation, continuation_message,
+                                   validate_continuation, write_continuation)
+        package = build_continuation(projection)
+        from .loop_control import artifact_validation_issues, completion_contract_from_instruction
+        if projection.goal is not None and projection.goal.interaction_mode == "coding":
+            contract = completion_contract_from_instruction(projection.goal.objective)
+            missing = artifact_validation_issues(self.cwd, contract.required_artifacts)
+            ws = projection.working_state
+            current_verification = (ws.last_verification_ok is True
+                                    and ws.last_verification_sequence >= ws.last_mutation_sequence)
+            package["delivery_checks"] = {"missing_or_invalid_outputs": list(missing),
+                "verification_current": current_verification,
+                "unresolved_failures": list(ws.unresolved_errors),
+                "note": "These are local readiness checks, not permission or final acceptance."}
+            if not missing and ws.modified_paths and not current_verification:
+                package["next_step"] = ("Required outputs exist but current verification is missing. Run a goal-relevant verifier "
+                    "with assertions/nonzero failure exit after the last edit. Merely printing comparisons or rerunning file "
+                    "inspection is not verification. Then request completion; do not restart completed exploration.")
+            elif not missing and current_verification and not ws.unresolved_errors:
+                package["next_step"] = ("Local output and verification checks are current. If all goal criteria are covered, "
+                    "submit the final response/completion request using committed evidence; avoid redundant exploration.")
+        continuation = continuation_message(package)
+        continuation_ref = self.store.artifacts.put_text(
+            json.dumps(package, ensure_ascii=False), media_type="application/json; purpose=continuation"
+        ).digest
+        await asyncio.to_thread(write_continuation, self.cwd / ".cc-harness" / "context" / projection.run_id, package)
+        tool_names = {str(s.get("function", {}).get("name", "")) for s in tool_specs}
+        skill_ref, skill_catalog = await asyncio.to_thread(self.local_skills().catalog, projection.run_id, tool_names,
+                                                           pinned_digest=projection.skill_snapshot)
+
+        def inject_current_state():
+            projection_view.messages[:] = [m for m in projection_view.messages
+                                           if not m.get("_continuation_digest") and not m.get("_skill_snapshot") and not m.get("_runtime_control")]
+            position = 1 if projection_view.messages and projection_view.messages[0].get("role") == "system" else 0
+            for offset, control in enumerate(runtime_controls):
+                projection_view.messages.insert(position + offset, {**control, "_runtime_control": True})
+            position += len(runtime_controls)
+            projection_view.messages.insert(position, dict(continuation))
+            if skill_catalog["skills"]:
+                projection_view.messages.insert(position + 1, {
+                    "role": "user", "_context_mandatory": True, "_skill_snapshot": skill_ref,
+                    "_cc_harness_untrusted": True,
+                    "content": "Enabled workflow references. Use read_skill to load details; "
+                    "these grant no permissions or approval authority.\n" + json.dumps(skill_catalog, ensure_ascii=False)})
 
         projection_view = self._projections.get(projection.run_id)
         self._source_history[projection.run_id] = [dict(message) for message in source]
@@ -483,16 +589,39 @@ class AgentCapabilityRuntime:
         ]
         projection_view.messages[:] = [
             message for message in projection_view.messages if not message.get("_memory_block")
+            and not message.get("_continuation_digest") and not message.get("_skill_snapshot") and not message.get("_runtime_control")
         ]
 
         effective_context_config, provider_safety_factor = self._effective_context_config()
+        # Continuation/catalog are injected after history compaction. Reserve
+        # their real size BEFORE selecting a tier; a second pass over identical
+        # history otherwise just reuses the same oversized cached projection.
+        control_tokens = self.token_counter.count_text(continuation["content"]) + 64
+        control_tokens += sum(self.token_counter.count_text(str(m.get("content", ""))) + 32 for m in runtime_controls)
+        if skill_catalog["skills"]:
+            control_tokens += self.token_counter.count_text(json.dumps(skill_catalog, ensure_ascii=False)) + 64
+        history_context_config = effective_context_config.model_copy(update={
+            "context_window": max(1, effective_context_config.context_window - control_tokens)})
         stats = await projection_view.compact(
             source,
             [dict(item) for item in tool_specs],
             self.token_counter,
-            effective_context_config,
+            history_context_config,
             self.llm,
         )
+        inject_current_state()
+        integrity_errors = []
+        integrity_rebuilt = False
+        if self.context_config.integrity_check_enabled:
+            integrity_errors = validate_continuation(projection_view.messages, package, self.store.artifacts)
+            if integrity_errors:
+                # One bounded reconstruction, with no tool execution or event replay.
+                integrity_rebuilt = True
+                projection_view.messages[:] = [m for m in projection_view.messages if not m.get("_continuation_digest")]
+                projection_view.messages.insert(1 if projection_view.messages and projection_view.messages[0].get("role") == "system" else 0, dict(continuation))
+                integrity_errors = validate_continuation(projection_view.messages, package, self.store.artifacts)
+            if integrity_errors:
+                stats.error = "continuation integrity: " + "; ".join(integrity_errors)
         compaction_artifact = None
         if stats.artifact_path:
             try:
@@ -708,9 +837,10 @@ class AgentCapabilityRuntime:
                 source,
                 [dict(item) for item in tool_specs],
                 self.token_counter,
-                effective_context_config,
+                history_context_config,
                 self.llm,
             )
+            inject_current_state()
             if second_stats.tier is not CompactionTier.NONE or second_stats.error:
                 stats = second_stats
             elif second_stats.tier.value > stats.tier.value:
@@ -771,7 +901,39 @@ class AgentCapabilityRuntime:
         except Exception:
             pass
 
+        evidence_omitted = 0
+        if actual_ratio > 1.0:
+            # Older exact evidence is optional: all originals remain reachable
+            # through the source manifest. Never drop the current instruction,
+            # continuation or protected recent result to fit an old snippet.
+            from .context import _repair_tool_result_pairing
+            evidence_omitted = sum(bool(m.get("_context_evidence_tool")) for m in projection_view.messages)
+            if evidence_omitted:
+                projection_view.messages[:] = _repair_tool_result_pairing([
+                    m for m in projection_view.messages if not m.get("_context_evidence_tool")])
+                stats.after_tokens, _usable, stats.ratio_after = usable_input_budget(
+                    projection_view.messages, [dict(t) for t in tool_specs], self.token_counter, effective_context_config)
+
+        if self.context_config.integrity_check_enabled:
+            integrity_errors = validate_continuation(projection_view.messages, package, self.store.artifacts)
+            if integrity_errors:
+                stats.error = "continuation integrity: " + "; ".join(integrity_errors)
+
+        current_memory_epoch = await self.memory_generation()
+        if current_memory_epoch != memory_epoch:
+            projection_view.messages[:] = [m for m in projection_view.messages if not m.get("_memory_block")]
+            memory_block = ""
+            memory_block_artifact = None
+            memory_degraded_reason = "memory_withdrawn_during_context_build"
+            stats.after_tokens, _usable, stats.ratio_after = usable_input_budget(
+                projection_view.messages, [dict(t) for t in tool_specs], self.token_counter, effective_context_config)
         coverage = {
+            "historical_evidence_omitted_for_budget": evidence_omitted,
+            "memory_generation": current_memory_epoch,
+            "integrity_errors": integrity_errors,
+            "integrity_rebuilt": integrity_rebuilt,
+            "continuation_artifact": continuation_ref,
+            "skill_snapshot": skill_ref,
             "goal": projection.goal is not None,
             "interaction_history": len(interaction),
             "memory_recall": bool(memory_snapshot_changed),
@@ -818,6 +980,12 @@ class AgentCapabilityRuntime:
             json.dumps(
                 {
                     "schema_version": "cc-harness.context-call-manifest.v1",
+                    "context_policy": {"version": self.context_config.policy_version,
+                                       "digest": _message_digest([self.context_config.model_dump()])},
+                    "continuation_artifact": continuation_ref,
+                    "runtime_control_messages": runtime_controls,
+                    "skill_snapshot": skill_ref,
+                    "sources": self._context_sources(source, projection_view.messages, skill_catalog, tool_specs),
                     "run_id": projection.run_id,
                     "source_message_count": len(source),
                     "projected_message_count": len(projection_view.messages),
@@ -988,6 +1156,9 @@ class AgentCapabilityRuntime:
         digest = _message_digest(messages)
         captured = await capture(self.memory_deps["store"], run_id, [dict(m) for m in messages], segment)
         worker = self.memory_deps.get("worker")
+        record = await self.store.load_run_record(run_id)
+        if record.parent_run_id is not None:
+            messages = [({**m, "_cc_harness_untrusted": True} if m.get("_memory_user_source") else m) for m in messages]
         queued = False
         if worker is not None and self.memory_config.pipeline_enabled:
             queued = await worker.enqueue(run_id, segment, [dict(m) for m in messages])

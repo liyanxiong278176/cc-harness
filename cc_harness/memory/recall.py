@@ -31,6 +31,9 @@ async def layered_recall(
     persona/scenarios 走本地 md(零依赖);atoms 走 retriever(向量召回)。
     """
     requested = _normalise_layers(layers)
+    from .governance import epoch_of
+    store = getattr(retriever, "_store", None) or getattr(retriever, "store", None)
+    start_epoch = await epoch_of(store)
 
     async def _run() -> RecallResult:
         text = str(query or "").strip()
@@ -152,7 +155,10 @@ async def layered_recall(
         )
 
     try:
-        return await asyncio.wait_for(_run(), timeout=timeout_s)
+        result = await asyncio.wait_for(_run(), timeout=timeout_s)
+        if await epoch_of(store) != start_epoch:
+            return RecallResult()
+        return result
     except asyncio.TimeoutError:
         return RecallResult()
 
@@ -301,6 +307,8 @@ def read_persona(persona_path: Path) -> Persona | None:
     if not persona_path.exists():
         return None
     txt = persona_path.read_text(encoding="utf-8")
+    if "validity: retracted" in txt:
+        return None
     return Persona(
         summary=txt,
         scenario_ids=_parse_list(txt, "scenario_ids"),
@@ -325,6 +333,8 @@ def read_scenarios_by_ids(scenarios_dir: Path, scenario_ids: list[str]) -> list[
         if path is None:
             continue
         text = path.read_text(encoding="utf-8")
+        if "validity: retracted" in text:
+            continue
         out.append(Scenario(
             atom_ids=_parse_atom_ids(text),
             summary=_extract_summary(text),
@@ -349,6 +359,8 @@ def read_top_scenarios(scenarios_dir: Path, top_k: int) -> list[Scenario]:
     seen_sessions: set[str] = set()
     for p in files:
         txt = p.read_text(encoding="utf-8")
+        if "validity: retracted" in txt:
+            continue
         session_id = _extract_session_id(p.stem)
         if session_id in seen_sessions:
             continue

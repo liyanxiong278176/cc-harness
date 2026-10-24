@@ -40,6 +40,7 @@ class ProjectInstructionLayer:
     text: str
     source_files: tuple[str, ...]
     digest: str
+    source_metadata: tuple[dict, ...] = ()
 
     def public_metadata(self) -> dict[str, object]:
         return {
@@ -67,6 +68,7 @@ def load_project_instructions(cwd: Path) -> ProjectInstructionLayer | None:
     root = Path(cwd).resolve()
     chunks: list[str] = []
     sources: list[str] = []
+    metadata: list[dict] = []
     remaining = _MAX_INSTRUCTION_CHARS
     for relative in _CANDIDATE_FILENAMES:
         path = root / relative
@@ -83,6 +85,10 @@ def load_project_instructions(cwd: Path) -> ProjectInstructionLayer | None:
         if not text:
             continue
         bounded = text[:remaining]
+        metadata.append({"source_id": relative.replace("\\", "/"), "scope": "project",
+                         "content_hash": "sha256:" + hashlib.sha256(bounded.encode("utf-8")).hexdigest(),
+                         "transform": "truncated" if len(bounded) < len(text) else "original",
+                         "chars": len(bounded)})
         chunks.append(bounded)
         sources.append(relative.replace("\\", "/"))
         remaining -= len(bounded)
@@ -93,6 +99,7 @@ def load_project_instructions(cwd: Path) -> ProjectInstructionLayer | None:
         text=joined,
         source_files=tuple(sources),
         digest=hashlib.sha256(joined.encode("utf-8")).hexdigest(),
+        source_metadata=tuple(metadata),
     )
 
 

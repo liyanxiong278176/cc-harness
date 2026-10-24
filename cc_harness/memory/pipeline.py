@@ -7,6 +7,8 @@ embed → search → decide → apply flow including ADD/UPDATE/DELETE/NOOP).
 from __future__ import annotations
 import json
 import re
+import hashlib
+import time
 from dataclasses import dataclass
 from cc_harness.prompts import MEMORY_EXTRACT_SYSTEM_PROMPT, memory_extract_user_prompt
 from cc_harness.tokens import TokenCounter
@@ -25,12 +27,14 @@ class MemoryPipeline:
         threshold: float = 0.55,
         recent_turns: int = 10,
         max_delta_tokens: int = 4000,
+        verified_sources: bool = False,
     ):
         self._llm = llm
         self._service = service
         self.threshold = threshold
         self.recent_turns = recent_turns
         self.max_delta_tokens = max_delta_tokens
+        self.verified_sources = verified_sources
 
     async def maybe_run(
         self, messages: list[dict], counter: TokenCounter, context_window: int,
@@ -58,9 +62,51 @@ class MemoryPipeline:
             return PipelineResult(results=[], error=f"{type(e).__name__}: {e}", ratio=ratio)
 
         results = []
-        for text in candidates:
+        for candidate in candidates:
             try:
-                r = await self._service.save(text, source="pipeline", session_id=session_id)
+                if self.verified_sources:
+                    if not isinstance(candidate, dict):
+                        continue
+                    index = candidate.get("source_index")
+                    if not isinstance(index, int) or not 0 <= index < len(delta):
+                        continue
+                    message = delta[index]
+                    quote = candidate.get("quote")
+                    if not isinstance(quote, str) or not quote.strip() or quote not in str(message.get("content", "")):
+                        continue
+                    kind = candidate.get("kind")
+                    if kind not in {"preference", "project_fact", "decision"}:
+                        continue
+                    role = message.get("role")
+                    if role == "user":
+                        if kind not in {"preference", "decision"}:
+                            continue
+                        if message.get("_cc_harness_untrusted") or (message.get("_context_mandatory")
+                            and not message.get("_memory_explicit_user") and not message.get("_cc_harness_resume_reason")):
+                            continue
+                    elif role == "tool" and kind == "project_fact":
+                        observation = json.loads(message.get("content", "{}"))
+                        if observation.get("status") != "succeeded" or not observation.get("observation_id"):
+                            continue
+                        if quote not in str(observation.get("content", "")):
+                            continue
+                    else:
+                        continue
+                    from cc_harness.l5 import KeyRegexLayer
+                    if KeyRegexLayer().find(quote):
+                        continue
+                    source_digest = hashlib.sha256(f"{role}\x00{message.get('content', '')}".encode()).hexdigest()
+                    if await self._service.store.retracted("source", source_digest):
+                        continue
+                    # Store the verified excerpt, never an unsupported paraphrase.
+                    provenance = {"source_digest": source_digest, "source_index": index, "kind": kind,
+                                  "verified_at": time.time(), "authority": "advisory",
+                                  "memory_epoch": await self._service.store.generation()}
+                    r = await self._service.save(quote.strip(), source="pipeline", session_id=session_id,
+                                                 provenance=provenance)
+                else:
+                    text = candidate.get("text", candidate.get("quote", "")) if isinstance(candidate, dict) else candidate
+                    r = await self._service.save(text, source="pipeline", session_id=session_id)
                 results.append(r)
             except Exception as e:
                 from cc_harness.memory.service import SaveResult
@@ -76,16 +122,18 @@ class MemoryPipeline:
             and not m.get("_compaction_summary")
             and not m.get("_memory_block")
         ]
-        return filtered[-self.recent_turns * 2:]  # 1 turn ≈ 2 条 (user+assistant)
+        recent = filtered[-self.recent_turns * 2:]
+        return [{**m, "content": m["_memory_user_source"], "_memory_explicit_user": True}
+                if isinstance(m.get("_memory_user_source"), str) else m for m in recent]
 
     def _render_delta(self, delta: list[dict]) -> str:
         out = []
-        for m in delta:
+        for index, m in enumerate(delta):
             role = m.get("role", "?")
             content = m.get("content", "")
             if isinstance(content, list):
                 content = "<multimodal>"
-            out.append(f"[{role}] {content}")
+            out.append(f"[source_index={index} role={role}] {content}")
         return "\n\n".join(out)
 
     def _truncate_to_tokens(self, text: str, counter: TokenCounter, max_tokens: int) -> str:
@@ -111,4 +159,4 @@ class MemoryPipeline:
         if not m:
             return []
         data = json.loads(m.group(0))
-        return [str(t).strip() for t in data.get("memories", []) if str(t).strip()]
+        return [t if isinstance(t, dict) else str(t).strip() for t in data.get("memories", []) if t]

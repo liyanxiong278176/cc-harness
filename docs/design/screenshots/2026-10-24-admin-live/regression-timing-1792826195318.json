@@ -1,0 +1,21 @@
+{
+  "errors": [],
+  "timing": [
+    {
+      "url": "http://127.0.0.1:3080/api/bootstrap?include_sessions=false",
+      "ms": 32
+    },
+    {
+      "url": "http://127.0.0.1:3080/api/web/v1/capabilities",
+      "ms": 3
+    },
+    {
+      "url": "http://127.0.0.1:3080/api/sessions",
+      "ms": 2778
+    },
+    {
+      "url": "http://127.0.0.1:3080/api/settings",
+      "ms": 329
+    }
+  ]
+}

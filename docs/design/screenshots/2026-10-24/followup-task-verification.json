@@ -1,0 +1,12 @@
+{
+  "result": "passed",
+  "source": "Real durable follow-up runs and SSE",
+  "checks": [
+    "greeting replaced by coding request while list stays open",
+    "child task statuses advance live",
+    "third request replaces previous tasks",
+    "reload restores latest tasks",
+    "Continue preserves objective and checklist with done count and pending states"
+  ],
+  "errors": []
+}

@@ -1,0 +1,9 @@
+{
+  "base_url": "http://127.0.0.1:3081",
+  "project_root": "C:\\Users\\A2781\\AppData\\Local\\Temp\\cc-harness-ui-verification-o9ga78fh\\atlas-workspace",
+  "completed": "0eff0f71-d7fa-42d1-9ed7-9640c56e30b5",
+  "approval": "8460d006-bdeb-42a7-be95-b159d0294deb",
+  "active": "63ac6549-ef97-4e0f-8c38-80b1aa472a3e",
+  "failed": "dd2d0e0a-5dbd-4ce9-8659-ddb1f7c7d5df",
+  "data_kind": "deterministic local verification, no remote model"
+}

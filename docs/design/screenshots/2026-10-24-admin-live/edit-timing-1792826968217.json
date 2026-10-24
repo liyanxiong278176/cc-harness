@@ -1,0 +1,49 @@
+{
+  "errors": [],
+  "timing": [
+    {
+      "url": "http://127.0.0.1:3084/api/bootstrap?include_sessions=false",
+      "ms": 6
+    },
+    {
+      "url": "http://127.0.0.1:3084/api/web/v1/capabilities",
+      "ms": 2
+    },
+    {
+      "url": "http://127.0.0.1:3084/api/sessions",
+      "ms": 986
+    },
+    {
+      "url": "http://127.0.0.1:3084/api/sessions/ad686df6-16e7-4acf-9afa-8ef325e6e13c/timeline?limit=10000",
+      "ms": 1433
+    },
+    {
+      "url": "http://127.0.0.1:3084/api/sessions/ad686df6-16e7-4acf-9afa-8ef325e6e13c/changes",
+      "ms": 1892
+    },
+    {
+      "url": "http://127.0.0.1:3084/api/sessions/ad686df6-16e7-4acf-9afa-8ef325e6e13c",
+      "ms": 2795
+    },
+    {
+      "url": "http://127.0.0.1:3084/api/sessions/ad686df6-16e7-4acf-9afa-8ef325e6e13c/timeline?limit=10000",
+      "ms": 1815
+    },
+    {
+      "url": "http://127.0.0.1:3084/api/sessions/ad686df6-16e7-4acf-9afa-8ef325e6e13c/changes",
+      "ms": 2452
+    },
+    {
+      "url": "http://127.0.0.1:3084/api/sessions/ad686df6-16e7-4acf-9afa-8ef325e6e13c/queue/650928c5-695c-4cb4-9042-1203218b2946",
+      "ms": 1994
+    },
+    {
+      "url": "http://127.0.0.1:3084/api/sessions/ad686df6-16e7-4acf-9afa-8ef325e6e13c",
+      "ms": 2923
+    },
+    {
+      "url": "http://127.0.0.1:3084/api/sessions",
+      "ms": 2979
+    }
+  ]
+}

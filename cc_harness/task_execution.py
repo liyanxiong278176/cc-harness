@@ -115,7 +115,6 @@ class TaskControl:
             "RunCreated": "created", "RunClaimed": "running", "RunResumed": "running",
             "ApprovalRequested": "waiting_approval", "ApprovalGranted": "running",
             "ApprovalRejected": "running", "RunStalled": "paused", "RunBlocked": "waiting_input",
-            "TaskApprovalSuperseded": "running",
             "RunCancelled": "cancelled", "RunFailed": "failed", "CompletionAccepted": "completed",
             "RunPaused": "paused", "TaskWaitStarted": str(payload.get("kind", "waiting_event")),
             "TaskWaitResolved": "running", "TaskVerificationStarted": "verifying",
@@ -129,10 +128,12 @@ class TaskControl:
             "ApprovalRequested": "idle", "RunBlocked": "idle", "RunStalled": "idle",
             "RunCancelled": "idle", "RunFailed": "idle", "CompletionAccepted": "idle",
             "TaskWaitStarted": "idle", "TaskWaitResolved": "queued",
-            "TaskApprovalSuperseded": "queued",
         }.get(event)
         if scheduling:
             state = replace(state, scheduling=scheduling)
+        if event == "TaskApprovalSuperseded" and self.lifecycle is TaskLifecycle.WAITING_APPROVAL:
+            state = replace(state, lifecycle=TaskLifecycle.RUNNING, scheduling="queued",
+                            reason=str(payload.get("reason", "")))
         if event == "TaskControlEnabled":
             state = replace(state, protocol_version=1)
         elif event == "RunCreated" and payload.get("task_protocol_version"):

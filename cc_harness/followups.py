@@ -8,7 +8,7 @@ from dataclasses import dataclass, replace
 
 from .artifacts import ArtifactStore
 from .run_events import EventActor, RunEvent
-from .run_model import GoalContract, PlanGraph, PlanNode, Run, RuntimeContract, predecessor_gate
+from .run_model import GoalContract, PlanGraph, PlanNode, Run, RunStatus, RuntimeContract, predecessor_gate
 from .run_projection import QueueProjection
 from .run_store import RunStore
 
@@ -49,7 +49,7 @@ class FollowUpService:
             },
         )
         await self.store.append(event, expected_sequence=predecessor.sequence)
-        started = gate in {"ready", "incomplete"}
+        started = gate in {"ready", "incomplete"} and not await self._has_active_predecessor(predecessor.queue)
         if started:
             await self._start(predecessor_run_id, follow_up_run_id, artifact.digest, incomplete=gate == "incomplete")
         return FollowUpReceipt(predecessor_run_id, follow_up_run_id, event.sequence, gate, started)
@@ -58,7 +58,11 @@ class FollowUpService:
         predecessor = await self.store.load_projection(predecessor_run_id)
         ready: list[FollowUpReceipt] = []
         for item in predecessor.queue:
-            if item.status != "queued":
+            if item.status == "started":
+                child = await self.store.load_projection(item.follow_up_run_id)
+                if child.status not in {RunStatus.COMPLETED, RunStatus.CANCELLED, RunStatus.STALLED, RunStatus.FAILED_RECOVERABLE, RunStatus.FAILED_TERMINAL, RunStatus.BLOCKED}:
+                    break
+            if item.status not in {"queued", "starting"}:
                 continue
             gate = predecessor_gate(predecessor.status, bypassed=item.gate == "bypassed").value
             if gate not in {"ready", "incomplete", "bypassed"}:
@@ -80,7 +84,18 @@ class FollowUpService:
                 )
             )
             predecessor = updated
+            break  # Release one message at a time to preserve FIFO execution.
         return tuple(ready)
+
+    async def _has_active_predecessor(self, queue) -> bool:
+        for item in queue:
+            if item.status in {"queued", "starting"}:
+                return True
+            if item.status == "started":
+                child = await self.store.load_projection(item.follow_up_run_id)
+                if child.status not in {RunStatus.COMPLETED, RunStatus.CANCELLED, RunStatus.STALLED, RunStatus.FAILED_RECOVERABLE, RunStatus.FAILED_TERMINAL, RunStatus.BLOCKED}:
+                    return True
+        return False
 
     async def bypass(self, predecessor_run_id: str, follow_up_run_id: str, reason: str) -> FollowUpReceipt:
         predecessor = await self.store.load_projection(predecessor_run_id)
@@ -101,6 +116,23 @@ class FollowUpService:
         updated = await self.store.load_projection(predecessor_run_id)
         return FollowUpReceipt(predecessor_run_id, follow_up_run_id, updated.sequence, "bypassed", True)
 
+    async def revise(self, predecessor_run_id: str, follow_up_run_id: str, message: str | None) -> int:
+        """Revise only unclaimed work, using the event sequence as a CAS fence."""
+        predecessor = await self.store.load_projection(predecessor_run_id)
+        item = self._find_item(predecessor.queue, follow_up_run_id)
+        if item.status != "queued" or await self.store.run_exists(follow_up_run_id):
+            raise ValueError("消息已开始处理，不能修改或撤回")
+        payload = {"follow_up_run_id": follow_up_run_id}
+        kind = "FollowUpCancelled"
+        if message is not None:
+            if not message.strip():
+                raise ValueError("消息不能为空")
+            payload["message_artifact"] = self.artifacts.put_text(message.strip()).digest
+            kind = "FollowUpUpdated"
+        event = self._event(predecessor, kind, payload)
+        await self.store.append(event, expected_sequence=predecessor.sequence)
+        return event.sequence
+
     async def _start(
         self,
         predecessor_run_id: str,
@@ -113,6 +145,15 @@ class FollowUpService:
         item = self._find_item(predecessor.queue, follow_up_run_id)
         if item.status == "started":
             return
+        if item.status == "cancelled":
+            return
+        if item.status == "queued":
+            claim = self._event(predecessor, "FollowUpClaimed", {"follow_up_run_id": follow_up_run_id})
+            await self.store.append(claim, expected_sequence=predecessor.sequence)
+            predecessor = await self.store.load_projection(predecessor_run_id)
+            item = self._find_item(predecessor.queue, follow_up_run_id)
+        # Always use the latest durable revision, including after a crash.
+        message_artifact = item.message_artifact
         contract = predecessor.runtime_contract
         if contract is None:
             raise ValueError("predecessor has no pinned runtime contract")
@@ -131,7 +172,6 @@ class FollowUpService:
         )
         if item.continuation and predecessor.goal is not None:
             goal = replace(predecessor.goal,
-                objective=predecessor.goal.objective + "\n\nContinuation request:\n" + message,
                 constraints=(*predecessor.goal.constraints, *constraints),
                 contract_version=predecessor.goal.contract_version + 1)
         handoff = self.artifacts.put_text(
@@ -206,14 +246,38 @@ class FollowUpService:
             )
             event_types.add("PlanCreated")
         child = await self.store.load_projection(follow_up_run_id)
-        if "TodoCreated" not in event_types:
+        if item.continuation and predecessor.todos:
+            # A continuation resumes the existing checklist. The control
+            # reason remains in the handoff, never becomes a task title.
+            # Seed each ID separately so recovery after a partial write does
+            # not drop the rest of the checklist or reset later progress.
+            created_ids = {
+                str(event.payload.get("todo", {}).get("id", ""))
+                for event in existing_events if event.event_type == "TodoCreated"
+            }
+            for todo in predecessor.todos:
+                if todo.todo_id in created_ids:
+                    continue
+                await self._append_new_run(
+                    follow_up_run_id,
+                    "TodoCreated",
+                    {"todo": {
+                        "id": todo.todo_id,
+                        "title": todo.title,
+                        "status": "done" if todo.status in {"done", "completed"} else "pending",
+                        "active_sessions": [follow_up_run_id],
+                        "evidence": [evidence.to_dict() for evidence in todo.evidence],
+                    }},
+                    contract,
+                )
+        elif "TodoCreated" not in event_types:
             await self._append_new_run(
                 follow_up_run_id,
                 "TodoCreated",
                 {
                     "todo": {
                         "id": f"follow-up-{follow_up_run_id}",
-                        "title": message,
+                        "title": goal.objective if item.continuation else message,
                         "status": "pending",
                         "active_sessions": [follow_up_run_id],
                         "plan_node_id": f"follow-up-{follow_up_run_id}",

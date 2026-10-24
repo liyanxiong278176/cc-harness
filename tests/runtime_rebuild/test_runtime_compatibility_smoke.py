@@ -62,7 +62,6 @@ async def test_durable_runtime_uses_audited_native_fallback_when_sandbox_is_down
     monkeypatch.setenv("OPENAI_MODEL", "provider-neutral-smoke-model")
     from unittest.mock import AsyncMock
     from cc_harness.sandbox import SandboxUnavailableError
-    from cc_harness import tools
 
     prewarm = AsyncMock(side_effect=SandboxUnavailableError("docker is unavailable"))
     monkeypatch.setattr("cc_harness.durable_runtime.prewarm_session_executor", prewarm)
@@ -78,7 +77,8 @@ async def test_durable_runtime_uses_audited_native_fallback_when_sandbox_is_down
         assert runtime["degraded_reason"].startswith("sandbox_unavailable_native_fallback:")
         assert runtime["details"]["sandbox_fallback"] == "native"
         assert client._services.executor_config.backend.value == "native"
-        assert tools.session_executor_status()["native_fallback_active"] is True
+        assert client.executor_status()["degraded"] is True
+        assert client.executor_status()["backend"] == "native"
         prewarm.assert_awaited_once_with()
     finally:
         await client.close()

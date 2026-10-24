@@ -44,9 +44,11 @@ async def consolidate(store: "MemoryStore", embedder, llm=None, *,
                       similarity_threshold: float = 0.15,
                       max_cluster_size: int = 5) -> int:
     """全库扫一次, cluster 相似, merge/update/noop。返回受影响条数。"""
+    from cc_harness.memory.governance import epoch_of
+    epoch = await epoch_of(store)
     cur = await store._db.execute(
         "SELECT id, text, embedding, created_at, updated_at, source, layer, session_id "
-        "FROM memories LIMIT 500"
+        "FROM memories WHERE validity='active' LIMIT 500"
     )
     rows = await cur.fetchall()
     if not rows:
@@ -94,7 +96,8 @@ async def consolidate(store: "MemoryStore", embedder, llm=None, *,
             for m in cluster:
                 if await store.delete(m.id):
                     pass
-            new_mem = await store.add(merged_text, new_emb, "consolidation", session_id=None)
+            new_mem = await store.add(merged_text, new_emb, "consolidation", session_id=None,
+                                      provenance_json=json.dumps({"memory_epoch": epoch, "parent_ids": [m.id for m in cluster]}))
             async with store.write_lock:
                 try:
                     await begin_immediate(store._db)
@@ -108,6 +111,8 @@ async def consolidate(store: "MemoryStore", embedder, llm=None, *,
                     raise
             affected += len(cluster)
         elif action == "update":
+            if await epoch_of(store) != epoch:
+                continue
             keep = cluster[-1]
             try:
                 new_text = await _ask_llm_merge(cluster, llm)
@@ -119,7 +124,8 @@ async def consolidate(store: "MemoryStore", embedder, llm=None, *,
                 new_emb = await embedder.embed(new_text)
             except Exception:
                 continue
-            await store.update(keep.id, new_text, new_emb)
+            await store.update(keep.id, new_text, new_emb,
+                               provenance_json=json.dumps({"memory_epoch": epoch, "parent_ids": [m.id for m in cluster]}))
             for m in cluster[:-1]:
                 if await store.delete(m.id):
                     affected += 1

@@ -5,9 +5,11 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import os
 import re
+import socket
 import time
-from contextlib import asynccontextmanager, suppress
+from contextlib import asynccontextmanager, suppress, nullcontext
 from collections.abc import AsyncIterator, Iterable
 from dataclasses import dataclass
 from pathlib import Path
@@ -84,6 +86,11 @@ class RunRecordView:
     predecessor_run_id: str | None = None
 
 
+# Bound replay work for long, actively written conversations. Snapshots are
+# verified accelerators; events and their transactional cursor remain authority.
+PROJECTION_SNAPSHOT_INTERVAL = 100
+
+
 @dataclass(frozen=True)
 class AppendEvent:
     event: RunEvent
@@ -93,6 +100,45 @@ class AppendEvent:
 
 
 StoredEvent = RunEvent
+
+# Format written by LocalSupervisor: supervisor-<host>-<pid>-<random suffix>.
+# The pid lets a restarted local WebUI reclaim a lease whose owner died without
+# waiting the full 120s TTL.  Older leases (plain random ids) remain valid until
+# expiry; they are indistinguishable from a live remote owner.
+_SUPERVISOR_OWNER = re.compile(r"^supervisor-(?P<host>.+)-(?P<pid>\d+)-[0-9a-f]{8,}$")
+
+
+def _process_is_alive(pid: int) -> bool:
+    if pid <= 0:
+        return False
+    if os.name == "nt":
+        try:
+            import ctypes
+
+            handle = ctypes.windll.kernel32.OpenProcess(0x1000, False, pid)
+            if not handle:
+                return False
+            ctypes.windll.kernel32.CloseHandle(handle)
+            return True
+        except Exception:
+            return False
+    try:
+        os.kill(pid, 0)
+    except OSError:
+        return False
+    return True
+
+
+def _lease_owner_is_dead(owner_id: str) -> bool:
+    match = _SUPERVISOR_OWNER.match(str(owner_id))
+    if match is None:
+        return False
+    if match.group("host").casefold() != socket.gethostname().casefold():
+        return False
+    try:
+        return not _process_is_alive(int(match.group("pid")))
+    except ValueError:
+        return False
 
 
 class RunStore:
@@ -115,6 +161,10 @@ class RunStore:
         self.artifacts = artifact_store or ArtifactStore(self.state_dir / "objects")
         self._db: aiosqlite.Connection | None = None
         self._write_lock = asyncio.Lock()
+        # Serialize event construction (read sequence -> append), shared by
+        # Worker and ExecutionControl. SQL transaction locking alone cannot
+        # protect the gap between these two operations.
+        self.event_append_lock = asyncio.Lock()
         self._open_lock = asyncio.Lock()
         # Legacy snapshots can be replayed safely, but a terminal Run may be
         # read many times by the supervisor.  Keep the migration diagnostic
@@ -317,7 +367,7 @@ class RunStore:
                     await self._db.close()
                     self._db = None
 
-    async def referenced_artifact_digests(self) -> set[str]:
+    async def referenced_artifact_digests(self, *, _locked: bool = False) -> set[str]:
         """Collect every content digest reachable from the durable runtime.
 
         Object publication intentionally happens before the event commit.  If a
@@ -343,8 +393,8 @@ class RunStore:
                 for item in value:
                     collect(item)
 
-        async with self._write_lock:
-            async with self._transaction(db, write=False):
+        async with (nullcontext() if _locked else self._write_lock):
+            async with (nullcontext() if _locked else self._transaction(db, write=False)):
                 cursor = await db.execute(
                     "SELECT payload_json, artifact_refs_json FROM run_event"
                 )
@@ -364,6 +414,28 @@ class RunStore:
                 collect(json.loads(projection_json))
             except (TypeError, ValueError, json.JSONDecodeError):
                 continue
+        # Manifests and continuations refer to other content-addressed objects.
+        # Follow those edges rather than collecting a still-live nested object.
+        import sqlite3
+        assets_db = self.project_root / ".cc-harness" / "local-assets.db"
+        if assets_db.is_file():
+            with sqlite3.connect(assets_db, timeout=30) as assets:
+                if assets.execute("SELECT 1 FROM sqlite_master WHERE name='skill_snapshot_history'").fetchone():
+                    collect([row[0] for row in assets.execute("SELECT digest FROM skill_snapshot_history")])
+        pending = list(found)
+        visited = set()
+        while pending:
+            ref = pending.pop()
+            if ref in visited:
+                continue
+            visited.add(ref)
+            try:
+                payload = json.loads(self.artifacts.read_text(ref))
+            except (OSError, RuntimeError, KeyError, ValueError, UnicodeError):
+                continue
+            previous = set(found)
+            collect(payload)
+            pending.extend(found - previous)
         return found
 
     async def collect_artifact_garbage(
@@ -371,24 +443,20 @@ class RunStore:
         *,
         now: float | None = None,
         grace_period_seconds: float | None = None,
+        allowed_digests: set[str] | None = None,
     ) -> GarbageCollectionReport:
         """Delete only old objects that are unreachable from durable state."""
 
-        referenced = await self.referenced_artifact_digests()
-        # Temp files are not addressable artifacts and can only be abandoned by
-        # an interrupted atomic publish; clean them independently.
-        self.artifacts.cleanup_temporary_files(
-            older_than_seconds=(
-                self.artifacts.grace_period_seconds
-                if grace_period_seconds is None
-                else max(0.0, float(grace_period_seconds))
-            )
-        )
-        return self.artifacts.collect_garbage(
-            referenced,
-            now=now,
-            grace_period_seconds=grace_period_seconds,
-        )
+        async with self._write_lock:
+            async with self._transaction(self._require_db(), write=True):
+                referenced = await self.referenced_artifact_digests(_locked=True)
+                if allowed_digests is not None:
+                    for path in self.artifacts.root.glob("[0-9a-f][0-9a-f]/*"):
+                        digest = "sha256:" + path.name
+                        if path.suffix != ".json" and digest not in allowed_digests:
+                            referenced.add(digest)
+                return self.artifacts.collect_garbage(
+                    referenced, now=now, grace_period_seconds=grace_period_seconds)
 
     @staticmethod
     async def _rollback_open_transaction(db: aiosqlite.Connection) -> None:
@@ -593,6 +661,8 @@ class RunStore:
                     await self._persist_lease_tx(event, run_row)
                     if snapshot is not None:
                         await self._insert_snapshot_tx(snapshot)
+                    elif event.sequence % PROJECTION_SNAPSHOT_INTERVAL == 0:
+                        await self._insert_snapshot_tx(new_projection)
             except aiosqlite.IntegrityError as exc:
                 if "event_id" in str(exc).lower():
                     raise DuplicateEventError(f"event id already exists: {event.event_id}") from exc
@@ -612,6 +682,47 @@ class RunStore:
                               runtime_contract_digest, payload_json, artifact_refs_json
                        FROM run_event WHERE run_id = ? AND sequence > ? ORDER BY sequence LIMIT ?""",
                     (run_id, after, limit + 1),
+                )
+                rows = await cursor.fetchall()
+                has_more = len(rows) > limit
+                events = tuple(self._event_from_row(row) for row in rows[:limit])
+                return EventPage(events, events[-1].sequence if has_more and events else None)
+
+    async def read_types(
+        self,
+        run_id: str,
+        *,
+        event_types: Iterable[str],
+        after: int = 0,
+        limit: int = 200,
+    ) -> EventPage:
+        """Read a bounded page restricted to one or more durable event types.
+
+        The WebUI transcript only needs the user/assistant/tool/plan surfaces;
+        the remaining kernel, budget, heartbeat, and memory records are durable
+        audit evidence but not chat material.  Filtering in SQL keeps a long
+        session from decoding thousands of unrelated rows just to paint the
+        last few turns.
+        """
+
+        if after < 0 or limit < 1:
+            raise RunStoreError("after must be non-negative and limit must be positive")
+        types = tuple(dict.fromkeys(str(item) for item in event_types if str(item)))
+        if not types:
+            return EventPage((), None)
+        db = self._require_db()
+        placeholders = ", ".join("?" for _ in types)
+        async with self._write_lock:
+            async with self._transaction(db, write=False):
+                await self._ensure_run(run_id)
+                cursor = await db.execute(
+                    f"""SELECT run_id, sequence, event_id, event_type, schema_version, occurred_at,
+                              actor_kind, actor_id, causation_id, correlation_id, lease_epoch,
+                              runtime_contract_digest, payload_json, artifact_refs_json
+                       FROM run_event
+                       WHERE run_id = ? AND sequence > ? AND event_type IN ({placeholders})
+                       ORDER BY sequence LIMIT ?""",
+                    (run_id, after, *types, limit + 1),
                 )
                 rows = await cursor.fetchall()
                 has_more = len(rows) > limit
@@ -981,9 +1092,16 @@ class RunStore:
                 )
                 row = await cursor.fetchone()
                 if row is not None and float(row[4]) > now and str(row[0]) != owner:
-                    raise SupervisorLeaseConflict(
-                        f"project {self.project_id} supervisor lease is owned by {row[0]}"
-                    )
+                    # A local process that died without releasing its lease
+                    # must not strand queued work for the full TTL.  The
+                    # owner-id pid is authoritative when present; legacy
+                    # owners without a pid are reclaimed once their heartbeat
+                    # has been absent for well over the 0.25s scheduler tick.
+                    missed_heartbeat = now - float(row[3]) > 15.0
+                    if not _lease_owner_is_dead(str(row[0])) and not missed_heartbeat:
+                        raise SupervisorLeaseConflict(
+                            f"project {self.project_id} supervisor lease is owned by {row[0]}"
+                        )
                 if row is not None and str(row[0]) == owner and float(row[4]) > now:
                     epoch = int(row[1])
                     acquired_at = float(row[2])

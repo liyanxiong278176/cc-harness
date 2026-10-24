@@ -427,7 +427,10 @@ def _windows_process_metrics(pid: int) -> tuple[int, int]:
                 ("other_bytes", ctypes.c_uint64),
             ]
 
-        kernel = ctypes.windll.kernel32
+        # ctypes.windll caches function objects process-wide. Each concurrent
+        # scan defines its own Structure types, so changing cached argtypes
+        # can reject another thread's pointers. Keep signatures local.
+        kernel = ctypes.WinDLL("kernel32", use_last_error=True)
         kernel.OpenProcess.argtypes = [ctypes.c_uint32, ctypes.c_int, ctypes.c_uint32]
         kernel.OpenProcess.restype = ctypes.c_void_p
         kernel.CloseHandle.argtypes = [ctypes.c_void_p]
@@ -468,7 +471,7 @@ def _windows_process_metrics(pid: int) -> tuple[int, int]:
             return int(cpu_ticks), int(io_bytes)
         finally:
             kernel.CloseHandle(handle)
-    except (AttributeError, OSError, TypeError, ValueError):
+    except (AttributeError, OSError, TypeError, ValueError, ctypes.ArgumentError):
         return 0, 0
 
 
@@ -669,11 +672,43 @@ async def _collect_process_output(
 ) -> tuple[bytes, bytes]:
     stdout_chunks: list[bytes] = []
     stderr_chunks: list[bytes] = []
-    await asyncio.gather(
-        _drain_pipe(proc.stdout, stdout_chunks, activity=activity, byte_key="stdout_bytes"),
-        _drain_pipe(proc.stderr, stderr_chunks, activity=activity, byte_key="stderr_bytes"),
-        proc.wait(),
-    )
+    # Retain already-read output if a timeout cancels the collector before EOF.
+    activity["_stdout_chunks"] = stdout_chunks
+    activity["_stderr_chunks"] = stderr_chunks
+    readers = [
+        asyncio.create_task(_drain_pipe(proc.stdout, stdout_chunks, activity=activity, byte_key="stdout_bytes")),
+        asyncio.create_task(_drain_pipe(proc.stderr, stderr_chunks, activity=activity, byte_key="stderr_bytes")),
+    ]
+    try:
+        # Process.wait() may itself wait for pipe EOF on asyncio transports.
+        # A detached child can retain those handles after the shell exited.
+        while proc.returncode is None:
+            for reader in readers:
+                if reader.done() and not reader.cancelled() and reader.exception() is not None:
+                    raise reader.exception()
+            await asyncio.sleep(0.05)
+        _, pending = await asyncio.wait(readers, timeout=1.0)
+        if pending:
+            activity["inherited_pipes_closed"] = True
+            for reader in pending:
+                reader.cancel()
+            # Close only our read handles after the shell's verified exit.
+            # The detached child is not killed or declared healthy here.
+            transport = getattr(proc, "_transport", None)
+            if transport is not None:
+                for fd in (1, 2):
+                    pipe = transport.get_pipe_transport(fd)
+                    if pipe is not None:
+                        pipe.close()
+        results = await asyncio.gather(*readers, return_exceptions=True)
+        for result in results:
+            if isinstance(result, BaseException) and not isinstance(result, asyncio.CancelledError):
+                raise result
+    finally:
+        for reader in readers:
+            if not reader.done():
+                reader.cancel()
+        await asyncio.gather(*readers, return_exceptions=True)
     return b"".join(stdout_chunks), b"".join(stderr_chunks)
 
 
@@ -1604,10 +1639,11 @@ class NativeExecutor:
             )
         command_digest = _command_digest(command)
         deadline_budget = remaining_task_budget()
+        requested_timeout = resolve_run_command_timeout(args.get("timeout_seconds"), default=self.timeout_s) if "timeout_seconds" in args else self.timeout_s
         command_timeout = (
-            min(self.timeout_s, deadline_budget)
+            min(requested_timeout, deadline_budget)
             if deadline_budget is not None
-            else self.timeout_s
+            else requested_timeout
         )
         progress_raw = os.getenv(RUN_COMMAND_PROGRESS_FILE_ENV)
         progress_path = Path(progress_raw) if progress_raw else None
@@ -1651,6 +1687,7 @@ class NativeExecutor:
                 health_timeout_s=args.get("health_timeout_s"),
                 shutdown_timeout_s=args.get("shutdown_timeout_s"),
             )
+        proc = None
         try:
             process_options: dict[str, object] = {}
             if os.name == "posix":
@@ -1713,6 +1750,12 @@ class NativeExecutor:
             stderr_b = b""
             try:
                 while not collector.done():
+                    if proc.returncode is not None:
+                        # The command has finished; allow its bounded output
+                        # drain instead of converting inherited handles into
+                        # a false foreground timeout.
+                        stdout_b, stderr_b = await collector
+                        break
                     now = asyncio.get_running_loop().time()
                     snapshot = await _async_process_activity_snapshot(
                         proc.pid, self.project_root
@@ -1743,6 +1786,8 @@ class NativeExecutor:
                         except (asyncio.TimeoutError, asyncio.CancelledError, OSError):
                             collector.cancel()
                             await asyncio.gather(collector, return_exceptions=True)
+                            stdout_b = b"".join(activity.get("_stdout_chunks", ()))
+                            stderr_b = b"".join(activity.get("_stderr_chunks", ()))
                         stdout = _decode_process_output(stdout_b)
                         stderr = _decode_process_output(stderr_b)
                         combined = (stdout + "\n" + stderr).strip()
@@ -1817,7 +1862,21 @@ class NativeExecutor:
                         idle_s=now - float(activity["last_activity"]),
                         activity=activity,
                     )
+        except asyncio.CancelledError:
+            if proc is not None:
+                await _terminate_process_tree(proc)
+                try:
+                    await asyncio.wait_for(proc.communicate(), timeout=2)
+                except (TimeoutError, OSError):
+                    pass
+            raise
         except Exception as e:
+            if proc is not None:
+                await _terminate_process_tree(proc)
+                try:
+                    await asyncio.wait_for(proc.communicate(), timeout=2)
+                except (TimeoutError, OSError):
+                    pass
             return ToolResult.error(
                 display=f"raised: {e}",
                 llm=f"[Tool Error] {type(e).__name__}: {e}",
@@ -1825,6 +1884,7 @@ class NativeExecutor:
                     "exit_code": None,
                     "timed_out": False,
                     "exception": type(e).__name__,
+                    "execution_not_started": proc is None,
                     "stdout": "",
                     "stderr": "",
                     "stdout_chunks": [],
@@ -1848,13 +1908,21 @@ class NativeExecutor:
         stderr = _decode_process_output(
             stderr_b, fallback_encodings=self.shell_profile.fallback_encodings
         )
+        output_complete = not bool(activity.get("inherited_pipes_closed"))
+        output_notice = (
+            "\n[Process output] The shell exited, but a child retained output handles. "
+            "Captured output is partial; child readiness is not verified. "
+            "Use background=true and a readiness_command for long-lived services."
+            if not output_complete else ""
+        )
         if proc.returncode != 0:
             combined = (stdout + stderr).strip() or f"(no output, exit {proc.returncode})"
             return ToolResult.error(
                 display=f"exit {proc.returncode}: {combined[:200]}",
-                llm=f"[Tool Error] exit {proc.returncode}\nstdout: {stdout}\nstderr: {stderr}",
+                llm=f"[Tool Error] exit {proc.returncode}\nstdout: {stdout}\nstderr: {stderr}{output_notice}",
                 metadata={
                     "exit_code": proc.returncode,
+                    "output_complete": output_complete,
                     "timed_out": False,
                     "stdout": stdout,
                     "stderr": stderr,
@@ -1874,9 +1942,10 @@ class NativeExecutor:
                 },
             )
         return ToolResult.success(
-            stdout if stdout else "(no output)",
+            (stdout if stdout else "(no output)") + output_notice,
             metadata={
                 "exit_code": 0,
+                "output_complete": output_complete,
                 "timed_out": False,
                 "stdout": stdout,
                 "stderr": stderr,

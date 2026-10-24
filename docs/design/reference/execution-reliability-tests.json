@@ -1,0 +1,22 @@
+{
+  "date": "2026-10-24",
+  "scope": "non-model execution reliability",
+  "backend": {
+    "passed": 369,
+    "skipped": 2,
+    "seconds": 98.87,
+    "skip_reasons": [
+      "Windows directory symlink privilege unavailable",
+      "POSIX process-group semantics"
+    ]
+  },
+  "new_fault_scenarios": 23,
+  "frontend": {
+    "passed": 13
+  },
+  "checks": [
+    "Ruff passed",
+    "git diff --check passed"
+  ],
+  "report": "docs/design/2026-10-24-execution-reliability-audit.md"
+}

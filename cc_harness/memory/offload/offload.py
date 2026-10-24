@@ -11,6 +11,7 @@
 """
 from __future__ import annotations
 import hashlib
+import asyncio
 import json
 import os
 import sqlite3
@@ -21,6 +22,8 @@ from uuid import uuid4
 from cc_harness.atomic import atomic_write_text
 from cc_harness.memory.offload.models import OffloadResult
 from cc_harness.sqlite_utils import begin_immediate_sync
+
+_SUMMARY_TIMEOUT_SECONDS = 10.0
 
 
 def gen_id(content: str | None = None) -> str:
@@ -57,6 +60,11 @@ async def maybe_offload(
     Returns:
         OffloadResult | None —— 超阈值返回卸载产物,否则 None。
     """
+    # Atomic reference reads are already paginated. Offloading them (or an
+    # existing pointer) creates reference-to-reference chains with no useful
+    # evidence reaching the model.
+    if tool_name in {"read_ref", "search_ref", "inspect_node"} or result_text.lstrip().startswith("[offloaded "):
+        return None
     if token_counter.count_text(result_text) <= threshold:
         return None
 
@@ -75,7 +83,7 @@ async def maybe_offload(
 
     if llm is not None:
         try:
-            summary = await _llm_summary(llm, result_text[:256 * 1024])
+            summary = await asyncio.wait_for(_llm_summary(llm, result_text[:256 * 1024]), _SUMMARY_TIMEOUT_SECONDS)
         except Exception:
             summary = ""
         if not summary:  # 空 content(refusal / filter / mid-stream err)→ fail-soft
@@ -110,7 +118,10 @@ async def maybe_offload(
                 "created_at": time.time(),
             }
         if state_db_path is not None:
-            _commit_sqlite_manifest(Path(state_db_path), str(session_id or ""), record)
+            # The Runtime may be committing another event on this database.
+            # Never wait synchronously for its write lock on the event loop:
+            # doing so prevents that same loop from completing the commit.
+            await asyncio.to_thread(_commit_sqlite_manifest, Path(state_db_path), str(session_id or ""), record)
             try:
                 _append_manifest(Path(manifest_path), record)
             except OSError:

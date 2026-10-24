@@ -1,0 +1,9 @@
+{
+  "result": "passed",
+  "status": "running",
+  "unknown_action_count": 0,
+  "worker_progress_after_resume": true,
+  "reconciliation_artifact": "sha256:a7f3b50a6a1635dc32cc276b1662985a0025478be72756cbedaecf81d92f72a2",
+  "verified_defect": "task_plan handler missing run_id; no planning mutation before TypeError",
+  "sequence": 579
+}

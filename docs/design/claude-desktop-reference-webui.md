@@ -2,6 +2,8 @@
 
 状态：已确认（2026-09-30）
 
+2026-10-23 更新：本轮重新设计已选择 DeepSeek Harness 作为整体交互基线，见 [ADR-0118](../adr/0118-use-deepseek-harness-as-redesign-interaction-reference.md)。本文保留历史实现契约；后续细节正在访谈，不继续作为本轮主要参考方向。
+
 本文记录 cc-harness WebUI 重设计的范围和交互契约。它取代 [`webui-ux-contract.md`](webui-ux-contract.md) 中旧的三栏/DeepSeek 方向，不改变 Durable Runtime、权限、事件、会话或现有 REST/SSE 语义。
 
 ## 目标与边界

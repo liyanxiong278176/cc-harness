@@ -13,8 +13,6 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Mapping, Protocol, Sequence
 
-from openai import AsyncOpenAI
-
 from .activation import CapabilityProfile
 from .config import (
     AppConfig,
@@ -30,6 +28,7 @@ from .config import (
 )
 from .l5 import build_l5_engine
 from .memory.config import load_memory_config
+from .net_env import make_async_openai
 from .policy import PolicyEngine
 
 
@@ -152,7 +151,10 @@ class SharedCapabilityServices:
         )
         l2_config = load_l2_config(policy_path)
         l2_client = (
-            AsyncOpenAI(api_key=config.openai_api_key, base_url=config.openai_base_url)
+            make_async_openai(
+                api_key=config.openai_api_key,
+                base_url=config.openai_base_url,
+            )
             if l2_config.enabled and config.openai_api_key
             else None
         )
@@ -211,6 +213,7 @@ class SharedCapabilityServices:
             policy=policy,
             context_config=context_config
             or load_context_config(
+                policy_path,
                 model=config.openai_model,
                 environ=config.runtime_environment,
             ),
