@@ -29,6 +29,10 @@ class ActionRequest:
     # restart can reconstruct the exact key without leaking it into the tool
     # payload or changing the semantic argument digest.
     idempotency_key: str | None = None
+    # A malformed provider tool call is recoverable: the worker returns this
+    # message as a failed observation so the model can re-issue valid JSON,
+    # instead of failing the whole run with an unhandled worker exception.
+    protocol_error: str | None = None
 
     def __post_init__(self) -> None:
         explicit = self.idempotency_key
@@ -263,13 +267,25 @@ class ReActKernel:
         if not isinstance(name, str) or not name.strip():
             raise KernelProtocolError("model tool call has no tool name")
         raw_arguments = call.get("arguments", call.get("args", {}))
+        protocol_error: str | None = None
         if isinstance(raw_arguments, str):
             try:
                 raw_arguments = json.loads(raw_arguments)
-            except json.JSONDecodeError as exc:
-                raise KernelProtocolError(f"tool arguments are not JSON: {name}") from exc
+            except json.JSONDecodeError:
+                protocol_error = (
+                    f"tool arguments for {name} are not valid JSON; "
+                    "re-issue the tool call with a single JSON object"
+                )
+                # Do not persist the malformed payload: it may contain
+                # credentials or other secrets the provider leaked into the
+                # arguments channel.  The model only needs the error category.
+                raw_arguments = {"_invalid_json": True}
         if not isinstance(raw_arguments, Mapping):
-            raise KernelProtocolError(f"tool arguments must be an object: {name}")
+            protocol_error = protocol_error or (
+                f"tool arguments for {name} must be a JSON object; "
+                "re-issue the tool call with an object"
+            )
+            raw_arguments = {"_invalid_arguments": type(raw_arguments).__name__}
         action_id = str(call.get("id") or "")
         if not action_id:
             action_id = str(
@@ -283,17 +299,26 @@ class ReActKernel:
             effect = EffectClass(str(effect))
         except ValueError:
             effect = str(effect)
+        if protocol_error is not None:
+            # The worker will not execute an invalid call.  Treat it as a
+            # read-only planning observation so no approval gate or side
+            # effect can be opened for malformed data.
+            effect = EffectClass.READ_ONLY
         return ActionRequest(
             action_id=action_id,
             tool_name=name,
             arguments=dict(raw_arguments),
             effect_class=effect,
-            requires_approval=bool(call.get("requires_approval", False)),
+            requires_approval=(
+                False if protocol_error is not None
+                else bool(call.get("requires_approval", False))
+            ),
             idempotency_key=(
                 str(call["idempotency_key"])
                 if call.get("idempotency_key") is not None
                 else None
             ),
+            protocol_error=protocol_error,
         )
 
 

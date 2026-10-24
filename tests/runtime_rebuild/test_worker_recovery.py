@@ -8,7 +8,8 @@ from cc_harness.run_model import RunStatus
 
 from cc_harness.run_kernel import ActionRequest, ModelSegment, ReActKernel
 from cc_harness.lease import LeaseManager
-from cc_harness.run_model import ActionStatus, EffectClass, EvidenceKind, EvidenceRef
+from cc_harness.run_model import ActionStatus, EffectClass, EvidenceKind, EvidenceRef, PlanNode
+from cc_harness.run_events import EventActor
 from cc_harness.run_store import RunStore
 from cc_harness.worker import ActionExecutionResult, RunWorker
 from cc_harness.coordinator import RunCoordinator, RunRequest
@@ -198,5 +199,152 @@ async def test_worker_propagates_action_cancellation_to_supervisor(tmp_path) -> 
         task.cancel()
         with pytest.raises(asyncio.CancelledError):
             await task
+    finally:
+        await store.close()
+
+
+class IdentityCompletionModel:
+    async def complete(self, messages, tools):
+        del messages, tools
+        return ModelSegment(
+            text="我是 cc-harness。",
+            completion_candidate={
+                "acceptance_criteria": ["answer"],
+                "evidence": [
+                    EvidenceRef(
+                        "identity-answer",
+                        EvidenceKind.TEST,
+                        "sha256:identity-answer",
+                        "runtime",
+                        1.0,
+                    ).to_dict()
+                ],
+            },
+        )
+
+
+class BadJsonThenAnswerModel:
+    def __init__(self) -> None:
+        self.calls = 0
+
+    async def complete(self, messages, tools):
+        del messages, tools
+        self.calls += 1
+        if self.calls == 1:
+            return ModelSegment(
+                text="",
+                tool_calls=(
+                    {"id": "bad-json-call", "name": "Read", "arguments": "{not json"},
+                ),
+            )
+        if self.calls == 2:
+            return ModelSegment(
+                text="",
+                tool_calls=(
+                    {
+                        "id": "good-read",
+                        "name": "Read",
+                        "arguments": '{"path": "README.md"}',
+                    },
+                ),
+            )
+        return await IdentityCompletionModel().complete((), ())
+
+
+@pytest.mark.asyncio
+async def test_worker_does_not_fail_run_on_malformed_tool_arguments(tmp_path) -> None:
+    """Invalid provider JSON must become a recoverable observation."""
+
+    project = tmp_path / "project"
+    project.mkdir()
+    store = RunStore(project, data_root=tmp_path / "data")
+    await store.open()
+    try:
+        coordinator = RunCoordinator(store)
+        handle = await coordinator.submit(
+            RunRequest("read README", ("answer",), interaction_mode="conversation")
+        )
+        model = BadJsonThenAnswerModel()
+        worker = RunWorker(
+            store,
+            ReActKernel(model),
+            worker_id="worker-bad-json",
+            action_executor=_success,
+        )
+        for _ in range(4):
+            view = await store.load_projection(handle.run_id)
+            if view.status not in {RunStatus.QUEUED, RunStatus.RUNNING}:
+                break
+            await worker.execute(await worker.claim(handle.run_id))
+        events = (await store.read(handle.run_id)).events
+        assert model.calls >= 2
+        observations = [
+            event for event in events if event.event_type == "ToolObservationCommitted"
+        ]
+        assert observations
+        assert any(
+            observation.payload.get("status") == "failed"
+            for observation in observations
+        )
+        assert not any(event.event_type == "RunFailed" for event in events)
+        # The provider error must be fed back to the model as a failed
+        # observation.  Completion is still subject to the normal gate (the
+        # test model does not mark its plan node done), but the run must not
+        # die with an unhandled worker exception.
+        assert (await store.load_projection(handle.run_id)).status is not RunStatus.FAILED_RECOVERABLE
+    finally:
+        await store.close()
+
+
+@pytest.mark.asyncio
+async def test_worker_allows_final_segment_after_plan_marks_every_node_done(tmp_path) -> None:
+    """A finished checklist must not become a scheduler dead end.
+
+    A model can call task_plan, mark the last milestone done, and still need a
+    second segment to write the final answer.  The old worker treated the
+    absence of a dependency-ready node as RunBlocked and ended the run with
+    ``no dependency-ready plan node`` even though the plan was complete.
+    """
+
+    project = tmp_path / "project"
+    project.mkdir()
+    store = RunStore(project, data_root=tmp_path / "data")
+    await store.open()
+    try:
+        coordinator = RunCoordinator(store)
+        handle = await coordinator.submit(RunRequest("你是谁", ("answer",)))
+        node = PlanNode(
+            node_id="answer-question",
+            kind="root",
+            title="回答用户身份问题",
+            acceptance_criteria=("answer",),
+        )
+        await coordinator.revise_plan(handle.run_id, (node,), reason="simple identity answer")
+        await coordinator._append(
+            handle.run_id,
+            "TodoUpdated",
+            {"todo": {
+                "id": node.node_id,
+                "title": node.title,
+                "status": "done",
+                "active_sessions": [handle.run_id],
+                "plan_node_id": node.node_id,
+            }},
+            EventActor("coordinator", "test"),
+        )
+        worker = RunWorker(
+            store,
+            ReActKernel(IdentityCompletionModel()),
+            worker_id="worker-plan-complete",
+            action_executor=_success,
+        )
+        await worker.execute(await worker.claim(handle.run_id))
+        events = (await store.read(handle.run_id)).events
+        assert not any(
+            event.event_type == "RunBlocked"
+            and event.payload.get("reason") == "no dependency-ready plan node"
+            for event in events
+        )
+        assert (await store.load_projection(handle.run_id)).status.value == "completed"
     finally:
         await store.close()

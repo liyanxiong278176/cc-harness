@@ -105,3 +105,11 @@ cc_harness/memory/*.db
 /logs/*.db-wal
 # Local cc-harness Durable Run state (never commit)
 /.cc-harness-data/
+
+# Generated wheel from the isolated cc-only eval harness.
+/eval/cc-only/_artifacts/
+
+# Ad-hoc local test captures.
+/.tmp_ui_delete_probe.png
+/docs/test.png
+/docs/test-mermaid.png

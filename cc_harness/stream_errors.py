@@ -167,6 +167,28 @@ def classify_stream_error(
     name = type(cause).__name__.casefold()
     text = str(cause).casefold()
 
+    # Billing failures can arrive as 402, or as 429 with a structured quota
+    # error. Unlike transient rate limiting, waiting and retrying cannot fix
+    # them. Keep the provider body out of the browser-safe envelope.
+    body = getattr(cause, "body", None)
+    error_body = body.get("error", body) if isinstance(body, Mapping) else {}
+    billing_codes = {"insufficient_balance", "insufficient_balance_error", "insufficient_quota", "billing_hard_limit_reached"}
+    structured_billing = isinstance(error_body, Mapping) and any(
+        str(error_body.get(key) or "").casefold() in billing_codes
+        for key in ("code", "type")
+    )
+    if status == 402 or code.casefold() in billing_codes or structured_billing or "insufficient balance" in text:
+        return StreamErrorDetails(
+            code="provider_billing_error",
+            phase=phase or "connection",
+            retryable=False,
+            partial_output=partial_output,
+            attempt=attempt,
+            next_action="恢复模型服务余额或配额后，从当前检查点继续；不要重复发送任务",
+            message="模型服务余额或配额不足，当前进度已保留",
+            request_id=request_id,
+        )
+
     if (
         code == "provider_protocol_error"
         or name in {"providerprotocolerror", "kernelprotocolerror"}

@@ -56,16 +56,37 @@ treatment 与必要的隔离 judge 均使用经服务端身份验证的 `deepsee
 不同 benchmark、样本及 treatment 分组使用互不共享的 workspace、运行目录、会话、记忆库、摘要、ref 与节点清单；每组完成后将其状态封存为只读审计证据并从后续活动运行中卸载，下一组启动前必须验证活动状态为空且不存在跨任务命中。隔离或清理失败使运行无效，评测不得读取或改写用户日常全局记忆。_Avoid_: 复用上一题的 CC_HARNESS_HOME、让 treatment 继承其他任务状态、为防污染删除审计证据、清理失败后继续运行
 
 **产品对标边界（Product Parity Boundary）**:
-cc-harness 是本机运行的编码代理；本次 WebUI 以 Claude Desktop 的页面布局、视觉效果和对话交互作为观察参照，同时保留 cc-harness 品牌、本地 Runtime 和现有功能。参照不包含 Claude 账户、云服务、原生 Desktop/Mobile 壳或 Claude 专属功能。_Avoid_: 让用户误以为 cc-harness 是 Claude 产品、让浏览器旁路 Runtime、把视觉参照扩展成云端产品对标
+cc-harness 是本机运行的编码代理；本次 WebUI 以 DeepSeek Harness 的整体信息架构和任务执行展示作为交互参照，使用 cc-harness 自有视觉语言与品牌。参照不包含上游账户、云服务或运行时能力。_Avoid_: 将参考产品的品牌当作本项目品牌、把交互参照理解为移植上游运行时
+
+**DeepSeek Harness 参考式 WebUI（DeepSeek Harness-Referenced WebUI）**:
+以本机 DeepSeek Harness 实际操作观察到的工作区与会话组织、对话、执行过程和轨迹展示为整体交互基线的 cc-harness 界面；它是本次重新设计的参考方向，取代此前以 Claude Desktop 为主的参考方向。_Avoid_: 仅替换配色却保留原有展示结构、将尚未验证的参考产品交互写成观察事实
+
+**对话执行摘要（Conversation Execution Summary）**:
+任务执行时在主对话中持续可见的简短进展说明与工具调用摘要，具体命令、参数和长输出按需展开；完成后过程收拢，失败与待审批项保持醒目。_Avoid_: 默认铺满工具原始输出、仅显示转圈而无法了解进展、收拢过程时隐藏异常或待决事项
+
+**任务执行轨迹（Task Execution Trace）**:
+在独立轨迹视图中按轮次组织的模型回复、工具调用、耗时、结果与错误时间线，支持搜索、展开及关联文件查看；原始参数与技术事件属于按需查看的详情。_Avoid_: 默认倾倒内部事件或参数、用推测补齐缺失的时间与结果、将隐藏思维链当作模型回复展示
+
+**对话计划清单（Conversation Plan Checklist）**:
+在主对话中呈现任务真实计划及其已完成、进行中、待执行状态的可收起步骤清单；没有已确认计划时以当前动作和耗时表达进展。_Avoid_: 用固定阶段推算完成百分比、编造计划步骤、将模型宣称完成等同于步骤已有完成证据
+
+**待执行消息（Pending Follow-Up Message）**:
+任务运行期间通过普通发送进入队列、尚未开始处理的新指令，用户可在生效前修改或撤回；入队与变更以服务端确认结果为准。_Avoid_: 将已发送回显等同于成功入队、把修改待执行消息变成修改已执行历史
+
+**停止并转向（Stop and Redirect）**:
+用户明确要求结束当前执行并改为处理新指令的操作，新指令在当前动作安全结束后生效。_Avoid_: 普通发送自动打断任务、停止尚未确认时展示新指令已经执行、承诺回滚已经发生的动作
 
 **Claude Desktop 参考式 WebUI（Claude Desktop-Referenced WebUI）**:
-用本机 Claude Desktop 的实机画面观察侧栏、导航、会话列表、对话区、composer、排版、间距和交互反馈，并在 cc-harness 自有页面中重新实现；保留 cc-harness 名称与素材，不复制 Claude 源码、标志、插画或专有资源。_Avoid_: 把 Claude 账户/云端能力接入本地 UI、把截图当作可维护源码、使用 Claude 品牌素材或造成官方产品混淆
+此前以本机 Claude Desktop 的侧栏、对话区和输入区为主要观察参照的 WebUI 设计方向；自 2026-10-23 起作为历史术语保留，新一轮重设计采用 DeepSeek Harness 参考式 WebUI。_Avoid_: 将历史参考方向当作本轮重设计的现行基线
 
 **整体 WebUI 重设计（Full WebUI Redesign）**:
-以 cc-harness 自有 React/Vite 页面替换现有 `web/src` 前端实现，并移除旧 DeepSeek UI vendor 快照；继续由现有 Web 工程构建和本地 Python WebUI 托管，既有 REST/SSE、Durable Runtime、事件、权限、上下文、记忆和安全契约保持权威。本次后端增量仅为项目产物的只读查询/预览路由。_Avoid_: 保留两套可见页面、把 Claude 或 DeepSeek 的 Runtime 引入项目、改变既有 API/Runtime 语义、让客户端另存运行状态
+以 DeepSeek Harness 为整体交互参照，统一 cc-harness 的主对话、执行轨迹、项目与会话、文件变更、设置及能力详情的界面与状态表达；任务文件差异和可修改、撤回的待执行消息属于本轮范围。_Avoid_: 仅改主对话配色、用演示状态替代运行事实、引入第二套任务权威状态
 
 **项目产物浏览（Project Artifact Browser）**:
 产物是 Agent 在该项目的任意历史任务中创建或修改过的项目文件；仅浏览当前选中项目，跨历史任务按规范化相对路径去重。列表可提供变更来源，预览只读取项目当前文件；内部对象存储 artifact、历史文件快照和未被 Agent 改动的普通文件均不属于该列表。_Avoid_: 枚举或暴露整个项目目录、跨项目聚合、把 Runtime 内部 artifact 当项目文件、保存或展示历史文件快照、通过预览修改文件
+
+**任务文件变更（Task File Change）**:
+有执行证据归属于某次任务的项目文件增删改，主对话提供摘要，右侧展示可核验的修改前后差异；它与跨历史任务汇集当前文件的项目产物浏览是不同概念。_Avoid_: 将工作区全部 Git 差异归为模型修改、把用户原有修改计入任务、在缺少前后证据时伪造差异
 
 **项目产物只读预览（Read-Only Project Artifact Preview）**:
 产物预览通过新增只读 API 读取当前选中项目目录中的当前文件内容，不读取历史快照或 Runtime 对象存储；服务端规范化相对路径并拒绝越出项目根目录的路径、符号链接和非普通文件。文件已删除或无法安全预览时显示明确状态，不回退到历史副本。_Avoid_: 接受绝对路径或 `..` 越界、跟随指向项目外的符号链接、读取目录/设备文件、把历史内容伪装成当前文件
@@ -119,7 +140,7 @@ WebUI 的“请求批准”“帮我批准”“完全访问权限”是 Runtime
 Web 工程继续通过现有 Vite 入口构建；依赖由 `web/package.json` 与锁文件管理，构建不隐式联网。_Avoid_: 提交 `node_modules`、引入第二套前端 workspace、使用不可复现的浮动依赖、构建时偷偷联网
 
 **WebUI 重设计验收边界（WebUI Redesign Acceptance Boundary）**:
-新页面沿用 Claude Desktop 实机观察到的桌面信息层级和对话操作节奏，同时完整映射当前项目选择、会话历史/搜索、输入与排队、审批、停止/继续、SSE 对账、模型设置、权限策略、Runtime 状态/上下文详情和主题切换。产物入口只显示当前项目全部历史任务中被 Agent 创建或修改且按路径去重的文件，详情读取当前文件且只读；现有 API/Runtime 行为保持不变。_Avoid_: 为像素相似牺牲可读性或现有操作、把历史快照冒充当前文件、让只读路由写入项目文件、用浏览器本地状态取代 Runtime 事实
+新页面沿用本机 DeepSeek Harness 的整体交互基线及已确认的重设计契约，同时完整映射当前项目选择、会话历史/搜索、输入与排队、审批、停止/继续、SSE 对账、模型设置、权限策略、Runtime 状态/上下文详情和主题切换。产物入口只显示当前项目全部历史任务中被 Agent 创建或修改且按路径去重的文件，详情读取当前文件且只读；现有 API/Runtime 行为保持不变。_Avoid_: 为像素相似牺牲可读性或现有操作、把历史快照冒充当前文件、让只读路由写入项目文件、用浏览器本地状态取代 Runtime 事实
 
 **项目内多会话并行（In-Project Session Concurrency）**:
 同一规范化项目可拥有多个会话和并行 Run；项目级 Supervisor lease 只选出一个调度者，不把其他 Web 控制端阻塞为不可用。每个 Run 使用独立 worker lease，工具动作再按路径、workspace 或外部副作用申请 resource lease；可安全并行的读操作和不重叠写操作同时运行，冲突动作明确等待、改用隔离 worktree 或返回可恢复冲突。_Avoid_: 每个会话抢项目 Supervisor 导致一个永久排队、多个 Supervisor 同时写事件、用全项目互斥锁阻塞无关 Run、静默覆盖其他会话文件
@@ -2067,6 +2088,14 @@ _Avoid_: 为提高分数硬编码题目解法、根据历史失败任务注入�
 **No-Model Regression Gate（无模型回归门）**:
 正式评测前必须先通过不调用模型的协议、资源、进程、恢复、并发和遥测故障注入测试；该门只证明 Runtime 基础设施可用，不产生 benchmark 成绩，也不替代官方 verifier。
 _Avoid_: 用一次模型成功掩盖基础设施回归、在无模型门未通过时消耗评测预算、把回归测试结果写入官方成绩
+
+**项目执行器归属（Project Executor Ownership）**:
+同一 WebUI 进程中的每个 DurableRuntimeClient 持有自己的 ExecutorSession，包含执行器、降级状态和降级锁；生命周期、调度及工具分发通过上下文绑定该归属。单会话 CLI 保留原有入口。关闭一个项目不能清理其他项目的执行器或仍被使用的共享沙箱服务。
+_Avoid_: Durable 多项目共用可覆盖的进程级执行器、在控制请求的上下文中误取另一个项目资源
+
+**执行前失败与未知副作用（Pre-dispatch Failure & Uncertain Effect）**:
+签名绑定、命令准备或确定未开始的本地执行失败，提交失败观察而非未知结果；可幂等只读动作在超时或暂停中断后允许重读。已经开始且结果未确认的写入、外部命令和非幂等内部控制保持对账边界。run_command 支持上界 1800 秒的 timeout_seconds，外层 watchdog 另留清理余量。
+_Avoid_: 吞掉取消异常、让只读失败永久阻塞、用继续按钮清除真实未知副作用
 
 **真实仓库压缩对照（Real-Repository Compression Comparison）**:
 以可追溯的外部仓库任务比较同一 Agent 开启与关闭上下文压缩后的任务结果和全部模型用量；计划以随机抽取的 100 道真实仓库任务进行两条件各三次对照，主要结论覆盖全部冻结样本，不以执行链长筛题。它独立于 treatment-only 上下文-记忆 benchmark 套件，不续接历史 control。

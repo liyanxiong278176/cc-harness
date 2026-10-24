@@ -27,10 +27,10 @@ from datetime import datetime
 from pathlib import Path
 from typing import TYPE_CHECKING
 
-from openai import AsyncOpenAI
 from rich.console import Console
 
 from cc_harness.audit import log_decision
+from cc_harness.net_env import make_async_openai
 from cc_harness.config import (
     ContextConfig,
     load_executor_config,
@@ -543,7 +543,10 @@ async def run_repl(
     l2_cfg = load_l2_config(policy_yaml_path)
     l2_api_key = os.getenv("OPENAI_API_KEY")
     l2_client = (
-        AsyncOpenAI(api_key=l2_api_key, base_url=os.getenv("OPENAI_BASE_URL"))
+        make_async_openai(
+            api_key=l2_api_key,
+            base_url=os.getenv("OPENAI_BASE_URL"),
+        )
         if l2_cfg.enabled and l2_api_key
         else None
     )

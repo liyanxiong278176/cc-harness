@@ -511,7 +511,7 @@ class RunCoordinator:
                 {
                     "todo": {
                         "id": node.node_id,
-                        "title": node.node_id,
+                        "title": node.title or node.node_id,
                         "status": "pending",
                         "active_sessions": [run_id],
                         "plan_node_id": node.node_id,
@@ -589,8 +589,11 @@ class RunCoordinator:
         ):
             raise ValueError("plan mutation requires a quiescent run after mutating actions")
         revision = self.plans.revise(view.projection.plan, nodes, reason=reason)
-        completed = {todo.todo_id for todo in view.projection.todos if todo.status in {"done", "completed"}}
         old_nodes = view.projection.plan.by_id
+        bootstrap_ids = {f"root-{run_id}", f"follow-up-{run_id}"}
+        completed = {todo.todo_id for todo in view.projection.todos
+                     if todo.status in {"done", "completed"} and todo.todo_id in old_nodes
+                     and todo.todo_id not in bootstrap_ids}
         new_nodes = revision.plan.by_id
         if any(node_id not in new_nodes or new_nodes[node_id] != old_nodes.get(node_id)
                for node_id in completed):

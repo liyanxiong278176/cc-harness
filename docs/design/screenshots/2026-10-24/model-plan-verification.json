@@ -1,0 +1,11 @@
+{
+  "result": "passed",
+  "source": "Deterministic model tool calls executed through production Worker and task_plan; real README read, no remote model calls or direct Todo fixture writes",
+  "checks": [
+    "bootstrap request hidden before planning",
+    "model-authored step titles persisted and streamed",
+    "model updates completion and current step after real read",
+    "reload restores step plan"
+  ],
+  "pageErrors": []
+}

@@ -740,12 +740,16 @@ class ProjectionBuilder:
                 queued_sequence=event.sequence,
                 continuation=bool(payload.get("continuation", False)),
             )
-        elif event.event_type == "FollowUpStarted":
+        elif event.event_type in {"FollowUpStarted", "FollowUpClaimed", "FollowUpUpdated", "FollowUpCancelled"}:
             follow_up_id = str(payload["follow_up_run_id"])
             item = state.queue.get(follow_up_id)
             if item is None:
                 raise ProjectionError(f"follow-up event has no queued item: {follow_up_id}")
-            state.queue[follow_up_id] = replace(item, status="started")
+            if event.event_type == "FollowUpUpdated":
+                state.queue[follow_up_id] = replace(item, message_artifact=str(payload["message_artifact"]))
+            else:
+                status = {"FollowUpStarted": "started", "FollowUpClaimed": "starting", "FollowUpCancelled": "cancelled"}[event.event_type]
+                state.queue[follow_up_id] = replace(item, status=status)
         elif event.event_type == "PredecessorBypassed":
             predecessor_id = str(payload["predecessor_run_id"])
             target_id = str(payload.get("follow_up_run_id") or "")

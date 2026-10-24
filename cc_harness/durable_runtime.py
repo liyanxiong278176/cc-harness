@@ -5,7 +5,9 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import hashlib
+import inspect
 import json
+import logging
 import os
 import re
 import subprocess
@@ -20,6 +22,7 @@ from .activation import ActivationManifest, CapabilityProfile
 from .capability_runtime import AgentCapabilityRuntime
 from .capability_services import SharedCapabilityServices
 from .config import ExecutorBackend, load_layered_config
+from .executor_session import ExecutorSession, executor_session_bound
 from .context import _repair_tool_result_pairing
 from .coordinator import RunCoordinator, RunRequest
 from .credential_broker import ActionScopedCapabilityBroker, CredentialBrokerError
@@ -134,10 +137,11 @@ RECALL_RUN_CONTEXT_SPEC: dict[str, Any] = {
 }
 
 
-def _workspace_snapshot(root: Path) -> dict[str, str]:
+def _workspace_snapshot(root: Path, *, artifacts=None) -> dict[str, str]:
     """Return a bounded-to-scope content digest map for command evidence."""
 
     snapshot: dict[str, str] = {}
+    captured_bytes = 0
     root = root.resolve()
     if not root.is_dir():
         return snapshot
@@ -154,8 +158,23 @@ def _workspace_snapshot(root: Path) -> dict[str, str]:
                 continue
             relative = path.relative_to(root).as_posix()
             try:
-                digest = hashlib.sha256(path.read_bytes()).hexdigest()
-            except OSError:
+                raw = path.read_bytes()
+                digest = hashlib.sha256(raw).hexdigest()
+                # Bounded immutable evidence for code differences; large, binary
+                # and credential files retain hashes without content capture.
+                if (artifacts is not None and len(raw) <= 262_144
+                    and captured_bytes + len(raw) <= 16_777_216
+                    and path.suffix.lower() in {".py", ".ts", ".tsx", ".js", ".jsx", ".css", ".html", ".md", ".txt", ".json", ".toml", ".yaml", ".yml", ".rs", ".go", ".java", ".sql", ".sh"}
+                    and not any(word in path.name.lower() for word in ("secret", "credential", "token", "password"))
+                    and b"\x00" not in raw):
+                    try:
+                        raw.decode("utf-8")
+                    except UnicodeError:
+                        pass
+                    else:
+                        artifacts.put(raw, media_type="text/plain; purpose=workspace-diff-evidence")
+                        captured_bytes += len(raw)
+            except (OSError, UnicodeError):
                 continue
             snapshot[relative] = f"sha256:{digest}"
     return snapshot
@@ -479,7 +498,9 @@ class DurableRuntimeClient:
         self._security_capability_metadata: dict[str, dict[str, Any]] = {}
         self._activation_manifest: ActivationManifest | None = None
         self._workspace_command_lock = asyncio.Lock()
+        self._supervisor_start_lock = asyncio.Lock()
         self._execution_started = False
+        self._executor_session = ExecutorSession()
         # Optional in-process WebUI stream sink.  It is intentionally not
         # persisted and remains unset for the CLI/TUI or detached supervisor.
         self._stream_emitter: Callable[[Mapping[str, Any]], Awaitable[None]] | None = None
@@ -532,6 +553,7 @@ class DurableRuntimeClient:
 
         self._supervisor_external_owner = False
 
+    @executor_session_bound
     def executor_status(self) -> dict[str, Any]:
         """Return the effective executor state without secrets or commands."""
         status = dict(self._executor_status)
@@ -741,14 +763,18 @@ class DurableRuntimeClient:
             stack.extend(sorted(children.get(current, ())))
         return tuple(result)
 
-    async def usage_for_run(self, root_run_id: str) -> dict[str, Any]:
+    async def usage_for_run(self, root_run_id: str, *, events: Sequence[Any] | None = None) -> dict[str, Any]:
         """Aggregate provider usage for a root Run and its durable descendants."""
 
-        run_ids = await self.run_tree(root_run_id)
-        events = []
-        for run_id in run_ids:
-            page = await self.store.read(run_id, limit=100_000)
-            events.extend(page.events)
+        if events is None:
+            run_ids = await self.run_tree(root_run_id)
+            collected = []
+            for run_id in run_ids:
+                page = await self.store.read(run_id, limit=100_000)
+                collected.extend(page.events)
+            events = collected
+        else:
+            run_ids = {event.run_id for event in events} | {root_run_id}
         summary = aggregate_model_usage(events)
         summary.update({"run_id": root_run_id, "run_count": len(run_ids)})
         return summary
@@ -839,7 +865,39 @@ class DurableRuntimeClient:
             await self.start_supervisor()
         return run_id
 
+    @executor_session_bound
     async def start_supervisor(
+        self,
+        *,
+        worker_id: str | None = None,
+        max_workers: int = 3,
+        reasoning_effort: str | None = None,
+        capability_profile: str = "standard",
+        host_execution: bool = False,
+        permission_mode: str | None = None,
+        config_overrides: Mapping[str, str] | None = None,
+        stream_emitter: Callable[[Mapping[str, Any]], Awaitable[None]] | None = None,
+    ) -> LocalSupervisor:
+        # A losing concurrent initialization must never close the resources
+        # captured by the winning worker factory.
+        async with self._supervisor_start_lock:
+            try:
+                return await self._start_supervisor_unlocked(
+                    worker_id=worker_id, max_workers=max_workers,
+                    reasoning_effort=reasoning_effort, capability_profile=capability_profile,
+                    host_execution=host_execution, permission_mode=permission_mode,
+                    config_overrides=config_overrides, stream_emitter=stream_emitter,
+                )
+            except BaseException:
+                failed_supervisor = self.supervisor
+                self.supervisor = None
+                if failed_supervisor is not None:
+                    with contextlib.suppress(Exception):
+                        await failed_supervisor.stop(drain=False)
+                await self._close_execution_components()
+                raise
+
+    async def _start_supervisor_unlocked(
         self,
         *,
         worker_id: str | None = None,
@@ -1579,6 +1637,8 @@ class DurableRuntimeClient:
                 "service_status",
                 "ContinueToolResult",
                 "RecallRunContext",
+                "task_plan",
+                "task_wait",
                 "dispatch_subagent",
                 "accept_child_candidate",
                 "reject_child_candidate",
@@ -1784,6 +1844,7 @@ class DurableRuntimeClient:
             },
         )
 
+    @executor_session_bound
     async def _execute_tool(
         self,
         request: ActionRequest,
@@ -1840,11 +1901,12 @@ class DurableRuntimeClient:
         command_lock = request.tool_name == "run_command"
         if command_lock:
             await self._workspace_command_lock.acquire()
-        workspace_before = _workspace_snapshot(execution_root) if command_lock else {}
-        from .local_verification import python_assertion_verifier
-        verifier_before = python_assertion_verifier(execution_root, str(request.arguments.get("command", ""))) if command_lock else None
+        execution_started = False
+        execution_request = request
         try:
-            execution_request = request
+            workspace_before = _workspace_snapshot(execution_root, artifacts=self.store.artifacts) if command_lock else {}
+            from .local_verification import python_assertion_verifier
+            verifier_before = python_assertion_verifier(execution_root, str(request.arguments.get("command", ""))) if command_lock else None
             capability_id = request.arguments.get("capability_id")
             if capability_id:
                 secret = self._capability_broker.resolve(
@@ -1866,6 +1928,7 @@ class DurableRuntimeClient:
             if result is not None:
                 pass
             elif request.tool_name == "ContinueToolResult":
+                execution_started = True
                 result = await self._continue_tool_result(
                     run_id,
                     execution_request,
@@ -1874,17 +1937,27 @@ class DurableRuntimeClient:
                     working_root=execution_root,
                 )
             elif request.tool_name == "RecallRunContext":
+                execution_started = True
                 result = await self._recall_run_context(run_id, execution_request.arguments)
             elif request.tool_name in handlers:
                 dependencies = dict(handler_deps.get(request.tool_name) or {})
-                if request.tool_name in {"dispatch_subagent", "accept_child_candidate", "reject_child_candidate"}:
+                if request.tool_name in {"task_plan", "task_wait", "dispatch_subagent", "accept_child_candidate", "reject_child_candidate"}:
                     dependencies["run_id"] = run_id
-                result = await handlers[request.tool_name](
+                handler = handlers[request.tool_name]
+                try:
+                    signature = inspect.signature(handler)
+                except (TypeError, ValueError):
+                    signature = None
+                if signature is not None:
+                    signature.bind(execution_request.arguments, cwd=str(execution_root), **dependencies)
+                execution_started = True
+                result = await handler(
                     execution_request.arguments,
                     cwd=str(execution_root),
                     **dependencies,
                 )
             elif self._mcp is not None:
+                execution_started = True
                 result = await self._mcp.call_tool(
                     request.tool_name, dict(execution_request.arguments)
                 )
@@ -1896,7 +1969,7 @@ class DurableRuntimeClient:
             if not isinstance(result, ToolResult):
                 result = ToolResult.success(str(result))
             if command_lock:
-                workspace_after = _workspace_snapshot(execution_root)
+                workspace_after = _workspace_snapshot(execution_root, artifacts=self.store.artifacts)
                 change_set = _workspace_change_set(workspace_before, workspace_after)
                 baseline_encoded = json.dumps(
                     workspace_before,
@@ -1926,10 +1999,20 @@ class DurableRuntimeClient:
                     capability=result.capability,
                     metadata=metadata,
                 )
-        except BaseException as exc:
-            return ActionExecutionResult(
-                ActionStatus.OUTCOME_UNKNOWN,
-                error_kind=type(exc).__name__,
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            contract = contracts.get(request.tool_name)
+            safe_read = contract.effect_class == EffectClass.READ_ONLY and contract.idempotent
+            if execution_started and not safe_read:
+                return ActionExecutionResult(
+                    ActionStatus.OUTCOME_UNKNOWN,
+                    error_kind=type(exc).__name__,
+                )
+            result = ToolResult.error(
+                f"Local tool failed: {type(exc).__name__}",
+                f"[Tool Error] {request.tool_name}: {type(exc).__name__}: {str(exc)[:1000]}",
+                metadata={"execution_not_started": not execution_started, "error_type": type(exc).__name__},
             )
         finally:
             if command_lock:
@@ -2077,6 +2160,9 @@ class DurableRuntimeClient:
             media_type="application/json; purpose=tool-result",
         )
         if result.is_error:
+            known_not_started = not execution_started or (
+                request.tool_name == "run_command" and metadata.get("execution_not_started") is True
+            )
             command_outcome_uncertain = bool(
                 request.tool_name == "run_command"
                 and (
@@ -2086,8 +2172,8 @@ class DurableRuntimeClient:
             )
             status = (
                 ActionStatus.OUTCOME_UNKNOWN
-                if effect_contract.effect_class is EffectClass.EXTERNAL_SIDE_EFFECT
-                or command_outcome_uncertain
+                if not known_not_started and (effect_contract.effect_class is EffectClass.EXTERNAL_SIDE_EFFECT
+                or command_outcome_uncertain)
                 else ActionStatus.FAILED
             )
             error_kind = "stale_content" if stale else "tool_error"
@@ -2152,6 +2238,7 @@ class DurableRuntimeClient:
             next_cursor=next_cursor,
         )
 
+    @executor_session_bound
     async def _close_execution_components(self) -> None:
         """Release provider/capability/executor resources but keep the store.
 
@@ -2161,26 +2248,37 @@ class DurableRuntimeClient:
         cleanup is intentionally separate from :meth:`close`.
         """
 
-        if self._mcp is not None:
-            await self._mcp.shutdown()
-            self._mcp = None
-        if self._capabilities is not None:
-            await self._capabilities.close()
-            self._capabilities = None
-        for record in await self.store.list_runs():
-            self._capability_broker.revoke_run(record.run_id)
+        async def cleanup(callback):
+            try:
+                await callback()
+            except Exception as exc:  # noqa: BLE001 - one broken resource must not leak the rest
+                logging.getLogger(__name__).warning("runtime resource cleanup failed: %s", type(exc).__name__)
+
+        mcp, self._mcp = self._mcp, None
+        if mcp is not None:
+            await cleanup(mcp.shutdown)
+        capabilities, self._capabilities = self._capabilities, None
+        if capabilities is not None:
+            await cleanup(capabilities.close)
+        with contextlib.suppress(Exception):
+            for record in await self.store.list_runs():
+                self._capability_broker.revoke_run(record.run_id)
         if self._services is not None and self._services.l2_client is not None:
-            await self._services.l2_client.close()
-            self._services.l2_client = None
+            l2, self._services.l2_client = self._services.l2_client, None
+            await cleanup(l2.close)
         self._services = None
-        if self._llm is not None:
-            await self._llm.aclose()
-            self._llm = None
+        llm, self._llm = self._llm, None
+        if llm is not None:
+            await cleanup(llm.aclose)
         if self._execution_started:
-            await shutdown_session_executor()
             self._execution_started = False
+            await cleanup(shutdown_session_executor)
 
     async def close(self) -> None:
+        async with self._supervisor_start_lock:
+            await self._close_unlocked()
+
+    async def _close_unlocked(self) -> None:
         if self.supervisor is not None:
             await self.supervisor.stop(drain=False)
             self.supervisor = None

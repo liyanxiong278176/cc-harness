@@ -482,6 +482,8 @@ class SandboxExecutor:
     async def run(self, args: dict, *, cwd: Path) -> ToolResult:
         # cwd 接受仅为协议对齐;实际工作目录由 mount/project_root + workdir 决定(Task 12 完整接线)。
         command = args.get("command", "")
+        from .executor import resolve_run_command_timeout
+        command_timeout = resolve_run_command_timeout(args.get("timeout_seconds"), default=self.cfg.timeout_s) if "timeout_seconds" in args else self.cfg.timeout_s
         if not isinstance(command, str) or not command.strip():
             return ToolResult.error(
                 display="'command' must be a non-empty string",
@@ -514,14 +516,14 @@ class SandboxExecutor:
             command_started = True
             execution = await asyncio.wait_for(
                 _with_retry(lambda: sb.commands.run(command)),
-                timeout=self.cfg.timeout_s,
+                timeout=command_timeout,
             )
         except TimeoutError:
             await self.kill()
             return ToolResult.error(
-                display=f"sandbox timeout after {self.cfg.timeout_s}s; sandbox destroyed",
+                display=f"sandbox timeout after {command_timeout}s; sandbox destroyed",
                 llm=(
-                    f"[Tool Error] sandbox timeout after {self.cfg.timeout_s}s; "
+                    f"[Tool Error] sandbox timeout after {command_timeout}s; "
                     "the sandbox was destroyed"
                 ),
                 metadata={

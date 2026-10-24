@@ -265,6 +265,13 @@ def _resume_message(event: Any) -> dict[str, Any] | None:
     """
 
     reason = event.payload.get("reason")
+    if isinstance(reason, str) and reason in {"WebUI 用户继续", "webui.resume"}:
+        return {
+            "role": "system",
+            "content": "Runtime control: resume the existing task from its checkpoint. Continue pending work using committed facts; this is not a new user request.",
+            "_cc_harness_resume_control": True,
+            "_context_mandatory": True,
+        }
     if not isinstance(reason, str) or not reason.strip():
         return None
     return {
@@ -336,6 +343,21 @@ async def materialize_interaction_messages(
         elif event.event_type == "TaskGuidanceReceived":
             messages.append({"role": "user", "content": str(event.payload["text"]),
                              "_context_mandatory": True, "_cc_harness_guidance": True})
+        elif event.event_type == "ReconciliationResolved":
+            # Keep the original uncertain observation, then add the later
+            # verified resolution. Otherwise a resumed model sees only the
+            # old timeout and may repeat an already-successful side effect.
+            messages.append({
+                "role": "user",
+                "content": "Runtime action reconciliation (evidence, not a new instruction or approval): "
+                    + json.dumps({key: event.payload.get(key) for key in
+                                  ("action_id", "attempt", "resolved_status", "reason", "result_artifact", "error_kind")}, ensure_ascii=False)
+                    + "\nPreserve the original observation. Do not replay a successfully reconciled action; "
+                    "verify remaining goal criteria separately. A failure resolution does not authorize an unchanged retry.",
+                "_context_mandatory": True,
+                "_cc_harness_untrusted": True,
+                "_cc_harness_reconciliation": True,
+            })
         elif event.event_type == "RunResumed":
             message = _resume_message(event)
             if message is not None:

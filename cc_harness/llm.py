@@ -9,16 +9,18 @@ import os
 from contextvars import ContextVar
 from typing import Any, Literal
 
-from openai import AsyncOpenAI
-
 from cc_harness.model_identity import canonical_model_identity
+from cc_harness.net_env import make_async_openai
 from cc_harness.stream_errors import ProviderStreamError
 from cc_harness.tokens import UsageRecord
 
 
-_PROVIDER_RETRY_ATTEMPTS = 3
+_PROVIDER_RETRY_ATTEMPTS = 4
 task_output_token_limit: ContextVar[int | None] = ContextVar("task_output_token_limit", default=None)
-_PROVIDER_RETRY_DELAYS = (1.0, 2.0)
+# Bounded exponential backoff before any stream delta.  A provider connection
+# blip should not surface as a failed run after two seconds; after the final
+# attempt the error is still surfaced unchanged (no infinite retry).
+_PROVIDER_RETRY_DELAYS = (1.0, 2.0, 4.0)
 
 
 def _retryable_provider_error(exc: BaseException) -> bool:
@@ -302,7 +304,7 @@ class LLMClient:
         self.thinking_mode: ThinkingMode = normalize_thinking_mode(thinking_mode)
         self._reasoning_content_seen = False
         self.thinking_fallback_used = False
-        self._client = AsyncOpenAI(api_key=api_key, base_url=base_url)
+        self._client = make_async_openai(api_key=api_key, base_url=base_url)
         self._closed = False
 
     @property

@@ -115,7 +115,9 @@ def test_remaining_task_budget_reserves_finalization_time(monkeypatch):
 async def test_executor_idle_timeout_is_opt_in_and_reports_reason(tmp_path: Path, monkeypatch):
     monkeypatch.setenv(RUN_COMMAND_IDLE_TIMEOUT_ENV, "0.1")
 
-    result = await NativeExecutor(project_root=tmp_path, timeout_s=2).run(
+    # Leave time for a cold Windows shell under load. The 100 ms idle limit
+    # remains the assertion target; a two-second total limit could win first.
+    result = await NativeExecutor(project_root=tmp_path, timeout_s=10).run(
         {
             "command": (
                 'python -c "print(\'partial\', flush=True); '

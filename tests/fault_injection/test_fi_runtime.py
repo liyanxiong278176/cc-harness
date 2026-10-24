@@ -149,12 +149,22 @@ async def test_real_provider_probe_uses_configured_model_without_leaking_secrets
     ],
     ids=["invalid-json", "array-arguments", "missing-tool-name"],
 )
-async def test_a2_kernel_rejects_malformed_tool_protocol(call):
+async def test_a2_kernel_handles_malformed_tool_protocol(call):
     run_id = str(uuid.uuid4())
     context = SegmentContext(run_id, RunProjection.empty(run_id), ())
     kernel = ReActKernel(ScriptedModel(ModelSegment(tool_calls=(call,))))
-    with pytest.raises(KernelProtocolError):
-        await kernel.execute_segment(context)
+    if "name" not in call:
+        # A missing tool name cannot be routed anywhere; it remains a hard
+        # protocol error.
+        with pytest.raises(KernelProtocolError):
+            await kernel.execute_segment(context)
+        return
+    outcome = await kernel.execute_segment(context)
+    request = outcome.action_requests[0]
+    assert request.protocol_error
+    assert request.effect_class is EffectClass.READ_ONLY
+    # Malformed JSON is replannable feedback, not a worker-killing exception.
+    assert "JSON" in request.protocol_error or "object" in request.protocol_error
 
 
 def test_a2_reasoning_replay_preserves_legacy_data_and_accepts_new_redacted_artifacts():

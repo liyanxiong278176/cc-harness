@@ -9,6 +9,7 @@ import time
 from collections.abc import Awaitable, Callable
 from pathlib import Path
 
+from cc_harness.executor_session import executor_session_state, may_shutdown_executor_server
 from cc_harness.config import ExecutorBackend, ExecutorConfig
 from cc_harness.executor import (
     Executor,
@@ -138,19 +139,17 @@ def init_session_executor(config: ExecutorConfig, project_root: str | Path) -> N
     project_root 锁执行 cwd;sandbox 在容器内 mount 该根为只读。
     Store config for status and diagnostics.
     """
-    global _session_executor, _session_executor_config
-    global _session_allow_native_fallback, _session_fallback_profile
-    global _session_fallback_reason
-    _session_executor = build_executor(config, Path(project_root))
-    _session_executor_config = config
+    state = executor_session_state(globals())
+    state.executor = build_executor(config, Path(project_root))
+    state.executor_config = config
     # A process can attach a new project/session without passing through the
     # full shutdown path (the WebUI keeps a manager-level client cache).  Do
     # not let a previous project's fallback reason leak into the new status
     # surface or make a fresh NativeExecutor look like a degraded fallback.
-    _session_allow_native_fallback = False
-    _session_fallback_profile = None
-    _session_fallback_reason = None
-    _surface_shell_metadata(_session_executor)
+    state.allow_native_fallback = False
+    state.fallback_profile = None
+    state.fallback_reason = None
+    _surface_shell_metadata(state.executor)
 
 
 def configure_session_native_fallback(
@@ -166,8 +165,8 @@ def configure_session_native_fallback(
     ``CC_HARNESS_SANDBOX_FALLBACK=native`` is accepted as an explicit local
     opt-in for callers that do not use a capability profile.
     """
+    state = executor_session_state(globals())
 
-    global _session_allow_native_fallback, _session_fallback_profile
     profile = (capability_profile or "").strip().lower() or None
     security_mode = os.getenv("CC_HARNESS_SECURITY_MODE", "").strip().lower()
     restricted_profile = profile == "hardened-safety" or security_mode in {
@@ -202,35 +201,37 @@ def configure_session_native_fallback(
     # when an inherited shell happens to contain the native opt-in variable.
     if benchmark_process:
         enabled = False
-    _session_allow_native_fallback = bool(enabled) and not restricted_profile
-    _session_fallback_profile = profile
+    state.allow_native_fallback = bool(enabled) and not restricted_profile
+    state.fallback_profile = profile
 
 
 def session_executor_status() -> dict[str, object]:
     """Return redaction-safe backend/fallback status for UI and audit paths."""
+    state = executor_session_state(globals())
 
-    config = _session_executor_config
+    config = state.executor_config
     backend = getattr(config, "backend", None)
     return {
-        "initialized": _session_executor is not None,
+        "initialized": state.executor is not None,
         "backend": backend.value if isinstance(backend, ExecutorBackend) else (
             str(backend) if backend is not None else None
         ),
-        "native_fallback_enabled": bool(_session_allow_native_fallback),
-        "native_fallback_active": isinstance(_session_executor, NativeExecutor)
-        and bool(_session_fallback_reason),
-        "fallback_profile": _session_fallback_profile,
-        "fallback_reason": _session_fallback_reason,
+        "native_fallback_enabled": bool(state.allow_native_fallback),
+        "native_fallback_active": isinstance(state.executor, NativeExecutor)
+        and bool(state.fallback_reason),
+        "fallback_profile": state.fallback_profile,
+        "fallback_reason": state.fallback_reason,
     }
 
 
 def get_session_executor() -> Executor:
     """Return the explicitly initialized executor or fail closed."""
-    if _session_executor is None:
+    state = executor_session_state(globals())
+    if state.executor is None:
         raise ExecutorNotInitializedError(
             "session executor is not initialized; command was not executed"
         )
-    return _session_executor
+    return state.executor
 
 
 async def prewarm_session_executor():
@@ -250,14 +251,12 @@ async def prewarm_session_executor():
 
 def reset_session_executor() -> None:
     """Clear session executor state for test and lifecycle isolation."""
-    global _session_executor, _session_executor_config
-    global _session_allow_native_fallback, _session_fallback_profile
-    global _session_fallback_reason
-    _session_executor = None
-    _session_executor_config = None
-    _session_allow_native_fallback = False
-    _session_fallback_profile = None
-    _session_fallback_reason = None
+    state = executor_session_state(globals())
+    state.executor = None
+    state.executor_config = None
+    state.allow_native_fallback = False
+    state.fallback_profile = None
+    state.fallback_reason = None
 
 
 async def shutdown_session_executor() -> None:
@@ -266,16 +265,14 @@ async def shutdown_session_executor() -> None:
     全部 best-effort:任何异常吞掉(退出路径不能炸)。NativeExecutor 无 kill
     方法 → getattr 返回 None → 跳过。
     """
-    global _session_executor, _session_executor_config
-    global _session_allow_native_fallback, _session_fallback_profile
-    global _session_fallback_reason
-    if _session_executor is None:
-        _session_executor_config = None
-        _session_allow_native_fallback = False
-        _session_fallback_profile = None
-        _session_fallback_reason = None
+    state = executor_session_state(globals())
+    if state.executor is None:
+        state.executor_config = None
+        state.allow_native_fallback = False
+        state.fallback_profile = None
+        state.fallback_reason = None
         return
-    kill = getattr(_session_executor, "kill", None)
+    kill = getattr(state.executor, "kill", None)
     if kill is not None:
         try:
             await kill()
@@ -283,18 +280,20 @@ async def shutdown_session_executor() -> None:
             pass
     try:
         from cc_harness.sandbox_server import shutdown_owned
-        await shutdown_owned()
+        if may_shutdown_executor_server(globals()):
+            await shutdown_owned()
     except Exception:
         pass
-    _session_executor = None
-    _session_executor_config = None
-    _session_allow_native_fallback = False
-    _session_fallback_profile = None
-    _session_fallback_reason = None
+    state.executor = None
+    state.executor_config = None
+    state.allow_native_fallback = False
+    state.fallback_profile = None
+    state.fallback_reason = None
 
 
 def _native_fallback_audit(project_root: Path, *, reason: str, stage: str, retry_current: bool) -> None:
     """Persist a redaction-safe record whenever the host fallback is armed."""
+    state = executor_session_state(globals())
 
     entry = {
         "ts": time.strftime("%Y-%m-%dT%H:%M:%S"),
@@ -302,7 +301,7 @@ def _native_fallback_audit(project_root: Path, *, reason: str, stage: str, retry
         "reason": reason,
         "stage": stage,
         "retry_current": bool(retry_current),
-        "profile": _session_fallback_profile,
+        "profile": state.fallback_profile,
     }
     path = project_root / ".cc-harness" / "logs" / "sandbox.jsonl"
     try:
@@ -327,19 +326,19 @@ async def fallback_session_executor(
     can therefore switch the *next* action to native without duplicating an
     action whose outcome is unknown.
     """
+    state = executor_session_state(globals())
 
-    global _session_executor, _session_executor_config, _session_fallback_reason
     if not isinstance(error, BaseException):
         return False
     if not bool(getattr(error, "fallback_safe", True)):
         return False
-    async with _session_fallback_lock:
-        config = _session_executor_config
+    async with state.fallback_lock:
+        config = state.executor_config
         if config is None or config.backend is not ExecutorBackend.SANDBOX:
-            return isinstance(_session_executor, NativeExecutor) and bool(_session_fallback_reason)
-        if not _session_allow_native_fallback:
+            return isinstance(state.executor, NativeExecutor) and bool(state.fallback_reason)
+        if not state.allow_native_fallback:
             return False
-        current = _session_executor
+        current = state.executor
         project_root = getattr(current, "project_root", None)
         if project_root is None:
             return False
@@ -355,13 +354,14 @@ async def fallback_session_executor(
                 pass
         try:
             from cc_harness.sandbox_server import shutdown_owned
-            await shutdown_owned()
+            if may_shutdown_executor_server(globals()):
+                await shutdown_owned()
         except Exception:
             pass
         config.backend = ExecutorBackend.NATIVE
         native = build_executor(config, Path(project_root))
-        _session_executor = native
-        _session_fallback_reason = str(error)
+        state.executor = native
+        state.fallback_reason = str(error)
         _native_fallback_audit(
             Path(project_root),
             reason=str(error),
@@ -485,6 +485,7 @@ async def run_command(
             result = ToolResult.error(
                 display="executor not initialized; command was not executed",
                 llm=f"[Tool Error] {exc}",
+                metadata={"execution_not_started": True},
             )
         except SandboxUnavailableError as exc:
             # Only a failure before dispatch may replay the current command.
@@ -514,14 +515,16 @@ async def run_command(
                 )
             else:
                 result = ToolResult.error(
-                    display="sandbox unavailable; command was not executed",
+                    display="sandbox unavailable; command was not executed" if safe_to_retry else "sandbox transport failed; command outcome is unknown",
                     llm=(
-                        "[Tool Error] sandbox unavailable; command was not executed and "
-                        f"native fallback is disabled: {exc}"
+                        ("[Tool Error] sandbox unavailable before dispatch; command was not executed. "
+                         if safe_to_retry else "[Tool Error] sandbox transport failed after dispatch; command outcome is unknown. ")
+                        + f"Native fallback is disabled: {exc}"
                     ),
                     metadata={
                         "exit_code": None,
-                        "outcome_unknown": False,
+                        "outcome_unknown": not safe_to_retry,
+                        "execution_not_started": safe_to_retry,
                         "sandbox_stage": getattr(exc, "stage", "preflight"),
                     },
                 )
@@ -730,7 +733,11 @@ RUN_COMMAND_SPEC = {
             "The command runs in the project root with a bounded timeout. "
             "Dangerous commands (rm -rf, format, drop database, etc.) require "
             "user confirmation. Use this for running scripts, git commands, "
-            "listing files, etc."
+            "listing files, etc. For long-lived servers use background=true with "
+            "the server command itself and a readiness_command. Do not wrap a "
+            "foreground call in Start-Process, nohup, or a trailing &: inherited "
+            "handles can keep the call open and cause an uncertain timeout. "
+            "Propagate native program exit codes (PowerShell: exit $LASTEXITCODE)."
         ),
         "parameters": {
             "type": "object",
@@ -741,6 +748,12 @@ RUN_COMMAND_SPEC = {
                         "The shell command to execute. The active session replaces this text "
                         "with its exact platform and command dialect before model use."
                     ),
+                },
+                "timeout_seconds": {
+                    "type": "number",
+                    "minimum": 0.1,
+                    "maximum": 1800,
+                    "description": "Foreground command timeout. Set a sufficient bounded duration for builds and test suites; defaults to the session timeout (normally 30 seconds).",
                 },
                 "background": {
                     "type": "boolean",

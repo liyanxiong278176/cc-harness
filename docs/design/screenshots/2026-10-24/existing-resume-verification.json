@@ -1,0 +1,10 @@
+{
+  "result": "passed",
+  "mode": "click Continue once",
+  "status": "running",
+  "checks": [
+    "no message submission",
+    "execution running after scheduler recovery",
+    "no system resume bubbles"
+  ]
+}

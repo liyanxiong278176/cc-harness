@@ -1,0 +1,83 @@
+{
+  "data": "deterministic local verification, no remote model",
+  "checks": [
+    "Welcome suggestion populates the real composer",
+    "Running process visible; raw tool output stays collapsed",
+    "Completed process collapses; final answer remains visible",
+    "Trace filtering, search, expansion and actual test output",
+    "Task-scoped diff loads immutable native mutation evidence",
+    "Queue edits persist in Runtime; withdrawal removes pending work",
+    "Settings dialog opens and Escape restores workspace",
+    "Current file preview remains separate from historical task diff",
+    "Narrow viewport has no page overflow",
+    "Stop reaches a durable cancelled boundary for the held real worker",
+    "Reload restores durable transcript and final answer"
+  ],
+  "errors": [],
+  "screenshots": [
+    {
+      "filename": "01-welcome-dark.png",
+      "title": "新会话 · 深色"
+    },
+    {
+      "filename": "02-running.png",
+      "title": "执行中 · 进展与计划"
+    },
+    {
+      "filename": "03-completed.png",
+      "title": "完成 · 回复与文件摘要"
+    },
+    {
+      "filename": "04-trace.png",
+      "title": "轨迹 · 工具结果与搜索"
+    },
+    {
+      "filename": "05-diff-dark.png",
+      "title": "任务变更 · 真实文本差异"
+    },
+    {
+      "filename": "06-approval-queue.png",
+      "title": "审批 · 操作范围与待执行消息"
+    },
+    {
+      "filename": "07-queue-updated.png",
+      "title": "队列修改 · 已持久化"
+    },
+    {
+      "filename": "08-settings.png",
+      "title": "模型与权限设置"
+    },
+    {
+      "filename": "15-memory-capabilities.png",
+      "title": "本地能力与记忆"
+    },
+    {
+      "filename": "16-permission-policy.png",
+      "title": "权限策略 · 真实生效范围"
+    },
+    {
+      "filename": "09-runtime-details.png",
+      "title": "任务详情 · 上下文与能力"
+    },
+    {
+      "filename": "10-recoverable-error.png",
+      "title": "可恢复失败 · 对话内处理"
+    },
+    {
+      "filename": "11-welcome-light.png",
+      "title": "新会话 · 浅色"
+    },
+    {
+      "filename": "12-diff-light.png",
+      "title": "文件差异 · 浅色"
+    },
+    {
+      "filename": "13-file-preview.png",
+      "title": "当前文件 · 代码预览"
+    },
+    {
+      "filename": "14-mobile.png",
+      "title": "窄屏 · 新会话"
+    }
+  ]
+}

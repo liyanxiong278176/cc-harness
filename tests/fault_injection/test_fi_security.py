@@ -28,7 +28,7 @@ from cc_harness.mcp_client import MCPClient
 from cc_harness.native_tools import MutationConflictError, MutationEngine, _hash
 from cc_harness.permissions import requires_approval_for_mode
 from cc_harness.policy import Action, PolicyEngine
-from cc_harness.run_kernel import ActionRequest, KernelProtocolError, ReActKernel
+from cc_harness.run_kernel import ActionRequest, ReActKernel
 from cc_harness.run_model import EffectClass
 from cc_harness.sandbox import (
     SandboxExecutor,
@@ -315,12 +315,14 @@ def test_d8_partial_tool_calls_are_removed_and_pairing_is_not_fabricated():
 
         canonical_message({"role": "tool", "content": "orphan"})
 
-    with pytest.raises(KernelProtocolError, match="must be an object"):
-        ReActKernel._action_request(
-            SimpleNamespace(run_id="d8", projection=SimpleNamespace(sequence=1)),
-            {"name": "Write", "arguments": []},
-            0,
-        )
+    request = ReActKernel._action_request(
+        SimpleNamespace(run_id="d8", projection=SimpleNamespace(sequence=1)),
+        {"name": "Write", "arguments": []},
+        0,
+    )
+    assert request.protocol_error
+    assert "object" in request.protocol_error
+    assert request.effect_class.value == "read_only"
 
 
 def test_d9_expected_hash_conflict_and_conservative_scheduling(tmp_path):

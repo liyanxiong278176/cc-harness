@@ -5,6 +5,8 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import logging
+import os
+import socket
 import time
 from collections.abc import Callable
 from dataclasses import dataclass
@@ -75,7 +77,13 @@ class LocalSupervisor:
         # fallback for crash recovery and for work created by another process.
         self._wake_event = asyncio.Event()
         self._lease_manager = LeaseManager(store)
-        self.supervisor_id = f"supervisor-{uuid4().hex}"
+        # Encode host + pid so another local process can prove this owner is
+        # dead and reclaim a crashed supervisor immediately (run_store parses
+        # this shape).  The random suffix keeps multiple supervisors in one
+        # process distinct.
+        self.supervisor_id = (
+            f"supervisor-{socket.gethostname()}-{os.getpid()}-{uuid4().hex[:8]}"
+        )
         self._supervisor_lease_manager = SupervisorLeaseManager(
             store,
             owner_id=self.supervisor_id,
@@ -174,7 +182,15 @@ class LocalSupervisor:
                 if task.owner != "main" and receiver is None:
                     await self.execution.pause(record.run_id, "handoff_receiver_unavailable")
                     continue
-                worker = (receiver or self.worker_factory)(record.run_id)
+                try:
+                    worker = (receiver or self.worker_factory)(record.run_id)
+                except Exception as exc:  # noqa: BLE001 - isolate local worker initialization failures
+                    _LOGGER.exception("worker initialization failed for run_id=%s", record.run_id)
+                    await self.execution.pause(
+                        record.run_id,
+                        f"worker_initialization_failed: {type(exc).__name__}",
+                    )
+                    continue
                 # The factory may provide a task-specific lease manager. The
                 # default worker created by DurableRuntimeClient uses the
                 # supervisor window below, while explicit test/custom workers

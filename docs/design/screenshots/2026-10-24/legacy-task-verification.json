@@ -1,0 +1,11 @@
+{
+  "result": "passed",
+  "source": "Existing persisted conversation on localhost:3080; GET requests and UI navigation only",
+  "checks": [
+    "old bootstrap task and raw user prompt are hidden",
+    "absence of model plan is explicit",
+    "reload preserves truthful empty state without new requests or resume",
+    "no page errors"
+  ],
+  "errors": []
+}

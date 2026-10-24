@@ -277,6 +277,7 @@ class PlanNode:
     timeout_seconds: int = 240
     max_retries: int = 1
     output_schema: Mapping[str, Any] = field(default_factory=dict)
+    title: str = ""
 
     def __post_init__(self) -> None:
         if not self.node_id or not self.kind:
@@ -289,7 +290,7 @@ class PlanNode:
             raise DomainValidationError("plan node max_retries must be in [0, 2]")
 
     def to_dict(self) -> dict[str, Any]:
-        return {
+        data = {
             "node_id": self.node_id,
             "kind": self.kind,
             "depth": self.depth,
@@ -306,11 +307,15 @@ class PlanNode:
             "max_retries": self.max_retries,
             "output_schema": dict(self.output_schema),
         }
+        if self.title:
+            data["title"] = self.title
+        return data
 
     @classmethod
     def from_dict(cls, data: Mapping[str, Any]) -> "PlanNode":
         return cls(
             node_id=str(data["node_id"]),
+            title=str(data.get("title") or ""),
             kind=str(data["kind"]),
             depth=int(data.get("depth", 0)),
             depends_on=tuple(str(item) for item in data.get("depends_on") or ()),
@@ -873,6 +878,13 @@ class RunStateMachine:
         "TaskApprovalSuperseded": {
             RunStatus.AWAITING_APPROVAL: {RunStatus.QUEUED},
             RunStatus.QUEUED: {RunStatus.QUEUED}, RunStatus.RUNNING: {RunStatus.RUNNING},
+            RunStatus.PAUSED: {RunStatus.PAUSED},
+            RunStatus.BLOCKED: {RunStatus.BLOCKED},
+            RunStatus.STALLED: {RunStatus.STALLED},
+            RunStatus.FAILED_RECOVERABLE: {RunStatus.FAILED_RECOVERABLE},
+            RunStatus.WAITING_INPUT: {RunStatus.WAITING_INPUT},
+            RunStatus.WAITING_EVENT: {RunStatus.WAITING_EVENT},
+            RunStatus.WAITING_ON_PREDECESSOR: {RunStatus.WAITING_ON_PREDECESSOR},
         },
         "RunQueued": {RunStatus.DRAFT: {RunStatus.QUEUED}},
         "RunClaimed": {RunStatus.QUEUED: {RunStatus.RUNNING}},
@@ -985,6 +997,9 @@ class RunStateMachine:
         "RunRuntimeMigrated",
         "RunSnapshotCreated",
         "FollowUpQueued",
+        "FollowUpUpdated",
+        "FollowUpCancelled",
+        "FollowUpClaimed",
         "FollowUpStarted",
         "PredecessorBypassed",
         "LegacyRunImported",
@@ -1102,6 +1117,9 @@ class RunStateMachine:
         "IntegrationConflictRaised": {RunStatus.RUNNING, RunStatus.BLOCKED},
         "RunOutcomeRecorded": set(RunStatus),
         "FollowUpQueued": set(RunStatus),
+        "FollowUpUpdated": set(RunStatus),
+        "FollowUpCancelled": set(RunStatus),
+        "FollowUpClaimed": set(RunStatus),
         "FollowUpStarted": set(RunStatus),
         "LegacyRunImported": set(RunStatus),
         # A stalled predecessor is still a valid recovery boundary.  The

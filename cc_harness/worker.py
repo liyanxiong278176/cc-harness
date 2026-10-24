@@ -445,12 +445,21 @@ class RunWorker:
             await self._append(current_lease, "RunSegmentStarted", {"segment": segment})
             self._active_node_id = await self._ensure_plan_node_started(current_lease, projection)
             if projection.plan.nodes and self._active_node_id is None:
-                await self._append(
-                    current_lease,
-                    "RunBlocked",
-                    {"reason": "no dependency-ready plan node"},
-                )
-                return
+                page = await self.store.read(lease.run_id, limit=100_000)
+                completed = self._completed_plan_node_ids(projection, page.events)
+                # A model may legitimately finish the checklist inside a tool
+                # call (for example task_plan marks the last step done) and
+                # still need one more segment to produce the final answer.
+                # Blocking here turned that normal flow into
+                # "no dependency-ready plan node"; only a genuinely stuck
+                # plan (some nodes still unfinished) is a scheduling block.
+                if any(node.node_id not in completed for node in projection.plan.nodes):
+                    await self._append(
+                        current_lease,
+                        "RunBlocked",
+                        {"reason": "no dependency-ready plan node"},
+                    )
+                    return
             heartbeat_task = asyncio.create_task(
                 self._heartbeat_loop(current_lease),
                 name=f"cc-harness-heartbeat-{lease.run_id}",
@@ -1464,17 +1473,19 @@ class RunWorker:
             )
             if observation is None:
                 effect = action.effect_class.value if isinstance(action.effect_class, EffectClass) else str(action.effect_class)
+                contract = self.contracts.get(action.tool_name)
+                safe_read = contract.effect_class == EffectClass.READ_ONLY and contract.idempotent
                 observation = make_observation(
                     action_id=action.action_id,
                     attempt=action.attempt,
                     tool_name=action.tool_name,
-                    status="unknown",
+                    status="cancelled" if safe_read else "unknown",
                     effect_class=effect,
-                    text="action interrupted before its external outcome was durable",
+                    text="read-only action interrupted; safe to read again" if safe_read else "action interrupted before its external outcome was durable",
                     error_kind="interrupted_before_observation",
-                    recovery="reconcile",
+                    recovery="retry_safe_read" if safe_read else "reconcile",
                     provenance=("durable-cancellation", "watchdog"),
-                    metadata={"requires_reconciliation": True, "interrupted": True},
+                    metadata={"requires_reconciliation": not safe_read, "interrupted": True},
                 )
                 observation_ref = self.store.artifacts.put_text(
                     json.dumps(
@@ -2986,21 +2997,25 @@ class RunWorker:
             for todo in projection.todos
         )
 
-    async def _ensure_plan_node_started(self, lease: Lease, projection: RunProjection) -> str | None:
-        if not projection.plan.nodes:
-            return None
+    def _completed_plan_node_ids(self, projection: RunProjection, events: Sequence[Any]) -> set[str]:
         completed = {
             todo.todo_id
             for todo in projection.todos
             if todo.status in {"done", "completed"}
         }
-        page = await self.store.read(lease.run_id, limit=100_000)
         completed.update(
             str(event.payload.get("node_id"))
-            for event in page.events
+            for event in events
             if event.event_type == "PlanNodeCompleted" and event.payload.get("node_id")
             and event.sequence > max((x["sequence"] for x in projection.task.guidance), default=0)
         )
+        return completed
+
+    async def _ensure_plan_node_started(self, lease: Lease, projection: RunProjection) -> str | None:
+        if not projection.plan.nodes:
+            return None
+        page = await self.store.read(lease.run_id, limit=100_000)
+        completed = self._completed_plan_node_ids(projection, page.events)
         node = next(
             (
                 item
@@ -3024,7 +3039,7 @@ class RunWorker:
                 {
                     "todo": {
                         "id": node.node_id,
-                        "title": node.node_id,
+                        "title": node.title or next((todo.title for todo in projection.todos if todo.todo_id == node.node_id), node.node_id),
                         "status": "in_progress",
                         "active_sessions": [lease.run_id],
                         "plan_node_id": node.node_id,
@@ -3235,9 +3250,30 @@ class RunWorker:
                 {"action_id": request.action_id, "attempt": attempt},
             )
         try:
-            if self.action_executor is None:
+            if request.protocol_error is not None:
+                # The provider produced malformed tool arguments.  Convert it
+                # into a normal failed observation so the model can correct the
+                # call in the next segment; never let malformed JSON escape as
+                # an unhandled worker exception that kills the run.
                 result = ActionExecutionResult(
-                    ActionStatus.OUTCOME_UNKNOWN,
+                    ActionStatus.FAILED,
+                    error_kind="invalid_tool_arguments",
+                    observation=make_observation(
+                        action_id=request.action_id,
+                        attempt=attempt,
+                        tool_name=request.tool_name,
+                        status="failed",
+                        effect_class="read_only",
+                        text=request.protocol_error,
+                        error_kind="invalid_tool_arguments",
+                        recovery="replan",
+                        provenance=("durable-worker", "protocol"),
+                        metadata={"request_arguments": dict(request.arguments)},
+                    ),
+                )
+            elif self.action_executor is None:
+                result = ActionExecutionResult(
+                    ActionStatus.FAILED,
                     error_kind="no_executor",
                 )
             else:
@@ -3249,7 +3285,7 @@ class RunWorker:
             raise
         except Exception:
             result = ActionExecutionResult(
-                ActionStatus.OUTCOME_UNKNOWN,
+                ActionStatus.FAILED if contract.effect_class == EffectClass.READ_ONLY and contract.idempotent else ActionStatus.OUTCOME_UNKNOWN,
                 error_kind="executor_lost",
             )
         cancellation_projection = await self.store.load_projection(lease.run_id)
@@ -3316,6 +3352,16 @@ class RunWorker:
         if result.read_paths:
             payload["read_paths"] = list(result.read_paths)
         payload["observation_artifact"] = observation_artifact
+        diff_refs = set()
+        change_set = observation.metadata.get("workspace_change_set") or {}
+        if isinstance(change_set, Mapping):
+            for kind in ("created", "modified", "deleted"):
+                for change in change_set.get(kind, ()):
+                    if isinstance(change, Mapping):
+                        for field in ("before", "after"):
+                            digest = change.get(field)
+                            if isinstance(digest, str) and self.store.artifacts.object_path(digest).is_file():
+                                diff_refs.add(digest)
         await self._append(
             lease,
             "ToolObservationCommitted",
@@ -3332,7 +3378,7 @@ class RunWorker:
                 "provenance": list(observation.provenance),
                 "safety_applied": bool(observation.metadata.get("sanitized_by_l5")),
             },
-            artifact_refs=(observation_artifact,),
+            artifact_refs=(observation_artifact, *sorted(diff_refs)),
         )
         self._trigger_activation(
             "tools",
@@ -3368,6 +3414,11 @@ class RunWorker:
     def _action_timeout_for(self, request: ActionRequest, contract) -> float:
         """Resolve one bounded action timeout from request/contract/runtime."""
 
+        if request.tool_name == "run_command" and "timeout_seconds" in request.arguments and "action_timeout_seconds" not in request.arguments:
+            from .executor import resolve_run_command_timeout
+            # Allow process-tree cleanup and a durable timeout receipt before
+            # the outer watchdog cancels the adapter at the same deadline.
+            return resolve_run_command_timeout(request.arguments["timeout_seconds"]) + 15.0
         raw = request.arguments.get("action_timeout_seconds")
         if raw is None:
             raw = request.arguments.get("timeout_seconds")
@@ -3377,7 +3428,7 @@ class RunWorker:
 
     async def _execute_action_call(self, request: ActionRequest, contract) -> ActionExecutionResult:
         if self.action_executor is None:
-            return ActionExecutionResult(ActionStatus.OUTCOME_UNKNOWN, error_kind="no_executor")
+            return ActionExecutionResult(ActionStatus.FAILED, error_kind="no_executor")
         timeout = self._action_timeout_for(request, contract)
         lease = getattr(self.execution, "worker_lease", None)
         if lease is not None:
@@ -3395,7 +3446,7 @@ class RunWorker:
         except asyncio.TimeoutError:
             await _cancel_task_bounded(task)
             return ActionExecutionResult(
-                ActionStatus.OUTCOME_UNKNOWN,
+                ActionStatus.FAILED if contract.effect_class == EffectClass.READ_ONLY and contract.idempotent else ActionStatus.OUTCOME_UNKNOWN,
                 error_kind=f"action_timeout:{timeout:.3f}s",
             )
         except asyncio.CancelledError:

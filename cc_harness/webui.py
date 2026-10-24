@@ -39,6 +39,7 @@ from .config import ConfigError, load_context_config
 from .durable_runtime import DurableRuntimeClient
 from .fact_store import default_user_data_dir
 from .live_stream import LiveStreamHub
+from .net_env import sanitize_no_proxy_env
 from .permissions import normalize_permission_mode
 from .run_model import RunStatus
 from .run_store import RunNotFound, SequenceConflict, SupervisorLeaseConflict, SupervisorLeaseFenceError
@@ -106,6 +107,67 @@ _RECOVERABLE_STATUSES = {
     RunStatus.FAILED_RECOVERABLE,
     RunStatus.WAITING_ON_PREDECESSOR,
 }
+
+# Durable types that can change the transcript, the plan/todo dock, an approval,
+# or the queue.  Kernel phases, budget reservations, heartbeats, memory
+# checkpoints, and context projections stay out of the chat read path; they are
+# still fully available through the trace timeline and audit log.
+_CHAT_EVENT_TYPES = (
+    "RunCreated",
+    "RunResumed",
+    "RunOutcomeRecorded",
+    "RunFailed",
+    "RunBlocked",
+    "RunPaused",
+    "RunCancelled",
+    "RunYielded",
+    "FollowUpQueued",
+    "FollowUpUpdated",
+    "FollowUpStarted",
+    "FollowUpClaimed",
+    "TaskProgressRequested",
+    "TaskProgressReported",
+    "TaskGuidanceReceived",
+    "AssistantMessageCommitted",
+    "ToolObservationCommitted",
+    "ActionPlanned",
+    "ActionFailed",
+    "ActionCancelled",
+    "ActionOutcomeUnknown",
+    "TodoCreated",
+    "TodoUpdated",
+    "TodoCompleted",
+    "PlanCreated",
+    "PlanRevised",
+    "PlanNodeStarted",
+    "PlanNodeCompleted",
+    "CompletionAccepted",
+    "ApprovalRequested",
+    "ApprovalGranted",
+    "ApprovalRejected",
+)
+
+# A bounded transcript page can start in the middle of a long turn.  Keep the
+# most recent user prompts regardless of where the page cuts so the question
+# that produced the visible tool stream is never hidden.
+_CHAT_USER_TYPES = (
+    "RunCreated",
+    "FollowUpQueued",
+    "FollowUpUpdated",
+    "TaskProgressRequested",
+    "TaskGuidanceReceived",
+    "RunResumed",
+)
+
+# Artifact bytes are immutable and are read dozens of times while projecting a
+# long transcript.  A small process-local cache removes repeated disk reads
+# without changing the durable source of truth.
+_ARTIFACT_JSON_CACHE: dict[tuple[str, str], dict[str, Any] | None] = {}
+_ARTIFACT_TEXT_CACHE: dict[tuple[str, str], str | None] = {}
+_ARTIFACT_CACHE_LIMIT = 2048
+_DISCOVERY_CACHE_SECONDS = 30.0
+_SESSIONS_CACHE_SECONDS = 2.5
+_CHAT_CACHE_SECONDS = 5.0
 
 
 class SessionDeleteConflict(RuntimeError):
@@ -324,23 +386,58 @@ def _public_capability_details(
     return public
 
 
+def _artifact_cache_key(client: DurableRuntimeClient, digest: Any) -> tuple[str, str] | None:
+    # Artifact bytes are immutable in the durable store, so a (database,
+    # digest) key is safe there.  Test doubles and alternative stores may not
+    # expose immutable artifacts; they opt out of caching entirely.
+    db_path = getattr(client.store, "db_path", None)
+    if db_path is None:
+        return None
+    return str(db_path), str(digest)
+
+
+def _cache_bounded(cache: dict[Any, Any], key: Any, value: Any) -> None:
+    """Store one immutable artifact result without letting the cache grow forever."""
+
+    if len(cache) >= _ARTIFACT_CACHE_LIMIT and key not in cache:
+        with contextlib.suppress(StopIteration):
+            cache.pop(next(iter(cache)))
+    cache[key] = value
+
+
 def _read_json_artifact(client: DurableRuntimeClient, digest: Any) -> dict[str, Any] | None:
     if not digest:
         return None
+    key = _artifact_cache_key(client, digest)
+    if key is not None and key in _ARTIFACT_JSON_CACHE:
+        return _ARTIFACT_JSON_CACHE[key]
     try:
         value = json.loads(client.store.artifacts.read_text(str(digest)))
     except (OSError, TypeError, ValueError, json.JSONDecodeError):
+        if key is not None:
+            _cache_bounded(_ARTIFACT_JSON_CACHE, key, None)
         return None
-    return value if isinstance(value, dict) else None
+    result = value if isinstance(value, dict) else None
+    if key is not None:
+        _cache_bounded(_ARTIFACT_JSON_CACHE, key, result)
+    return result
 
 
 def _read_text_artifact(client: DurableRuntimeClient, digest: Any) -> str | None:
     if not digest:
         return None
+    key = _artifact_cache_key(client, digest)
+    if key is not None and key in _ARTIFACT_TEXT_CACHE:
+        return _ARTIFACT_TEXT_CACHE[key]
     try:
-        return client.store.artifacts.read_text(str(digest))
+        value = client.store.artifacts.read_text(str(digest))
     except (OSError, TypeError, ValueError):
+        if key is not None:
+            _cache_bounded(_ARTIFACT_TEXT_CACHE, key, None)
         return None
+    if key is not None:
+        _cache_bounded(_ARTIFACT_TEXT_CACHE, key, value)
+    return value
 
 
 def _looks_like_completion_candidate(value: str) -> bool:
@@ -455,10 +552,10 @@ def _public_event(
         if isinstance(goal, Mapping) and isinstance(goal.get("objective"), str):
             result["kind"] = "user"
             result["content"] = goal["objective"]
-    elif event_type == "FollowUpQueued":
+    elif event_type in {"FollowUpQueued", "FollowUpUpdated"}:
         text = _read_text_artifact(client, payload.get("message_artifact"))
-        if text is not None:
-            result["kind"] = "user"
+        if text is not None and payload.get("continuation") is not True:
+            result["kind"] = "user" if event_type == "FollowUpQueued" else "status"
             result["content"] = text
     elif event_type == "TaskProgressRequested":
         result["kind"] = "user"
@@ -471,7 +568,7 @@ def _public_event(
         result["content"] = str(payload["text"])
     elif event_type == "RunResumed":
         reason = payload.get("reason")
-        if isinstance(reason, str) and reason.strip():
+        if isinstance(reason, str) and reason.strip() and reason not in {"WebUI 用户继续", "webui.resume"}:
             result["kind"] = "user"
             result["content"] = reason
     elif event_type == "AssistantMessageCommitted":
@@ -903,13 +1000,26 @@ class WebRuntimeManager:
         self.settings = WebSettingsStore()
         self.selected_root: Path | None = None
         self._clients: dict[str, DurableRuntimeClient] = {}
+        self._client_locks: dict[str, asyncio.Lock] = {}
+        self._run_project_roots: dict[str, Path] = {}
         self._client_fingerprints: dict[str, tuple[str, str, str, str]] = {}
         # A crashed scheduler leaves a valid project lease until its TTL
         # expires.  Keep a bounded, in-process takeover watcher so a restarted
         # WebUI can resume queued Runs without requiring a second user click;
         # this is recovery logic, not an external scheduled job.
         self._supervisor_retry_tasks: dict[str, asyncio.Task[None]] = {}
+        self._background_supervisor_tasks: set[asyncio.Task[Any]] = set()
         self._lock = asyncio.Lock()
+        # Discovery walks every persisted project database (one SQLite open per
+        # project).  A browser refresh, a session switch, and a send all used to
+        # pay that cost independently, which made the UI look hung on a machine
+        # with a long local history.  Cache the directory scan and the derived
+        # sidebar summaries; durable event reads remain authoritative.
+        self._discovered_roots: tuple[Path, ...] | None = None
+        self._discovered_roots_at = 0.0
+        self._roots_lock = asyncio.Lock()
+        self._sessions_cache: tuple[float, list[dict[str, Any]]] | None = None
+        self._chat_cache: dict[str, tuple[tuple[tuple[str, int], ...], float, dict[str, Any]]] = {}
         # Best-effort in-process stream fan-out.  Durable events remain the
         # replay source; this hub only removes the visible delay between a
         # provider chunk and the next committed event.
@@ -1052,6 +1162,10 @@ class WebRuntimeManager:
                     row = database.execute(
                         "SELECT canonical_root FROM project_record LIMIT 1"
                     ).fetchone()
+                    run_rows = (
+                        database.execute("SELECT run_id FROM run_record").fetchall()
+                        if row and row[0] else []
+                    )
             except (OSError, sqlite3.Error):
                 continue
             if not row or not row[0]:
@@ -1062,7 +1176,40 @@ class WebRuntimeManager:
                 continue
             if root.is_dir():
                 discovered.append(root)
+                # Index run -> project during the one directory scan.  Without
+                # this, the first chat/SSE request for a historical run opens
+                # every project database in sequence until it finds the owner.
+                for (run_id,) in run_rows:
+                    if run_id:
+                        self._run_project_roots[str(run_id)] = root
         return tuple(discovered)
+
+    def _invalidate_project_caches(self) -> None:
+        self._discovered_roots = None
+        self._discovered_roots_at = 0.0
+        self._sessions_cache = None
+        self._chat_cache.clear()
+
+    async def _discovered_project_roots(self) -> tuple[Path, ...]:
+        """Return the persisted project directories, reusing a short-lived scan."""
+
+        now = time.monotonic()
+        if (
+            self._discovered_roots is not None
+            and now - self._discovered_roots_at < _DISCOVERY_CACHE_SECONDS
+        ):
+            return self._discovered_roots
+        async with self._roots_lock:
+            now = time.monotonic()
+            if (
+                self._discovered_roots is not None
+                and now - self._discovered_roots_at < _DISCOVERY_CACHE_SECONDS
+            ):
+                return self._discovered_roots
+            discovered = await asyncio.to_thread(self._discover_project_roots_sync)
+            self._discovered_roots = tuple(discovered)
+            self._discovered_roots_at = time.monotonic()
+            return self._discovered_roots
 
     async def _project_roots(self) -> tuple[Path, ...]:
         """Return selected, cached, and persisted project roots in UI order."""
@@ -1070,7 +1217,7 @@ class WebRuntimeManager:
         roots: list[Path] = []
         if self.selected_root is not None:
             roots.append(self.selected_root)
-        roots.extend(await asyncio.to_thread(self._discover_project_roots_sync))
+        roots.extend(await self._discovered_project_roots())
         roots.extend(Path(key) for key in self._clients)
         unique: list[Path] = []
         seen: set[str] = set()
@@ -1099,6 +1246,7 @@ class WebRuntimeManager:
             if key not in self._clients:
                 self._clients[key] = await DurableRuntimeClient.create(root, data_root=self.data_root)
             self.selected_root = root
+            self._invalidate_project_caches()
         # Reattach the detached execution loop when a browser refresh or a
         # WebUI restart discovers queued durable work.  Without this, a
         # follow-up submitted just before a restart could remain in SQLite
@@ -1114,7 +1262,7 @@ class WebRuntimeManager:
 
         key = str(Path(root).resolve())
         client = self._clients.get(key)
-        if client is None or client.supervisor is not None:
+        if client is None or (client.supervisor is not None and getattr(client.supervisor, "is_running", True)):
             return
         try:
             records = await client.store.list_runs()
@@ -1161,6 +1309,12 @@ class WebRuntimeManager:
     async def _client_for_root(self, root: Path, *, start: bool = False) -> DurableRuntimeClient:
         root = Path(root).resolve(strict=True)
         key = str(root)
+        async with self._client_locks.setdefault(key, asyncio.Lock()):
+            return await self._client_for_root_unlocked(root, start=start)
+
+    async def _client_for_root_unlocked(self, root: Path, *, start: bool = False) -> DurableRuntimeClient:
+        root = Path(root).resolve(strict=True)
+        key = str(root)
         client = self._clients.get(key)
         if client is None:
             client = await DurableRuntimeClient.create(root, data_root=self.data_root)
@@ -1190,8 +1344,8 @@ class WebRuntimeManager:
             for record in await client.store.list_runs():
                 if record.parent_run_id is not None:
                     continue
-                view = await client.coordinator.inspect(record.run_id)
-                if view.status in _ACTIVE_STATUSES:
+                _, effective, _, _, _ = await self._conversation_snapshot(client, record.run_id)
+                if effective.status in _ACTIVE_STATUSES:
                     active.append(record.run_id)
             if active:
                 raise ConfigError("当前运行仍在使用旧配置；结束后新会话才会应用新配置")
@@ -1241,6 +1395,9 @@ class WebRuntimeManager:
         return await self._client_for_root(self._require_root(), start=start)
 
     async def sessions(self, *, all_projects: bool = True) -> list[dict[str, Any]]:
+        cached = self._sessions_cache
+        if cached is not None and time.monotonic() - cached[0] < _SESSIONS_CACHE_SECONDS:
+            return [dict(item) for item in cached[1]]
         roots = await self._project_roots() if all_projects else (self._require_root(),)
         result: list[dict[str, Any]] = []
         for root in roots:
@@ -1252,6 +1409,7 @@ class WebRuntimeManager:
             for record in records:
                 if record.parent_run_id is not None:
                     continue
+                self._run_project_roots[record.run_id] = root
                 try:
                     _root_view, view, _head, _approvals, _tree = await self._conversation_snapshot(client, record.run_id)
                 except Exception:
@@ -1288,6 +1446,7 @@ class WebRuntimeManager:
                         "scheduler": self._scheduler_status(client),
                     }
                 )
+        self._sessions_cache = (time.monotonic(), [dict(item) for item in result])
         return result
 
     async def artifacts(self) -> dict[str, Any]:
@@ -1574,7 +1733,9 @@ class WebRuntimeManager:
     async def _client_for_run(self, run_id: str, *, start: bool = False) -> DurableRuntimeClient:
         """Resolve a root run across the grouped project history."""
 
-        for root in await self._project_roots():
+        cached_root = self._run_project_roots.get(run_id)
+        roots = (cached_root,) if cached_root is not None else await self._project_roots()
+        for root in roots:
             try:
                 client = await self._client_for_root(root)
                 record = await client.store.load_run_record(run_id)
@@ -1582,7 +1743,13 @@ class WebRuntimeManager:
                 continue
             if record.parent_run_id is not None:
                 raise ValueError("只能从根会话发送消息")
-            self.selected_root = root
+            # Cache only the directory, never status/approvals. Each access
+            # still checks the durable record (including tombstones). SSE
+            # polling must not reopen every historical project database.
+            self._run_project_roots[run_id] = root
+            # Reading an old session (including its SSE stream) must not
+            # retarget another browser's selected workspace or settings.
+            # Explicit project selection owns that presentation state.
             # Event replay/session inspection can be the first request after a
             # browser refresh (the client may still have an EventSource open),
             # so project selection is not guaranteed to pass through
@@ -1592,6 +1759,9 @@ class WebRuntimeManager:
             if not start:
                 await self._start_pending_if_configured(root)
             return await self._client_for_root(root, start=start)
+        if cached_root is not None:
+            self._run_project_roots.pop(run_id, None)
+            return await self._client_for_run(run_id, start=start)
         # Keep a missing/stale browser id distinguishable from malformed
         # control requests.  The HTTP layer maps this durable lookup result
         # to 404 so the frontend can clear its selection instead of polling a
@@ -1613,8 +1783,11 @@ class WebRuntimeManager:
     ) -> dict[str, Any]:
         if not text.strip():
             raise ValueError("消息不能为空")
+        self._sessions_cache = None
         if session_id:
-            client = await self._client_for_run(session_id, start=True)
+            self._chat_cache.pop(session_id, None)
+        if session_id:
+            client = await self._client_for_run(session_id, start=False)
             _root_view, _effective, head, _approvals, _tree = await self._conversation_snapshot(client, session_id)
             # A pending approval is a tool-level boundary, not a conversation
             # lock.  Keep accepting ordinary user messages and durable them in
@@ -1638,10 +1811,23 @@ class WebRuntimeManager:
                     await client.coordinator.execution.attach_terminal(head.run_id, self.terminal_pid)
                 if head.status in {RunStatus.PAUSED, RunStatus.BLOCKED, RunStatus.STALLED, RunStatus.FAILED_RECOVERABLE} and text.strip() not in {"继续", "接着做", "继续执行", "resume", "continue"}:
                     await client.coordinator.execution.guidance(head.run_id, text.strip())
+                    if any(action.status.value == "outcome_unknown" for action in head.projection.actions):
+                        # The message is already durable. Acknowledge it even
+                        # though the unresolved side effect still forbids resume.
+                        # Returning an error here falsely invites duplicate sends.
+                        updated = await client.coordinator.inspect(head.run_id)
+                        self._start_supervisor_background(client.cwd)
+                        return {
+                            "session_id": session_id, "run_id": session_id,
+                            "follow_up_run_id": None, "continuation": "same_run",
+                            "sequence": updated.sequence, "status": updated.status.value,
+                            "resume_required": True,
+                        }
                 receipt = await client.coordinator.resume(head.run_id, text.strip())
                 if getattr(self, "terminal_pid", None) and receipt.run_id != head.run_id:
                     await client.coordinator.execution.attach_terminal(receipt.run_id, self.terminal_pid)
                 await self._wake_supervisor(client)
+                self._start_supervisor_background(client.cwd)
                 return {
                     "session_id": session_id,
                     "run_id": session_id,
@@ -1651,15 +1837,19 @@ class WebRuntimeManager:
                     "message_event_id": f"{head.run_id}:{receipt.sequence}",
                     "status": "queued",
                 }
-            receipt = await client.coordinator.send(head.run_id, text.strip())
+            # All pending WebUI messages share the conversation root FIFO,
+            # even while a child is active. Separate child queues could let
+            # a later message overtake one already waiting on the root.
+            receipt = await client.coordinator.send(session_id, text.strip(), follow_up=True)
             await self._wake_supervisor(client)
+            self._start_supervisor_background(client.cwd)
             return {
                 "session_id": session_id,
                 "run_id": session_id,
                 "follow_up_run_id": receipt.follow_up_run_id,
-                "continuation": "guidance" if receipt.follow_up_run_id is None else "child_run",
+                "continuation": "child_run",
                 "sequence": receipt.sequence,
-                "message_event_id": f"{head.run_id}:{receipt.sequence}",
+                "message_event_id": f"{session_id}:{receipt.sequence}",
                 "status": "queued",
             }
         # A browser can have several project/session requests in flight.  The
@@ -1676,9 +1866,9 @@ class WebRuntimeManager:
                 raise ValueError(f"项目文件夹不可用: {exc}") from exc
             if not requested_root.is_dir():
                 raise ValueError("项目路径必须是文件夹")
-            client = await self._client_for_root(requested_root, start=True)
+            client = await self._client_for_root(requested_root, start=False)
         else:
-            client = await self._client(start=True)
+            client = await self._client(start=False)
         submit_options = {}
         if budget_limits is not None:
             submit_options["budget_limits"] = budget_limits
@@ -1691,7 +1881,9 @@ class WebRuntimeManager:
             interaction_mode=classify_interaction_mode(text, interaction_mode),
             **submit_options,
         )
+        self._run_project_roots[run_id] = client.cwd
         await self._wake_supervisor(client)
+        self._start_supervisor_background(client.cwd)
         # ``RunCreated`` is the first durable root event and is therefore a
         # stable acknowledgement target for the optimistic WebUI message.
         return {
@@ -1702,11 +1894,20 @@ class WebRuntimeManager:
             "message_event_id": f"{run_id}:1",
         }
 
-    async def session(self, run_id: str) -> dict[str, Any]:
+    async def session(self, run_id: str, *, include_usage: bool = True) -> dict[str, Any]:
         client = await self._validate_root_run(run_id)
         root_view, effective, _head, approvals, tree = await self._conversation_snapshot(client, run_id)
-        usage = await client.usage_for_run(run_id)
-        context = await self.context(run_id, client=client, usage=usage)
+        if include_usage:
+            event_rows = []
+            for view in tree:
+                event_rows.extend((await client.store.read(view.run_id, limit=100_000)).events)
+            # Usage and compaction describe the same captured history; avoid
+            # decoding the entire conversation twice for each status/SSE refresh.
+            usage = await client.usage_for_run(run_id, events=event_rows)
+            context = await self.context(run_id, client=client, usage=usage, event_rows=event_rows)
+        else:
+            usage = None
+            context = None
         projection = _redact(root_view.projection.to_dict())
         # ApprovalProjection carries its owning run_id. Add descendant
         # approvals to the root-facing projection so the browser can render
@@ -1720,18 +1921,126 @@ class WebRuntimeManager:
             "run_id": run_id,
             "project_root": str(client.cwd),
             "status": effective.status.value,
+            # Root projection owns the conversation; task facts follow the
+            # request currently executing, including subsequent user turns.
+            "task_run_id": effective.run_id,
+            "task_projection": _redact(effective.projection.to_dict()),
             "task": _redact(effective.projection.task.to_dict()),
             "plan_digest": effective.projection.plan.digest,
             "sequence": max((item.sequence for item in tree), default=effective.sequence),
             "projection": projection,
-            "usage": _redact(usage),
+            "usage": _redact(usage) if usage is not None else None,
             "context": context,
-            "capabilities": context.get("capabilities", {}),
+            "capabilities": context.get("capabilities", {}) if context else {},
             "executor": client.executor_status(),
             "scheduler": self._scheduler_status(client),
         }
 
-    async def context(self, run_id: str, *, client: DurableRuntimeClient | None = None, usage: dict[str, Any] | None = None) -> dict[str, Any]:
+    async def chat_snapshot(self, run_id: str, *, limit: int = 900) -> dict[str, Any]:
+        """Return one fast, chat-oriented session payload.
+
+        The sidebar/status surfaces only need the root projection; the
+        transcript needs the last bounded page of user/assistant/tool/plan
+        events.  Splitting this from :meth:`session` avoids decoding every
+        kernel, budget, heartbeat, and memory record on every conversation
+        switch.  The cached value is keyed by the authoritative per-Run sequence
+        signature, so a new durable event always invalidates it.
+        """
+
+        client = await self._validate_root_run(run_id)
+        root_view, effective, _head, approvals, tree = await self._conversation_snapshot(client, run_id)
+        signature = tuple((view.run_id, view.sequence) for view in tree)
+        cached = self._chat_cache.get(run_id)
+        if (
+            cached is not None
+            and cached[0] == signature
+            and time.monotonic() - cached[1] < _CHAT_CACHE_SECONDS
+        ):
+            return cached[2]
+
+        page_limit = max(100, min(int(limit), 3000))
+        events: list[Any] = []
+        for view in tree:
+            try:
+                page = await client.store.read_types(
+                    view.run_id,
+                    event_types=_CHAT_EVENT_TYPES,
+                    limit=page_limit,
+                )
+            except Exception:
+                continue
+            events.extend(page.events)
+        events.sort(key=lambda event: (str(event.occurred_at), event.run_id, event.sequence))
+        selected = {event.event_id: event for event in events[-page_limit:]}
+        # Always carry the newest prompts, even when the bounded page starts
+        # after them.  Five is enough for the current turn plus a short recall
+        # tail and costs one extra filtered query per Run.
+        for view in tree:
+            try:
+                user_page = await client.store.read_types(
+                    view.run_id,
+                    event_types=_CHAT_USER_TYPES,
+                    limit=100,
+                )
+            except Exception:
+                continue
+            for event in user_page.events[-5:]:
+                selected[event.event_id] = event
+        events = sorted(
+            selected.values(),
+            key=lambda event: (str(event.occurred_at), event.run_id, event.sequence),
+        )
+        public_events = _public_events(client, events, root_run_id=run_id)
+        projection = _redact(root_view.projection.to_dict())
+        # A user-facing plan spans the Run tree: the root owns the first
+        # objective, while task_plan stages and their todos live on descendant
+        # Runs.  Aggregate them so a cold reload shows the same checklist SSE
+        # built incrementally, instead of collapsing back to the root item.
+        tree_todos: dict[str, dict[str, Any]] = {}
+        tree_nodes: dict[str, dict[str, Any]] = {}
+        plan_revision = 0
+        for view in tree:
+            try:
+                for todo in view.projection.todos:
+                    tree_todos[str(todo.todo_id)] = _redact(todo.to_dict())
+                for node in view.projection.plan.nodes:
+                    tree_nodes[str(node.node_id)] = _redact(node.to_dict())
+                plan_revision = max(plan_revision, int(view.projection.plan.revision))
+            except Exception:
+                continue
+        if tree_todos:
+            projection["todos"] = list(tree_todos.values())
+        if tree_nodes:
+            plan = _redact(root_view.projection.plan.to_dict())
+            plan["nodes"] = list(tree_nodes.values())
+            plan["revision"] = plan_revision
+            projection["plan"] = plan
+        projection["approvals"] = [
+            _redact(approval.to_dict())
+            for _owner_run_id, approval in approvals
+        ]
+        projection["effective_run_id"] = effective.run_id
+        payload = {
+            "run_id": run_id,
+            "project_root": str(client.cwd),
+            "status": effective.status.value,
+            "task_run_id": effective.run_id,
+            "task_projection": _redact(effective.projection.to_dict()),
+            "task": _redact(effective.projection.task.to_dict()),
+            "plan_digest": effective.projection.plan.digest,
+            "sequence": max((item.sequence for item in tree), default=effective.sequence),
+            "projection": projection,
+            "events": public_events,
+            "cursors": {view.run_id: view.sequence for view in tree},
+            "executor": client.executor_status(),
+            "scheduler": self._scheduler_status(client),
+        }
+        if len(self._chat_cache) > 24:
+            self._chat_cache.clear()
+        self._chat_cache[run_id] = (signature, time.monotonic(), payload)
+        return payload
+
+    async def context(self, run_id: str, *, client: DurableRuntimeClient | None = None, usage: dict[str, Any] | None = None, event_rows: list[Any] | None = None) -> dict[str, Any]:
         client = client or await self._validate_root_run(run_id)
         usage = usage or await client.usage_for_run(run_id)
         invocations = usage.get("invocations") or []
@@ -1783,10 +2092,11 @@ class WebRuntimeManager:
         # summary, instead of displaying only the last request's buckets.
         compaction: dict[str, Any] | None = None
         try:
-            event_rows: list[Any] = []
-            for tree_run_id in await client.run_tree(run_id):
-                page = await client.store.read(tree_run_id, limit=100_000)
-                event_rows.extend(page.events)
+            if event_rows is None:
+                event_rows = []
+                for tree_run_id in await client.run_tree(run_id):
+                    page = await client.store.read(tree_run_id, limit=100_000)
+                    event_rows.extend(page.events)
             event_rows.sort(key=lambda event: (event.occurred_at, event.run_id, event.sequence))
             latest_projection: dict[str, Any] | None = None
             latest_applied: dict[str, Any] | None = None
@@ -1957,6 +2267,12 @@ class WebRuntimeManager:
         client = await self._validate_root_run(run_id)
         await client.terminate_run_tree(run_id, reason="WebUI 用户停止", stop_supervisor=False)
 
+    async def _task_control_target(self, run_id: str) -> tuple[Any, Any]:
+        """Resolve controls against the task displayed in the conversation."""
+        client = await self._validate_root_run(run_id)
+        _root, effective, _head, _approvals, _tree = await self._conversation_snapshot(client, run_id)
+        return client, effective
+
     async def delete_session(self, run_id: str) -> dict[str, Any]:
         """Remove a conversation from the WebUI without destroying its facts.
 
@@ -2017,7 +2333,7 @@ class WebRuntimeManager:
             "audit_retained": True,
         }
 
-    async def resume(self, run_id: str) -> None:
+    async def resume(self, run_id: str) -> dict[str, Any]:
         # Resuming may need to create a supervisor.  Use the same explicit
         # WebUI settings path as a new message so a resume never falls back to
         # process-wide environment values (and never starts with a different
@@ -2026,6 +2342,10 @@ class WebRuntimeManager:
         _root_view, _effective, head, approvals, _tree = await self._conversation_snapshot(client, run_id)
         if approvals:
             raise ValueError("当前会话有待处理审批，请先在运行面板中允许或拒绝该动作")
+        unknown = next((action for action in head.projection.actions if action.status.value == 'outcome_unknown'), None)
+        if unknown is not None:
+            label = {'task_plan': '任务计划保存', 'task_wait': '等待状态设置', 'Write': '文件写入', 'run_command': '命令执行'}.get(unknown.tool_name, unknown.tool_name)
+            raise ValueError(f'上次{label}的执行结果尚未确认，需要先核对结果，不能直接重复执行。')
         if head.status not in _RECOVERABLE_STATUSES:
             raise ValueError(f"当前状态不可恢复: {head.status.value}")
         if getattr(self, "terminal_pid", None) and head.status is not RunStatus.CANCELLED:
@@ -2036,10 +2356,13 @@ class WebRuntimeManager:
         # a second time in the same request.
         resumed_run_id = await client.continue_run(
             head.run_id,
-            reason="WebUI 用户继续",
+            reason="webui.resume",
         )
         if getattr(self, "terminal_pid", None) and resumed_run_id != head.run_id:
             await client.coordinator.execution.attach_terminal(resumed_run_id, self.terminal_pid)
+        await self._wake_supervisor(client)
+        view = await client.coordinator.inspect(resumed_run_id)
+        return {"task_run_id": resumed_run_id, "status": view.status.value}
 
     async def _wake_supervisor(self, client: DurableRuntimeClient) -> None:
         """Wake the project scheduler after a durable control decision."""
@@ -2048,6 +2371,36 @@ class WebRuntimeManager:
         wake = getattr(supervisor, "wake", None) if supervisor is not None else None
         if callable(wake):
             wake()
+
+    def _start_supervisor_background(self, root: Path) -> None:
+        """Start (or reuse) the project scheduler without blocking a send.
+
+        The durable submission is already committed when this runs, so the
+        browser can leave its "sending" state immediately while provider and
+        tool initialization happen off the request path.
+        """
+
+        key = str(Path(root).resolve())
+        client = self._clients.get(key)
+        if client is not None:
+            supervisor = client.supervisor
+            if supervisor is not None and getattr(supervisor, "is_running", True):
+                self._wake_supervisor(client)
+                return
+        task = asyncio.create_task(
+            self._client_for_root(Path(root), start=True),
+            name=f"cc-harness-supervisor-start-{hashlib.sha1(key.encode()).hexdigest()[:10]}",
+        )
+        self._background_supervisor_tasks.add(task)
+
+        def finish(done: asyncio.Task[Any]) -> None:
+            self._background_supervisor_tasks.discard(done)
+            if done.cancelled():
+                return
+            with contextlib.suppress(Exception):
+                done.result()
+
+        task.add_done_callback(finish)
 
     @staticmethod
     def _approval_in_tree(
@@ -2186,8 +2539,12 @@ class WebRuntimeManager:
         self._supervisor_retry_tasks.clear()
         for task in retry_tasks:
             task.cancel()
-        if retry_tasks:
-            await asyncio.gather(*retry_tasks, return_exceptions=True)
+        background = tuple(self._background_supervisor_tasks)
+        self._background_supervisor_tasks.clear()
+        for task in background:
+            task.cancel()
+        if retry_tasks or background:
+            await asyncio.gather(*retry_tasks, *background, return_exceptions=True)
         clients = tuple(self._clients.values())
         for client in clients:
             with contextlib.suppress(Exception):
@@ -2259,6 +2616,7 @@ class SettingsRequest(BaseModel):
     api_key: str | None = None
     permission_mode: str | None = None
     project_scoped: bool = False
+    project_root: str | None = None
 
 
 class ApprovalRequest(BaseModel):
@@ -2383,11 +2741,20 @@ def _static_root() -> Path | None:
 
 
 def create_web_app(manager: WebRuntimeManager | None = None) -> FastAPI:
+    sanitize_no_proxy_env()
     manager = manager or WebRuntimeManager(initial_cwd=Path.cwd())
 
     @asynccontextmanager
     async def lifespan(_app: FastAPI):
+        # Warm the project registry while the browser fetches the shell.  The
+        # scan is bounded and best-effort; the first sidebar request simply
+        # waits for it if the browser wins the race.
+        warmup = asyncio.create_task(manager._discovered_project_roots())
+        warmup.add_done_callback(lambda task: task.exception() if not task.cancelled() else None)
         yield
+        warmup.cancel()
+        with contextlib.suppress(asyncio.CancelledError, Exception):
+            await warmup
         await manager.shutdown()
 
     app = FastAPI(title="cc-harness WebUI", version="0.1.0", docs_url=None, redoc_url=None, lifespan=lifespan)
@@ -2449,7 +2816,17 @@ def create_web_app(manager: WebRuntimeManager | None = None) -> FastAPI:
 
     @app.post("/api/settings")
     async def save_settings(payload: SettingsRequest) -> dict[str, Any]:
-        if payload.project_scoped and manager.selected_root is None:
+        root = None
+        if payload.project_scoped and payload.project_root:
+            try:
+                root = Path(payload.project_root).expanduser().resolve(strict=True)
+            except (OSError, ValueError) as exc:
+                raise HTTPException(status_code=400, detail="项目文件夹不可用") from exc
+            if not root.is_dir():
+                raise HTTPException(status_code=400, detail="项目路径必须是文件夹")
+        elif payload.project_scoped:
+            root = manager.selected_root
+        if payload.project_scoped and root is None:
             raise HTTPException(
                 status_code=409,
                 detail=StreamErrorDetails(
@@ -2460,7 +2837,6 @@ def create_web_app(manager: WebRuntimeManager | None = None) -> FastAPI:
                     message="选择项目后才能保存项目级配置",
                 ).to_dict(),
             )
-        root = manager.selected_root if payload.project_scoped else None
         values = {field: getattr(payload, field) for field in _MODEL_FIELDS}
         if payload.permission_mode is not None:
             try:
@@ -2493,7 +2869,7 @@ def create_web_app(manager: WebRuntimeManager | None = None) -> FastAPI:
             await manager.settings.update(values, project_root=root)
         except Exception as exc:
             raise _http_error(exc) from exc
-        return {"saved": True, "settings": await manager.settings.public(manager.selected_root)}
+        return {"saved": True, "settings": await manager.settings.public(root if payload.project_scoped else manager.selected_root)}
 
     @app.post("/api/settings/test")
     async def test_settings(payload: SettingsRequest) -> dict[str, Any]:
@@ -2703,7 +3079,11 @@ def create_web_app(manager: WebRuntimeManager | None = None) -> FastAPI:
             raise _http_error(exc) from exc
 
     async def send_message(payload: MessageRequest) -> dict[str, Any]:
-        if manager.selected_root is None and not payload.project_root:
+        # A follow-up already identifies its project through the durable Run
+        # tree.  Requiring the browser's mutable workspace selection here used
+        # to make every second turn fail with project_required after a refresh
+        # when no project had been re-selected yet.
+        if manager.selected_root is None and not payload.project_root and not payload.session_id:
             raise HTTPException(
                 status_code=409,
                 detail=StreamErrorDetails(
@@ -2739,9 +3119,16 @@ def create_web_app(manager: WebRuntimeManager | None = None) -> FastAPI:
         return await send_message(payload.model_copy(update={"session_id": run_id}))
 
     @app.get("/api/sessions/{run_id}")
-    async def get_session(run_id: str) -> dict[str, Any]:
+    async def get_session(run_id: str, view: str = "full") -> dict[str, Any]:
         try:
-            return await manager.session(run_id)
+            return await manager.session(run_id, include_usage=view != "chat")
+        except Exception as exc:
+            raise _http_error(exc) from exc
+
+    @app.get("/api/sessions/{run_id}/chat")
+    async def get_chat(run_id: str, limit: int = 900) -> dict[str, Any]:
+        try:
+            return await manager.chat_snapshot(run_id, limit=max(100, min(limit, 3000)))
         except Exception as exc:
             raise _http_error(exc) from exc
 
@@ -2749,6 +3136,40 @@ def create_web_app(manager: WebRuntimeManager | None = None) -> FastAPI:
     async def get_timeline(run_id: str, limit: int = 500) -> dict[str, Any]:
         try:
             return {"events": await manager.timeline(run_id, limit=max(1, min(limit, 10000)))}
+        except Exception as exc:
+            raise _http_error(exc) from exc
+
+    @app.get("/api/sessions/{run_id}/changes")
+    async def get_changes(run_id: str) -> dict[str, Any]:
+        from .web_changes import task_changes
+        try:
+            client = await manager._client_for_run(run_id)
+            tree = list(await client.run_tree(run_id))
+            return {"changes": await task_changes(client, tree)}
+        except Exception as exc:
+            raise _http_error(exc) from exc
+
+    @app.patch("/api/sessions/{run_id}/queue/{follow_up_id}")
+    async def edit_queue(run_id: str, follow_up_id: str, payload: MessageRequest) -> dict[str, Any]:
+        from .followups import FollowUpService
+        try:
+            client = await manager._client_for_run(run_id)
+            sequence = await FollowUpService(client.store).revise(run_id, follow_up_id, payload.text)
+            return {"sequence": sequence, "status": "queued"}
+        except (ValueError, SequenceConflict) as exc:
+            raise HTTPException(status_code=409, detail={"message": "消息状态已变化，请刷新后重试", "code": "queue_conflict"}) from exc
+        except Exception as exc:
+            raise _http_error(exc) from exc
+
+    @app.delete("/api/sessions/{run_id}/queue/{follow_up_id}")
+    async def withdraw_queue(run_id: str, follow_up_id: str) -> dict[str, Any]:
+        from .followups import FollowUpService
+        try:
+            client = await manager._client_for_run(run_id)
+            sequence = await FollowUpService(client.store).revise(run_id, follow_up_id, None)
+            return {"sequence": sequence, "status": "cancelled"}
+        except (ValueError, SequenceConflict) as exc:
+            raise HTTPException(status_code=409, detail={"message": "消息已开始处理，无法撤回", "code": "queue_conflict"}) from exc
         except Exception as exc:
             raise _http_error(exc) from exc
 
@@ -2760,7 +3181,12 @@ def create_web_app(manager: WebRuntimeManager | None = None) -> FastAPI:
             raise _http_error(exc) from exc
 
     @app.get("/api/sessions/{run_id}/events")
-    async def stream_events(run_id: str, request: Request, after: int = 0) -> StreamingResponse:
+    async def stream_events(
+        run_id: str,
+        request: Request,
+        after: int = 0,
+        cursors: str | None = None,
+    ) -> StreamingResponse:
         try:
             client = await manager._validate_root_run(run_id)
         except Exception as exc:
@@ -2775,9 +3201,19 @@ def create_web_app(manager: WebRuntimeManager | None = None) -> FastAPI:
                 cursor = max(0, after)
         except ValueError:
             cursor = max(0, after)
+        initial_cursors: dict[str, int] = {run_id: cursor}
+        if cursors:
+            try:
+                decoded = json.loads(cursors)
+            except (TypeError, ValueError, json.JSONDecodeError):
+                decoded = None
+            if isinstance(decoded, Mapping):
+                for key, value in decoded.items():
+                    if isinstance(key, str) and isinstance(value, (int, float)):
+                        initial_cursors[key] = max(0, int(value))
 
         async def events() -> AsyncIterator[str]:
-            cursors: dict[str, int] = {run_id: cursor}
+            cursors: dict[str, int] = dict(initial_cursors)
             consecutive_projection_errors = 0
             projection_degraded = False
             retry_sent = False
@@ -2935,8 +3371,8 @@ def create_web_app(manager: WebRuntimeManager | None = None) -> FastAPI:
     @app.post("/api/sessions/{run_id}/pause")
     async def pause_session(run_id: str) -> dict[str, Any]:
         try:
-            client = await manager._validate_root_run(run_id)
-            receipt = await client.coordinator.pause(run_id, "user pause")
+            client, task = await manager._task_control_target(run_id)
+            receipt = await client.coordinator.pause(task.run_id, "user pause")
             return {"run_id": receipt.run_id, "status": receipt.status.value}
         except Exception as exc:
             raise _http_error(exc) from exc
@@ -2944,17 +3380,18 @@ def create_web_app(manager: WebRuntimeManager | None = None) -> FastAPI:
     @app.put("/api/sessions/{run_id}/budget")
     async def configure_task_budget(run_id: str, payload: TaskBudgetRequest) -> dict[str, Any]:
         try:
-            client = await manager._validate_root_run(run_id)
-            await client.coordinator.execution.configure_budget(run_id, payload.limits)
-            return {"updated": True, "run_id": run_id}
+            client, task = await manager._task_control_target(run_id)
+            await client.coordinator.execution.configure_budget(task.run_id, payload.limits)
+            return {"updated": True, "run_id": run_id, "task_run_id": task.run_id}
         except Exception as exc:
             raise _http_error(exc) from exc
 
     @app.post("/api/sessions/{run_id}/wake")
     async def wake_task(run_id: str, payload: WakeTaskRequest) -> dict[str, Any]:
         try:
-            client = await manager._validate_root_run(run_id)
-            resumed = await client.coordinator.execution.wake(run_id, payload.wait_id)
+            client, task = await manager._task_control_target(run_id)
+            client = await manager._client_for_root(client.cwd, start=True)
+            resumed = await client.coordinator.execution.wake(task.run_id, payload.wait_id)
             if resumed:
                 await manager._wake_supervisor(client)
             return {"resumed": resumed, "run_id": run_id}
@@ -2964,8 +3401,9 @@ def create_web_app(manager: WebRuntimeManager | None = None) -> FastAPI:
     @app.post("/api/sessions/{run_id}/plan/approve")
     async def approve_task_plan(run_id: str, payload: PlanDecisionRequest) -> dict[str, Any]:
         try:
-            client = await manager._validate_root_run(run_id)
-            receipt = await client.coordinator.approve_plan(run_id, payload.plan_digest)
+            client, task = await manager._task_control_target(run_id)
+            client = await manager._client_for_root(client.cwd, start=True)
+            receipt = await client.coordinator.approve_plan(task.run_id, payload.plan_digest)
             await manager._wake_supervisor(client)
             return {"run_id": receipt.run_id, "status": receipt.status.value}
         except Exception as exc:
@@ -2981,10 +3419,10 @@ def create_web_app(manager: WebRuntimeManager | None = None) -> FastAPI:
     @app.post("/api/sessions/{run_id}/resume")
     async def resume_session(run_id: str) -> dict[str, Any]:
         try:
-            await manager.resume(run_id)
+            result = await manager.resume(run_id)
         except Exception as exc:
             raise _http_error(exc) from exc
-        return {"resumed": True, "run_id": run_id}
+        return {"resumed": True, "run_id": run_id, **(result or {})}
 
     @app.post("/api/sessions/{run_id}/approvals/{approval_id}/approve")
     async def approve(run_id: str, approval_id: str, payload: ApprovalRequest) -> dict[str, Any]:
@@ -3036,6 +3474,8 @@ def create_web_app(manager: WebRuntimeManager | None = None) -> FastAPI:
                     "delete": "tombstone",
                 },
                 "approvals": {"supported": True, "reject_continues": True},
+                "task_changes": {"supported": True, "source": "immutable_tool_evidence"},
+                "follow_up_queue": {"supported": True, "edit": True, "withdraw": True},
                 "stop": {"supported": True, "scope": "run_tree"},
                 "resume": {"supported": True, "mode": "natural_language_or_checkpoint"},
                 "context": {"supported": True, "source": "runtime"},
@@ -3060,7 +3500,11 @@ def create_web_app(manager: WebRuntimeManager | None = None) -> FastAPI:
         ("/api/web/v1/sessions", create_session, ["POST"]),
         ("/api/web/v1/sessions/{run_id}/messages", post_session_message, ["POST"]),
         ("/api/web/v1/sessions/{run_id}", get_session, ["GET"]),
+        ("/api/web/v1/sessions/{run_id}/chat", get_chat, ["GET"]),
         ("/api/web/v1/sessions/{run_id}/timeline", get_timeline, ["GET"]),
+        ("/api/web/v1/sessions/{run_id}/changes", get_changes, ["GET"]),
+        ("/api/web/v1/sessions/{run_id}/queue/{follow_up_id}", edit_queue, ["PATCH"]),
+        ("/api/web/v1/sessions/{run_id}/queue/{follow_up_id}", withdraw_queue, ["DELETE"]),
         ("/api/web/v1/sessions/{run_id}/context", get_context, ["GET"]),
         ("/api/web/v1/sessions/{run_id}/events", stream_events, ["GET"]),
         ("/api/web/v1/sessions/{run_id}", delete_session, ["DELETE"]),
@@ -3129,6 +3573,7 @@ async def run_web_server(
 ) -> int:
     """Run the foreground WebUI process until Ctrl+C or server shutdown."""
 
+    sanitize_no_proxy_env()
     try:
         import uvicorn
     except ImportError:  # pragma: no cover - dependency packaging guard

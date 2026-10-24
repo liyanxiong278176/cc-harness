@@ -3,7 +3,6 @@ from __future__ import annotations
 import pytest
 
 from cc_harness.run_kernel import (
-    KernelProtocolError,
     ModelSegment,
     ReActKernel,
     SegmentContext,
@@ -75,10 +74,12 @@ async def test_kernel_supports_json_arguments_and_completion_candidate() -> None
 
 
 @pytest.mark.asyncio
-async def test_kernel_rejects_malformed_tool_arguments_and_honors_cancel() -> None:
+async def test_kernel_marks_malformed_tool_arguments_for_replan_and_honors_cancel() -> None:
     model = FakeModel({"tool_calls": ({"name": "Read", "arguments": "not-json"},)})
-    with pytest.raises(KernelProtocolError):
-        await ReActKernel(model).execute_segment(context())
+    outcome = await ReActKernel(model).execute_segment(context())
+    assert outcome.action_requests
+    assert outcome.action_requests[0].protocol_error
+    assert outcome.action_requests[0].effect_class.value == "read_only"
     cancelled = context()
     cancelled = SegmentContext(**{**cancelled.__dict__, "cancellation_requested": True})
     outcome = await ReActKernel(model).execute_segment(cancelled)
