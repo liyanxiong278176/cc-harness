@@ -52,7 +52,16 @@ async def _wait_status(coordinator: RunCoordinator, run_id: str, expected: RunSt
 
 
 @pytest.mark.asyncio
-async def test_ctrl_c_boundary_can_resume_same_run_from_checkpoint(tmp_path) -> None:
+async def test_cancelled_run_resume_creates_continuation_run(tmp_path) -> None:
+    """Ctrl+C then "继续" continues through a linked run, not a reopened one.
+
+    The implemented contract (``RunCoordinator.resume`` → ``FollowUpService``)
+    keeps the cancelled run immutable and starts a continuation run that carries
+    the predecessor handoff.  An earlier version of this test asserted that the
+    *same* run id was reopened and that a ``RunResumed`` event was appended; the
+    code has always used the continuation model, so that expectation was stale
+    (it failed on a clean checkout too).
+    """
     project = tmp_path / "project"
     project.mkdir()
     store = await RunStore(project, data_root=tmp_path / "state").open()
@@ -80,21 +89,30 @@ async def test_ctrl_c_boundary_can_resume_same_run_from_checkpoint(tmp_path) -> 
         assert requested.status is RunStatus.CANCEL_REQUESTED
         await _wait_status(coordinator, handle.run_id, RunStatus.CANCELLED)
 
-        # Natural-language continuation and the explicit resume endpoint both
-        # append RunResumed; the existing run id/checkpoint is reused.
         resumed = await coordinator.resume(handle.run_id, "继续")
-        assert resumed.run_id == handle.run_id
+        assert resumed.run_id != handle.run_id
+        assert resumed.status is RunStatus.QUEUED
+
         supervisor.wake()
-        await _wait_status(coordinator, handle.run_id, RunStatus.COMPLETED)
+        await _wait_status(coordinator, resumed.run_id, RunStatus.COMPLETED)
 
         assert model.calls == 2
-        events = (await store.read(handle.run_id, limit=200)).events
-        event_types = [event.event_type for event in events]
-        assert event_types.count("InterruptRequested") == 1
-        assert event_types.count("RunCancelled") == 1
-        assert event_types.count("RunResumed") == 1
-        assert event_types.count("RunCreated") == 1
-        assert (await coordinator.inspect(handle.run_id)).status is RunStatus.COMPLETED
+        predecessor_events = (await store.read(handle.run_id, limit=200)).events
+        predecessor_types = [event.event_type for event in predecessor_events]
+        assert predecessor_types.count("InterruptRequested") == 1
+        assert predecessor_types.count("RunCancelled") == 1
+        assert predecessor_types.count("RunCreated") == 1
+        assert predecessor_types.count("FollowUpQueued") == 1
+        assert predecessor_types.count("RunResumed") == 0
+        queued = next(e for e in predecessor_events if e.event_type == "FollowUpQueued")
+        assert queued.payload["follow_up_run_id"] == resumed.run_id
+        assert queued.payload["continuation"] is True
+
+        continuation_events = (await store.read(resumed.run_id, limit=200)).events
+        continuation_types = [event.event_type for event in continuation_events]
+        assert continuation_types[0] == "RunCreated"
+        assert "PredecessorHandoffCommitted" in continuation_types
+        assert (await coordinator.inspect(handle.run_id)).status is RunStatus.CANCELLED
     finally:
         model.release.set()
         await supervisor.stop(drain=False)

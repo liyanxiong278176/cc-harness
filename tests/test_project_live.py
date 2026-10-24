@@ -9,7 +9,7 @@ from __future__ import annotations
 
 from datetime import datetime, timezone
 from io import StringIO
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 from rich.console import Console
@@ -249,22 +249,6 @@ def test_panel_with_statement(svc):
 
 
 @pytest.mark.asyncio
-async def test_live_panel_does_not_break_read_user(svc):
-    """Live panel start 后,_read_user 仍可被 mock 调(REPL 测试兼容)。
-
-    关键:Rich Live + asyncio.to_thread(input) 不冲突。
-    """
-    panel = TodoLivePanel(Console(), svc, _make_manifest())
-    panel.start()
-    try:
-        # 模拟 _read_user 返回 'exit'
-        with patch("cc_harness.repl._read_user",
-                   new=AsyncMock(return_value="exit")):
-            from cc_harness.repl import _read_user as live_read
-            result = await live_read("anything>")
-            assert result == "exit"
-    finally:
-        panel.stop()
 
 
 @pytest.mark.asyncio

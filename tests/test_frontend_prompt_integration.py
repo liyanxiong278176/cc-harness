@@ -1,57 +1,15 @@
-"""Integration checks for language and conditional frontend prompt injection."""
+"""Integration checks for language and conditional frontend prompt injection.
+
+The two legacy ``run_turn`` cases that used to live here were removed: the
+durable path injects the same guidance through ``objective_messages`` and the
+two assertions below cover it without booting the legacy ReAct loop.
+See ``docs/runtime-legacy-migration.md`` batch 1.
+"""
 
 from __future__ import annotations
 
-import pytest
-
-from cc_harness.agent import run_turn
 from cc_harness.interaction_history import objective_messages
 from cc_harness.run_model import GoalContract
-from tests.test_agent import FakeLLM, FakeMCP, FakeStreamEvent
-
-
-@pytest.mark.asyncio
-async def test_run_turn_injects_frontend_guidance_for_current_user_request(tmp_path):
-    llm = FakeLLM(
-        responses=[[
-            FakeStreamEvent(
-                kind="done", content="已完成页面调整", pending=[], finish_reason="stop"
-            )
-        ]]
-    )
-    messages = [{"role": "user", "content": "请实现一个 React 页面"}]
-
-    await run_turn(
-        messages,
-        llm,
-        FakeMCP(tools_spec=[], results={}, calls=[]),
-        cwd=str(tmp_path),
-        max_iter=1,
-    )
-
-    assert "前端设计与实现规范(frontend-design" in messages[0]["content"]
-
-
-@pytest.mark.asyncio
-async def test_run_turn_does_not_inject_frontend_guidance_for_backend_request(tmp_path):
-    llm = FakeLLM(
-        responses=[[
-            FakeStreamEvent(
-                kind="done", content="接口已修复", pending=[], finish_reason="stop"
-            )
-        ]]
-    )
-    messages = [{"role": "user", "content": "请修复后端 API 超时"}]
-
-    await run_turn(
-        messages,
-        llm,
-        FakeMCP(tools_spec=[], results={}, calls=[]),
-        cwd=str(tmp_path),
-        max_iter=1,
-    )
-
-    assert "前端设计与实现规范(frontend-design" not in messages[0]["content"]
 
 
 def test_durable_objective_messages_inject_frontend_guidance_for_worker_path(tmp_path):

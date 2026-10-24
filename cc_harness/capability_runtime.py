@@ -1,9 +1,9 @@
 """One capability runtime shared by durable workers.
 
-The interactive ``SessionRuntime`` already owns the mature context, offload,
-memory, safety, native-tool, and MCP implementations.  Durable execution uses
-this adapter to activate those same services instead of creating a second
-implementation hidden inside the worker loop.
+It owns the context, offload, memory, safety, native-tool, and MCP
+implementations used by the Durable Runtime.  The legacy in-process loop was
+removed from the product (see ``docs/runtime-legacy-migration.md``), so this
+adapter is the only assembly point for those services.
 """
 
 from __future__ import annotations

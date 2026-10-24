@@ -76,6 +76,11 @@ class MemoryConfig(BaseModel):
     persona_trigger_every_n: int = 50    # L2→L3 画像刷新触发周期
     recall_top_k: int = 5                # L3 分层召回每层 top_k
     recall_timeout_s: float = 5.0        # 召回超时(秒,float)
+    # 向量召回相关性闸门:store 只返回最近邻,不看远近。
+    # min_similarity = 0 表示不做绝对阈值(本地 hash embedder 未校准);
+    # relative_margin 始终生效:比本轮最佳命中差 > margin 的命中视为噪声丢弃。
+    min_similarity: float = 0.0
+    relative_margin: float = 0.25
     # kill-switches(对应三层管线)
     layered_inject: bool = True          # pre-turn 分层注入开关
     capture_enabled: bool = True         # L0 会话录制开关
@@ -159,6 +164,13 @@ class MemoryConfig(BaseModel):
     def _check_positive(cls, v: float) -> float:
         if v <= 0:
             raise ValueError(f"must be > 0, got {v}")
+        return v
+
+    @field_validator("min_similarity", "relative_margin")
+    @classmethod
+    def _check_similarity_range(cls, v: float) -> float:
+        if not 0.0 <= v <= 1.0:
+            raise ValueError(f"must be within [0, 1], got {v}")
         return v
 
     @field_validator("reflection_every_n_turns", "reflection_max_pending")

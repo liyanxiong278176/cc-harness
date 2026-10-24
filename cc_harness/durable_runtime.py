@@ -1904,7 +1904,16 @@ class DurableRuntimeClient:
         execution_started = False
         execution_request = request
         try:
-            workspace_before = _workspace_snapshot(execution_root, artifacts=self.store.artifacts) if command_lock else {}
+            # Hashing every file is filesystem-bound; keep it off the event loop
+            # so a large workspace cannot stall heartbeats, cancellation, or the
+            # WebUI stream while a command runs.
+            workspace_before = (
+                await asyncio.to_thread(
+                    _workspace_snapshot, execution_root, artifacts=self.store.artifacts
+                )
+                if command_lock
+                else {}
+            )
             from .local_verification import python_assertion_verifier
             verifier_before = python_assertion_verifier(execution_root, str(request.arguments.get("command", ""))) if command_lock else None
             capability_id = request.arguments.get("capability_id")
@@ -1969,7 +1978,9 @@ class DurableRuntimeClient:
             if not isinstance(result, ToolResult):
                 result = ToolResult.success(str(result))
             if command_lock:
-                workspace_after = _workspace_snapshot(execution_root, artifacts=self.store.artifacts)
+                workspace_after = await asyncio.to_thread(
+                    _workspace_snapshot, execution_root, artifacts=self.store.artifacts
+                )
                 change_set = _workspace_change_set(workspace_before, workspace_after)
                 baseline_encoded = json.dumps(
                     workspace_before,

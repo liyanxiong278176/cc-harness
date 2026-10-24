@@ -1218,13 +1218,21 @@ class RunWorker:
 
         if execution_task is None:
             return
+        # Poll a single indexed row, not the full projection: the old 50 ms
+        # rebuild replayed every event of the run (taking the store write lock)
+        # twenty times per second, starving the appends it was waiting on.
+        # A cheap status row plus backoff keeps cancellation responsive at the
+        # start of an action and nearly free for long ones.
+        interval = 0.05
         while not execution_task.done():
-            await asyncio.sleep(0.05)
+            await asyncio.sleep(interval)
+            interval = min(0.5, interval * 1.5)
             try:
-                projection = await self.store.load_projection(run_id)
-            except Exception:
+                record = await self.store.load_run_record(run_id)
+                status = RunStatus(record.status)
+            except Exception:  # noqa: BLE001 - transient store errors must not kill cancellation
                 continue
-            if projection.status in {RunStatus.CANCEL_REQUESTED, RunStatus.CANCELLED}:
+            if status in {RunStatus.CANCEL_REQUESTED, RunStatus.CANCELLED}:
                 if not execution_task.done():
                     execution_task.cancel()
                 return

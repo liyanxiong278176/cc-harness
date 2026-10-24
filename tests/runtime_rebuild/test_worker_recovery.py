@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import time
+from types import SimpleNamespace
 
 import pytest
 from cc_harness.run_model import RunStatus
@@ -348,3 +350,66 @@ async def test_worker_allows_final_segment_after_plan_marks_every_node_done(tmp_
         assert (await store.load_projection(handle.run_id)).status.value == "completed"
     finally:
         await store.close()
+
+
+class _WatchdogStore:
+    """Minimal store stub: the watchdog may read the status row only."""
+
+    def __init__(self, status: str) -> None:
+        self.status = status
+        self.projection_reads = 0
+
+    async def load_run_record(self, run_id: str):
+        del run_id
+        return SimpleNamespace(status=self.status)
+
+    async def load_projection(self, run_id: str):
+        del run_id
+        self.projection_reads += 1
+        raise AssertionError("the cancellation watchdog must not rebuild the projection")
+
+
+async def _watchdog_worker(tmp_path, status: str):
+    """A real worker (for its constructor invariants) with a stubbed store."""
+    project = tmp_path / "watchdog-project"
+    project.mkdir()
+    real = RunStore(project, data_root=tmp_path / "watchdog-data")
+    await real.open()
+    worker = RunWorker(real, ReActKernel(FakeModel()), worker_id="watchdog")
+    fake = _WatchdogStore(status)
+    worker.store = fake
+    return real, worker, fake
+
+
+@pytest.mark.asyncio
+async def test_cancellation_watchdog_reads_status_row_not_projection(tmp_path) -> None:
+    real, worker, store = await _watchdog_worker(tmp_path, "cancel_requested")
+    execution = asyncio.create_task(asyncio.sleep(30))
+    try:
+        await asyncio.wait_for(worker._cancellation_watchdog("run-1", execution), timeout=2)
+
+        # The watchdog requests cancellation; await the task so it settles.
+        with contextlib.suppress(asyncio.CancelledError):
+            await execution
+        assert execution.cancelled()
+        assert store.projection_reads == 0
+    finally:
+        execution.cancel()
+        await real.close()
+
+
+@pytest.mark.asyncio
+async def test_cancellation_watchdog_leaves_running_task_alone(tmp_path) -> None:
+    real, worker, store = await _watchdog_worker(tmp_path, "running")
+    execution = asyncio.create_task(asyncio.sleep(30))
+    try:
+        watchdog = asyncio.create_task(worker._cancellation_watchdog("run-1", execution))
+        await asyncio.sleep(0.3)
+        assert not execution.cancelled()
+        watchdog.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await watchdog
+        assert store.projection_reads == 0
+    finally:
+        execution.cancel()
+        await real.close()

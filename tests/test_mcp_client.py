@@ -150,7 +150,9 @@ async def test_start_boots_good_server_alongside_a_bad_one():
     bad = MCPServerConfig(type="sse", url="http://127.0.0.1:1/never_listens")
     client = MCPClient({"good": good, "bad": bad})
     try:
-        await client.start(init_timeout_s=2.0)
+        # 10s, not 2s: this test spawns a real Python subprocess and a real SSE
+        # attempt, and a 2s budget flaked on cold/loaded Windows runners.
+        await client.start(init_timeout_s=10.0)
         names = {t["function"]["name"] for t in await client.list_tools()}
         assert "mcp__good__echo" in names
         # The bad server contributed nothing.
@@ -259,3 +261,53 @@ def test_route_preserves_double_underscores_inside_tool_name():
     assert client._route("mcp__server__tool__with__double") == (
         "server", "tool__with__double",
     )
+
+
+# --- tool output size cap: unbounded output used to reach the event log ---------
+
+
+def test_oversized_tool_result_is_truncated_head_and_tail():
+    from cc_harness.mcp_client import MAX_TOOL_TEXT_CHARS
+
+    text = "HEAD" + "x" * (MAX_TOOL_TEXT_CHARS + 5_000) + "TAIL"
+    result = ToolResult.success(text)
+
+    assert len(result.llm_text) <= MAX_TOOL_TEXT_CHARS + 100
+    assert result.llm_text.startswith("HEAD")
+    assert result.llm_text.endswith("TAIL")
+    assert "characters truncated" in result.llm_text
+    assert result.metadata["tool_text_truncated"] is True
+    assert result.metadata["tool_text_chars"] == len(text)
+
+
+def test_display_text_is_capped_too():
+    from cc_harness.mcp_client import MAX_TOOL_TEXT_CHARS
+
+    result = ToolResult.success("d" * (MAX_TOOL_TEXT_CHARS * 2))
+
+    assert result.metadata.get("tool_display_truncated") is True
+    assert len(result.display_text) < MAX_TOOL_TEXT_CHARS * 2
+
+
+def test_small_tool_result_is_untouched():
+    result = ToolResult.success("short output")
+    assert result.llm_text == "short output"
+    assert "tool_text_truncated" not in result.metadata
+
+
+def test_direct_construction_is_capped_as_well():
+    """durable_runtime builds ToolResult directly; the cap cannot be bypassed."""
+    from cc_harness.mcp_client import MAX_TOOL_TEXT_CHARS
+
+    result = ToolResult(llm_text="z" * (MAX_TOOL_TEXT_CHARS + 1))
+
+    assert result.metadata.get("tool_text_truncated") is True
+
+
+def test_error_result_is_capped(monkeypatch):
+    monkeypatch.setenv("CC_HARNESS_MAX_TOOL_CHARS", "1000")
+    result = ToolResult.error("e" * 5_000, "e" * 5_000, source="tool_error")
+
+    assert len(result.llm_text) < 1_500
+    assert result.is_error is True
+    assert "characters truncated" in result.llm_text

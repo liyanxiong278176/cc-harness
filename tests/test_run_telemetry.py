@@ -3,7 +3,7 @@ from types import SimpleNamespace
 import pytest
 
 from cc_harness.run_telemetry import aggregate_model_usage
-from cc_harness.repl import _format_durable_usage
+from cc_harness.durable_repl import _format_durable_usage
 
 
 def _event(event_type: str, usage: dict, **payload):

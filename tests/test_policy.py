@@ -382,3 +382,77 @@ def test_shadow_policy_evaluation_never_dispatches_and_marks_counterfactual():
     assert d.rule_id.startswith("shadow:")
     assert d.evidence["shadow"] is True
     assert d.evidence["shadow_of_provenance_mode"] is True
+
+
+# --- containment regressions: nested / unknown path keys -------------------
+
+
+def test_nested_path_key_outside_workspace_is_deny():
+    """A path hidden one level deep must not bypass the hard boundary."""
+    d = _engine().evaluate(
+        "mcp__filesystem__read_file",
+        {"options": {"path": str(Path.home() / ".ssh/id_rsa")}},
+        {"project_root": ROOT},
+    )
+    assert d.action is Action.DENY
+    assert d.rule_id == "path_outside_allowed_roots"
+
+
+def test_unknown_path_like_key_outside_workspace_is_deny():
+    """Unknown keys such as ``target`` are locations when they look like paths."""
+    d = _engine().evaluate(
+        "mcp__filesystem__read_file",
+        {"target": str(Path.home() / ".ssh/id_rsa")},
+        {"project_root": ROOT},
+    )
+    assert d.action is Action.DENY
+    assert d.rule_id == "path_outside_allowed_roots"
+
+
+def test_payload_containing_path_is_not_treated_as_a_location():
+    """File *content* may mention any path; only real locations are contained."""
+    d = _engine().evaluate(
+        "mcp__filesystem__write_file",
+        {
+            "path": str(ROOT / "notes.md"),
+            "content": str(Path.home() / ".ssh/id_rsa"),
+        },
+        {"project_root": ROOT},
+    )
+    assert d.action is Action.ASK  # write tier, not a path denial
+
+
+def test_relative_traversal_outside_workspace_is_deny():
+    d = _engine().evaluate(
+        "mcp__filesystem__read_file",
+        {"target": "../../etc/passwd"},
+        {"project_root": ROOT},
+    )
+    assert d.action is Action.DENY
+
+
+# --- classification regressions: write verbs beat read substrings ----------
+
+
+def test_git_tool_with_push_verb_is_ask_not_allow():
+    """``git_list_and_push`` must not be auto-allowed by the read substring."""
+    d = _engine().evaluate("mcp__git__list_and_push", {"ref": "HEAD"}, {"project_root": ROOT})
+    assert d.action is Action.ASK
+
+
+def test_filesystem_tool_with_write_verb_is_ask_not_allow():
+    d = _engine().evaluate(
+        "mcp__filesystem__read_and_delete",
+        {"path": str(ROOT / "a.py")},
+        {"project_root": ROOT},
+    )
+    assert d.action is Action.ASK
+
+
+def test_plain_filesystem_read_is_still_allow():
+    d = _engine().evaluate(
+        "mcp__filesystem__read_file",
+        {"path": str(ROOT / "a.py")},
+        {"project_root": ROOT},
+    )
+    assert d.action is Action.ALLOW

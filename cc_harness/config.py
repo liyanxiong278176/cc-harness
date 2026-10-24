@@ -187,37 +187,114 @@ class PolicyConfig(BaseModel):
     (从 main.py 透传到 repl.py → agent.py run_turn,作为 _e1_extra["e1_decompose_hint"]
     的 AND 守卫,与 iter_count==0 / mode==coding 共同三重 gate)。默认 True
     (向后兼容;不写该字段也 default True — extra:ignore 已就位)。
+
+    ``workspace_overrides_rejected`` 记录被拒绝的工作区放宽项(见
+    ``_reject_workspace_relaxations``):仓库自带的 policy.yaml 可以收紧,不能松绑。
     """
     enabled: bool = True
     e1_decompose_enabled: bool = True
+    workspace_overrides_rejected: tuple[str, ...] = ()
 
     model_config = {"extra": "ignore"}
 
 
-def load_policy_config(path: Path) -> PolicyConfig:
+TRUST_WORKSPACE_POLICY_ENV = "CC_HARNESS_TRUST_WORKSPACE_POLICY"
+_TRUSTY_ENV_VALUES = {"1", "true", "yes", "on"}
+
+
+def _workspace_policy_untrusted(path: Path, project_root: Path | None = None) -> bool:
+    """True when a policy file lives inside the working tree and no opt-in is set.
+
+    ``policy.yaml`` / ``mcp.json`` travel with a repository, so a cloned project
+    can ship ``l2.enabled: false`` or ``executor.backend: native`` and quietly
+    disable the very controls that are supposed to contain it.  A workspace file
+    may therefore tighten security controls but never loosen them; the owner of
+    the checkout can opt in with ``CC_HARNESS_TRUST_WORKSPACE_POLICY=1``.
+
+    Both the process cwd and the selected project root count as "the workspace":
+    the WebUI can open a project folder that is not the directory the process was
+    launched from, and checking only cwd would miss that project's policy file.
+    """
+    if os.getenv(TRUST_WORKSPACE_POLICY_ENV, "").strip().lower() in _TRUSTY_ENV_VALUES:
+        return False
+    try:
+        resolved = Path(path).resolve(strict=False)
+        roots = [Path.cwd().resolve(strict=False)]
+        if project_root is not None:
+            roots.append(Path(project_root).resolve(strict=False))
+    except OSError:
+        return False
+    for root in roots:
+        try:
+            if resolved.is_relative_to(root):
+                return True
+        except ValueError:
+            continue
+    return False
+
+
+def _reject_workspace_relaxations(
+    cfg,
+    path: Path,
+    *,
+    project_root: Path | None = None,
+    booleans: tuple[str, ...] = (),
+    backend: bool = False,
+) -> tuple[str, ...]:
+    """Force security-critical fields back to safe values; return what was rejected."""
+    if not _workspace_policy_untrusted(path, project_root):
+        return ()
+    rejected: list[str] = []
+    for name in booleans:
+        if not getattr(cfg, name):
+            setattr(cfg, name, True)
+            rejected.append(name)
+    if backend and getattr(cfg, "backend", None) == ExecutorBackend.NATIVE:
+        cfg.backend = ExecutorBackend.SANDBOX
+        rejected.append("executor.backend")
+    if rejected:
+        log.warning(
+            "policy.yaml inside the workspace tried to relax security controls %s; "
+            "kept safe defaults (opt in with %s=1 if you own this checkout)",
+            ", ".join(rejected),
+            TRUST_WORKSPACE_POLICY_ENV,
+        )
+    return tuple(rejected)
+
+
+def load_policy_config(path: Path, *, project_root: Path | None = None) -> PolicyConfig:
     """从可选 policy.yaml 加载;文件不存在返回默认。"""
     if not path.exists():
         return PolicyConfig()
     import yaml
     raw = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
-    return PolicyConfig(**raw)
+    cfg = PolicyConfig(**raw)
+    cfg.workspace_overrides_rejected = _reject_workspace_relaxations(
+        cfg, path, project_root=project_root, booleans=("enabled",)
+    )
+    return cfg
 
 
 class L2Config(BaseModel):
     """L2 输入防御配置。从 policy.yaml 的 `l2:` 段读;缺省全开。"""
     enabled: bool = True
     heuristic_on: bool = True
+    workspace_overrides_rejected: tuple[str, ...] = ()
 
     model_config = {"extra": "ignore"}
 
 
-def load_l2_config(path: Path) -> L2Config:
+def load_l2_config(path: Path, *, project_root: Path | None = None) -> L2Config:
     """读 policy.yaml 的 `l2:` 子段(与 L4 的 PolicyConfig 独立)。文件/段缺失→默认。"""
     if not path.exists():
         return L2Config()
     import yaml
     raw = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
-    return L2Config(**(raw.get("l2") or {}))
+    cfg = L2Config(**(raw.get("l2") or {}))
+    cfg.workspace_overrides_rejected = _reject_workspace_relaxations(
+        cfg, path, project_root=project_root, booleans=("enabled", "heuristic_on")
+    )
+    return cfg
 
 
 class L5Config(BaseModel):
@@ -225,17 +302,22 @@ class L5Config(BaseModel):
     enabled: bool = True
     keys_on: bool = True    # Layer A 密钥正则(零依赖)
     pii_on: bool = True     # Layer B Presidio PII(可选;失败自动退化)
+    workspace_overrides_rejected: tuple[str, ...] = ()
 
     model_config = {"extra": "ignore"}
 
 
-def load_l5_config(path: Path) -> L5Config:
+def load_l5_config(path: Path, *, project_root: Path | None = None) -> L5Config:
     """读 policy.yaml 的 `l5:` 子段(与 L2/L4 独立)。文件/段缺失→默认。"""
     if not path.exists():
         return L5Config()
     import yaml
     raw = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
-    return L5Config(**(raw.get("l5") or {}))
+    cfg = L5Config(**(raw.get("l5") or {}))
+    cfg.workspace_overrides_rejected = _reject_workspace_relaxations(
+        cfg, path, project_root=project_root, booleans=("enabled", "keys_on", "pii_on")
+    )
+    return cfg
 
 
 class ExecutorBackend(str, Enum):
@@ -355,16 +437,20 @@ class ExecutorConfig(BaseModel):
     enabled: bool = True          # compatibility only; false cannot select host execution
     backend: ExecutorBackend = ExecutorBackend.SANDBOX
     sandbox: SandboxConfig = SandboxConfig()
+    workspace_overrides_rejected: tuple[str, ...] = ()
 
     model_config = {"extra": "ignore"}
 
 
-def load_executor_config(path: Path) -> ExecutorConfig:
+def load_executor_config(path: Path, *, project_root: Path | None = None) -> ExecutorConfig:
     """Read executor config; missing configuration defaults to sandbox.
 
     ``CC_HARNESS_EXECUTOR_BACKEND=native`` is an explicit host-execution opt-in.
     The legacy fallback setting is accepted and normalized for compatibility;
     the active Runtime decides whether an audited native fallback is allowed.
+    A workspace policy file cannot downgrade the backend to native (see
+    ``_reject_workspace_relaxations``); the env var still can, because it is set
+    by whoever launches the process rather than by the cloned repository.
     """
     if not path.exists():
         cfg = ExecutorConfig()
@@ -372,6 +458,9 @@ def load_executor_config(path: Path) -> ExecutorConfig:
         import yaml
         raw = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
         cfg = ExecutorConfig(**(raw.get("executor") or {}))
+        cfg.workspace_overrides_rejected = _reject_workspace_relaxations(
+            cfg, path, project_root=project_root, backend=True
+        )
     fallback_env = os.getenv("CC_HARNESS_SANDBOX_FALLBACK", "").strip().lower()
     if fallback_env == "native" or cfg.sandbox.fallback_on_error == "native":
         log.warning(

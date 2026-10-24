@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import uuid
 from dataclasses import dataclass, replace
@@ -10,7 +11,7 @@ from .artifacts import ArtifactStore
 from .run_events import EventActor, RunEvent
 from .run_model import GoalContract, PlanGraph, PlanNode, Run, RunStatus, RuntimeContract, predecessor_gate
 from .run_projection import QueueProjection
-from .run_store import RunStore
+from .run_store import RunStore, RunStoreError
 
 
 @dataclass(frozen=True)
@@ -20,6 +21,23 @@ class FollowUpReceipt:
     sequence: int
     gate: str
     started: bool
+
+
+# ``enqueue`` (coordinator/webui) and ``release_ready`` (supervisor) run on
+# different FollowUpService instances but may start the same queued item at the
+# same time.  Both would then try to append ``RunCreated`` for the same child
+# run: one wins, the other raises "RunCreated can only be the first event".
+# A process-wide lock keyed by store serializes the start sequence; durable
+# cross-process conflicts are still caught by the store's sequence check.
+_START_LOCKS: dict[int, asyncio.Lock] = {}
+
+
+def _start_lock(store) -> asyncio.Lock:
+    lock = _START_LOCKS.get(id(store))
+    if lock is None:
+        lock = asyncio.Lock()
+        _START_LOCKS[id(store)] = lock
+    return lock
 
 
 class FollowUpService:
@@ -141,6 +159,23 @@ class FollowUpService:
         *,
         incomplete: bool,
     ) -> None:
+        # Serialized per store: two services may start the same queued item.
+        async with _start_lock(self.store):
+            await self._start_unlocked(
+                predecessor_run_id,
+                follow_up_run_id,
+                message_artifact,
+                incomplete=incomplete,
+            )
+
+    async def _start_unlocked(
+        self,
+        predecessor_run_id: str,
+        follow_up_run_id: str,
+        message_artifact: str,
+        *,
+        incomplete: bool,
+    ) -> None:
         predecessor = await self.store.load_projection(predecessor_run_id)
         item = self._find_item(predecessor.queue, follow_up_run_id)
         if item.status == "started":
@@ -196,15 +231,24 @@ class FollowUpService:
             media_type="application/json; purpose=predecessor-handoff",
         )
         if not await self.store.run_exists(follow_up_run_id):
-            await self.store.create_run(
-                Run(
-                    run_id=follow_up_run_id,
-                    goal=goal,
-                    runtime_contract=contract,
-                    parent_run_id=predecessor_run_id,
-                    predecessor_run_id=predecessor_run_id,
+            try:
+                await self.store.create_run(
+                    Run(
+                        run_id=follow_up_run_id,
+                        goal=goal,
+                        runtime_contract=contract,
+                        parent_run_id=predecessor_run_id,
+                        predecessor_run_id=predecessor_run_id,
+                    )
                 )
-            )
+            except RunStoreError:
+                # ``enqueue`` and the supervisor's ``release_ready`` can both
+                # decide to start the same queued item.  The run-exists check
+                # above is TOCTOU, so a concurrent starter may win the insert;
+                # that is a benign duplicate start, not corruption — the event
+                # appends below are idempotent.  Anything else is re-raised.
+                if not await self.store.run_exists(follow_up_run_id):
+                    raise
         # Complete the child stream step-by-step.  If the process died after
         # creating the child but before FollowUpStarted, the next supervisor
         # tick can safely continue instead of treating the queue item as a

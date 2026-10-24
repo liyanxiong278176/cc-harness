@@ -3,25 +3,11 @@ from types import SimpleNamespace
 import pytest
 
 from cc_harness.entrypoint import (
+    _budget_limits,
     _has_usable_committed_final,
-    _api_cost_status,
-    _run_print,
     async_main,
     build_parser,
 )
-
-
-def test_api_cost_status_requires_provider_fact_and_supports_legacy_direct_cost():
-    assert _api_cost_status(SimpleNamespace(api_reported_cost=None)) == "unavailable"
-    assert _api_cost_status(
-        SimpleNamespace(api_reported_cost=0.25, api_cost_observed=True, api_cost_complete=True)
-    ) == "reported"
-    assert _api_cost_status(
-        SimpleNamespace(api_reported_cost=None, api_cost_observed=True, api_cost_complete=False)
-    ) == "incomplete"
-    # Older callers that only exposed a provider cost remain compatible; no
-    # token tariff is inferred when the cost field is absent.
-    assert _api_cost_status(SimpleNamespace(api_reported_cost=0.25)) == "reported"
 
 
 def test_installed_cli_contract_parses_claude_style_flags(tmp_path):
@@ -57,7 +43,8 @@ def test_print_mode_supports_machine_readable_output():
 
 
 def test_iteration_budget_is_configurable_and_bounded():
-    assert build_parser().parse_args([]).max_iterations == 20
+    # No flag → no budget cap (the old default of 20 was never enforced).
+    assert build_parser().parse_args([]).max_iterations is None
     assert build_parser().parse_args(["--max-iterations", "50"]).max_iterations == 50
     assert build_parser().parse_args(["--unbounded-iterations"]).max_iterations is None
     with pytest.raises(SystemExit):
@@ -66,6 +53,16 @@ def test_iteration_budget_is_configurable_and_bounded():
         build_parser().parse_args(
             ["--max-iterations", "50", "--unbounded-iterations"]
         )
+
+
+def test_max_iterations_maps_to_durable_budget_limits():
+    assert _budget_limits(build_parser().parse_args([])) is None
+
+    limits = _budget_limits(build_parser().parse_args(["--max-iterations", "7"]))
+
+    # Each ReAct segment reserves both counters; the CLI flag must bound both,
+    # otherwise the tighter one is not actually enforced.
+    assert limits == {"model_calls": 7.0, "steps": 7.0}
 
 
 def test_host_execution_requires_explicit_flag():
@@ -93,79 +90,7 @@ async def test_sandbox_capability_profile_prints_without_starting_runtime(capsys
 
 
 @pytest.mark.asyncio
-async def test_print_json_reports_provider_model_and_usage(tmp_path, monkeypatch, capsys):
-    from cc_harness.terminal.attachments import AttachmentManager
-
-    async def prepare(self, prompt_text, *, confirm_outside):
-        del self, confirm_outside
-        return prompt_text, []
-
-    monkeypatch.setattr(AttachmentManager, "prepare", prepare)
-
-    class Runtime:
-        cwd = tmp_path
-        additional_dirs = ()
-        session_store = SimpleNamespace(attachments_root=tmp_path / "attachments")
-        state = SimpleNamespace(session_id="session-test")
-        llm = SimpleNamespace(model="deepseek-v4-flash", resolved_model="deepseek-v4-flash")
-
-        async def run_user_turn(self, prompt_text, *, event_emitter, **kwargs):
-            del prompt_text, kwargs
-            await event_emitter({"type": "result", "text": "done ✅"})
-            return SimpleNamespace(
-                error=None,
-                api_prompt_tokens=12,
-                api_uncached_prompt_tokens=3,
-                api_cache_creation_prompt_tokens=2,
-                api_cache_read_prompt_tokens=7,
-                api_completion_tokens=4,
-                iter_count=2,
-                tool_call_log=[{"name": "read"}],
-            )
-
-        async def close(self):
-            return None
-
-    assert await _run_print(Runtime(), "hello", "bypass-prompts", "json") == 0
-    output = capsys.readouterr().out
-    assert '"resolved_model": "deepseek-v4-flash"' in output
-    assert '"input_tokens": 12' in output
-    assert '"uncached_input_tokens": 3' in output
-    assert '"cache_creation_input_tokens": 2' in output
-    assert '"cache_read_input_tokens": 7' in output
-    assert '"trajectory":' in output
-    assert "✅" in output
-
-
 @pytest.mark.asyncio
-async def test_print_json_preserves_structured_error(tmp_path, monkeypatch, capsys):
-    from cc_harness.terminal.attachments import AttachmentManager
-
-    async def prepare(self, prompt_text, *, confirm_outside):
-        del self, confirm_outside
-        return prompt_text, []
-
-    monkeypatch.setattr(AttachmentManager, "prepare", prepare)
-
-    class Runtime:
-        cwd = tmp_path
-        additional_dirs = ()
-        session_store = SimpleNamespace(attachments_root=tmp_path / "attachments")
-        state = SimpleNamespace(session_id="session-error")
-        llm = SimpleNamespace(model="deepseek-v4-flash", resolved_model=None)
-
-        async def run_user_turn(self, prompt_text, *, event_emitter, **kwargs):
-            del prompt_text, event_emitter, kwargs
-            return SimpleNamespace(error="provider unavailable")
-
-        async def close(self):
-            return None
-
-    assert await _run_print(Runtime(), "hello", "bypass-prompts", "json") == 1
-    output = capsys.readouterr().out
-    assert '"error": "provider unavailable"' in output
-
-
 @pytest.mark.asyncio
 async def test_usable_committed_final_requires_successful_last_observation():
     artifacts = {

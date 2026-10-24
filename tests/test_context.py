@@ -1120,3 +1120,69 @@ async def test_summary_keeps_offload_source_ref_visible_to_model(tmp_path):
     pointers = [m for m in projection.messages if m.get("_compaction_pointer")]
     assert len(pointers) == 1
     assert "source_ref=node:n1" in pointers[0]["content"]
+
+
+# ============================================================
+# Tier-3 delta budget regressions (silent-history-loss fix)
+# ============================================================
+
+
+@pytest.mark.asyncio
+async def test_tier3_chunks_authoritative_delta_instead_of_dropping_head():
+    """A delta larger than the summary cap must be chunked, not tail-truncated.
+
+    Regression: the durable path used to `_cap_delta_size` the *whole* delta,
+    keeping 0.7 x summarize_max_output_tokens (≈1.4K of a 100K history) while
+    the persisted summary still claimed full coverage.
+    """
+    from cc_harness.context import apply_tier3_summarize
+
+    class RecordingLLM:
+        def __init__(self) -> None:
+            self.prompts: list[str] = []
+
+        async def chat(self, messages, tools=None):
+            self.prompts.append(str(messages[-1]["content"]))
+            yield StreamEvent(kind="done", content=f"summary-{len(self.prompts)}")
+
+    cfg = _cfg(summarize_max_output_tokens=40)  # cap = 160 tokens
+    counter = FakeCounter()
+    early = "EARLY-CONSTRAINT-42: never touch prod config"
+    source = [{"role": "system", "content": "sys"}]
+    for i in range(8):
+        text = early if i == 0 else f"turn {i}"
+        source.append({"role": "user", "content": text + " " + "x" * 60})
+
+    messages = [dict(m) for m in source]
+    llm = RecordingLLM()
+    stats = await apply_tier3_summarize(
+        messages,
+        len(messages),
+        cfg,
+        llm,
+        counter,
+        authoritative_messages=source,
+        authoritative_start=0,
+        authoritative_protect_until=len(source),
+    )
+
+    assert stats.summarized is True
+    assert len(llm.prompts) > 1, "large delta should be summarized in chunks"
+    assert any(early in prompt for prompt in llm.prompts), "head of the delta was dropped"
+    assert not any("delta truncated" in prompt for prompt in llm.prompts)
+
+
+def test_cap_delta_size_keeps_seventy_percent_of_the_cap():
+    """The keep budget is 70% of the cap, not 70% of the (smaller) output budget."""
+    from cc_harness.context import _cap_delta_size
+
+    cfg = _cfg(summarize_max_output_tokens=50)  # cap = 200 tokens/chars
+    msgs = [{"role": "user", "content": f"M{i}-" + "y" * 30} for i in range(10)]
+    rendered = "\n".join(str(m["content"]) for m in msgs)
+
+    capped = _cap_delta_size(rendered, msgs, cfg, FakeCounter())
+
+    assert "delta truncated" in capped
+    kept = sum(1 for m in msgs if str(m["content"]) in capped)
+    # Old arithmetic kept 0.7*50 = 35 tokens ≈ one message; the cap allows four.
+    assert kept >= 3
