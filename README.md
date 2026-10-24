@@ -4,25 +4,21 @@
 
 ## 运行截图
 
-以下截图于 **2026-10-21** 重新构建并启动当前项目后，在真实浏览器和模型调用过程中拍摄。
+以下截图于 **2026-10-24** 重新构建并启动当前项目后，在真实浏览器和模型调用过程中拍摄。
 点击下表链接可直接查看图片。
 
 | 执行阶段 | 图片访问路径 |
 | --- | --- |
-| 启动 WebUI | [01-welcome.png](img/runtime-20261021/01-welcome.png) |
-| 选择当前项目并输入测试任务 | [02-task-ready.png](img/runtime-20261021/02-task-ready.png) |
-| 命令等待审批 | [03-command-approval.png](img/runtime-20261021/03-command-approval.png) |
-| 允许后执行命令 | [04-command-running.png](img/runtime-20261021/04-command-running.png) |
-| 命令结果未知，任务阻塞 | [05-command-blocked.png](img/runtime-20261021/05-command-blocked.png) |
-| 提交只读报告任务 | [06-report-reading.png](img/runtime-20261021/06-report-reading.png) |
-| 报告摘要及暂停状态 | [07-report-result.png](img/runtime-20261021/07-report-result.png) |
-| 查看上下文来源 | [08-context-sources.png](img/runtime-20261021/08-context-sources.png) |
-| 查看本地 Skill 管理 | [09-local-skills.png](img/runtime-20261021/09-local-skills.png) |
-| 查看 Runtime 状态与事件 | [10-runtime-state.png](img/runtime-20261021/10-runtime-state.png) |
+| 启动 WebUI | [01-welcome-dark.png](img/runtime-20261024/01-welcome-dark.png) |
+| 模型执行中，任务列表同步为「进行中」 | [02-running-task.png](img/runtime-20261024/02-running-task.png) |
+| 回答完成，任务列表同步为「已完成」 | [03-completed-task.png](img/runtime-20261024/03-completed-task.png) |
+| 查看事件轨迹 | [04-trace.png](img/runtime-20261024/04-trace.png) |
+| 查看任务列表详情 | [05-tasks.png](img/runtime-20261024/05-tasks.png) |
+| 查看设置与权限 | [06-settings.png](img/runtime-20261024/06-settings.png) |
+| 浅色主题 | [07-light.png](img/runtime-20261024/07-light.png) |
 
-本次命令演示因 `executor_lost` 阻塞；只读任务成功读取报告并生成摘要，随后因完成门槛暂停，
-两次运行均未标记为 completed。详情见 [截图索引与运行记录](img/README.md)。
-此前已完成的确定性测试结果见 [测试与修复报告](docs/audits/runtime-context-memory-skill-matrix-20261021.md)。
+截图中的任务是真实的 `deepseek-flash` 调用；任务列表的「进行中 / 已完成」直接来自
+Runtime task-control 层，不是前端模拟。拍摄与运行记录见 [截图索引](img/README.md)。
 
 ## 下载
 
