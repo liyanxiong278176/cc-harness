@@ -15,6 +15,7 @@ DOMAINS = (
     "safety_and_privacy", "reliability_and_recovery", "human_interaction", "operational_fitness",
 )
 VERSION = "1.0.0"
+CHECK_VERSION = "1.1.0"
 _SECRET_KEY = re.compile(r"^(?:[a-z0-9]+[_-])*(?:api[_-]?key|secret[_-]?key|access[_-]?token|authorization|cookie|password|passwd|private[_-]?key|credential[s]?)$", re.I)
 _HIDDEN = {"reasoning_content", "reasoning", "chain_of_thought", "thinking"}
 
@@ -55,6 +56,11 @@ def check_trace(events: list[dict[str, Any]]) -> dict[str, Any]:
             domain, problem = "agent_loop", "no_progress"
         if kind == "RunBlocked":
             domain, problem = "reliability_and_recovery", "run_blocked"
+        if kind == "ModelInvocationFinished":
+            code = str(payload.get("error_details", {}).get("code") or "")
+            if payload.get("status") == "failed" and code.startswith("provider_"):
+                domain, problem = "operational_fitness", code
+                error = code
         if kind == "RunPaused" and "budget_exhausted" in error:
             domain, problem = "agent_loop", "budget_exhausted"
         if kind in {"VerificationRecorded", "TaskVerificationFinished"}:
@@ -72,14 +78,14 @@ def check_trace(events: list[dict[str, Any]]) -> dict[str, Any]:
         coverage[domain] = "issue_found"
         issues.append({
             "issue_id": identity, "run_id": event["run_id"], "domain": domain, "problem": problem,
-            "status": "confirmed", "source": "rule", "version": VERSION,
+            "status": "confirmed", "source": "rule", "version": CHECK_VERSION,
             "sequence": event["sequence"], "evidence": [evidence],
             "reason": error or kind, "check_scope": "committed_runtime_events",
         })
     # A later successful observation must not erase an earlier failure finding.
     for issue in issues:
         coverage[issue["domain"]] = "issue_found"
-    return {"issues": issues, "coverage": coverage, "check_version": VERSION,
+    return {"issues": issues, "coverage": coverage, "check_version": CHECK_VERSION,
             "check_scope": "explicit_failure_events_only"}
 
 

@@ -16,7 +16,7 @@ from typing import Any
 from .analysis import review_trace
 from .capture import read_asset, save_asset
 from .config import ObservationConfig
-from .diagnostics import check_trace, redact, select_for_analysis
+from .diagnostics import CHECK_VERSION, check_trace, redact, select_for_analysis
 from .langfuse_sink import LangfuseSink, span_id, trace_id
 from .store import ObservationStore, stable_id
 
@@ -61,6 +61,16 @@ class ObservationService:
         self._task: asyncio.Task | None = None
         self._analysis_task: asyncio.Task | None = None
         self._stopping = False
+        row = self.store.db.execute("SELECT value FROM metadata WHERE key='rule_version'").fetchone()
+        if row is None or row[0] != CHECK_VERSION:
+            # Recheck only already-captured new-task evidence when rules change;
+            # this does not import any historical Runtime task.
+            for record in self.store.db.execute("SELECT DISTINCT run_id FROM events").fetchall():
+                events = self.store.events(record[0])
+                if any(e["event_type"] in _CHECKPOINT_EVENTS for e in events):
+                    self.store.enqueue("diagnose", record[0], events[-1]["sequence"], version=CHECK_VERSION)
+            with self.store.db:
+                self.store.db.execute("INSERT OR REPLACE INTO metadata VALUES('rule_version',?)", (CHECK_VERSION,))
 
     async def start(self) -> None:
         if self._task is not None:
@@ -161,7 +171,7 @@ class ObservationService:
                     count += 1
                 events = self.store.events(run.run_id)
                 if any(e["event_type"] in _CHECKPOINT_EVENTS for e in events[-len(page.events):]):
-                    self.store.enqueue("diagnose", run.run_id, cursor)
+                    self.store.enqueue("diagnose", run.run_id, cursor, version=CHECK_VERSION)
         return count
 
     async def deliver(self) -> None:
@@ -246,7 +256,7 @@ class ObservationService:
             await asyncio.to_thread(self.sink.score, self.project_id, run_id, "coverage." + source + "." + domain,
                     status, identity=stable_id("coverage", source, domain), evidence={"sequence": sequence,
                         "scope": "explicit_failure_events_only" if source == "rule" else "full_visible_trace_semantic_review",
-                        "version": "1.0.0", "unchecked_capabilities_are_not_excluded": True})
+                        "version": CHECK_VERSION if source == "rule" else "1.0.0", "unchecked_capabilities_are_not_excluded": True})
 
     async def import_annotations(self) -> None:
         """Replay successful native UI mutations from the proxy's durable journal."""

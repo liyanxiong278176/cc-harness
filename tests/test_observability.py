@@ -46,6 +46,15 @@ def test_explicit_tool_failure_is_confirmed_without_guessing_context_root_cause(
     assert select_for_analysis("p", "r", events, ordinary=0, complex_rate=0) == (True, "abnormal")
 
 
+def test_provider_billing_error_is_searchable_without_waiting_for_a_model():
+    events = [{"event_id": "billing", "run_id": "r", "sequence": 1, "event_type": "ModelInvocationFinished",
+               "payload": {"status": "failed", "error_details": {"code": "provider_billing_error", "partial_output": False}}}]
+    result = check_trace(events)
+    assert [(issue["domain"], issue["problem"], issue["status"]) for issue in result["issues"]] == [
+        ("operational_fitness", "provider_billing_error", "confirmed")]
+    assert result["coverage"]["context_management"] == "unchecked"
+
+
 def test_full_visible_trace_is_not_silently_truncated_and_credentials_are_removed() -> None:
     trace = [{"message": "start" + "x" * 12000 + "middle-evidence" + "z" * 12000,
               "authorization": "Bearer secret", "reasoning_content": "private thought"}]

@@ -27,6 +27,8 @@
 
 例如查上下文问题时，选择 `issue.current.context_management.<问题>` 为 `confirmed`；同一任务的工具问题同时通过 `issue.current.tools_and_protocols.<问题>` 检索。评分按名称区分来源，不依赖 UI 的 source 过滤。原生筛选语法与可选项以部署版本页面为准，未增加自定义两级树控件。
 
+提供方明确报告的余额等错误会由程序直接归入 `operational_fitness`，例如 `issue.current.operational_fitness.provider_billing_error=confirmed`，不需要等待已经不可用的分析模型。规则升级只重查已经接入的新任务副本，不导入启用前历史。
+
 `unchecked`、`checked_no_issue`、`issue_found` 分开记录；检查器的范围和版本在 comment 中。没有标签不表示已经排除问题。模型意见始终为待核实，发现线索的能力域不会同时显示为“未发现问题”。
 
 人工复核时先选择具体证据步骤，再填写 `review.*` 的确认、驳回或待核实值，可补充理由。缺少具体问题配置时可先使用该能力域的 `review.<能力域>.other`。使用项目的原生 Annotation Queues 组织复核。对具体问题的自动判断会创建对应的复核配置。
@@ -126,7 +128,7 @@ python -m eval.observability.gates publish --experiment release-001 --command YO
 
 ## 验收记录与未完成项
 
-已核实：七个服务启动；实际观测和 Dataset API 可读；D 盘 backend 与数据盘写入；六个持久卷冷备份、逐文件恢复比较以及恢复后 Postgres 读取两个初始 Dataset；原生评分“确认 → 驳回”的两次修订、当前投影与原模型意见均保留；离线队列重启补传、重复幂等、凭据脱敏、模型证据引用、覆盖状态和 oracle 正反例有自动测试。
+已核实：七个服务启动；实际观测和 Dataset API 可读；同一受控 Trace 同时记录工具已确认问题与上下文待核实线索；D 盘 backend 与数据盘写入；六个持久卷冷备份、逐文件恢复比较以及最新恢复后的 Postgres 读取四个版本化 Dataset；原生评分“确认 → 驳回”的两次修订、当前投影与原模型意见均保留；离线队列重启补传、重复幂等、凭据脱敏、模型证据引用、覆盖状态和 oracle 正反例有自动测试。
 
 完整旧版试跑 `candidate-20261025-v1` 共尝试 42 条：**12 条任务失败，30 条无效**。无效中 29 条为提供方 `provider_billing_error`（HTTP 402），另 1 条为初版采集器故障未产出完整结果。原始 `result.json` 与修正前分类保留，环境重分类记录为新文件，Langfuse 评分按稳定 ID 修正。该开发过程跨了多个代码版本，不能作为发布基线，也不能当作当前修正版本的通过率。
 
