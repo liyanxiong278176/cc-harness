@@ -1,5 +1,4 @@
 """Release evidence cannot be replaced by stale, missing or model-only claims."""
-from pathlib import Path
 import json
 
 from eval.observability import gates
@@ -13,7 +12,7 @@ def test_gate_rejects_missing_and_stale_evidence(tmp_path, monkeypatch):
     monkeypatch.setattr(gates, "model_fingerprint", lambda _: "sha256:model")
     decision = gates.check(tmp_path, tmp_path, tmp_path / "baseline.json")
     assert not decision["passed"]
-    assert set(decision["reasons"]) == {"missing_golden_decision", "missing_holdout_decision", "missing_quick_checks", "no_approved_baseline"}
+    assert set(decision["reasons"]) == {"missing_golden_decision", "missing_holdout_decision", "no_approved_baseline"}
     for split in ("golden", "holdout"):
         (tmp_path / f"decision-{split}.json").write_text(json.dumps({"decision": {"status": "pass", "valid": True, "complete": True},
             "source_fingerprint": "sha256:old", "model_fingerprint": "sha256:model", "dataset_version": gates.VERSION}))
@@ -50,7 +49,11 @@ def test_review_segments_preserve_whole_steps_and_oversized_fragments():
     assert all(fragment["event_id"] == "big" for fragment in fragments)
 
 
-def test_quick_targets_all_exist():
-    source = Path(__file__).resolve().parents[1]
-    assert len(gates.QUICK_GROUPS) == 9
-    assert all((source / name).is_file() for names in gates.QUICK_GROUPS.values() for name in names)
+def test_source_snapshot_excludes_unrelated_unit_tests(tmp_path):
+    folder = tmp_path / "tests"
+    folder.mkdir()
+    file = folder / "test_unrelated.py"
+    file.write_text("first")
+    before = source_fingerprint(tmp_path)
+    file.write_text("second")
+    assert source_fingerprint(tmp_path) == before

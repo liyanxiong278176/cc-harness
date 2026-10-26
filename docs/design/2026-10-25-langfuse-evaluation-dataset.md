@@ -1,6 +1,6 @@
 # Langfuse 首版评测集设计
 
-日期：2026-10-25，更新：2026-10-26。状态：用户已确认整体方案及 30 条 Golden Set 候选加 12 条保留任务。任务、初始夹具、独立评分器和九组快检已实现；旧版尝试均保留。当前 v1.1.2 修正了机制验收、验证器隔离及任务完成契约，输入采集也已对齐 Runtime 接口。充值后一度恢复试跑，随后模型接口再次 HTTP 402，最终源码下完整真实验收尚未完成，未批准或冻结基线。见[运行手册与验收记录](../observability-langfuse.md)。
+日期：2026-10-25，更新：2026-10-26。状态：用户已确认整体方案及 30 条 Golden Set 候选加 12 条保留任务。按最新要求只执行这 42 条 Agent 评测，取消仓库 pytest 执行和相关门禁。任务、初始夹具、独立评分器已实现；旧版尝试均保留。当前 v1.1.2 修正了机制验收、验证器隔离及任务完成契约，输入采集也已对齐 Runtime 接口。充值后一度恢复试跑，随后模型接口再次 HTTP 402，最终源码下完整真实验收尚未完成，未批准或冻结基线。见[运行手册与验收记录](../observability-langfuse.md)。
 
 关联：[总体设计](2026-10-25-langfuse-observability-evaluation.md)、[ADR-0119](../adr/0119-use-langfuse-for-agent-observability-and-evaluation.md)。
 
@@ -12,7 +12,6 @@
 
 | 层次 | 组成 | 作用 |
 | --- | --- | --- |
-| 无模型契约层 | 复核并复用现有九个能力域的原生回归组 | 提交前快检与基础设施底线，不计入 Agent 任务完成率 |
 | Agent Golden Set | 30 条受控端到端任务，完成验收、执行恢复、上下文使用各 10 条 | 推送或发布前执行，被测 Agent 实际运行模型和工具，保留独立验收与完整轨迹 |
 | 流程保留集 | 12 条独立任务家族，三个重点方向各 4 条 | 排除日常调参后作阶段性验证，单独报告，不并入 30 条日常回归分数 |
 
@@ -20,7 +19,7 @@
 
 ## 2. 可复用材料与限制
 
-- `eval/native/catalog.py` 定义九个能力域；其中退役入口不能直接复用，当前快检目标在 `eval/observability/gates.py::QUICK_GROUPS` 逐组映射至现行 Runtime 测试。它们不是九条真实 Agent 端到端任务。
+- `eval/native/catalog.py` 的九个能力域用于能力分类。按用户 2026-10-26 最新要求，仓库无模型回归组不纳入本轮评测，不触发执行，也不作为 Agent 门禁条件。
 - `eval/canary/catalog.py` 有十条基础 coding canary，`eval/canary/advanced_catalog.py` 有跨文件配置、检查点恢复和决策上下文三条高级任务；用作候选任务与适配器材料，需验证仍走当前 Runtime。
 - `eval/specialist/catalog.py` 与 `cases.py` 已有受控错误恢复、上下文压力、记忆和 Tools/MCP 材料；现有专项目录不自动等于本轮已完成的 Golden Set。
 - `scripts/local_agent_trials.py` 有代码修复、构建收据、长数据处理、上下文恢复、引用和记忆隔离的内部场景，可提取为固定任务；脚本存在不等于已验证其 oracle 可靠。

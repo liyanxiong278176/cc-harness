@@ -26,7 +26,7 @@ def digest(data: bytes) -> str:
 
 
 def source_paths(source: Path):
-    paths = sorted(set(source.glob("cc_harness/**/*.py")) | set(source.glob("eval/observability/*.py")) | set(source.glob("tests/**/*.py")) |
+    paths = sorted(set(source.glob("cc_harness/**/*.py")) | set(source.glob("eval/observability/*.py")) |
                    {source / "pyproject.toml", source / "uv.lock"})
     return [p for p in paths if p.is_file()]
 

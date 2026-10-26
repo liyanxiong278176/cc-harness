@@ -34,4 +34,4 @@ Langfuse 或分析模型暂不可用时，主任务继续执行，轨迹及待�
 
 Langfuse 数据映射、同步实现、回归闭环、验收要求及可调实施初值见[完整设计](../design/2026-10-25-langfuse-observability-evaluation.md)。词汇表只保留领域定义，部署与运行策略以本 ADR 和完整设计为准。
 
-评测集是本轮明确交付项。用户已确认首版 30 条 Agent Golden Set 候选加 12 条流程保留任务，另复用九组无模型原生契约；[首版评测集设计](../design/2026-10-25-langfuse-evaluation-dataset.md)给出具体用例目录、环境与独立验收契约、Langfuse Dataset/Experiment 关联及保留集边界。实际夹具、验证器、运行命令和试跑结果必须一并交付，现阶段不记为已实现数据集。
+评测集是本轮明确交付项。用户已确认首版 30 条 Agent Golden Set 候选加 12 条流程保留任务；2026-10-26 最新指令明确只执行这 42 条 Agent 任务，取消仓库 pytest 执行、提交快检及其门禁依赖。[首版评测集设计](../design/2026-10-25-langfuse-evaluation-dataset.md)给出具体用例目录、环境与独立验收契约、Langfuse Dataset/Experiment 关联及保留集边界。实际夹具、验证器、运行命令和试跑结果必须一并交付，未完成真实验收前不记为已冻结基线。

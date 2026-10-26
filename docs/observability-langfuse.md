@@ -81,12 +81,11 @@ python -m cc_harness.observability.worker --retry-now --status
 
 当前候选版本为 **1.1.2**，包含 30 条 Golden 候选和 12 条流程保留任务。两组 Dataset 分开，保留集不会在每次推送时运行。每次任务使用新的原生项目目录；函数及机制的独立 oracle 在无网络、只读挂载候选源码的 Docker 容器中执行。可信父进程保留预期结果，候选以独立低权限子进程运行，不能靠打印一个 `passed=true` 伪造整体判定。Agent 本身运行在一次性本机项目中，并非完整 OS 沙箱；隔离类型在结果和 core manifest 中如实记录。
 
+2026-10-26 按用户最新要求，评测范围仅为这 42 条 Agent 任务。仓库 pytest 套件不再由观测评测命令或本次安装的提交钩子触发，也不作为 Agent 发布判定的前置条件；普通单元测试文件不再进入 Agent 执行身份快照。Langfuse 核查未发现仓库 pytest 用例导入，当前版本 Dataset 实际为 Golden 30 条、holdout 12 条，核查记录在 D 盘 `deployment/agent-only-evaluation-audit.json`。任务内部的独立验收与轨迹证据继续保留。
+
 ```powershell
 python -m eval.observability.runner prepare
 python -m eval.observability.runner publish
-
-# 提交前：九个能力域的无模型快检
-python -m eval.observability.gates quick
 
 # 日常完整回归：30 条 Golden，随后检查已批准基线
 python -m eval.observability.gates full --experiment daily-001
@@ -101,7 +100,7 @@ python -m eval.observability.runner case --task outcome.01 --experiment smoke-00
 python -m eval.observability.runner publish-results --experiment release-001
 ```
 
-每次运行保留初始夹具、保护文件摘要、事件、独立结果、用量与控制动作。代码（含未跟踪 Python 文件和测试）、依赖、有效环境、层叠模型/MCP/policy 配置与数据集版本均绑定到执行身份；快照不包含凭据明文。代码或配置变化后旧证据不能放行。
+每次运行保留初始夹具、保护文件摘要、事件、独立结果、用量与控制动作。产品与 Agent 评测器代码（含未跟踪 Python 文件）、依赖、有效环境、层叠模型/MCP/policy 配置与数据集版本均绑定到执行身份；快照不包含凭据明文。代码或配置变化后旧证据不能放行。
 
 `normalize` 将现有结果导入 `eval/core`，结果变化时保留新的不可变证据修订；`check` 验证 core 判定内容摘要及当前身份。失败、环境无效、必要证据缺失都不放行；模型疑似判断不能代替独立结果。
 
@@ -118,7 +117,7 @@ python -m eval.observability.gates check --experiment release-001
 python -m eval.observability.gates approve-baseline --experiment release-001 --reviewer YOUR_NAME
 ```
 
-已安装 `pre-commit → quick` 和 `pre-push → full`，并保留/串行调用原 hook。显式发布包装器会再次校验证据，只有通过才执行后面的发布命令：
+已移除本次安装的 `pre-commit → quick`，保留 `pre-push → full`，它只运行 30 条 Golden Agent 任务。阶段或发布命令运行全部 42 条；既有用户 hook 保留。显式发布包装器会再次校验证据，只有通过才执行后面的发布命令：
 
 ```powershell
 python -m eval.observability.gates publish --experiment release-001 --command YOUR_RELEASE_COMMAND
@@ -146,7 +145,7 @@ python -m eval.observability.gates publish --experiment release-001 --command YO
 
 本轮修正提交为 `a86dd06`。输入补传后已在 Langfuse 的实际 generation 中核实 34697 字节输入，证据记录为 `deployment/provider-capture-verification.json`。本轮冷备份 `backups/20261026T024115Z` 的恢复抽检通过：六个卷全部恢复并逐文件比较，隔离 Postgres 可读，包含八个版本化 Dataset；恢复结果保存在该目录的 `restore-drill.json`。
 
-此前完整 pytest 记录为 2453 passed / 26 skipped；本轮任务契约与输入采集修正后的完整检查为 **2459 passed / 25 skipped**，进程退出码为 0，记录在 `evaluation/full-pytest-capture-fixed.log` 及同名 summary JSON；测试中的回调声明格式调整也有定向复测。该轮另有既有 asyncio 标记和 SQLite 线程退出时事件循环已关闭的警告，未报告测试失败。最新快检记录见对应 `quick.json`。无模型测试证明实现边界和验证器行为，不证明 Agent 任务通过。
+此前仓库工程测试日志仅在 D 盘本地保存，未导入 Langfuse，不计入 42 条 Agent 任务。用户已明确取消这部分测试执行及其门禁依赖。历史日志和旧 `quick.json` 只保留作历史记录，不作为当前 Agent 验收条件。
 
 ## 备份与恢复抽检
 

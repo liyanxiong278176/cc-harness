@@ -1,4 +1,4 @@
-"""Compose local regression hooks with existing hooks without replacing config."""
+"""Install the Agent regression hook and remove the retired pytest hook."""
 from __future__ import annotations
 
 import os
@@ -16,10 +16,18 @@ def install(source: Path) -> list[str]:
         folder = source / folder
     folder.mkdir(parents=True, exist_ok=True)
     installed = []
-    for name, action in (("pre-commit", "quick"), ("pre-push", "full")):
+    marker = "# cc-harness-observability hook v1"
+    retired = folder / "pre-commit"
+    previous_commit = folder / "pre-commit.cc-harness-previous"
+    if retired.exists() and marker in retired.read_text(encoding="utf-8", errors="replace"):
+        if previous_commit.exists():
+            previous_commit.replace(retired)
+        else:
+            retired.unlink()
+        installed.append(f"Removed observation pytest hook: {retired}")
+    for name, action in (("pre-push", "full"),):
         path = folder / name
         previous = folder / (name + ".cc-harness-previous")
-        marker = "# cc-harness-observability hook v1"
         if path.exists() and marker not in path.read_text(encoding="utf-8", errors="replace"):
             if previous.exists():
                 raise ValueError(f"existing backup prevents replacing {path}")
