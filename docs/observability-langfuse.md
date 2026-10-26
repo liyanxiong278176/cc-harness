@@ -144,6 +144,8 @@ python -m eval.observability.gates publish --experiment release-001 --command YO
 
 因此 **当前最终源码下 v1.1.2 的完整 42 条真实试跑、完整语义分析验收及基线审查仍未完成**。已完成的旧轨迹分析中，缺少源资产或有弃权的结果明确标记为不完整。暂不宣称评测集已冻结或发布验证已通过。服务恢复后使用新的 experiment，先确认实际请求资产可读，再运行全套评测；不要复用上述批次作为通过基线。
 
+本轮修正提交为 `a86dd06`。输入补传后已在 Langfuse 的实际 generation 中核实 34697 字节输入，证据记录为 `deployment/provider-capture-verification.json`。本轮冷备份 `backups/20261026T024115Z` 的恢复抽检通过：六个卷全部恢复并逐文件比较，隔离 Postgres 可读，包含八个版本化 Dataset；恢复结果保存在该目录的 `restore-drill.json`。
+
 此前完整 pytest 记录为 2453 passed / 26 skipped；本轮任务契约与输入采集修正后的完整检查为 **2459 passed / 25 skipped**，进程退出码为 0，记录在 `evaluation/full-pytest-capture-fixed.log` 及同名 summary JSON；测试中的回调声明格式调整也有定向复测。该轮另有既有 asyncio 标记和 SQLite 线程退出时事件循环已关闭的警告，未报告测试失败。最新快检记录见对应 `quick.json`。无模型测试证明实现边界和验证器行为，不证明 Agent 任务通过。
 
 ## 备份与恢复抽检
