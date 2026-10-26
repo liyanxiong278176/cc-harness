@@ -1,6 +1,6 @@
 # Langfuse 配置说明
 
-2026-10-26 更新：已按用户确认的方案部署本机 Langfuse v4，并接入 Durable Runtime 新任务、分类诊断、复核历史及评测集。部署配置在 `docker/langfuse`，实现分别位于 `cc_harness/observability` 与 `eval/observability`。[运行手册与实际验收状态](../../docs/observability-langfuse.md)是当前入口；模型服务 HTTP 402 尚阻止修正评测集的最终真实试跑。
+2026-10-26 更新：已按用户确认的方案部署本机 Langfuse v4，并接入 Durable Runtime 新任务、分类诊断、复核历史及评测集。部署配置在 `docker/langfuse`，实现分别位于 `cc_harness/observability` 与 `eval/observability`。[运行手册与实际验收状态](../../docs/observability-langfuse.md)是当前入口；当前候选 v1.1.2 已修正任务完成契约和输入采集接口，充值后一度恢复试跑，随后接口再次 HTTP 402，最终真实验收仍未完成。
 
 以下保留早期 v3 调研归档，不代表当前部署状态。
 

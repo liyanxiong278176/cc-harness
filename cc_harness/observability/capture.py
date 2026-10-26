@@ -41,7 +41,7 @@ class ObservedKernel:
     def __getattr__(self, name):
         return getattr(self.kernel, name)
 
-    async def execute(self, context, *, stream_callback=None):
+    async def execute_segment(self, context, *, stream_callback=None):
         token = None
         try:
             config = ObservationConfig.load()
@@ -53,7 +53,7 @@ class ObservedKernel:
         except Exception:
             pass  # Capturing evidence cannot become a task prerequisite.
         try:
-            return await self.kernel.execute(context, stream_callback=stream_callback)
+            return await self.kernel.execute_segment(context, stream_callback=stream_callback)
         finally:
             if token:
                 request_context.reset(token)

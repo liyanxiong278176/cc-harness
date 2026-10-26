@@ -79,7 +79,7 @@ python -m cc_harness.observability.worker --retry-now --status
 
 ## 评测和发布门禁
 
-当前候选版本为 **1.1.0**，包含 30 条 Golden 候选和 12 条流程保留任务。两组 Dataset 分开，保留集不会在每次推送时运行。每次任务使用新的原生项目目录；函数及机制的独立 oracle 在无网络、只读挂载候选源码的 Docker 容器中执行。可信父进程保留预期结果，候选以独立低权限子进程运行，不能靠打印一个 `passed=true` 伪造整体判定。Agent 本身运行在一次性本机项目中，并非完整 OS 沙箱；隔离类型在结果和 core manifest 中如实记录。
+当前候选版本为 **1.1.2**，包含 30 条 Golden 候选和 12 条流程保留任务。两组 Dataset 分开，保留集不会在每次推送时运行。每次任务使用新的原生项目目录；函数及机制的独立 oracle 在无网络、只读挂载候选源码的 Docker 容器中执行。可信父进程保留预期结果，候选以独立低权限子进程运行，不能靠打印一个 `passed=true` 伪造整体判定。Agent 本身运行在一次性本机项目中，并非完整 OS 沙箱；隔离类型在结果和 core manifest 中如实记录。
 
 ```powershell
 python -m eval.observability.runner prepare
@@ -132,9 +132,19 @@ python -m eval.observability.gates publish --experiment release-001 --command YO
 
 完整旧版试跑 `candidate-20261025-v1` 共尝试 42 条：**12 条任务失败，30 条无效**。无效中 29 条为提供方 `provider_billing_error`（HTTP 402），另 1 条为初版采集器故障未产出完整结果。原始 `result.json` 与修正前分类保留，环境重分类记录为新文件，Langfuse 评分按稳定 ID 修正。该开发过程跨了多个代码版本，不能作为发布基线，也不能当作当前修正版本的通过率。
 
-2026-10-26 09:25（Asia/Singapore）的独立短请求仍返回 HTTP 402，记录在 `deployment/provider-health.json`。因此 **v1.1.0 每条真实 Agent 试跑、完整真实模型分析、有效基线审查仍未完成**；暂不宣称评测集已冻结或发布验证已通过。服务恢复后应以新的 experiment 运行修正版本，保留旧 attempt。
+2026-10-26 09:25（Asia/Singapore）的独立短请求仍返回 HTTP 402。用户充值后，10:09 的短请求成功，已解除分析退避并恢复真实任务与待补分析。试跑发现并修正了以下接入边界，生产完成门禁和独立评分标准没有放宽：
 
-修正前完整 pytest 记录为 2445 passed / 26 skipped；最终完整检查为 **2453 passed / 26 skipped**，记录在 `evaluation/full-pytest-final.log`，另对其后的凭据转义和证据校验修正执行了相应定向测试。最新快检记录见对应 `quick.json`。无模型测试证明实现边界和验证器行为，不证明 Agent 任务通过。
+- 公共测试命令后的英文说明被完成契约解析器吸入命令。现在命令单独成句，并用全部 42 项任务调用生产解析器验证精确匹配。
+- 审批拒绝任务曾误把被拒绝的目标列为必需产物；增量构建任务曾误把模板文件名列为必需产物。任务措辞已修正，并增加生产产物契约回归。
+- 输入采集包装器的方法名应为 Runtime 实际调用的 `execute_segment`。已修正，并验证新旧任务时间边界、跨线程上下文、请求资产与索引、回调透传和异常恢复。修正后的真实失败请求已保存在 D 盘，轨迹含完整脱敏请求，未报告缺失输入。
+
+`acceptance-v110-20261026-0210` 的 8 份原始结果、`pilot-v111-20261026-0220` 的试跑及各中断记录均保留。`acceptance-v112-20261026-0230` 在输入采集修正前产生 **1 条通过、10 条因提供方欠费无效**，随后停止；这些记录不代表当前最终源码的完整验收。
+
+10:33 的独立短请求再次返回 HTTP 402。10:34 查询同一 API Key 对应的官方账户余额接口，返回 `is_available=false`、CNY `-0.06`、USD `0.00`。最新健康及余额记录位于 D 盘 `deployment/provider-health.json`、`provider-health-history.jsonl` 和 `provider-balance.json`。修正输入采集后的 `pilot-capture-20261026-0233` 也因欠费无效；分析已进入一小时退避，原始证据和待补任务保留。
+
+因此 **当前最终源码下 v1.1.2 的完整 42 条真实试跑、完整语义分析验收及基线审查仍未完成**。已完成的旧轨迹分析中，缺少源资产或有弃权的结果明确标记为不完整。暂不宣称评测集已冻结或发布验证已通过。服务恢复后使用新的 experiment，先确认实际请求资产可读，再运行全套评测；不要复用上述批次作为通过基线。
+
+此前完整 pytest 记录为 2453 passed / 26 skipped；本轮任务契约与输入采集修正后的完整检查为 **2459 passed / 25 skipped**，进程退出码为 0，记录在 `evaluation/full-pytest-capture-fixed.log` 及同名 summary JSON；测试中的回调声明格式调整也有定向复测。该轮另有既有 asyncio 标记和 SQLite 线程退出时事件循环已关闭的警告，未报告测试失败。最新快检记录见对应 `quick.json`。无模型测试证明实现边界和验证器行为，不证明 Agent 任务通过。
 
 ## 备份与恢复抽检
 

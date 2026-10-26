@@ -13,6 +13,45 @@ from cc_harness.observability.langfuse_sink import span_id, trace_id
 from cc_harness.observability.langfuse_sink import LangfuseSink
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize("created_at,should_capture", [("2026-10-26T00:00:00Z", True), ("2026-10-24T00:00:00Z", False)])
+async def test_kernel_segment_binds_provider_capture_and_restores_context(tmp_path, monkeypatch, created_at, should_capture):
+    import asyncio
+    import sqlite3
+    from cc_harness.observability.capture import ObservedKernel, capture_request, read_asset, request_context
+
+    config = ObservationConfig(tmp_path, "2026-10-25T00:00:00Z", "http://localhost", "public", "secret")
+    monkeypatch.setattr(ObservationConfig, "load", classmethod(lambda cls: config))
+
+    class Runtime:
+        project_id = "project"
+
+        async def read(self, run_id, *, limit):
+            return SimpleNamespace(events=[SimpleNamespace(occurred_at=created_at)])
+
+    class Kernel:
+        async def execute_segment(self, context, *, stream_callback=None):
+            assert stream_callback is callback
+            reference = await asyncio.to_thread(capture_request, [{"role": "user", "content": "visible input"}], [])
+            if context.fail:
+                raise RuntimeError("controlled segment failure")
+            return reference
+
+    def callback(value):
+        pass
+    wrapper = ObservedKernel(Kernel(), Runtime())
+    reference = await wrapper.execute_segment(SimpleNamespace(run_id="new-run", fail=False), stream_callback=callback)
+    assert bool(reference) is should_capture
+    if should_capture:
+        assert read_asset(tmp_path, reference)["messages"][0]["content"] == "visible input"
+        with sqlite3.connect(tmp_path / "projects/project/requests.db") as db:
+            assert db.execute("SELECT run_id,reference FROM requests").fetchall() == [("new-run", reference)]
+    assert request_context.get() is None
+    with pytest.raises(RuntimeError, match="controlled segment failure"):
+        await wrapper.execute_segment(SimpleNamespace(run_id="new-run", fail=True), stream_callback=callback)
+    assert request_context.get() is None
+
+
 def test_restarted_consumer_keeps_new_run_boundary_and_pending_events(tmp_path: Path) -> None:
     store = ObservationStore(tmp_path, "project")
     store.establish_boundary({"old-run"})

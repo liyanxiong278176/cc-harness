@@ -6,6 +6,28 @@ from eval.observability.catalog import cases, materialize
 from eval.observability.grader import grade_files, verify_function
 
 
+def test_fixture_verification_command_matches_runtime_completion_contract() -> None:
+    from cc_harness.loop_control import completion_contract_from_instruction
+    from eval.observability.fixtures import initial_files
+
+    for case in cases("golden") + cases("holdout"):
+        contract = completion_contract_from_instruction(initial_files(case)["TASK.md"])
+        assert contract.verification_commands == ("python -m pytest test_visible.py -q",), case.task_id
+
+
+def test_runtime_artifact_contract_respects_rejection_and_concrete_build_paths() -> None:
+    from cc_harness.loop_control import completion_contract_from_instruction
+    from eval.observability.fixtures import initial_files
+
+    selected = {c.task_id: c for c in cases("golden") + cases("holdout")}
+    rejected = completion_contract_from_instruction(initial_files(selected["recovery.10"])["TASK.md"])
+    assert "proposed.txt" not in rejected.required_paths
+    assert "result.json" in rejected.required_paths
+    incremental = completion_contract_from_instruction(initial_files(selected["holdout.03"])["TASK.md"])
+    assert not any("NAME" in path for path in incremental.required_paths)
+    assert {"incremental.py", "solution.py", "result.json"} <= set(incremental.required_paths)
+
+
 def test_frozen_catalog_has_distinct_golden_and_holdout_families(tmp_path: Path) -> None:
     golden = cases("golden")
     holdout = cases("holdout")
