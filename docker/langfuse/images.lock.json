@@ -1,0 +1,30 @@
+[
+  {
+    "image": "docker.langfuse.com/langfuse/langfuse:4",
+    "digest": "docker.langfuse.com/langfuse/langfuse@sha256:932a46dfab770f89ecb2ec35258b6b80d3be8773403981a64d271ff0a408deef"
+  },
+  {
+    "image": "docker.langfuse.com/langfuse/langfuse-worker:4",
+    "digest": "docker.langfuse.com/langfuse/langfuse-worker@sha256:3b3b204fa72fd02d010ab90c667d07281e4b9ec3b5b0b1d21470ac2624b8a564"
+  },
+  {
+    "image": "postgres:17",
+    "digest": "postgres@sha256:b8faeff7712663c2773a190181e1246e37e364b887611c04658c28b44e2408fe"
+  },
+  {
+    "image": "clickhouse/clickhouse-server:25.12",
+    "digest": "clickhouse/clickhouse-server@sha256:8a790dd3468db22b1d4e7b18a176f378ff5ff6053b9c48dd4ea1fa71a24c5ba6"
+  },
+  {
+    "image": "redis:7.2",
+    "digest": "redis@sha256:1009f15ccd9ed271996d1c65745a1ab1dadedea188feb3f1ab938602a32e50a3"
+  },
+  {
+    "image": "cgr.dev/chainguard/minio:latest",
+    "digest": "cgr.dev/chainguard/minio@sha256:87896cb33f93ecfcca4e883c3fb2f86a0a1a600c003a104011ed30631c1869c3"
+  },
+  {
+    "image": "python:3.13-slim",
+    "digest": "python@sha256:d98cc29d3266e535dd9da1099688d9cb3ca4753813571e071763d17725460962"
+  }
+]

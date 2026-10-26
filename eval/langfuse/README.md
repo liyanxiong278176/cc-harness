@@ -1,6 +1,10 @@
-# Langfuse 配置说明(暂未启用)
+# Langfuse 配置说明
 
-## 当前状态
+2026-10-26 更新：已按用户确认的方案部署本机 Langfuse v4，并接入 Durable Runtime 新任务、分类诊断、复核历史及评测集。部署配置在 `docker/langfuse`，实现分别位于 `cc_harness/observability` 与 `eval/observability`。[运行手册与实际验收状态](../../docs/observability-langfuse.md)是当前入口；模型服务 HTTP 402 尚阻止修正评测集的最终真实试跑。
+
+以下保留早期 v3 调研归档，不代表当前部署状态。
+
+## 早期调研状态（归档）
 **本目录只保留 README 文档,不包含任何运行时配置。**
 
 > Langfuse v3 自托管需要 Postgres + ClickHouse + Redis + Langfuse web 4 个容器协同。

@@ -282,14 +282,22 @@ class DurableModelAdapter(ModelAdapter):
         reasoning_content_required = bool(
             getattr(self.llm, "reasoning_content_required", False)
         )
-        stream = self.llm.chat(
-            self._provider_messages(
+        provider_messages = self._provider_messages(
                 messages,
                 thinking_mode=thinking_mode,
                 reasoning_content_required=reasoning_content_required,
-            ),
-            [dict(item) for item in tools],
         )
+        provider_tools = [dict(item) for item in tools]
+        observation_request_ref = None
+        try:
+            from .observability.capture import capture_request
+            credential = getattr(getattr(self.llm, "_client", None), "api_key", "")
+            observation_request_ref = await asyncio.to_thread(
+                capture_request, provider_messages, provider_tools, secrets=(credential,),
+            )
+        except Exception:
+            logging.getLogger(__name__).warning("Observation input capture unavailable; execution continues")
+        stream = self.llm.chat(provider_messages, provider_tools)
         try:
             async for event in stream:
                 if event.kind == "content":
@@ -393,6 +401,8 @@ class DurableModelAdapter(ModelAdapter):
             }
             if usage is not None else {"model_calls": 1}
         )
+        if observation_request_ref is not None:
+            usage_payload["observation_request_ref"] = observation_request_ref
         if usage is not None:
             usage_payload["reported_cost"] = usage.reported_cost
             usage_payload["reported_cost_currency"] = usage.reported_cost_currency
@@ -486,6 +496,7 @@ class DurableRuntimeClient:
         self.cwd = store.project_root
         self.supervisor: LocalSupervisor | None = None
         self._llm: LLMClient | None = None
+        self._observation_service = None
         self._mcp: MCPClient | None = None
         self._capabilities: AgentCapabilityRuntime | None = None
         self._services: SharedCapabilityServices | None = None
@@ -1159,7 +1170,8 @@ class DurableRuntimeClient:
             mcp_tool_count=len(self._mcp._tools),
         )
         model = DurableModelAdapter(self._llm, tool_bundles=self.tool_bundles)
-        kernel = ReActKernel(model)
+        from .observability.capture import ObservedKernel
+        kernel = ObservedKernel(ReActKernel(model), self.store)
         base_worker_id = worker_id or f"supervisor-{os.getpid()}"
         counter = 0
 
@@ -1232,6 +1244,19 @@ class DurableRuntimeClient:
             with contextlib.suppress(Exception):
                 await self._close_execution_components()
             raise
+        try:
+            from .observability.config import ObservationConfig
+            from .observability.service import ObservationService
+            observation_config = ObservationConfig.load()
+            if observation_config is not None:
+                analysis_llm = LLMClient(
+                    api_key=config.openai_api_key, model=config.openai_model,
+                    base_url=config.openai_base_url, thinking_mode="disabled",
+                )
+                self._observation_service = ObservationService(self.store, observation_config, analysis_llm)
+                await self._observation_service.start()
+        except Exception:
+            logging.getLogger(__name__).warning("Observation service unavailable; Runtime execution continues")
         return self.supervisor
 
     def start_detached_supervisor(
@@ -2290,6 +2315,10 @@ class DurableRuntimeClient:
             await self._close_unlocked()
 
     async def _close_unlocked(self) -> None:
+        if self._observation_service is not None:
+            with contextlib.suppress(Exception):
+                await self._observation_service.close()
+            self._observation_service = None
         if self.supervisor is not None:
             await self.supervisor.stop(drain=False)
             self.supervisor = None
