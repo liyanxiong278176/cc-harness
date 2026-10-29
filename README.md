@@ -3,12 +3,6 @@
 本地运行的 coding agent：在选定项目目录里读写文件、执行命令、跑测试，并在浏览器 WebUI 里对话与审阅。
 核心是一条 **Durable Runtime**（事件溯源 + 租约 + 可恢复执行），外围是上下文压缩、分层记忆、权限闸门与输出 DLP。
 
-## 演示视频
-
-[![点击播放 1080p 演示视频](docs/demo/cc-harness-vue3-security-1080p.jpg)](https://cdn.jsdelivr.net/gh/liyanxiong278176/cc-harness@master/docs/demo/cc-harness-vue3-security-1080p.mp4)
-
-[点击在线播放 1080p 演示视频](https://cdn.jsdelivr.net/gh/liyanxiong278176/cc-harness@master/docs/demo/cc-harness-vue3-security-1080p.mp4)。视频展示多轮对话完成 Vue 3 商品管理前端、执行中暂停与继续、浏览器刷新后的本地持久化验证，以及敏感数据边界测试；配有中文男声旁白。安全测试覆盖已知密钥格式和所测路径，不保证识别任意敏感文本。
-
 > 定位：单用户、本地、可审计的编程代理。**不是**多租户沙箱，也**不是**"无人值守跑任意外部代码"的运行时。
 
 ## 三个可复核的数字
