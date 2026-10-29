@@ -1,8 +1,6 @@
 # cc-harness
 
-[![cc-harness 演示视频：点击观看](docs/demo/cc-harness-demo-preview.png)](docs/demo/cc-harness-demo.mp4)
-
-▶ [观看演示视频（MP4，2 分 07 秒，1080p）](docs/demo/cc-harness-demo.mp4)
+https://github.com/user-attachments/assets/e6d09f1d-7213-4cfa-829b-ce914dfaeedd
 
 本地运行的 coding agent：在选定项目目录里读写文件、执行命令、跑测试，并在浏览器 WebUI 里对话与审阅。
 核心是一条 **Durable Runtime**（事件溯源 + 租约 + 可恢复执行），外围是上下文压缩、分层记忆、权限闸门与输出 DLP。
