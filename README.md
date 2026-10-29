@@ -3,6 +3,12 @@
 本地运行的 coding agent：在选定项目目录里读写文件、执行命令、跑测试，并在浏览器 WebUI 里对话与审阅。
 核心是一条 **Durable Runtime**（事件溯源 + 租约 + 可恢复执行），外围是上下文压缩、分层记忆、权限闸门与输出 DLP。
 
+## 演示视频
+
+[![点击播放 cc-harness 演示视频](docs/demo/poster.jpg)](https://cdn.jsdelivr.net/gh/liyanxiong278176/cc-harness@master/docs/demo/cc-harness-product-management.mp4)
+
+[点击在线播放演示视频](https://cdn.jsdelivr.net/gh/liyanxiong278176/cc-harness@master/docs/demo/cc-harness-product-management.mp4)。视频展示多轮对话生成 Vue 3、Spring Boot、MySQL 商品管理系统，执行中停止与继续，以及刷新页面后的数据验证；配有中文男声旁白。
+
 > 定位：单用户、本地、可审计的编程代理。**不是**多租户沙箱，也**不是**"无人值守跑任意外部代码"的运行时。
 
 ## 三个可复核的数字
