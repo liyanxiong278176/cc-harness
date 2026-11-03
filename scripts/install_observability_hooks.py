@@ -37,7 +37,7 @@ def install(source: Path, *, agent_eval_on_push: bool = False) -> list[str]:
         text = "\n".join(("#!/bin/sh", marker,
             'if [ -f "$0.cc-harness-previous" ]; then',
             '  "$0.cc-harness-previous" "$@" || exit $?', "fi",
-            "cd " + shlex.quote(source.as_posix()) + " || exit 1",
+            'cd "$(git rev-parse --show-toplevel)" || exit 1',
             "exec " + shlex.quote(Path(sys.executable).as_posix()) + " -m " + target, ""))
         path.write_text(text, encoding="utf-8", newline="\n")
         if os.name != "nt":

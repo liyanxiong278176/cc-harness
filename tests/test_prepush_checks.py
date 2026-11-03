@@ -13,6 +13,8 @@ def test_default_hook_migrates_without_chaining_the_paid_hook(tmp_path):
     install(tmp_path)
     assert 'eval.observability.prepush' in hook.read_text()
     assert 'gates full' not in hook.read_text()
+    assert 'git rev-parse --show-toplevel' in hook.read_text()
+    assert tmp_path.as_posix() not in hook.read_text()
     assert not hook.with_name('pre-push.cc-harness-previous').exists()
 
 
