@@ -20,6 +20,7 @@ from pathlib import Path
 from typing import Any, Mapping
 
 from .run_model import GoalContract
+from .exact_json import canonical_json, literal_json_artifacts
 
 
 class ToolErrorKind(str, Enum):
@@ -166,6 +167,7 @@ class ArtifactRequirement:
     min_bytes: int = 1
     sha256: str | None = None
     format: str | None = None
+    expected_json: str | None = None
 
     def __post_init__(self) -> None:
         if not str(self.path).strip():
@@ -180,6 +182,10 @@ class ArtifactRequirement:
                 raise ValueError("artifact requirement sha256 must be a 64-character hex digest")
         if self.format is not None and self.format not in {"json", "text", "binary"}:
             raise ValueError("artifact requirement format must be json, text, or binary")
+        if self.expected_json is not None:
+            if self.format != "json":
+                raise ValueError("expected_json requires JSON format")
+            canonical_json(self.expected_json)
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -188,6 +194,7 @@ class ArtifactRequirement:
             "min_bytes": self.min_bytes,
             "sha256": self.sha256,
             "format": self.format,
+            **({"expected_json": self.expected_json} if self.expected_json is not None else {}),
         }
 
     @classmethod
@@ -200,6 +207,7 @@ class ArtifactRequirement:
             min_bytes=max(0, int(value.get("min_bytes", 1))),
             sha256=(str(value["sha256"]) if value.get("sha256") else None),
             format=(str(value["format"]) if value.get("format") else None),
+            expected_json=(str(value["expected_json"]) if value.get("expected_json") is not None else None),
         )
 
 
@@ -409,7 +417,13 @@ def artifact_validation_issues(
                         issues.append(f"required JSON artifact is too large to validate: {requirement.path}")
                     else:
                         try:
-                            json.loads(target.read_text(encoding="utf-8"))
+                            content = target.read_text(encoding="utf-8")
+                            json.loads(content)
+                            if requirement.expected_json is not None and canonical_json(content) != canonical_json(requirement.expected_json):
+                                issues.append(
+                                    f"required JSON artifact does not match the requested exact value: {requirement.path}; "
+                                    "match the literal value in the task (no extra fields)"
+                                )
                         except (OSError, UnicodeDecodeError, json.JSONDecodeError, ValueError):
                             issues.append(f"required artifact is not valid JSON: {requirement.path}")
             except OSError:
@@ -480,6 +494,7 @@ def completion_contract_from_instruction(
     """
 
     required: list[str] = []
+    exact_values = literal_json_artifacts(instruction)
     artifact_formats: dict[str, str | None] = {}
     artifact_digests: dict[str, str | None] = {}
     for line in instruction.splitlines():
@@ -522,7 +537,8 @@ def completion_contract_from_instruction(
             ArtifactRequirement(
                 path=path,
                 sha256=artifact_digests.get(path),
-                format=artifact_formats.get(path),
+                format=("json" if path.replace("\\", "/") in exact_values else artifact_formats.get(path)),
+                expected_json=exact_values.get(path.replace("\\", "/")),
             )
             for path in required
         ),
