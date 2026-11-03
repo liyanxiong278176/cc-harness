@@ -101,7 +101,11 @@ async def execute_case(case: EvalCase, attempt: Path, config_source: Path) -> di
                     yield event
             client._llm.chat = interrupted_chat
         objective = (workspace / "TASK.md").read_text(encoding="utf-8")
+        # The controller is the authorized initiator of these frozen tasks in
+        # disposable workspaces. Initial goal confirmation is separate from
+        # exercising tool approval rejection or transport recovery below.
         run_id = await client.submit(objective, acceptance_criteria=("TASK.md requirements satisfied", "real result artifacts verified"),
+                                     confirm_high_risk=True,
                                      budget_limits={"model_calls": case.max_model_calls, "active_seconds": case.wall_seconds})
         paused = resumed = cancelled = rejected = False
         continuation_time = None
@@ -139,7 +143,7 @@ async def execute_case(case: EvalCase, attempt: Path, config_source: Path) -> di
                 await client.coordinator.cancel(run_id, "controlled cancellation during slow action")
                 cancelled = True
                 controller_events.append("cancel_requested")
-            if case.fault == "partial_stream" and not resumed and status in {"failed_recoverable", "stalled", "blocked"}:
+            if case.fault == "partial_stream" and injected and not resumed and status in {"failed_recoverable", "stalled", "blocked"}:
                 await client.coordinator.resume(run_id, "reconcile committed state after stream interruption")
                 resumed = True
                 controller_events.append("transport_resumed")

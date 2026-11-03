@@ -36,9 +36,11 @@ def function_probes(case: EvalCase) -> list[dict[str, Any]]:
     return probes + extra.get(case.task_id, [])
 
 
-_CANDIDATE_PROBE = """import copy, json, os, sys, tempfile
-sys.path.insert(0, '/source')
-os.chdir(tempfile.mkdtemp(dir='/work'))
+_CANDIDATE_PROBE = """import copy, json, os, shutil, sys, tempfile
+workspace=tempfile.mkdtemp(dir='/work')
+shutil.copyfile('/source/solution.py', os.path.join(workspace, 'solution.py'))
+sys.path[:0] = [workspace, '/source']
+os.chdir(workspace)
 value=json.load(sys.stdin); before=copy.deepcopy(value)
 try:
     from solution import transform
@@ -218,7 +220,13 @@ def grade_trajectory(case: EvalCase, events: list[dict[str, Any]]) -> dict[str, 
     if case.fault == "cancel":
         result["cancellation_committed"] = "RunCancelled" in types or "TaskCancelled" in types
     if case.fault == "partial_stream":
-        result["transport_fault_exercised"] = any(e["event_type"] == "ModelInvocationFinished" and e.get("payload", {}).get("status") == "failed" for e in events)
+        failures = [e.get("sequence", 0) for e in events
+                    if e["event_type"] == "ModelInvocationFinished" and e.get("payload", {}).get("status") == "failed"]
+        result["transport_fault_exercised"] = bool(failures)
+        result["transport_resumed_after_fault"] = bool(failures) and any(
+            e["event_type"] == "RunResumed" and e.get("sequence", 0) > min(failures)
+            for e in events
+        )
     if case.task_id == "context.05":
         offloaded = {}
         for event in events:

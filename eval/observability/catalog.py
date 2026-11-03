@@ -11,7 +11,7 @@ import json
 from pathlib import Path
 from typing import Any
 
-VERSION = "1.1.2"
+VERSION = "1.1.3"
 
 
 @dataclass(frozen=True)
@@ -47,7 +47,7 @@ _OUTCOMES = (
     ("layered-port-config", "Fix layered configuration", "Given defaults and override mappings, return a new merged mapping; coerce port to an integer in 1..65535, reject invalid ports with ValueError and preserve both inputs.",
      {"defaults": {"port": 8080, "host": "127.0.0.1"}, "override": {"port": "9090"}}, {"port": 9090, "host": "127.0.0.1"}),
     ("multi-artifact-report", "Deliver data and report", "Return {'count': number of items, 'total': sum of item integer values}; additionally create report.md with the exact line 'COUNT=3 TOTAL=12'.", [2, 4, 6], {"count": 3, "total": 12}),
-    ("hidden-clamp-boundaries", "Repair clamp boundaries", "Clamp value inclusively into [low,high]; reject low>high with ValueError. Handle values equal to bounds.", {"value": 12, "low": 0, "high": 10}, 10),
+    ("hidden-clamp-boundaries", "Repair clamp boundaries", "Return the scalar value clamped inclusively into [low,high], not a mapping; reject low>high with ValueError. Handle values equal to bounds.", {"value": 12, "low": 0, "high": 10}, 10),
     ("fresh-verification-receipt", "Verify the final patch", "Return a stable list of unique input values preserving first occurrence. Run verification after the final change; do not rely on an earlier successful check.", [3, 1, 3, 2, 1], [3, 1, 2]),
     ("live-service-health", "Start a working local service", "Fix solution.py transform to return {'healthy': True, 'value': data['value']*2}. Start the provided server.py in the background and verify its /health endpoint.", {"value": 21}, {"healthy": True, "value": 42}),
     ("nonmutating-rename-preview", "Preview renames without applying them", "Return [{'from': old, 'to': old.upper()}] sorted by old name. This is a dry-run: do not rename or modify files under originals/.", ["beta.txt", "alpha.txt"], [{"from": "alpha.txt", "to": "ALPHA.TXT"}, {"from": "beta.txt", "to": "BETA.TXT"}]),

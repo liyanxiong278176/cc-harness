@@ -220,14 +220,48 @@ def _is_verification_command(tool_name: str, command: str) -> bool:
     return bool(_VERIFICATION_COMMAND_RE.search(command or ""))
 
 
-def _local_verifier_invocations(command: str) -> set[str]:
+def _local_verifier_invocations(command: str, root: Path | None = None) -> set[str]:
     """Identify the same local verifier across display/redirect wrappers."""
     invocations = set()
     for match in re.finditer(r"\b(?:python(?:3)?|pytest|ruff|mypy|node|npm|pnpm|yarn)\s+[^;|\n]+", command):
         core = re.split(r"\s+\d*[<>]", match.group())[0].strip()
         if _VERIFICATION_COMMAND_RE.search(core) and not re.search(r"\b(?:deploy|publish|push|upload)\b", core):
             invocations.add(" ".join(core.split()))
+    if root is not None:
+        # Running a workspace verifier as a module fixes imports relative to
+        # the project root. It supersedes a failed direct run of that exact
+        # file, without treating unrelated checks as a repair.
+        text = command.strip()
+        if os.name == "nt":
+            text = re.sub(r";\s*exit\s+\$LASTEXITCODE\s*$", "", text, flags=re.I)
+            text = re.sub(r"^\$env:PYTHONPATH\s*=\s*\(Get-Location\)\.Path\s*;\s*", "", text, flags=re.I)
+        match = re.fullmatch(
+            r'''(?:python(?:3)?|py)(?:\.exe)?\s+(?:-m\s+([A-Za-z_]\w*(?:\.[A-Za-z_]\w*)*)|"([^"\n]+\.py)"|'([^'\n]+\.py)'|([^\s;&|]+\.py))\s*''',
+            text,
+        )
+        if match and _VERIFICATION_COMMAND_RE.search(text):
+            relative = (Path(*match[1].split(".")).with_suffix(".py") if match[1]
+                        else Path(next(value for value in match.groups()[1:] if value)))
+            try:
+                path = (root / relative).resolve()
+                if path.is_relative_to(root.resolve()) and path.is_file():
+                    invocations.add("workspace-script:" + os.path.normcase(str(path)))
+            except (OSError, ValueError):
+                pass  # An invalid or inaccessible path proves no equivalence.
     return invocations
+
+
+def _verification_command_digest(command: str) -> str:
+    """Match an executed check with its contract across Windows exit propagation.
+
+    Only the terminal PowerShell exit-code forwarding suffix is equivalent.
+    Keep pipelines, cwd changes, output wrappers and other trailing commands
+    intact so they cannot satisfy a different explicitly required check.
+    """
+
+    if os.name == "nt":
+        command = re.sub(r";\s*exit\s+\$LASTEXITCODE\s*$", "", command, flags=re.I)
+    return _text_digest(_normalise_command(command))
 
 
 def _observation_verifies(observation: ToolObservation, command: str) -> bool:
@@ -2135,8 +2169,8 @@ class RunWorker:
             if action.tool_name != request.tool_name and not (action.tool_name == "Read" and pinned_resource) and not discarded_precondition:
                 continue
             same_command = (request.tool_name == "run_command" and _observation_verifies(observation, str(request.arguments.get("command", "")))
-                            and (args == dict(request.arguments) or bool(_local_verifier_invocations(str(args.get("command", "")))
-                                     & _local_verifier_invocations(str(request.arguments.get("command", ""))))))
+                            and (args == dict(request.arguments) or bool(_local_verifier_invocations(str(args.get("command", "")), self.working_directory)
+                                     & _local_verifier_invocations(str(request.arguments.get("command", "")), self.working_directory))))
             same_file = (request.tool_name in {"Write", "Edit", "Read"} and args.get("path")
                          and self._workspace_path(str(args["path"])) is not None
                          and self._workspace_path(str(args["path"])) == self._workspace_path(str(request.arguments.get("path", ""))))
@@ -2153,6 +2187,11 @@ class RunWorker:
         p = await self.store.load_projection(run_id)
         contract = completion_contract_from_instruction(_goal_public_text(p.goal) if p.goal else "")
         issues = list(artifact_validation_issues(self.working_directory, contract.required_artifacts))
+        issues.extend(
+            f"Required verifier from the task contract: {command}. Run this command directly; "
+            "on PowerShell only '; exit $LASTEXITCODE' may be appended to forward its exit status."
+            for command in contract.verification_commands
+        )
         unresolved = {e.get("action_id") for e in p.working_state.unresolved_errors}
         for a in p.actions:
             if a.action_id in unresolved:
@@ -2597,7 +2636,7 @@ class RunWorker:
             )
             if _observation_verifies(observation, command):
                 successful_commands.add(
-                    _text_digest(_normalise_command(command))
+                    _verification_command_digest(command)
                 )
             if observation.tool_name == "service_status":
                 health_status = str(metadata.get("health_status") or "")
@@ -2607,7 +2646,7 @@ class RunWorker:
                 healthy_service = True
 
         for command in contract.verification_commands:
-            if _text_digest(_normalise_command(command)) not in successful_commands:
+            if _verification_command_digest(command) not in successful_commands:
                 return False
         if contract.require_service_health_check and not healthy_service:
             return False
