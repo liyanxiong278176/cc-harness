@@ -17,7 +17,17 @@
 - Ruff 检查：通过。
 - 原 `outcome.02` 从 `stalled`、18 次模型调用、121.865 秒，变为两次实际复测均 `completed`（15 次/48.036 秒；9 次/37.073 秒）。模型采样与服务延迟会变化，这不是稳定性能提升比例。
 
-完整真实评估的最终结果另行记录。只有 Golden 与 Holdout 全部通过才允许批准首次基线。
+## 真实评估结果与阻塞
+
+最终批次 `completion-fix-final-20261103`（数据集 `1.1.3`）取得 23 项完成记录：14 通过、1 失败、8 无效，另外 19 项未完成（包含停止时正在执行的样例）。编码结果类 10 项全部通过，恢复类前 4 项通过。
+
+8 项无效记录均因模型服务返回 HTTP 402 / `provider_billing_error`（Insufficient Balance）。确认连续余额错误后停止剩余调用，未把无效或未完成样例计为通过。恢复余额后必须重新进行完整验证。
+
+唯一有效失败是 `recovery.06`：代理交付了正确的 `blocked` 与 `reason`，但还添加了 `attempts`、`max_attempts`、`probe_error`、`detail`，不满足任务要求的精确 JSON 对象。该问题保留为真实模型交付失败，未放宽裁决。此前 `recovery.05` 也曾出现失败诊断未解除的问题；最终批次因余额不足未能验证其恢复结果。
+
+离线规范化与门禁检查已执行，门禁正确拒绝：`golden_required_checks_not_passed`、`holdout_required_checks_not_passed`、`no_approved_baseline`。依照用户“全部检查通过后”才批准基线的授权条件，未创建基线，未绕过推送钩子。已完成代码修复提交，远端尚未更新。
+
+机器摘要见 `completion-gate-result.json`。测试通过与真实模型评估通过是不同结论，不能互相替代。
 
 ## 证据与复现
 
