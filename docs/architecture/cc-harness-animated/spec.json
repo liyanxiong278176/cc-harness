@@ -1,0 +1,133 @@
+{
+  "canvas": {
+    "width": 1210,
+    "height": 1138,
+    "fps": 20,
+    "frames": 41
+  },
+  "signature": "cc-harness",
+  "title": {
+    "prefix": "Inside",
+    "highlight": "cc-harness",
+    "subtitle": "本地编程代理 · 一条执行链路 · 可恢复与可审计"
+  },
+  "input_title": "用户与工作区",
+  "inputs": [
+    {
+      "label": "WebUI",
+      "icon": "file",
+      "color": "#7ee3d6"
+    },
+    {
+      "label": "CLI",
+      "icon": "file",
+      "color": "#ff7ab6"
+    },
+    {
+      "label": "项目",
+      "icon": "folder",
+      "color": "#f4b64e"
+    },
+    {
+      "label": "目标",
+      "icon": "file",
+      "color": "#7ee3d6"
+    }
+  ],
+  "core": {
+    "title": "Agent Loop",
+    "subtitle": "Durable Runtime",
+    "cards": [
+      {
+        "title": "准备",
+        "body": "Client / Coordinator\n入队・状态投影",
+        "icon": "scan"
+      },
+      {
+        "title": "调度",
+        "body": "Supervisor / Worker\n租约・心跳・执行",
+        "icon": "shield"
+      },
+      {
+        "title": "推理",
+        "body": "ReActKernel / LLM\n规划・工具调用",
+        "icon": "file"
+      }
+    ]
+  },
+  "decision": {
+    "title": "可交付？",
+    "body": "验收条件\n证据完整"
+  },
+  "output": {
+    "label": "交付",
+    "icon": "file"
+  },
+  "loop_label": "策略 → 执行 → 观察 → 再推理",
+  "retry_label": "证据不足 → 继续执行",
+  "left_panel": {
+    "title": "上下文与记忆",
+    "badge": "按需注入",
+    "cards": [
+      {
+        "title": "上下文",
+        "body": "截取 → 裁剪 → 摘要\n原文引用可回查",
+        "icon": "file"
+      },
+      {
+        "title": "分层记忆",
+        "body": "L1–L2–L3 持久记忆\n默认注入 L3",
+        "icon": "db"
+      }
+    ]
+  },
+  "center_panel": {
+    "title": "持久化与恢复",
+    "subtitle": "RunStore · 事件是权威事实",
+    "footer": "SQLite + Artifacts",
+    "cards": [
+      {
+        "title": "事件",
+        "body": "只追加写入\n任务与动作事实",
+        "icon": "file"
+      },
+      {
+        "title": "投影",
+        "body": "从事件重建\n当前运行状态",
+        "icon": "db"
+      },
+      {
+        "title": "检查点",
+        "body": "状态快照\n加速恢复",
+        "icon": "hash"
+      },
+      {
+        "title": "续跑",
+        "body": "检查点＋事件\n未知动作先核对",
+        "icon": "package"
+      }
+    ]
+  },
+  "right_panel": {
+    "title": "安全工具执行",
+    "incoming_label": "续跑",
+    "return_label": "工具观察",
+    "cards": [
+      {
+        "title": "权限闸门",
+        "body": "allow / ask / deny\n范围・审批・输出 DLP",
+        "icon": "shield"
+      },
+      {
+        "title": "工具派发",
+        "body": "Native / MCP\n命令走配置执行器",
+        "icon": "file"
+      },
+      {
+        "title": "项目工作区",
+        "body": "OpenSandbox / 本机\n文件・命令・测试",
+        "icon": "folder"
+      }
+    ]
+  }
+}

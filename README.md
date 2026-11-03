@@ -18,6 +18,10 @@
 
 ## 架构
 
+![cc-harness 动态架构图](docs/architecture/cc-harness-animated/cc-harness.gif)
+
+[静态 PNG](docs/architecture/cc-harness-animated/cc-harness.png) · [可编辑 Excalidraw](docs/architecture/cc-harness-animated/cc-harness.excalidraw) · [图示说明与生成方法](docs/architecture/cc-harness-animated/README.md)
+
 ```mermaid
 flowchart LR
     UI[WebUI / TUI] --> C[DurableRuntimeClient]

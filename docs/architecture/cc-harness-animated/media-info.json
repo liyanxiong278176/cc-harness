@@ -1,0 +1,13 @@
+{
+  "width": 1210,
+  "height": 1138,
+  "frames": 41,
+  "fps": 20.0,
+  "duration_seconds": 2.05,
+  "all_frame_durations_ms": [
+    50
+  ],
+  "motion_verified": true,
+  "output_checks_passed": true,
+  "metadata_reader": "Pillow (ffprobe not installed on PATH)"
+}

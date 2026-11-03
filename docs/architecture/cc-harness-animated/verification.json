@@ -1,0 +1,122 @@
+{
+  "png": "docs\\architecture\\cc-harness-animated\\cc-harness.png",
+  "gif": "docs\\architecture\\cc-harness-animated\\cc-harness.gif",
+  "excalidraw": "docs\\architecture\\cc-harness-animated\\cc-harness.excalidraw",
+  "elements": 153,
+  "verification": {
+    "frames": 41,
+    "diffs": [
+      {
+        "from": 0,
+        "to": 10,
+        "changed_pixels": 205572
+      },
+      {
+        "from": 10,
+        "to": 20,
+        "changed_pixels": 210907
+      },
+      {
+        "from": 20,
+        "to": 30,
+        "changed_pixels": 234441
+      },
+      {
+        "from": 30,
+        "to": 40,
+        "changed_pixels": 213266
+      }
+    ]
+  },
+  "checks": {
+    "ok": true,
+    "checks": [
+      {
+        "name": "gif_exists",
+        "ok": true
+      },
+      {
+        "name": "gif_width",
+        "ok": true,
+        "expected": 1210,
+        "actual": 1210
+      },
+      {
+        "name": "gif_height",
+        "ok": true,
+        "expected": 1138,
+        "actual": 1138
+      },
+      {
+        "name": "gif_frames",
+        "ok": true,
+        "expected": 41,
+        "actual": 41
+      },
+      {
+        "name": "gif_fps",
+        "ok": true,
+        "expected": 20,
+        "actual": 20.0
+      },
+      {
+        "name": "gif_has_motion",
+        "ok": true,
+        "diffs": [
+          {
+            "from": 0,
+            "to": 10,
+            "changed_pixels": 205572
+          },
+          {
+            "from": 10,
+            "to": 20,
+            "changed_pixels": 210907
+          },
+          {
+            "from": 20,
+            "to": 30,
+            "changed_pixels": 234441
+          },
+          {
+            "from": 30,
+            "to": 40,
+            "changed_pixels": 213266
+          }
+        ]
+      },
+      {
+        "name": "excalidraw_exists",
+        "ok": true
+      },
+      {
+        "name": "excalidraw_unique_ids",
+        "ok": true
+      },
+      {
+        "name": "excalidraw_text_font_family",
+        "ok": true
+      },
+      {
+        "name": "excalidraw_files_empty",
+        "ok": true
+      },
+      {
+        "name": "png_exists",
+        "ok": true
+      },
+      {
+        "name": "png_width",
+        "ok": true,
+        "expected": 1210,
+        "actual": 1210
+      },
+      {
+        "name": "png_height",
+        "ok": true,
+        "expected": 1138,
+        "actual": 1138
+      }
+    ]
+  }
+}
