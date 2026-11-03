@@ -2192,6 +2192,12 @@ class RunWorker:
             "on PowerShell only '; exit $LASTEXITCODE' may be appended to forward its exit status."
             for command in contract.verification_commands
         )
+        if contract.require_service_health_check:
+            issues.append(
+                "The task requires a live service at completion. Restart a stopped required service "
+                "and record current healthy service_status/readiness evidence. A health response "
+                "from before stopping the service is no longer valid."
+            )
         unresolved = {e.get("action_id") for e in p.working_state.unresolved_errors}
         for a in p.actions:
             if a.action_id in unresolved:
@@ -2610,13 +2616,11 @@ class RunWorker:
             return False
         events = await self._read_all_events(run_id)
         successful_commands: set[str] = set()
-        healthy_service = False
+        service_health: dict[tuple[str, str], bool] = {}
         for event in events:
             if event.event_type != "ToolObservationCommitted":
                 continue
-            if event.payload.get("status") != "succeeded" or not bool(
-                event.payload.get("complete", True)
-            ):
+            if not bool(event.payload.get("complete", True)):
                 continue
             artifact = str(event.payload.get("observation_artifact") or "")
             if not artifact:
@@ -2638,17 +2642,29 @@ class RunWorker:
                 successful_commands.add(
                     _verification_command_digest(command)
                 )
-            if observation.tool_name == "service_status":
-                health_status = str(metadata.get("health_status") or "")
-                healthy_service = healthy_service or health_status == "healthy"
+            pid = metadata.get("pid")
+            if pid is None and isinstance(arguments, Mapping):
+                pid = arguments.get("pid")
+            key = (("pid", str(pid)) if pid is not None else
+                   ("name", str(metadata.get("service_name") or "unspecified")))
+            state = str(metadata.get("state") or "")
+            if observation.tool_name in {"process_stop", "process_status", "service_status"}:
+                if observation.status != "succeeded" or observation.tool_name == "process_stop" or state in {"stopped", "exited", "failed", "terminated"}:
+                    service_health[key] = False
+                    continue
+            if observation.status != "succeeded":
+                continue
+            if observation.tool_name == "service_status" and metadata.get("health_status") not in {None, "", "not_configured"}:
+                service_health[key] = metadata["health_status"] == "healthy"
+                continue
             readiness = metadata.get("readiness")
-            if isinstance(readiness, Mapping) and readiness.get("status") == "ready":
-                healthy_service = True
+            if isinstance(readiness, Mapping) and readiness.get("status") == "ready" and state not in {"stopped", "exited", "failed", "terminated"}:
+                service_health[key] = True
 
         for command in contract.verification_commands:
             if _verification_command_digest(command) not in successful_commands:
                 return False
-        if contract.require_service_health_check and not healthy_service:
+        if contract.require_service_health_check and not any(service_health.values()):
             return False
         return True
 
