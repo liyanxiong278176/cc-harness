@@ -33,6 +33,7 @@ from .loop_control import (
 )
 from .llm import ProviderProtocolError
 from .stream_errors import StreamErrorDetails, classify_stream_error
+from .command_failures import nonblocking_command_failure as _is_nonblocking_command_failure
 from .run_events import EventActor, RunEvent
 from .local_verification import python_assertion_verifier
 from .run_kernel import ActionRequest, AgentKernel, SegmentContext
@@ -599,7 +600,7 @@ class RunWorker:
                     and projection.goal.interaction_mode == "coding" and not _is_benchmark_task()
                     and ws.last_verification_ok is True and ws.last_verification_sequence >= ws.last_mutation_sequence
                     and ws.last_verification_sequence > self._assessed_verification_sequence
-                    and not ws.unresolved_errors and not projection.task.pause_requested):
+                    and not self._blocking_unresolved_errors(projection) and not projection.task.pause_requested):
                     contract = completion_contract_from_instruction(_goal_public_text(projection.goal))
                     if contract.required_artifacts and await self._durable_contract_satisfied(lease.run_id, projection, contract):
                         proposal = await self._synthesize_completion_candidate(current_lease, projection)
@@ -2198,16 +2199,59 @@ class RunWorker:
                 "and record current healthy service_status/readiness evidence. A health response "
                 "from before stopping the service is no longer valid."
             )
-        unresolved = {e.get("action_id") for e in p.working_state.unresolved_errors}
+        blocking = {str(e.get("action_id")) for e in self._blocking_unresolved_errors(p)}
         for a in p.actions:
-            if a.action_id in unresolved:
+            if a.action_id in blocking:
                 args = self.store.artifacts.read_text(a.arguments_artifact)
                 issues.append(f"Unresolved failed {a.tool_name}: {args[:600]}. Repair its cause and run the corresponding action/verifier successfully.")
         issues.append("Completion is not verified. Run a goal-relevant verifier after the last edit, without output pipelines that mask its exit code. Check required outputs. A command succeeding or git status alone is not goal acceptance.")
-        if any(a.action_id in unresolved and a.tool_name == "Read"
+        if any(a.action_id in blocking and a.tool_name == "Read"
                and "skill-runs" in self.store.artifacts.read_text(a.arguments_artifact) for a in p.actions):
             issues.append("For the failed pinned Skill resource read, use read_skill with the enabled skill_id and resource instead of direct Read of the internal path.")
         return issues
+
+    @staticmethod
+    def _is_nonblocking_command_failure(observation: Mapping[str, Any]) -> bool:
+        return _is_nonblocking_command_failure(observation)
+
+    def _blocking_unresolved_errors(self, projection: RunProjection):
+        """Return unresolved failures that still represent an unverified effect.
+
+        Authoring-only command failures remain visible in the projection and in
+        the completion review text, but they no longer starve the completion
+        gate or trigger an unrepairable repair loop.
+        """
+
+        latest: dict[str, Any] = {}
+        for action in projection.actions:
+            current = latest.get(action.action_id)
+            if current is None or action.attempt > current.attempt:
+                latest[action.action_id] = action
+        receipts: dict[tuple[str, int], Any] = {}
+        for observation in projection.observations:
+            if str(observation.status) == "failed":
+                receipts[(observation.action_id, observation.attempt)] = observation
+        blocking = []
+        for entry in projection.working_state.unresolved_errors:
+            action_id = str(entry.get("action_id") or "")
+            action = latest.get(action_id)
+            if action is None or action.tool_name != "run_command":
+                blocking.append(entry)
+                continue
+            receipt = receipts.get((action_id, action.attempt))
+            if receipt is None:
+                blocking.append(entry)
+                continue
+            try:
+                observation = json.loads(
+                    self.store.artifacts.read_text(receipt.observation_artifact)
+                )
+            except (OSError, ValueError, TypeError, AttributeError):
+                blocking.append(entry)
+                continue
+            if not isinstance(observation, Mapping) or not _is_nonblocking_command_failure(observation, root=getattr(self, "working_directory", None)):
+                blocking.append(entry)
+        return tuple(blocking)
 
     @staticmethod
     def _action_deduplication_status(
@@ -2391,7 +2435,7 @@ class RunWorker:
         # terminal successful boundary.  This also covers provider-supplied
         # candidates: canonical evidence alone must not hide a later failed or
         # outcome-unknown action in the same turn.
-        if projection.working_state.unresolved_errors:
+        if self._blocking_unresolved_errors(projection):
             return False
         if any(item.status.value == "requested" for item in projection.approvals):
             return False

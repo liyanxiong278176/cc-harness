@@ -1,14 +1,15 @@
-"""Install the Agent regression hook and remove the retired pytest hook."""
+"""Install local push checks, with an explicit paid Agent evaluation opt-in."""
 from __future__ import annotations
 
 import os
+import argparse
 from pathlib import Path
 import shlex
 import subprocess
 import sys
 
 
-def install(source: Path) -> list[str]:
+def install(source: Path, *, agent_eval_on_push: bool = False) -> list[str]:
     resolved = subprocess.run(["git", "rev-parse", "--git-path", "hooks"], cwd=source,
                               capture_output=True, text=True, check=True).stdout.strip()
     folder = Path(resolved)
@@ -25,7 +26,8 @@ def install(source: Path) -> list[str]:
         else:
             retired.unlink()
         installed.append(f"Removed observation pytest hook: {retired}")
-    for name, action in (("pre-push", "full"),):
+    target = "eval.observability.gates full" if agent_eval_on_push else "eval.observability.prepush"
+    for name in ("pre-push",):
         path = folder / name
         previous = folder / (name + ".cc-harness-previous")
         if path.exists() and marker not in path.read_text(encoding="utf-8", errors="replace"):
@@ -36,7 +38,7 @@ def install(source: Path) -> list[str]:
             'if [ -f "$0.cc-harness-previous" ]; then',
             '  "$0.cc-harness-previous" "$@" || exit $?', "fi",
             "cd " + shlex.quote(source.as_posix()) + " || exit 1",
-            "exec " + shlex.quote(Path(sys.executable).as_posix()) + " -m eval.observability.gates " + action, ""))
+            "exec " + shlex.quote(Path(sys.executable).as_posix()) + " -m " + target, ""))
         path.write_text(text, encoding="utf-8", newline="\n")
         if os.name != "nt":
             path.chmod(path.stat().st_mode | 0o111)
@@ -45,5 +47,8 @@ def install(source: Path) -> list[str]:
 
 
 if __name__ == "__main__":
-    for hook in install(Path(__file__).resolve().parents[1]):
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--agent-eval-on-push", action="store_true", help="Opt in to paid Golden Agent evaluation on every push")
+    args = parser.parse_args()
+    for hook in install(Path(__file__).resolve().parents[1], agent_eval_on_push=args.agent_eval_on_push):
         print(hook)

@@ -117,7 +117,15 @@ python -m eval.observability.gates check --experiment release-001
 python -m eval.observability.gates approve-baseline --experiment release-001 --reviewer YOUR_NAME
 ```
 
-已移除本次安装的 `pre-commit → quick`，保留 `pre-push → full`，它只运行 30 条 Golden Agent 任务。阶段或发布命令运行全部 42 条；既有用户 hook 保留。显式发布包装器会再次校验证据，只有通过才执行后面的发布命令：
+默认 `pre-push` 运行本地 Ruff 和核心回归，关闭真实 LLM 与观测服务，不进行付费 Agent 评估。既有用户 hook 保留。更新本地 hook：
+
+```powershell
+python scripts/install_observability_hooks.py
+```
+
+需要每次推送都运行 30 条 Golden Agent 任务时，显式使用 `python scripts/install_observability_hooks.py --agent-eval-on-push`，该模式会调用配置的模型并产生费用。手动 `gates full` 仍运行 Golden；阶段或发布命令运行全部 42 条。这些付费评估不会被本地回归替代为“已通过”，基线审批规则保持独立。
+
+显式发布包装器会再次校验证据，只有通过才执行后面的发布命令：
 
 ```powershell
 python -m eval.observability.gates publish --experiment release-001 --command YOUR_RELEASE_COMMAND

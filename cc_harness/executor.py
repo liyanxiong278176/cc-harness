@@ -1921,6 +1921,7 @@ class NativeExecutor:
                 display=f"exit {proc.returncode}: {combined[:200]}",
                 llm=f"[Tool Error] exit {proc.returncode}\nstdout: {stdout}\nstderr: {stderr}{output_notice}",
                 metadata={
+                    "shell_dialect": self.shell_profile.dialect,
                     "exit_code": proc.returncode,
                     "output_complete": output_complete,
                     "timed_out": False,
