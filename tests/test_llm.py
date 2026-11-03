@@ -1,4 +1,5 @@
 import http.client
+import json
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
@@ -115,6 +116,35 @@ def _make_client(stream_chunks):
     mock.chat.completions.create = AsyncMock(return_value=aiter(stream_chunks))
     client._client = mock
     return client
+
+
+@pytest.mark.asyncio
+async def test_provider_http_request_redacts_credential_shaped_data_without_mutating_history():
+    token = "sk-proj-" + "FAKEONLY" * 5
+    messages = [
+        {
+            "role": "assistant",
+            "content": None,
+            "tool_calls": [{"id": "call-1", "type": "function", "function": {
+                "name": "Read", "arguments": json.dumps({"api_key": token}),
+            }}],
+        },
+        {"role": "tool", "tool_call_id": "call-1", "content": f"sample credential {token}"},
+    ]
+    tools = [{"type": "function", "function": {
+        "name": "Read", "description": f"example credential {token}",
+    }}]
+    client = _make_client([_FakeChunk(_FakeChoiceDelta(content="ok"), finish_reason="stop")])
+
+    events = [event async for event in client.chat(messages, tools)]
+
+    assert events[-1].content == "ok"
+    sent = client._client.chat.completions.create.await_args.kwargs
+    assert token not in json.dumps(sent)
+    assert "<redacted>" in json.dumps(sent)
+    assert sent["messages"][1]["tool_call_id"] == "call-1"
+    assert token in messages[1]["content"]
+    assert token in tools[0]["function"]["description"]
 
 async def aiter(items):
     for x in items:

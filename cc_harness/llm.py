@@ -11,6 +11,7 @@ from typing import Any, Literal
 
 from cc_harness.model_identity import canonical_model_identity
 from cc_harness.net_env import make_async_openai
+from cc_harness.secret_patterns import redact_credentials
 from cc_harness.stream_errors import ProviderStreamError
 from cc_harness.tokens import UsageRecord
 
@@ -21,6 +22,18 @@ task_output_token_limit: ContextVar[int | None] = ContextVar("task_output_token_
 # blip should not surface as a failed run after two seconds; after the final
 # attempt the error is still surfaced unchanged (no infinite retry).
 _PROVIDER_RETRY_DELAYS = (1.0, 2.0, 4.0)
+
+
+def _redact_provider_value(value: Any) -> Any:
+    """Redact credential-shaped strings at the final HTTP request boundary."""
+
+    if isinstance(value, str):
+        return redact_credentials(value)
+    if isinstance(value, dict):
+        return {key: _redact_provider_value(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_redact_provider_value(item) for item in value]
+    return value
 
 
 def _retryable_provider_error(exc: BaseException) -> bool:
@@ -399,7 +412,11 @@ class LLMClient:
     ) -> AsyncIterator[StreamEvent]:
         """Yield StreamEvents; the final 'done' event carries the full assistant
         message (content + pending tool_calls + finish_reason)."""
-        kwargs: dict[str, Any] = {"model": self.model, "messages": messages, "stream": True}
+        kwargs: dict[str, Any] = {
+            "model": self.model,
+            "messages": _redact_provider_value(messages),
+            "stream": True,
+        }
         output_limit = task_output_token_limit.get()
         if output_limit is not None:
             kwargs["max_tokens"] = output_limit
@@ -412,7 +429,7 @@ class LLMClient:
             # explicitly selected disabled; auto never changes provider mode.
             kwargs["extra_body"] = {"thinking": {"type": "disabled"}}
         if tools:
-            kwargs["tools"] = tools
+            kwargs["tools"] = _redact_provider_value(tools)
 
         pending: list[PendingToolCall] = []
         content_parts: list[str] = []
