@@ -22,33 +22,6 @@ https://github.com/user-attachments/assets/b30e264d-889f-4b11-b173-1d9f7d392246
 
 ![cc-harness 动态架构图](docs/architecture/cc-harness-animated/cc-harness.gif)
 
-[静态 PNG](docs/architecture/cc-harness-animated/cc-harness.png) · [可编辑 Excalidraw](docs/architecture/cc-harness-animated/cc-harness.excalidraw) · [图示说明与生成方法](docs/architecture/cc-harness-animated/README.md)
-
-```mermaid
-flowchart LR
-    UI[WebUI / TUI] --> C[DurableRuntimeClient]
-    C --> S[RunCoordinator<br/>RunStore: append-only events]
-    S --> W[RunWorker<br/>lease + epoch fence]
-    W --> K[ReActKernel<br/>budget / loop guard]
-    K --> LLM[LLMClient<br/>OpenAI-compatible]
-    K --> CTX[ContextProjection<br/>Snippet→Prune→Summary]
-    K --> P[PolicyEngine<br/>allow / ask / deny]
-    P --> EX[Executor<br/>native or sandbox]
-    EX --> WS[(Workspace)]
-    W --> M[(SQLite<br/>runs · context · memory)]
-```
-
-一次任务的主链路：
-
-1. `entrypoint` 解析参数 → `DurableRuntimeClient.submit()` 写入 `RunCreated/RunQueued`。
-2. `LocalSupervisor` 选可运行的 run → `RunWorker.claim()` 拿 lease（带 epoch，过期提交会被拒）。
-3. 每个 segment：重建投影 → 压缩上下文 → 调模型 → 工具动作经 `PolicyEngine` → 落事件。
-4. 崩溃/中断后从事件日志恢复；工具结果不确定时记 `OUTCOME_UNKNOWN` 并要求显式对账，而不是盲目重放。
-5. WebUI 只读事件流，不拥有第二套执行引擎。
-
-更细的图与状态机见 [runtime 全景](docs/agent-runtime-full-flow.md)、[任务执行内核](docs/task-execution-kernel.md)、
-[租约模型](docs/runtime-leases.md)。
-
 ## 快速开始
 
 要求 Python 3.11+。
