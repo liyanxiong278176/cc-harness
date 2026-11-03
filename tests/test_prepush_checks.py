@@ -30,17 +30,20 @@ def test_foreign_hook_is_preserved_and_paid_checks_require_opt_in(tmp_path):
 
 def test_local_checks_disable_paid_services_and_fail_closed(monkeypatch, tmp_path):
     calls = []
+    monkeypatch.setenv('GIT_DIR', 'inherited-from-push')
 
     def run(command, **kwargs):
         calls.append((command, kwargs))
-        return SimpleNamespace(returncode=0)
+        return SimpleNamespace(returncode=0, stdout='GIT_DIR\nGIT_WORK_TREE\nGIT_INDEX_FILE\n')
 
     monkeypatch.setattr(prepush.subprocess, 'run', run)
     assert prepush.main(tmp_path) == 0
-    assert len(calls) == 2
-    for command, kwargs in calls:
+    assert len(calls) == 3
+    assert calls[0][0] == ['git', 'rev-parse', '--local-env-vars']
+    for command, kwargs in calls[1:]:
         assert kwargs['env']['CC_HARNESS_RUN_REAL_LLM'] == '0'
         assert kwargs['env']['CC_HARNESS_OBSERVABILITY_DISABLED'] == '1'
+        assert 'GIT_DIR' not in kwargs['env']
         assert not any('gates' in part for part in command)
     assert all((Path(__file__).resolve().parents[1] / path).exists() for path in prepush.TESTS)
     calls.clear()

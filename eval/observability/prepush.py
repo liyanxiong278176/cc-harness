@@ -29,6 +29,12 @@ def main(source: Path | None = None) -> int:
     source = source or Path(__file__).resolve().parents[2]
     env = dict(os.environ, CC_HARNESS_RUN_REAL_LLM="0",
                CC_HARNESS_RUN_SANDBOX_CONFORMANCE="0", CC_HARNESS_OBSERVABILITY_DISABLED="1")
+    local_vars = subprocess.run(["git", "rev-parse", "--local-env-vars"], cwd=source,
+                                env=env, capture_output=True, text=True)
+    if local_vars.returncode:
+        return local_vars.returncode
+    for name in local_vars.stdout.splitlines():
+        env.pop(name, None)
     commands = (
         [sys.executable, "-m", "ruff", "check", *SOURCES],
         [sys.executable, "-m", "pytest", "-q", "-m", "not requires_llm and not sandbox_conformance", *TESTS],
